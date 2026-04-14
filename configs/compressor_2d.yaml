@@ -1,0 +1,143 @@
+experiment:
+  name: compressor_2d_baseline
+  output_root: ./outputs/runs
+  seed: 42
+  device: auto
+  save_top_k: 1
+
+data:
+  dimensions: 2
+  dataset_name: tensor_folder_2d
+  source_roots:
+    all_primary: ./data/raw/all
+    all_extra: []
+    train_primary: ./data/raw/train
+    train_extra: []
+    val_primary: ./data/raw/val
+    val_extra: []
+    test_primary: ./data/raw/test
+    test_extra: []
+    external_reference_roots: []
+  split:
+    mode: predefined
+    seed: 42
+    shuffle: true
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+  dataset:
+    recursive: true
+    allow_empty: true
+    extensions:
+      - .npy
+      - .npz
+      - .h5
+      - .hdf5
+      - .png
+      - .jpg
+      - .jpeg
+      - .bmp
+      - .tif
+      - .tiff
+    npz_key: null
+    hdf5_dataset_key: null
+    hdf5_key_candidates: []
+    detect_hdf5_by_signature: true
+    allow_images: true
+    channels: 1
+    input_size: [128, 128]
+    strict_size: false
+    resize_mode: bilinear
+    normalization:
+      mode: none
+      stats_path: null
+      clip_min: null
+      clip_max: null
+  loader:
+    batch_size: 8
+    num_workers: 0
+    shuffle_train: true
+    pin_memory: true
+    drop_last: false
+    persistent_workers: false
+
+model:
+  name: conv_token_autoencoder_2d
+  in_channels: 1
+  out_channels: 1
+  input_size: [128, 128]
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 8]
+  num_res_blocks: 2
+  latent_dim: 128
+  latent_grid: [8, 8]
+  dropout: 0.0
+  norm: batch
+  activation: gelu
+  output_activation: identity
+
+loss:
+  name: composite_reconstruction_loss
+  weights:
+    mse: 1.0
+    l1: 0.1
+    relative_l1: 0.05
+    gradient: 0.05
+  eps: 1.0e-6
+
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+
+scheduler:
+  name: cosine
+  t_max: 50
+  min_lr: 1.0e-6
+
+training:
+  epochs: 50
+  mixed_precision: true
+  grad_clip_norm: 1.0
+  log_interval: 10
+  val_interval: 1
+  checkpoint_interval: 1
+
+visualization:
+  enabled: true
+  num_samples: 4
+  every_n_epochs: 1
+  field_cmap: turbo
+  error_cmap: inferno
+  robust_percentile: 1.0
+  display_channel: 0
+  add_colorbar: true
+  save_dirname: reconstructions
+
+wandb:
+  enabled: false
+  api_key: null
+  project: tensor-compression
+  entity: null
+  group: compression
+  tags:
+    - compression
+    - reconstruction
+    - 2d
+  mode: offline
+  log_model: false
+
+future:
+  adapters:
+    enabled: false
+    module_name: null
+  llm:
+    enabled: false
+    model_name: null
+    prompt_token_count: 16
+  tensor_3d:
+    model_name: conv_token_autoencoder_3d
+    dataset_name: tensor_folder_3d
+  tensor_4d:
+    model_name: factorized_autoencoder_4d
+    dataset_name: tensor_folder_4d
