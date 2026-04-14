@@ -27,7 +27,10 @@ class TensorFolder2DDataset(BaseTensorDataset):
         self.allow_images = bool(self.dataset_cfg["allow_images"])
         self.allow_empty = bool(self.dataset_cfg.get("allow_empty", False))
         self.npz_key = self.dataset_cfg.get("npz_key")
-        self.hdf5_dataset_key = self.dataset_cfg.get("hdf5_dataset_key")
+        self.hdf5_dataset_key = (
+            self.dataset_cfg.get("hdf5_dataset_key")
+            or self.dataset_cfg.get("field_key")
+        )
         self.hdf5_key_candidates = list(self.dataset_cfg.get("hdf5_key_candidates", []))
         self.detect_hdf5_by_signature = bool(self.dataset_cfg.get("detect_hdf5_by_signature", True))
         self.hdf5_index_mode = str(self.dataset_cfg.get("hdf5_index_mode", "auto")).lower()
@@ -48,8 +51,12 @@ class TensorFolder2DDataset(BaseTensorDataset):
         for root in self._resolve_roots():
             if not root.exists():
                 continue
-            iterator = root.rglob("*") if recursive else root.glob("*")
-            for path in iterator:
+            if root.is_file():
+                candidate_paths = [root]
+            else:
+                iterator = root.rglob("*") if recursive else root.glob("*")
+                candidate_paths = iterator
+            for path in candidate_paths:
                 if not path.is_file():
                     continue
                 if path.suffix.lower() in self.extensions:

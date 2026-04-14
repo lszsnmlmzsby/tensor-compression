@@ -304,6 +304,11 @@ tensor compression2.0/
 - `test_extra`：额外测试目录列表。
 - `external_reference_roots`：预留给外部参考数据源。
 
+说明：
+
+- `all_primary / train_primary / val_primary / test_primary` 既可以指向目录，也可以直接指向单个文件。
+- 当它们直接指向单个 `.h5/.hdf5/.npy/.npz/图片` 文件时，数据集会只读取这个文件，而不会继续扫描同目录下其他文件。
+
 #### `data.split`
 
 - `mode`：数据切分模式。
@@ -336,6 +341,7 @@ tensor compression2.0/
 - `extensions`：支持读取的文件后缀。
 - `npz_key`：`.npz` 文件中要读取的 key；为 `null` 时读取第一个数组。
 - `hdf5_dataset_key`：指定 `.h5/.hdf5` 文件中要读取的 dataset 路径。
+- `field_key`：`hdf5_dataset_key` 的兼容别名，方便兼容旧配置写法。
 - `hdf5_key_candidates`：当 `hdf5_dataset_key` 为空时，按顺序尝试的候选 dataset 路径列表。
 - `detect_hdf5_by_signature`：是否通过文件头自动识别 HDF5。开启后，即使后缀写得不标准，也会尽量识别。
 - `hdf5_index_mode`：HDF5 索引模式。

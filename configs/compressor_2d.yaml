@@ -9,9 +9,13 @@ data:
   dimensions: 2
   dataset_name: tensor_folder_2d
   source_roots:
-    all_primary: ./data/raw/all
+    all_primary: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
+    # Original default:
+    # all_primary: ./data/raw/all
     all_extra: []
     train_primary: ./data/raw/train
+    # Original default is kept for predefined split usage:
+    # train_primary: ./data/raw/train
     train_extra: []
     val_primary: ./data/raw/val
     val_extra: []
@@ -19,7 +23,9 @@ data:
     test_extra: []
     external_reference_roots: []
   split:
-    mode: predefined
+    mode: auto
+    # Original default:
+    # mode: predefined
     seed: 42
     shuffle: true
     train_ratio: 0.8
@@ -40,12 +46,22 @@ data:
       - .tif
       - .tiff
     npz_key: null
-    hdf5_dataset_key: null
+    hdf5_dataset_key: Vx
+    # Backward-compatible alias supported by code:
+    # field_key: Vx
+    # Original default:
+    # hdf5_dataset_key: null
     hdf5_key_candidates: []
     detect_hdf5_by_signature: true
+    hdf5_index_mode: sample
+    # Original default:
+    # hdf5_index_mode: auto
+    hdf5_sample_axis: 0
     allow_images: true
     channels: 1
-    input_size: [128, 128]
+    input_size: [512, 512]
+    # Original default:
+    # input_size: [128, 128]
     strict_size: false
     resize_mode: bilinear
     normalization:
@@ -55,7 +71,10 @@ data:
       clip_max: null
   loader:
     batch_size: 8
-    num_workers: 0
+    # If 512x512 runs out of memory, try batch_size: 1 or 2 first.
+    num_workers: 4
+    # Original default:
+    # num_workers: 0
     shuffle_train: true
     pin_memory: true
     drop_last: false
@@ -65,12 +84,16 @@ model:
   name: conv_token_autoencoder_2d
   in_channels: 1
   out_channels: 1
-  input_size: [128, 128]
+  input_size: [512, 512]
+  # Original default:
+  # input_size: [128, 128]
   base_channels: 32
   channel_multipliers: [1, 2, 4, 8]
   num_res_blocks: 2
   latent_dim: 128
-  latent_grid: [8, 8]
+  latent_grid: [32, 32]
+  # Original default:
+  # latent_grid: [8, 8]
   dropout: 0.0
   norm: batch
   activation: gelu
@@ -115,8 +138,12 @@ visualization:
   save_dirname: reconstructions
 
 wandb:
-  enabled: false
+  enabled: true
+  # Original default:
+  # enabled: false
   api_key: null
+  # Do not commit a real API key here. Prefer environment variable:
+  # export WANDB_API_KEY=your_new_key
   project: tensor-compression
   entity: null
   group: compression
@@ -124,7 +151,9 @@ wandb:
     - compression
     - reconstruction
     - 2d
-  mode: offline
+  mode: online
+  # Original default:
+  # mode: offline
   log_model: false
 
 future:
