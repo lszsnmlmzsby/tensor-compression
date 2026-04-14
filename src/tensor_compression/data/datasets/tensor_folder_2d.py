@@ -65,23 +65,23 @@ class TensorFolder2DDataset(BaseTensorDataset):
                 if self._has_hdf5_like_suffix(path) and path not in seen:
                     files.append(path)
                     seen.add(path)
-        return self._apply_split(sorted(files))
+        return sorted(files)
 
     def _build_samples(self, files: list[Path]) -> list[dict]:
         samples: list[dict] = []
         for path in files:
             if self._is_hdf5_file(path):
                 samples.extend(self._build_hdf5_samples(path))
-            else:
-                samples.append(
-                    {
-                        "path": path,
-                        "kind": "file",
-                        "dataset_path": None,
-                        "sample_index": None,
-                        "sample_axis": None,
-                    }
-                )
+                continue
+            samples.append(
+                {
+                    "path": path,
+                    "kind": "file",
+                    "dataset_path": None,
+                    "sample_index": None,
+                    "sample_axis": None,
+                }
+            )
         return self._apply_split(samples)
 
     def _build_hdf5_samples(self, path: Path) -> list[dict]:
@@ -108,7 +108,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
 
             sample_axis = self._normalize_sample_axis(self.hdf5_sample_axis, dataset.ndim)
             sample_count = int(dataset.shape[sample_axis])
-            samples = []
+            samples: list[dict] = []
             for sample_index in range(sample_count):
                 samples.append(
                     {

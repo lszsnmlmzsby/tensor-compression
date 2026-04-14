@@ -287,10 +287,10 @@ tensor compression2.0/
 
 说明：
 
-- `tensor_folder_2d` 不是 PyTorch 内置名字。
-- 它是本项目里单独定义并注册的一种 2D 数据集读取逻辑。
+- `tensor_folder_2d` 不是 PyTorch 内置数据集名字。
+- 它是本项目里单独定义并注册的一种通用 2D 数据读取逻辑。
 - 当前对应实现文件是 `src/tensor_compression/data/datasets/tensor_folder_2d.py`。
-- 它负责统一读取 `.npy / .npz / .h5 / .hdf5 / 图片` 等 2D 数据源，并完成样本索引、HDF5 dataset 选择、resize、通道整理、归一化等处理。
+- 这个读取器负责统一处理 `.npy / .npz / .h5 / .hdf5 / 图片` 等 2D 数据源，并完成样本索引、HDF5 dataset 选择、通道整理、resize、归一化等步骤。
 
 #### `data.source_roots`
 
@@ -323,7 +323,10 @@ tensor compression2.0/
 说明：
 
 - 当前 `train_ratio + val_ratio + test_ratio` 必须等于 `1.0`。
-- 自动切分是**按文件级别**做的，不是按文件内部样本做的。
+- 自动切分是按“最终样本列表”做的。
+- 对普通 `.npy / .npz / 图片` 文件来说，最终样本通常就是文件本身。
+- 对 HDF5 来说，如果 `hdf5_index_mode: file`，则按文件内选中的整个 dataset 作为一个样本切分。
+- 对 HDF5 来说，如果 `hdf5_index_mode: sample`，则会先按 `hdf5_sample_axis` 展开文件内多个样本，再按展开后的样本切分。
 - 自动切分结果是确定性的：同一组文件、同一个 `seed` 会得到同样的切分。
 
 #### `data.dataset`
@@ -615,10 +618,6 @@ data:
 - `mode: auto` 后，程序会扫描 `all_primary` 和 `all_extra` 中的文件，再自动分成 `train / val / test`。
 - 这个切分是文件级切分，所以适合“一个文件对应一个样本”的场景。
 - 如果一个 HDF5 文件里本身包含很多子样本，当前代码不会自动在文件内部继续切分；那种情况建议后续单独扩展 dataset 类。
-如果一个 HDF5 文件里本身包含很多子样本，当前代码现在已经可以直接处理，只要正确设置：
-
-- `hdf5_index_mode`
-- `hdf5_sample_axis`
 
 ### 7.3 HDF5 dataset 选择规则
 
@@ -636,9 +635,9 @@ data:
 
 如果你的 HDF5 结构比较复杂，最稳妥的方式仍然是直接指定 `hdf5_dataset_key`。
 
-### 7.4 单个 HDF5 文件内部包含多个样本时的配置
+### 7.4 单个 HDF5 文件内部有多个样本时
 
-现在已经支持“一个 HDF5 文件里保存很多 2D 样本”的情况。
+现在已经支持“一个 `.h5/.hdf5` 文件里保存很多 2D 样本”的情况。
 
 常见形状包括：
 
@@ -652,21 +651,10 @@ data:
 - `H, W` 是空间尺寸
 - `C` 是通道数
 
-如果你的 HDF5 文件是这种结构，建议这样配置：
+推荐配置示例：
 
 ```yaml
 data:
-  dataset_name: tensor_folder_2d
-  source_roots:
-    all_primary: ./data/raw/all
-    all_extra: []
-    train_primary: ./data/raw/train
-    train_extra: []
-    val_primary: ./data/raw/val
-    val_extra: []
-    test_primary: ./data/raw/test
-    test_extra: []
-    external_reference_roots: []
   split:
     mode: auto
     seed: 42
@@ -699,27 +687,25 @@ data:
       clip_max: null
 ```
 
-这段配置的意思是：
+这段配置的含义是：
 
-- 从 `./data/raw/all` 扫描 HDF5 文件
-- 读取 `/data` 这个 dataset
-- 把第 `0` 维当作样本维
-- 把一个 HDF5 文件内部的很多样本展开出来
-- 再按展开后的样本自动切成 `train / val / test`
+- 从指定目录扫描 HDF5 文件。
+- 读取 `/data` 这个 dataset。
+- 把第 `0` 维视为样本维。
+- 将单个 HDF5 文件内部的多个样本展开为独立样本。
+- 在 `data.split.mode: auto` 下，按展开后的样本再划分 `train / val / test`。
 
-如果你确定一个 HDF5 文件整体就是一个样本，而不是样本集合，则可以改成：
+如果你的 HDF5 整体就是一个样本，可以改成：
 
 ```yaml
 hdf5_index_mode: file
 ```
 
-如果你不确定，就先用：
+如果暂时不确定，就先用：
 
 ```yaml
 hdf5_index_mode: auto
 ```
-
-它会做一个比较保守的自动判断。
 
 ## 8. GitHub 上传与下载
 

@@ -43,7 +43,7 @@ class BaseTensorDataset(Dataset, ABC):
             roots.append(Path(entry))
         return roots
 
-    def _apply_split(self, items: list):
+    def _apply_split(self, items: list) -> list:
         split_mode = str(self.split_cfg.get("mode", "predefined")).lower()
         if split_mode == "predefined":
             return items
