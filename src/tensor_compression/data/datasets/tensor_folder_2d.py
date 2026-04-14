@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import product
 from pathlib import Path
 
 import h5py
@@ -34,6 +35,13 @@ class TensorFolder2DDataset(BaseTensorDataset):
         self.hdf5_key_candidates = list(self.dataset_cfg.get("hdf5_key_candidates", []))
         self.detect_hdf5_by_signature = bool(self.dataset_cfg.get("detect_hdf5_by_signature", True))
         self.hdf5_index_mode = str(self.dataset_cfg.get("hdf5_index_mode", "auto")).lower()
+        raw_sample_axes = self.dataset_cfg.get("hdf5_sample_axes")
+        if raw_sample_axes is None:
+            self.hdf5_sample_axes = None
+        elif isinstance(raw_sample_axes, (list, tuple)):
+            self.hdf5_sample_axes = [int(axis) for axis in raw_sample_axes]
+        else:
+            self.hdf5_sample_axes = [int(raw_sample_axes)]
         self.hdf5_sample_axis = int(self.dataset_cfg.get("hdf5_sample_axis", 0))
         self.normalization_cfg = self.dataset_cfg.get("normalization", {})
         self.files = self._scan_files()
@@ -85,8 +93,8 @@ class TensorFolder2DDataset(BaseTensorDataset):
                     "path": path,
                     "kind": "file",
                     "dataset_path": None,
-                    "sample_index": None,
-                    "sample_axis": None,
+                    "sample_indices": None,
+                    "sample_axes": None,
                 }
             )
         return self._apply_split(samples)
@@ -97,7 +105,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
             if dataset_path is None:
                 available = self._list_hdf5_datasets(handle)
                 raise ValueError(
-                    "No suitable numeric 2D/3D/4D dataset found in "
+                    "No suitable numeric 2D/3D/4D/5D dataset found in "
                     f"{path}. Available datasets: {available}"
                 )
             dataset = handle[dataset_path]
@@ -108,22 +116,22 @@ class TensorFolder2DDataset(BaseTensorDataset):
                         "path": path,
                         "kind": "hdf5_file",
                         "dataset_path": dataset_path,
-                        "sample_index": None,
-                        "sample_axis": None,
+                        "sample_indices": None,
+                        "sample_axes": None,
                     }
                 ]
 
-            sample_axis = self._normalize_sample_axis(self.hdf5_sample_axis, dataset.ndim)
-            sample_count = int(dataset.shape[sample_axis])
+            sample_axes = self._resolve_hdf5_sample_axes(dataset.shape)
+            sample_ranges = [range(int(dataset.shape[axis])) for axis in sample_axes]
             samples: list[dict] = []
-            for sample_index in range(sample_count):
+            for sample_indices in product(*sample_ranges):
                 samples.append(
                     {
                         "path": path,
                         "kind": "hdf5_sample",
                         "dataset_path": dataset_path,
-                        "sample_index": sample_index,
-                        "sample_axis": sample_axis,
+                        "sample_indices": tuple(int(index) for index in sample_indices),
+                        "sample_axes": tuple(sample_axes),
                     }
                 )
             return samples
@@ -141,8 +149,9 @@ class TensorFolder2DDataset(BaseTensorDataset):
         tensor = self._load_tensor(sample)
         tensor = self._normalize(tensor)
         sample_id = path.stem
-        if sample["sample_index"] is not None:
-            sample_id = f"{sample_id}#{sample['sample_index']}"
+        if sample["sample_indices"] is not None:
+            indices = "-".join(str(index) for index in sample["sample_indices"])
+            sample_id = f"{sample_id}#{indices}"
         return {
             "input": tensor,
             "target": tensor.clone(),
@@ -169,8 +178,8 @@ class TensorFolder2DDataset(BaseTensorDataset):
             array = self._load_hdf5_array(
                 path=path,
                 dataset_path=sample.get("dataset_path"),
-                sample_index=sample.get("sample_index"),
-                sample_axis=sample.get("sample_axis"),
+                sample_indices=sample.get("sample_indices"),
+                sample_axes=sample.get("sample_axes"),
             )
         else:
             if not self.allow_images:
@@ -192,27 +201,25 @@ class TensorFolder2DDataset(BaseTensorDataset):
         self,
         path: Path,
         dataset_path: str | None = None,
-        sample_index: int | None = None,
-        sample_axis: int | None = None,
+        sample_indices: tuple[int, ...] | None = None,
+        sample_axes: tuple[int, ...] | None = None,
     ) -> np.ndarray:
         with h5py.File(path, "r") as handle:
             dataset_path = dataset_path or self._select_hdf5_dataset_path(handle)
             if dataset_path is None:
                 available = self._list_hdf5_datasets(handle)
                 raise ValueError(
-                    "No suitable numeric 2D/3D/4D dataset found in "
+                    "No suitable numeric 2D/3D/4D/5D dataset found in "
                     f"{path}. Available datasets: {available}"
                 )
             dataset = handle[dataset_path]
-            if sample_index is None:
+            if sample_indices is None:
                 array = dataset[()]
             else:
-                normalized_axis = self._normalize_sample_axis(
-                    sample_axis if sample_axis is not None else self.hdf5_sample_axis,
-                    dataset.ndim,
-                )
+                resolved_axes = self._resolve_hdf5_sample_axes(dataset.shape, sample_axes)
                 indexer = [slice(None)] * dataset.ndim
-                indexer[normalized_axis] = sample_index
+                for axis, index in zip(resolved_axes, sample_indices):
+                    indexer[axis] = index
                 array = dataset[tuple(indexer)]
         return np.asarray(array, dtype=np.float32)
 
@@ -247,7 +254,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
     def _is_supported_hdf5_dataset(self, dataset: h5py.Dataset) -> bool:
         if not np.issubdtype(dataset.dtype, np.number):
             return False
-        return dataset.ndim in (2, 3, 4)
+        return dataset.ndim in (2, 3, 4, 5)
 
     def _list_hdf5_datasets(self, handle: h5py.File) -> list[str]:
         datasets: list[str] = []
@@ -295,6 +302,51 @@ class TensorFolder2DDataset(BaseTensorDataset):
             return "sample"
         return "file"
 
+    def _resolve_hdf5_sample_axes(
+        self,
+        shape: tuple[int, ...],
+        configured_axes: tuple[int, ...] | list[int] | None = None,
+    ) -> list[int]:
+        raw_axes = configured_axes
+        if raw_axes is None:
+            raw_axes = self.hdf5_sample_axes
+        if raw_axes is None:
+            axes = [self._normalize_sample_axis(self.hdf5_sample_axis, len(shape))]
+            axes = self._augment_sample_axes(shape, axes)
+        else:
+            axes = [self._normalize_sample_axis(int(axis), len(shape)) for axis in raw_axes]
+        if len(set(axes)) != len(axes):
+            raise ValueError(f"Duplicated sample axes are not allowed: {axes}")
+        if not self._is_valid_2d_sample_shape(shape, axes):
+            raise ValueError(
+                "Configured HDF5 sample axes do not leave a valid 2D sample shape. "
+                f"Got dataset shape={shape}, sample_axes={axes}. "
+                "Adjust `hdf5_sample_axes` (for example [0, 1] for [N, T, H, W]) "
+                "or switch to `hdf5_index_mode: file`."
+            )
+        return list(axes)
+
+    def _augment_sample_axes(self, shape: tuple[int, ...], axes: list[int]) -> list[int]:
+        resolved_axes = list(axes)
+        while not self._is_valid_2d_sample_shape(shape, resolved_axes):
+            candidates = [axis for axis in range(len(shape)) if axis not in resolved_axes]
+            if not candidates:
+                break
+            next_axis = candidates[0]
+            resolved_axes.append(next_axis)
+        return resolved_axes
+
+    def _is_valid_2d_sample_shape(self, shape: tuple[int, ...], sample_axes: list[int]) -> bool:
+        remaining = [size for axis, size in enumerate(shape) if axis not in sample_axes]
+        if len(remaining) == 2:
+            return True
+        if len(remaining) != 3:
+            return False
+        return (
+            remaining[0] in (self.channels, 1, 3, 4)
+            or remaining[-1] in (self.channels, 1, 3, 4)
+        )
+
     def _normalize_sample_axis(self, axis: int, ndim: int) -> int:
         if axis < 0:
             axis = ndim + axis
@@ -312,7 +364,10 @@ class TensorFolder2DDataset(BaseTensorDataset):
                 tensor = tensor.permute(2, 0, 1)
             else:
                 raise ValueError(
-                    f"Cannot infer 2D tensor channel order from shape {tuple(tensor.shape)}."
+                    "Cannot infer 2D tensor channel order from shape "
+                    f"{tuple(tensor.shape)}. If this came from an HDF5 sequence like "
+                    "[N, T, H, W], set `hdf5_sample_axes: [0, 1]` so time is expanded "
+                    "into samples instead of being treated as channels."
                 )
         else:
             raise ValueError(

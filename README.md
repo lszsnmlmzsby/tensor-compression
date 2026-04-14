@@ -348,6 +348,7 @@ tensor compression2.0/
   - `file`：整个 HDF5 dataset 当成一个样本。
   - `sample`：按 `hdf5_sample_axis` 将一个 HDF5 dataset 展开成多个样本。
   - `auto`：自动判断是否应展开为多个样本。
+- `hdf5_sample_axes`：可选的“多个样本维”配置，例如 `[0, 1]` 可将 `[N, T, H, W]` 展开成 `N*T` 个 2D 样本。
 - `hdf5_sample_axis`：当 `hdf5_index_mode: sample` 时，指定样本维。
 - `allow_images`：是否允许图片类文件作为 2D 输入读取。
 - `channels`：输入通道数。
@@ -648,12 +649,14 @@ data:
 常见形状包括：
 
 - `[N, H, W]`
+- `[N, T, H, W]`
 - `[N, C, H, W]`
 - `[N, H, W, C]`
 
 其中：
 
 - `N` 是样本数
+- `T` 可以是时间步或序列长度
 - `H, W` 是空间尺寸
 - `C` 是通道数
 
@@ -680,6 +683,7 @@ data:
       - data
     detect_hdf5_by_signature: true
     hdf5_index_mode: sample
+    hdf5_sample_axes: [0, 1]
     hdf5_sample_axis: 0
     allow_images: false
     channels: 1
@@ -697,8 +701,8 @@ data:
 
 - 从指定目录扫描 HDF5 文件。
 - 读取 `/data` 这个 dataset。
-- 把第 `0` 维视为样本维。
-- 将单个 HDF5 文件内部的多个样本展开为独立样本。
+- 优先按 `hdf5_sample_axes: [0, 1]` 把前两维视为样本维。
+- 因而像 `[N, T, H, W]` 这样的数据会被展开成 `N*T` 个独立 2D 样本。
 - 在 `data.split.mode: auto` 下，按展开后的样本再划分 `train / val / test`。
 
 如果你的 HDF5 整体就是一个样本，可以改成：

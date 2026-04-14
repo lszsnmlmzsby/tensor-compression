@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm.auto import tqdm
@@ -73,7 +72,7 @@ class CompressionTrainer:
         optimizer = self._build_optimizer(model)
         scheduler = self._build_scheduler(optimizer)
         amp_enabled = bool(self.config["training"]["mixed_precision"]) and self.device.type == "cuda"
-        scaler = GradScaler(enabled=amp_enabled)
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
         best_val_loss = float("inf")
         all_metrics: dict[str, dict] = {}
 
@@ -202,7 +201,7 @@ class CompressionTrainer:
             inputs = batch["input"].to(self.device)
             targets = batch["target"].to(self.device)
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=scaler.is_enabled()):
+            with torch.amp.autocast(device_type=self.device.type, enabled=scaler.is_enabled()):
                 outputs = model(inputs)
                 loss_dict = criterion(outputs["reconstruction"], targets)
             scaler.scale(loss_dict["total"]).backward()

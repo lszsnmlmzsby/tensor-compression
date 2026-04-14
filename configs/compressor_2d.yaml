@@ -33,18 +33,24 @@ data:
     test_ratio: 0.1
   dataset:
     recursive: true
-    allow_empty: true
+    allow_empty: false
+    # Original default:
+    # allow_empty: true
     extensions:
-      - .npy
-      - .npz
       - .h5
       - .hdf5
-      - .png
-      - .jpg
-      - .jpeg
-      - .bmp
-      - .tif
-      - .tiff
+    # Original default:
+    # extensions:
+    #   - .npy
+    #   - .npz
+    #   - .h5
+    #   - .hdf5
+    #   - .png
+    #   - .jpg
+    #   - .jpeg
+    #   - .bmp
+    #   - .tif
+    #   - .tiff
     npz_key: null
     hdf5_dataset_key: Vx
     # Backward-compatible alias supported by code:
@@ -56,8 +62,14 @@ data:
     hdf5_index_mode: sample
     # Original default:
     # hdf5_index_mode: auto
+    hdf5_sample_axes: [0, 1]
+    # PDEBench Vx often behaves like [sample, time, height, width].
+    # Original single-axis default:
+    # hdf5_sample_axes: null
     hdf5_sample_axis: 0
-    allow_images: true
+    allow_images: false
+    # Original default:
+    # allow_images: true
     channels: 1
     input_size: [512, 512]
     # Original default:
@@ -70,8 +82,10 @@ data:
       clip_min: null
       clip_max: null
   loader:
-    batch_size: 8
+    batch_size: 2
     # If 512x512 runs out of memory, try batch_size: 1 or 2 first.
+    # Original default:
+    # batch_size: 8
     num_workers: 4
     # Original default:
     # num_workers: 0
