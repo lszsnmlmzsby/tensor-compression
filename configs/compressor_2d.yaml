@@ -43,6 +43,8 @@ data:
     hdf5_dataset_key: null
     hdf5_key_candidates: []
     detect_hdf5_by_signature: true
+    hdf5_index_mode: auto
+    hdf5_sample_axis: 0
     allow_images: true
     channels: 1
     input_size: [128, 128]

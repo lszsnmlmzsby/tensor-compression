@@ -43,15 +43,15 @@ class BaseTensorDataset(Dataset, ABC):
             roots.append(Path(entry))
         return roots
 
-    def _apply_split(self, files: list[Path]) -> list[Path]:
+    def _apply_split(self, items: list):
         split_mode = str(self.split_cfg.get("mode", "predefined")).lower()
         if split_mode == "predefined":
-            return files
+            return items
         if split_mode != "auto":
             raise ValueError(f"Unsupported data.split.mode: {split_mode}")
 
-        if not files:
-            return files
+        if not items:
+            return items
 
         train_ratio = float(self.split_cfg.get("train_ratio", 0.8))
         val_ratio = float(self.split_cfg.get("val_ratio", 0.1))
@@ -63,7 +63,7 @@ class BaseTensorDataset(Dataset, ABC):
                 f"(train={train_ratio}, val={val_ratio}, test={test_ratio})."
             )
 
-        ordered = list(files)
+        ordered = list(items)
         if bool(self.split_cfg.get("shuffle", True)):
             rng = random.Random(int(self.split_cfg.get("seed", 42)))
             rng.shuffle(ordered)
@@ -80,7 +80,7 @@ class BaseTensorDataset(Dataset, ABC):
             subset = ordered[val_end:]
         else:
             raise ValueError(f"Unsupported split: {self.split}")
-        return sorted(subset)
+        return subset
 
     def _to_tensor(self, array) -> torch.Tensor:
         tensor = torch.as_tensor(array, dtype=torch.float32)

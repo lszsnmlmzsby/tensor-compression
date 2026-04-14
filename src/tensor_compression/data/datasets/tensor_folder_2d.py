@@ -30,9 +30,12 @@ class TensorFolder2DDataset(BaseTensorDataset):
         self.hdf5_dataset_key = self.dataset_cfg.get("hdf5_dataset_key")
         self.hdf5_key_candidates = list(self.dataset_cfg.get("hdf5_key_candidates", []))
         self.detect_hdf5_by_signature = bool(self.dataset_cfg.get("detect_hdf5_by_signature", True))
+        self.hdf5_index_mode = str(self.dataset_cfg.get("hdf5_index_mode", "auto")).lower()
+        self.hdf5_sample_axis = int(self.dataset_cfg.get("hdf5_sample_axis", 0))
         self.normalization_cfg = self.dataset_cfg.get("normalization", {})
         self.files = self._scan_files()
-        if not self.files and not self.allow_empty:
+        self.samples = self._build_samples(self.files)
+        if not self.samples and not self.allow_empty:
             joined_roots = ", ".join(str(p) for p in self._resolve_roots()) or "<none>"
             raise FileNotFoundError(
                 f"No 2D tensor files found for split={split!r} under: {joined_roots}"
@@ -64,26 +67,85 @@ class TensorFolder2DDataset(BaseTensorDataset):
                     seen.add(path)
         return self._apply_split(sorted(files))
 
+    def _build_samples(self, files: list[Path]) -> list[dict]:
+        samples: list[dict] = []
+        for path in files:
+            if self._is_hdf5_file(path):
+                samples.extend(self._build_hdf5_samples(path))
+            else:
+                samples.append(
+                    {
+                        "path": path,
+                        "kind": "file",
+                        "dataset_path": None,
+                        "sample_index": None,
+                        "sample_axis": None,
+                    }
+                )
+        return self._apply_split(samples)
+
+    def _build_hdf5_samples(self, path: Path) -> list[dict]:
+        with h5py.File(path, "r") as handle:
+            dataset_path = self._select_hdf5_dataset_path(handle)
+            if dataset_path is None:
+                available = self._list_hdf5_datasets(handle)
+                raise ValueError(
+                    "No suitable numeric 2D/3D/4D dataset found in "
+                    f"{path}. Available datasets: {available}"
+                )
+            dataset = handle[dataset_path]
+            mode = self._resolve_hdf5_index_mode(dataset.shape)
+            if mode == "file":
+                return [
+                    {
+                        "path": path,
+                        "kind": "hdf5_file",
+                        "dataset_path": dataset_path,
+                        "sample_index": None,
+                        "sample_axis": None,
+                    }
+                ]
+
+            sample_axis = self._normalize_sample_axis(self.hdf5_sample_axis, dataset.ndim)
+            sample_count = int(dataset.shape[sample_axis])
+            samples = []
+            for sample_index in range(sample_count):
+                samples.append(
+                    {
+                        "path": path,
+                        "kind": "hdf5_sample",
+                        "dataset_path": dataset_path,
+                        "sample_index": sample_index,
+                        "sample_axis": sample_axis,
+                    }
+                )
+            return samples
+
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.samples)
 
     def __getitem__(self, index: int) -> dict:
-        if not self.files:
+        if not self.samples:
             raise RuntimeError(
                 "Dataset is empty. Add training files or set `data.dataset.allow_empty: false` after data is ready."
             )
-        path = self.files[index]
-        tensor = self._load_tensor(path)
+        sample = self.samples[index]
+        path = sample["path"]
+        tensor = self._load_tensor(sample)
         tensor = self._normalize(tensor)
+        sample_id = path.stem
+        if sample["sample_index"] is not None:
+            sample_id = f"{sample_id}#{sample['sample_index']}"
         return {
             "input": tensor,
             "target": tensor.clone(),
-            "sample_id": path.stem,
+            "sample_id": sample_id,
             "path": str(path),
             "dimensions": 2,
         }
 
-    def _load_tensor(self, path: Path) -> torch.Tensor:
+    def _load_tensor(self, sample: dict) -> torch.Tensor:
+        path = sample["path"]
         suffix = path.suffix.lower()
         if suffix == ".npy":
             array = np.load(path)
@@ -97,7 +159,12 @@ class TensorFolder2DDataset(BaseTensorDataset):
                 first_key = loaded.files[0]
                 array = loaded[first_key]
         elif self._is_hdf5_file(path):
-            array = self._load_hdf5_array(path)
+            array = self._load_hdf5_array(
+                path=path,
+                dataset_path=sample.get("dataset_path"),
+                sample_index=sample.get("sample_index"),
+                sample_axis=sample.get("sample_axis"),
+            )
         else:
             if not self.allow_images:
                 raise ValueError(f"Image loading is disabled, but got {path}.")
@@ -114,16 +181,32 @@ class TensorFolder2DDataset(BaseTensorDataset):
         tensor = self._resize_if_needed(tensor)
         return tensor
 
-    def _load_hdf5_array(self, path: Path) -> np.ndarray:
+    def _load_hdf5_array(
+        self,
+        path: Path,
+        dataset_path: str | None = None,
+        sample_index: int | None = None,
+        sample_axis: int | None = None,
+    ) -> np.ndarray:
         with h5py.File(path, "r") as handle:
-            dataset_path = self._select_hdf5_dataset_path(handle)
+            dataset_path = dataset_path or self._select_hdf5_dataset_path(handle)
             if dataset_path is None:
                 available = self._list_hdf5_datasets(handle)
                 raise ValueError(
-                    "No suitable numeric 2D/3D dataset found in "
+                    "No suitable numeric 2D/3D/4D dataset found in "
                     f"{path}. Available datasets: {available}"
                 )
-            array = handle[dataset_path][()]
+            dataset = handle[dataset_path]
+            if sample_index is None:
+                array = dataset[()]
+            else:
+                normalized_axis = self._normalize_sample_axis(
+                    sample_axis if sample_axis is not None else self.hdf5_sample_axis,
+                    dataset.ndim,
+                )
+                indexer = [slice(None)] * dataset.ndim
+                indexer[normalized_axis] = sample_index
+                array = dataset[tuple(indexer)]
         return np.asarray(array, dtype=np.float32)
 
     def _select_hdf5_dataset_path(self, handle: h5py.File) -> str | None:
@@ -157,7 +240,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
     def _is_supported_hdf5_dataset(self, dataset: h5py.Dataset) -> bool:
         if not np.issubdtype(dataset.dtype, np.number):
             return False
-        return dataset.ndim in (2, 3)
+        return dataset.ndim in (2, 3, 4)
 
     def _list_hdf5_datasets(self, handle: h5py.File) -> list[str]:
         datasets: list[str] = []
@@ -186,6 +269,31 @@ class TensorFolder2DDataset(BaseTensorDataset):
 
     def _is_hdf5_file(self, path: Path) -> bool:
         return self._has_hdf5_like_suffix(path) or self._looks_like_hdf5(path)
+
+    def _resolve_hdf5_index_mode(self, shape: tuple[int, ...]) -> str:
+        mode = self.hdf5_index_mode
+        if mode not in {"auto", "file", "sample"}:
+            raise ValueError(f"Unsupported hdf5_index_mode: {mode}")
+        if mode in {"file", "sample"}:
+            return mode
+
+        ndim = len(shape)
+        if ndim <= 2:
+            return "file"
+        if ndim == 3:
+            if shape[0] == self.channels or shape[-1] == self.channels:
+                return "file"
+            return "sample"
+        if ndim >= 4:
+            return "sample"
+        return "file"
+
+    def _normalize_sample_axis(self, axis: int, ndim: int) -> int:
+        if axis < 0:
+            axis = ndim + axis
+        if axis < 0 or axis >= ndim:
+            raise ValueError(f"Sample axis {axis} is out of range for ndim={ndim}.")
+        return axis
 
     def _ensure_chw(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.ndim == 2:
