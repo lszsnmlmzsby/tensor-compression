@@ -37,10 +37,10 @@ class WandbLogger:
             return
         self._wandb.log(payload, step=step)
 
-    def image(self, path: str, caption: str | None = None):
+    def image(self, data, caption: str | None = None):
         if self.run is None:
             return None
-        return self._wandb.Image(path, caption=caption)
+        return self._wandb.Image(data, caption=caption)
 
     def finish(self) -> None:
         if self.run is None:

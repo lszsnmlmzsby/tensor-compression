@@ -25,6 +25,12 @@ class ReconstructionVisualizer2D:
         return self.enabled and (epoch % self.every_n_epochs == 0)
 
     def save(self, inputs: torch.Tensor, reconstructions: torch.Tensor, epoch: int) -> Path:
+        fig = self.render(inputs=inputs, reconstructions=reconstructions)
+        path = self.save_figure(fig=fig, epoch=epoch)
+        plt.close(fig)
+        return path
+
+    def render(self, inputs: torch.Tensor, reconstructions: torch.Tensor):
         inputs = inputs.detach().cpu()
         reconstructions = reconstructions.detach().cpu()
         count = min(self.num_samples, inputs.shape[0])
@@ -52,9 +58,11 @@ class ReconstructionVisualizer2D:
                 fig.colorbar(im2, ax=axes[row][2], fraction=0.046, pad=0.04)
             for col in range(3):
                 axes[row][col].axis("off")
+        return fig
+
+    def save_figure(self, fig, epoch: int) -> Path:
         path = self.output_dir / f"epoch_{epoch:04d}.png"
         fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
         return path
 
     def _to_scalar_field(self, tensor: torch.Tensor) -> np.ndarray:
@@ -87,6 +95,12 @@ class _UnsupportedVisualizer:
         return False
 
     def save(self, inputs: torch.Tensor, reconstructions: torch.Tensor, epoch: int):
+        raise NotImplementedError("Visualizer is not implemented for this tensor dimensionality yet.")
+
+    def render(self, inputs: torch.Tensor, reconstructions: torch.Tensor):
+        raise NotImplementedError("Visualizer is not implemented for this tensor dimensionality yet.")
+
+    def save_figure(self, fig, epoch: int):
         raise NotImplementedError("Visualizer is not implemented for this tensor dimensionality yet.")
 
 

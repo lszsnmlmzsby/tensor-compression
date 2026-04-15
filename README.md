@@ -249,6 +249,7 @@ tensor compression2.0/
 - checkpoint 保存
 - 重建图保存
 - W&B 日志记录
+- 验证阶段重建图直接上传到 W&B
 
 ## 4. 可视化设计
 
@@ -1156,130 +1157,7 @@ hdf5_index_mode: file
 hdf5_index_mode: auto
 ```
 
-## 8. GitHub 上传与下载
-
-当前仓库已经补好了适合上传 GitHub 的基础文件：
-
-- `.gitignore`
-- `.gitattributes`
-- `.editorconfig`
-
-这些文件的作用：
-
-- `.gitignore`：避免把数据、训练输出、虚拟环境、checkpoint、W&B 本地缓存等无关内容推上 GitHub。
-- `.gitattributes`：统一行尾，并把二进制数据格式标记为 binary。
-- `.editorconfig`：统一基础文本格式习惯。
-
-### 8.1 上传到 GitHub
-
-假设你已经在 GitHub 网站上创建了一个空仓库，下面是在 Linux 服务器或本地 Linux 环境中的常见流程。
-
-1. 进入项目目录
-
-```bash
-cd /path/to/tensor-compression2.0
-```
-
-2. 初始化 Git 仓库
-
-```bash
-git init
-```
-
-3. 查看当前状态
-
-```bash
-git status
-```
-
-4. 添加文件
-
-```bash
-git add .
-```
-
-5. 提交
-
-```bash
-git commit -m "Initial commit"
-```
-
-6. 将默认分支设为 `main`
-
-```bash
-git branch -M main
-```
-
-7. 绑定远程仓库
-
-HTTPS 方式：
-
-```bash
-git remote add origin https://github.com/<your-name>/<repo-name>.git
-```
-
-SSH 方式：
-
-```bash
-git remote add origin git@github.com:<your-name>/<repo-name>.git
-```
-
-8. 推送到 GitHub
-
-```bash
-git push -u origin main
-```
-
-说明：
-
-- 如果你使用 HTTPS，GitHub 现在通常要求使用 **Personal Access Token**，而不是账户密码。
-- 上传前请确认 `configs/compressor_2d.yaml` 中的 `wandb.api_key` 仍然是 `null`，不要把真实密钥提交到 GitHub。
-
-### 8.2 从 GitHub 下载
-
-使用 Git 克隆：
-
-```bash
-git clone https://github.com/<your-name>/<repo-name>.git
-cd <repo-name>
-```
-
-或使用 SSH：
-
-```bash
-git clone git@github.com:<your-name>/<repo-name>.git
-cd <repo-name>
-```
-
-### 8.3 拉取更新
-
-```bash
-git pull
-```
-
-### 8.4 查看远程仓库地址
-
-```bash
-git remote -v
-```
-
-### 8.5 修改远程仓库地址
-
-```bash
-git remote set-url origin https://github.com/<your-name>/<repo-name>.git
-```
-
-### 8.6 不使用 Git，直接下载 ZIP
-
-如果只是下载仓库代码，不想使用 Git：
-
-1. 打开 GitHub 仓库网页。
-2. 点击 `Code`。
-3. 选择 `Download ZIP`。
-
-这种方式适合快速拿代码，但不方便后续同步更新。
-
-## 9. 后续扩展建议
+## 8. 后续扩展建议
 
 下一步建议优先做以下几项：
 
@@ -1290,13 +1168,13 @@ git remote set-url origin https://github.com/<your-name>/<repo-name>.git
 5. 接入 adapter 与 LLM。
 6. 增加下游任务训练脚本。
 
-## 10. 相关文档
+## 9. 相关文档
 
 - `training_workflow.md`：完整训练流程文档。
 - `./configs/compressor_2d.yaml`：默认 2D 配置。
 - `./scripts/train_compressor.py`：训练入口。
 
-## 11. PyTorch 安装说明
+## 10. PyTorch 安装说明
 
 当前仓库使用的是：
 

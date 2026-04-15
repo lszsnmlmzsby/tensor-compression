@@ -4,6 +4,7 @@ import copy
 import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -110,14 +111,19 @@ class CompressionTrainer:
             log_payload.update({f"val/{k}": v for k, v in val_metrics.items()})
 
             if self.visualizer.should_run(epoch):
-                vis_path = self.visualizer.save(
+                vis_figure = self.visualizer.render(
                     inputs=val_batch["input"],
                     reconstructions=val_batch["reconstruction"],
-                    epoch=epoch,
                 )
-                image = self.wandb_logger.image(str(vis_path), caption=f"epoch={epoch}")
+                vis_path = self.visualizer.save_figure(fig=vis_figure, epoch=epoch)
+                image = self.wandb_logger.image(
+                    vis_figure,
+                    caption=f"epoch={epoch}",
+                )
+                plt.close(vis_figure)
                 if image is not None:
                     log_payload["val/reconstruction"] = image
+                    log_payload["val/reconstruction_path"] = str(vis_path)
 
             self.wandb_logger.log(log_payload, step=epoch)
 
