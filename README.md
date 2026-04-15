@@ -388,6 +388,445 @@ tensor compression2.0/
 - `activation`：激活函数，当前支持 `relu`、`gelu`、`silu`。
 - `output_activation`：输出层激活，当前支持 `identity`、`sigmoid`、`tanh`。
 
+#### 5.3.1 `conv_token_autoencoder_2d` 结构直观说明
+
+当前 2D 模型可以粗略理解为：
+
+1. 一个输入投影层
+2. 多层卷积下采样
+3. 每个尺度上若干残差块
+4. 一个 `1x1` 卷积把特征投影到 latent
+5. 对称的反卷积解码器把 latent 还原回原尺寸
+
+其中：
+
+- `stem conv`：指编码器开头那一层卷积，也就是“输入投影层”。
+- 它当前对应代码里的：
+
+```python
+nn.Conv2d(self.in_channels, base_channels, kernel_size=3, padding=1)
+```
+
+- 它的作用是把原始输入从 `in_channels` 映射到模型主干使用的 `base_channels`。
+
+例如当前常见配置是：
+
+```yaml
+in_channels: 1
+base_channels: 32
+```
+
+那么 `stem conv` 会把：
+
+```text
+[B, 1, H, W] -> [B, 32, H, W]
+```
+
+这里的 `channel` 可以理解为“每个像素位置上的特征维度”。
+
+对 2D 张量来说：
+
+- `1` 个 channel：常见于单标量场，如压力场、速度某一分量等。
+- `3` 个 channel：常见于 RGB 图像。
+- 更大的 channel 数：表示网络内部学习到的多组特征，而不是人类直接可见的颜色通道。
+
+例如：
+
+```text
+[B, 1, 512, 512]
+```
+
+表示一个 batch 中，每个样本是单通道、分辨率 `512x512` 的张量场。
+
+```text
+[B, 32, 512, 512]
+```
+
+表示同样的空间位置上，现在每个位置不再只有 1 个数，而是有 32 个特征值。
+
+#### 5.3.2 下采样后为什么残差还能连接
+
+当前残差块 `ResidualBlock2D` 的结构是：
+
+```text
+输入 -> Conv -> Norm -> Act -> Conv -> Norm -> 与原输入相加 -> Act
+```
+
+关键点是：
+
+- 残差块内部不会改变空间分辨率。
+- 残差块内部也不会改变 channel 数。
+
+也就是说，进入残差块前后的张量形状完全一致，所以可以直接做：
+
+```text
+inputs + block(inputs)
+```
+
+例如：
+
+```text
+[B, 64, 128, 128]
+```
+
+经过一个残差块之后，输出仍然是：
+
+```text
+[B, 64, 128, 128]
+```
+
+真正发生尺寸变化的是前面的下采样卷积，而不是残差块本身。
+
+以当前编码器为例：
+
+```text
+[B, 32, 512, 512]
+  -> stride=2 conv
+[B, 32, 256, 256]
+  -> residual blocks
+[B, 32, 256, 256]
+```
+
+也就是说：
+
+- 先用下采样卷积把分辨率从 `512x512` 变成 `256x256`
+- 再在这个新尺度上堆叠残差块
+- 残差连接只发生在“同一尺度、同一 channel 数”内部
+
+#### 5.3.3 当前配置下从样本到 latent 的形状变化
+
+以当前常见配置为例：
+
+```yaml
+in_channels: 1
+input_size: [512, 512]
+base_channels: 32
+channel_multipliers: [1, 2, 4, 8]
+latent_dim: 128
+latent_grid: [32, 32]
+```
+
+单个样本进入模型时的形状是：
+
+```text
+[1, 512, 512]
+```
+
+如果 batch size 为 `B`，则实际输入形状是：
+
+```text
+[B, 1, 512, 512]
+```
+
+编码过程形状变化如下：
+
+```text
+输入                         [B, 1,   512, 512]
+stem conv                    [B, 32,  512, 512]
+
+downsample 1                 [B, 32,  256, 256]
+res blocks                   [B, 32,  256, 256]
+
+downsample 2                 [B, 64,  128, 128]
+res blocks                   [B, 64,  128, 128]
+
+downsample 3                 [B, 128, 64,  64]
+res blocks                   [B, 128, 64,  64]
+
+downsample 4                 [B, 256, 32,  32]
+res blocks                   [B, 256, 32,  32]
+
+to_latent (1x1 conv)         [B, 128, 32,  32]   <- latent_map
+flatten + transpose          [B, 1024, 128]      <- latent_tokens
+```
+
+这里：
+
+- `latent_map` 是更接近卷积网络内部表示的 latent。
+- `latent_tokens` 是把空间维展平成 token 后的表示。
+- 因为 `32 * 32 = 1024`，所以 token 数是 `1024`。
+
+#### 5.3.4 压缩率如何计算
+
+这套模型里常见有两种压缩率口径：
+
+1. 按 token 数计算的压缩率
+2. 按内存占用计算的压缩率
+
+##### 按 token 数计算
+
+对输入大小为 `[H, W]` 的 2D 样本：
+
+- 原始空间位置数：`H * W`
+- latent token 数：`latent_grid[0] * latent_grid[1]`
+
+所以：
+
+```text
+token 压缩率 = (H * W) / (latent_grid[0] * latent_grid[1])
+```
+
+当前 `512x512 -> 32x32` 时：
+
+```text
+token 压缩率 = (512 * 512) / (32 * 32) = 256:1
+```
+
+##### 按内存占用计算
+
+若输入和 latent 使用相同精度存储，例如都按 `float32` 保存，则：
+
+- 输入标量数：`in_channels * H * W`
+- latent 标量数：`latent_dim * latent_grid[0] * latent_grid[1]`
+
+所以：
+
+```text
+内存压缩率 = (in_channels * H * W) / (latent_dim * latent_grid[0] * latent_grid[1])
+```
+
+当前配置下：
+
+```text
+in_channels = 1
+H = W = 512
+latent_dim = 128
+latent_grid = [32, 32]
+```
+
+因此：
+
+```text
+内存压缩率 = (1 * 512 * 512) / (128 * 32 * 32) = 2:1
+```
+
+注意：
+
+- token 压缩率高，不代表真实内存压缩率也同样高。
+- 当前 latent 仍然是连续浮点张量，没有做量化或熵编码，所以按内存算的压缩率会更保守。
+
+#### 5.3.5 哪些 config 会影响压缩率
+
+最关键的是两个：
+
+- `latent_dim`
+- `channel_multipliers`
+
+其中：
+
+- `latent_dim` 决定每个 latent token 有多少特征维。
+- `channel_multipliers` 的长度决定下采样层数，也决定 `latent_grid` 的大小。
+
+src\tensor_compression\models\compressors\conv_token_autoencoder_2d.py代码中
+```python
+for mult in multipliers:
+    next_channels = base_channels * mult
+```
+即假设
+```
+multipliers = [1, 2, 4]
+```
+那么channels会变成
+```
+base → base → 2base → 4base
+```
+其中base指base_channel，默认值为32，即在进入卷积层之前，每个空间位置的量会由特征维度为1的数字先转换成特征维度为32的向量。（channel即通道，例如RBG图像为3通道）
+
+如果把 `channel_multipliers` 的长度记为 `L`，则总下采样因子为：
+
+```text
+down_factor = 2^L
+```
+
+因此必须满足：
+
+```text
+input_size = latent_grid * down_factor
+```
+
+更展开地写，就是：
+
+```text
+latent_grid[0] = input_size[0] / 2^L
+latent_grid[1] = input_size[1] / 2^L
+```
+
+其中 `L = len(channel_multipliers)`。
+
+也就是说：
+
+- `input_size[0]` 和 `input_size[1]` 必须都能被 `2^L` 整除。
+- `latent_grid` 必须与 `input_size` 和下采样层数严格匹配。
+- `latent_dim` 本身不会影响这个几何关系，但会影响最终内存压缩率。
+
+例如当前 `input_size: [512, 512]` 时：
+
+- 若 `channel_multipliers` 长度为 `4`，则 `down_factor = 16`，必须有 `latent_grid = [32, 32]`
+- 若 `channel_multipliers` 长度为 `5`，则 `down_factor = 32`，必须有 `latent_grid = [16, 16]`
+- 若 `channel_multipliers` 长度为 `6`，则 `down_factor = 64`，必须有 `latent_grid = [8, 8]`
+
+例如下面这组配置：
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8, 8, 8]
+latent_grid: [8, 8]
+latent_dim: 256
+```
+
+是满足几何关系的，因为：
+
+```text
+L = 6
+down_factor = 2^6 = 64
+512 / 64 = 8
+```
+
+因此：
+
+```text
+latent_grid = [8, 8]
+```
+
+正好与 `input_size` 匹配。
+
+但这组配置虽然“能建模成功”，并不代表一定“训练最优”。
+
+它对应的压缩率是：
+
+- token 压缩率：`(512*512) / (8*8) = 4096:1`
+- 内存压缩率：`(1*512*512) / (256*8*8) = 16:1`
+
+可见：
+
+- token 压缩率非常高
+- 内存压缩率也明显高于当前基线
+- 但 latent 更小、压缩更强，重建任务会更难，训练也更容易掉细节
+
+所以判断一组配置时，通常需要同时检查两件事：
+
+1. 数学上是否满足：
+
+```text
+input_size = latent_grid * 2^len(channel_multipliers)
+```
+
+2. 压缩是否过强，是否可能明显损伤重建质量
+
+##### `latent_dim` 的作用
+
+在不改变 `latent_grid` 的情况下：
+
+- `latent_dim` 越小，内存压缩率越高。
+- `latent_dim` 越大，latent 表达能力越强，但压缩率越低。
+
+例如在 `512 -> 32x32` 不变时：
+
+- `latent_dim: 128` -> 内存压缩率 `2:1`
+- `latent_dim: 64` -> 内存压缩率 `4:1`
+- `latent_dim: 32` -> 内存压缩率 `8:1`
+
+##### `channel_multipliers` 长度的作用
+
+如果把：
+
+```yaml
+channel_multipliers: [1, 2, 4, 8]
+```
+
+改成：
+
+```yaml
+channel_multipliers: [1, 2, 4, 8, 8]
+```
+
+那么下采样层数从 `4` 变成 `5`，总下采样因子从：
+
+```text
+16 -> 32
+```
+
+这时在 `input_size: [512, 512]` 下，`latent_grid` 需要从：
+
+```text
+[32, 32] -> [16, 16]
+```
+
+此时：
+
+- token 压缩率从 `256:1` 提高到 `1024:1`
+- 若 `latent_dim` 仍为 `128`，则内存压缩率从 `2:1` 提高到 `8:1`
+
+#### 5.3.6 推荐压缩率分档
+
+下面给出几组常见配置档位，便于按压缩率做实验。
+
+##### 档位 A：当前基线
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8]
+latent_grid: [32, 32]
+latent_dim: 128
+```
+
+- token 压缩率：`256:1`
+- 内存压缩率：`2:1`
+
+##### 档位 B：中等压缩
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8]
+latent_grid: [32, 32]
+latent_dim: 64
+```
+
+- token 压缩率：`256:1`
+- 内存压缩率：`4:1`
+
+##### 档位 C：较强压缩
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8]
+latent_grid: [32, 32]
+latent_dim: 32
+```
+
+- token 压缩率：`256:1`
+- 内存压缩率：`8:1`
+
+##### 档位 D：减少 token 数
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8, 8]
+latent_grid: [16, 16]
+latent_dim: 128
+```
+
+- token 压缩率：`1024:1`
+- 内存压缩率：`8:1`
+
+##### 档位 E：高压缩
+
+```yaml
+input_size: [512, 512]
+channel_multipliers: [1, 2, 4, 8, 8]
+latent_grid: [16, 16]
+latent_dim: 64
+```
+
+- token 压缩率：`1024:1`
+- 内存压缩率：`16:1`
+
+实验建议：
+
+- 如果你优先关心“真实内存压缩率太低”，先减小 `latent_dim`。
+- 如果你优先关心“token 数太多，不利于后续接 Transformer / LLM”，先增加下采样层数，减小 `latent_grid`。
+- 如果两者都关心，就同时减小 `latent_dim` 与 `latent_grid`。
+
 ### 5.4 `loss`
 
 - `name`：当前损失函数名，固定为组合重建损失。
