@@ -2,6 +2,8 @@
 
 该仓库用于训练面向 **2D / 3D / 4D 数值张量** 的压缩-重建模型，并为后续接入 **LLM soft prompt / adapter / downstream tasks** 预留清晰的扩展接口。
 
+当前实验配置已经切到 **PDEBench** 数据集，当前 2D 示例默认按 PDEBench 的 HDF5 文件组织方式来配置与说明。
+
 当前版本已经完成：
 
 - 仓库基础结构与模块划分
@@ -15,7 +17,7 @@
 
 当前版本尚未完成：
 
-- 实际数据集内容
+- PDEBench 之外的数据整理、标准化统计与 manifest 生成
 - 4D 具体数据处理与模型实现
 - latent 对齐 LLM 的 adapter
 - 下游任务训练
@@ -100,6 +102,49 @@ python ./scripts/train_compressor.py --config ./configs/compressor_2d.yaml
 - 当前仓库不会主动安装任何依赖，也不会执行任何污染环境的操作。
 - 当前 `requirements.txt` 默认面向 **CUDA 12.4** 环境。
 - 当前配置默认允许数据目录为空，以便先完成工程搭建；真正开始训练时，如果训练集或验证集为空，程序会明确报错并停止。
+
+### 1.3 检查 PDEBench HDF5 的 key 和 shape
+
+仓库新增了测试文件 `tests/test_inspect_pdebench_hdf5.py`，用于在不启动训练的情况下检查 `.h5/.hdf5` 文件中的：
+
+- 顶层 `key`
+- 所有 dataset 路径
+- 每个 dataset 的 `shape`
+- 每个 dataset 的 `dtype`
+
+这个测试会优先读取环境变量 `PDEBENCH_HDF5_PATH` 指向的文件；如果没有设置，则回退到 `configs/compressor_2d.yaml` 中的 `data.source_roots.all_primary`。
+
+Linux / macOS 示例：
+
+```bash
+export PDEBENCH_HDF5_PATH=/path/to/your_pdebench_file.hdf5
+python -m unittest discover -s tests -p "test_inspect_pdebench_hdf5.py" -v
+```
+
+PowerShell 示例：
+
+```powershell
+$env:PDEBENCH_HDF5_PATH="E:\path\to\your_pdebench_file.hdf5"
+python -m unittest discover -s tests -p "test_inspect_pdebench_hdf5.py" -v
+```
+
+如果输出里出现类似：
+
+```text
+- Vx: shape=(N, T, H, W), dtype=float32
+```
+
+那么当前 2D 配置通常可以写成：
+
+```yaml
+data:
+  dataset:
+    hdf5_dataset_key: Vx
+    hdf5_index_mode: sample
+    hdf5_sample_axes: [0, 1]
+```
+
+也就是把 PDEBench 常见的 `[sample, time, height, width]` 展开成 `sample * time` 个 2D 样本。
 
 ## 2. 仓库结构
 
@@ -227,6 +272,27 @@ tensor compression2.0/
 - 重建图保存
 - W&B 日志记录
 - 验证阶段重建图直接上传到 W&B
+
+当前 W&B 记录策略如下：
+
+- 保留一组精简后的 `train_step/*` 标量，便于直接观察训练趋势。
+- 额外上传一个 `reconstruction_panel` 图片面板，用于查看 `reconstructions/` 目录中的三联图。
+
+当前默认保留的 `train_step/*` 指标含义如下：
+
+- `loss_total`：总目标函数值，等于各损失项按权重加权后的结果，是训练时真正反向传播的目标。
+- `psnr`：峰值信噪比，越高越好，用于衡量整体重建质量。
+- `mse`：均方误差，越低越好。
+- `mae`：平均绝对误差，越低越好。
+- `relative_l1`：相对绝对误差，越低越好，适合目标尺度变化较大的场数据。
+- `max_abs_error`：最大绝对误差，越低越好，用于观察最坏点误差。
+- `loss_gradient`：梯度差损失，越低越好，用于约束局部变化和边缘结构。
+
+当前已去掉的重复项如下：
+
+- `loss_mse` 与 `mse` 数值相同。
+- `loss_l1` 与 `mae` 数值相同。
+- `loss_relative_l1` 与 `relative_l1` 数值相同。
 
 ## 4. 可视化设计
 
@@ -886,7 +952,24 @@ latent_dim: 64
 - `future.tensor_3d`：3D 数据与模型注册名预留。
 - `future.tensor_4d`：4D 数据与模型注册名预留。
 
-## 6. 当前默认数据放置方式
+## 6. 当前数据来源与放置方式
+
+### 6.1 当前 PDEBench 示例
+
+当前实验默认使用 **PDEBench** 的 HDF5 文件作为 2D 数据源。
+
+`configs/compressor_2d.yaml` 里的当前示例配置是：
+
+- `data.source_roots.all_primary`：直接指向一个 PDEBench `.hdf5` 文件
+- `data.dataset.hdf5_dataset_key`：当前设为 `Vx`
+- `data.dataset.hdf5_index_mode`：当前设为 `sample`
+- `data.dataset.hdf5_sample_axes`：当前设为 `[0, 1]`
+
+这表示当前默认把 PDEBench 的 `Vx` 字段作为训练输入，并将常见的 `[sample, time, height, width]` 结构展开成多个 2D 样本。
+
+如果你换成 PDEBench 中的其他字段，例如 `Vy`、`density` 或 `pressure`，最稳妥的做法是先运行 `tests/test_inspect_pdebench_hdf5.py` 看实际 key 和 shape，再改 `hdf5_dataset_key`。
+
+### 6.2 通用目录放置方式
 
 将训练、验证、测试数据分别放到：
 
@@ -982,6 +1065,7 @@ data:
 
 - `extensions` 里只保留 HDF5 后缀，避免混入图片或其他格式。
 - `hdf5_dataset_key` 用于显式指定你要读取的 dataset 路径。
+- 如果你不知道 key 是什么，建议先运行 `python -m unittest discover -s tests -p "test_inspect_pdebench_hdf5.py" -v`。
 - 如果你不确定 dataset 路径，可以先把 `hdf5_dataset_key` 设为 `null`，并把常见候选路径写到 `hdf5_key_candidates`。
 - `detect_hdf5_by_signature: true` 时，即使后缀写得不完全标准，只要文件本体是 HDF5，也会尽量识别。
 
@@ -1080,6 +1164,13 @@ data:
 - `[N, T, H, W]`
 - `[N, C, H, W]`
 - `[N, H, W, C]`
+
+对当前项目正在使用的 PDEBench 2D 数据来说，像 `Vx` 这样的字段通常更接近 `[N, T, H, W]`，因此当前配置才会使用：
+
+```yaml
+hdf5_index_mode: sample
+hdf5_sample_axes: [0, 1]
+```
 
 其中：
 

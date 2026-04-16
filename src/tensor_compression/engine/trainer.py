@@ -107,10 +107,6 @@ class CompressionTrainer:
             dump_json(self.metrics_path, all_metrics)
 
             log_step = epoch * train_steps_per_epoch
-            log_payload = {"epoch": epoch, "lr": merged["lr"]}
-            log_payload.update({f"train/{k}": v for k, v in train_metrics.items()})
-            log_payload.update({f"val/{k}": v for k, v in val_metrics.items()})
-
             if self.visualizer.should_run(epoch):
                 vis_path = self.visualizer.save(
                     inputs=val_batch["input"],
@@ -119,13 +115,13 @@ class CompressionTrainer:
                 )
                 image = self.wandb_logger.image(
                     str(vis_path),
-                    caption=f"epoch={epoch}",
+                    caption=f"epoch={epoch}: original | reconstruction | absolute difference",
                 )
                 if image is not None:
-                    log_payload["val/reconstruction"] = image
-                    log_payload["val/reconstruction_path"] = str(vis_path)
-
-            self.wandb_logger.log(log_payload, step=log_step)
+                    self.wandb_logger.log(
+                        {"reconstruction_panel": image},
+                        step=log_step,
+                    )
 
             if val_metrics["loss_total"] < best_val_loss:
                 best_val_loss = val_metrics["loss_total"]
@@ -184,6 +180,24 @@ class CompressionTrainer:
             wandb_cfg["api_key"] = "***REDACTED***"
         return redacted
 
+    def _build_train_step_wandb_payload(self, metrics: dict[str, float]) -> dict[str, float]:
+        # Keep only non-duplicated metrics in W&B. The removed keys are:
+        # loss_mse == mse, loss_l1 == mae, loss_relative_l1 == relative_l1.
+        keep_order = [
+            "loss_total",
+            "psnr",
+            "mse",
+            "mae",
+            "relative_l1",
+            "max_abs_error",
+            "loss_gradient",
+        ]
+        payload: dict[str, float] = {}
+        for key in keep_order:
+            if key in metrics:
+                payload[f"train_step/{key}"] = metrics[key]
+        return payload
+
     def _run_epoch(
         self,
         model,
@@ -236,10 +250,12 @@ class CompressionTrainer:
             )
 
             if step % int(self.config["training"]["log_interval"]) == 0:
-                self.wandb_logger.log(
-                    {f"{stage}_step/{key}": value for key, value in averages.items()},
-                    step=(epoch - 1) * len(dataloader) + step,
-                )
+                payload = self._build_train_step_wandb_payload(averages)
+                if payload:
+                    self.wandb_logger.log(
+                        payload,
+                        step=(epoch - 1) * len(dataloader) + step,
+                    )
 
         return {key: value / max(1, len(dataloader)) for key, value in running.items()}
 
