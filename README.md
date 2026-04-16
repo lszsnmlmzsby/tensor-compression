@@ -81,48 +81,7 @@ PY
 
 如果这两项不满足，说明当前安装到的不是可用的 CUDA 版 PyTorch，或服务器驱动 / 环境仍有问题。
 
-### 1.2 Linux 路径与命令说明
-
-当前仓库默认按 Linux 优先写法给出命令示例：
-
-- 相对路径使用 `./...`
-- 目录分隔符使用 `/`
-- 虚拟环境激活使用 `source .venv/bin/activate`
-
-配置文件中的路径目前使用的是相对路径，例如：
-
-```yaml
-./data/raw/train
-./outputs/runs
-./configs/compressor_2d.yaml
-```
-
-这些写法在 Linux 下可以直接使用，不需要改成别的形式。
-
-另外，代码现在会把这些相对路径统一解释为 **相对于项目根目录**，而不是相对于 `configs/` 目录。
-因此像下面这样的配置：
-
-```yaml
-output_root: ./outputs/runs
-```
-
-会被解析到：
-
-```bash
-<project_root>/outputs/runs
-```
-
-而不会错误地落到：
-
-```bash
-<project_root>/configs/outputs/runs
-```
-
-只有在你手动改成绝对路径时，才需要写成 Linux 风格，例如：
-
-```bash
-/home/yourname/tensor-compression/data/raw/train
-```
+### 1.2 快速开始
 
 仅检查配置和对象构建，不启动训练：
 
