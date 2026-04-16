@@ -30,9 +30,24 @@ class CompositeReconstructionLoss(nn.Module):
         return terms
 
     def _gradient_difference(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_dx = prediction[..., :, 1:] - prediction[..., :, :-1]
-        pred_dy = prediction[..., 1:, :] - prediction[..., :-1, :]
-        tgt_dx = target[..., :, 1:] - target[..., :, :-1]
-        tgt_dy = target[..., 1:, :] - target[..., :-1, :]
-        return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
-
+        if prediction.ndim == 4:
+            pred_dx = prediction[..., :, 1:] - prediction[..., :, :-1]
+            pred_dy = prediction[..., 1:, :] - prediction[..., :-1, :]
+            tgt_dx = target[..., :, 1:] - target[..., :, :-1]
+            tgt_dy = target[..., 1:, :] - target[..., :-1, :]
+            return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
+        if prediction.ndim == 5:
+            pred_dz = prediction[..., 1:, :, :] - prediction[..., :-1, :, :]
+            pred_dy = prediction[..., :, 1:, :] - prediction[..., :, :-1, :]
+            pred_dx = prediction[..., :, :, 1:] - prediction[..., :, :, :-1]
+            tgt_dz = target[..., 1:, :, :] - target[..., :-1, :, :]
+            tgt_dy = target[..., :, 1:, :] - target[..., :, :-1, :]
+            tgt_dx = target[..., :, :, 1:] - target[..., :, :, :-1]
+            return (
+                F.l1_loss(pred_dz, tgt_dz)
+                + F.l1_loss(pred_dy, tgt_dy)
+                + F.l1_loss(pred_dx, tgt_dx)
+            )
+        raise ValueError(
+            f"Gradient difference only supports 2D/3D tensors with ndim 4 or 5, got ndim={prediction.ndim}."
+        )

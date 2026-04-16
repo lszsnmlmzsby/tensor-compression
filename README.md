@@ -6,16 +6,17 @@
 
 - 仓库基础结构与模块划分
 - 2D 压缩-重建训练链路
+- 3D 压缩-重建 baseline 训练链路
 - config 驱动的数据、模型、训练控制
 - W&B 记录入口
 - 重建结果可视化
-- 3D / 4D 数据与模型注册入口预留
+- 4D 数据与模型注册入口预留
 - 后续 adapter / downstream / LLM 命名空间预留
 
 当前版本尚未完成：
 
 - 实际数据集内容
-- 3D / 4D 具体数据处理与模型实现
+- 4D 具体数据处理与模型实现
 - latent 对齐 LLM 的 adapter
 - 下游任务训练
 
@@ -186,7 +187,7 @@ tensor compression2.0/
 - `configs/`：训练配置文件。
 - `data/`：数据目录占位。当前只建结构，不放实际数据。
 - `scripts/train_compressor.py`：压缩-重建训练入口脚本。
-- `src/tensor_compression/data/`：数据集和 DataLoader 组装逻辑。当前已实现 2D 文件夹数据集，3D/4D 入口已预留。
+- `src/tensor_compression/data/`：数据集和 DataLoader 组装逻辑。当前已实现 2D / 3D 文件夹数据集，4D 入口已预留。
 - `src/tensor_compression/models/compressors/`：压缩模型定义。当前实现 2D 卷积式 token autoencoder。
 - `src/tensor_compression/losses/`：重建损失定义。
 - `src/tensor_compression/metrics/`：重建评估指标。
@@ -225,18 +226,35 @@ tensor compression2.0/
 - 支持自动 resize 到固定输入尺寸
 - 支持简单归一化
 
+当前也支持 3D 数据 baseline：
+
+- `.npy`
+- `.npz`
+- `.h5`
+- `.hdf5`
+
+3D baseline 当前能力：
+
+- 支持规则体数据读取
+- 支持 HDF5 dataset 选择
+- 支持单文件多样本展开
+- 支持通道数对齐
+- 支持 3D resize 到固定输入尺寸
+- 支持简单归一化
+
 ### 3.2 模型
 
 当前模型为：
 
 - `conv_token_autoencoder_2d`
+- `conv_token_autoencoder_3d`
 
 特点：
 
 - 编码器：卷积下采样 + 残差块
 - latent：连续 latent map 与 latent tokens
 - 解码器：反卷积上采样 + 残差块
-- 适合先完成 2D 数值张量压缩-重建基线
+- 适合先完成 2D / 3D 数值张量压缩-重建基线
 
 ### 3.3 训练
 
@@ -388,6 +406,12 @@ tensor compression2.0/
 - `norm`：归一化类型，当前支持 `batch`、`group`、`identity`。
 - `activation`：激活函数，当前支持 `relu`、`gelu`、`silu`。
 - `output_activation`：输出层激活，当前支持 `identity`、`sigmoid`、`tanh`。
+
+3D baseline 使用同一套参数语义，只是：
+
+- `input_size` 变成 `[D, H, W]`
+- `latent_grid` 变成 `[D_lat, H_lat, W_lat]`
+- `name` 可切换为 `conv_token_autoencoder_3d`
 
 #### 5.3.1 `conv_token_autoencoder_2d` 结构直观说明
 
@@ -869,6 +893,11 @@ latent_dim: 64
 - `display_channel`：多通道输入时，选择哪个通道进行可视化。
 - `add_colorbar`：是否为每个子图添加色条。
 - `save_dirname`：可视化图像输出目录名。
+
+说明：
+
+- 当前仓库的可视化模块主要面向 2D。
+- 3D baseline 训练建议先将 `visualization.enabled: false`，等后续补充 3D 可视化后再开启。
 
 ### 5.9 `wandb`
 

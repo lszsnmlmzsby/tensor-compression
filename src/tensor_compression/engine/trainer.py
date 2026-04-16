@@ -4,7 +4,6 @@ import copy
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import torch
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -78,6 +77,7 @@ class CompressionTrainer:
         all_metrics: dict[str, dict] = {}
 
         epochs = int(self.config["training"]["epochs"])
+        train_steps_per_epoch = max(1, len(dataloaders["train"]))
         for epoch in range(1, epochs + 1):
             train_metrics = self._run_epoch(
                 model=model,
@@ -106,26 +106,26 @@ class CompressionTrainer:
             all_metrics[f"epoch_{epoch:04d}"] = merged
             dump_json(self.metrics_path, all_metrics)
 
+            log_step = epoch * train_steps_per_epoch
             log_payload = {"epoch": epoch, "lr": merged["lr"]}
             log_payload.update({f"train/{k}": v for k, v in train_metrics.items()})
             log_payload.update({f"val/{k}": v for k, v in val_metrics.items()})
 
             if self.visualizer.should_run(epoch):
-                vis_figure = self.visualizer.render(
+                vis_path = self.visualizer.save(
                     inputs=val_batch["input"],
                     reconstructions=val_batch["reconstruction"],
+                    epoch=epoch,
                 )
-                vis_path = self.visualizer.save_figure(fig=vis_figure, epoch=epoch)
                 image = self.wandb_logger.image(
-                    vis_figure,
+                    str(vis_path),
                     caption=f"epoch={epoch}",
                 )
-                plt.close(vis_figure)
                 if image is not None:
                     log_payload["val/reconstruction"] = image
                     log_payload["val/reconstruction_path"] = str(vis_path)
 
-            self.wandb_logger.log(log_payload, step=epoch)
+            self.wandb_logger.log(log_payload, step=log_step)
 
             if val_metrics["loss_total"] < best_val_loss:
                 best_val_loss = val_metrics["loss_total"]
