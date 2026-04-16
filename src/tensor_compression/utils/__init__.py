@@ -1,7 +1,7 @@
 from .checkpoint import save_checkpoint
 from .io import dump_json, dump_yaml
 from .seed import seed_everything
-from .visualization import ReconstructionVisualizer2D, build_visualizer
+from .visualization import ReconstructionVisualizer2D, ReconstructionVisualizer3D, build_visualizer
 
 __all__ = [
     "save_checkpoint",
@@ -9,6 +9,6 @@ __all__ = [
     "dump_yaml",
     "seed_everything",
     "ReconstructionVisualizer2D",
+    "ReconstructionVisualizer3D",
     "build_visualizer",
 ]
-
