@@ -12,15 +12,16 @@
 - config 驱动的数据、模型、训练控制
 - W&B 记录入口
 - 重建结果可视化
+- PDEBench HDF5 多字段训练与下游算子评估入口
 - 4D 数据与模型注册入口预留
-- 后续 adapter / downstream / LLM 命名空间预留
+- 后续 adapter / LLM 命名空间预留
 
 当前版本尚未完成：
 
 - PDEBench 之外的数据整理、标准化统计与 manifest 生成
 - 4D 具体数据处理与模型实现
 - latent 对齐 LLM 的 adapter
-- 下游任务训练
+- PDEBench 官方 forward / inverse 算子的训练本身
 
 ## 1. 快速开始
 
@@ -131,20 +132,100 @@ python -m unittest discover -s tests -p "test_inspect_pdebench_hdf5.py" -v
 如果输出里出现类似：
 
 ```text
+- density: shape=(N, T, H, W), dtype=float32
+- pressure: shape=(N, T, H, W), dtype=float32
 - Vx: shape=(N, T, H, W), dtype=float32
+- Vy: shape=(N, T, H, W), dtype=float32
 ```
 
-那么当前 2D 配置通常可以写成：
+那么当前 2D 配置可以把这些物理字段作为一个 4 通道样本一起训练：
 
 ```yaml
 data:
   dataset:
-    hdf5_dataset_key: Vx
+    hdf5_dataset_key: null
+    hdf5_dataset_keys: [density, pressure, Vx, Vy]
     hdf5_index_mode: sample
     hdf5_sample_axes: [0, 1]
+    channels: 4
+model:
+  in_channels: 4
+  out_channels: 4
 ```
 
-也就是把 PDEBench 常见的 `[sample, time, height, width]` 展开成 `sample * time` 个 2D 样本。
+也就是把 PDEBench 常见的 `[sample, time, height, width]` 展开成 `sample * time` 个 2D 样本，并把 `density/pressure/Vx/Vy` 堆叠为通道维。若显存不够，可以退回单字段训练：设置 `hdf5_dataset_key: Vx`、删除或置空 `hdf5_dataset_keys`，并把 `channels / in_channels / out_channels` 改回 `1`。
+
+### 1.4 PDEBench 下载辅助
+
+本仓库不会自动下载 PDEBench 大文件，但可以基于 `PDEBench_code/PDEBench-main/pdebench/data_download/pdebench_data_urls.csv` 列出匹配条目和官方下载命令：
+
+```bash
+python ./scripts/pdebench_download_helper.py \
+  --pdebench-root ./PDEBench_code/PDEBench-main \
+  --pde-name 2d_cfd \
+  --filename-contains 2D_CFD_Turb_M0.1 \
+  --root-folder ./data/external/pdebench
+```
+
+如果已经手动下载了单个 HDF5 文件，也可以直接把 `configs/compressor_2d.yaml` 里的 `data.source_roots.all_primary` 指向该文件，不必把文件复制到仓库里。
+
+如果你确认要直接下载匹配文件，可以显式加上 `--download`，脚本会用标准库下载并在 CSV 里有 MD5 时校验完整性：
+
+```bash
+python ./scripts/pdebench_download_helper.py \
+  --pdebench-root ./PDEBench_code/PDEBench-main \
+  --pde-name 2d_cfd \
+  --filename-contains 2D_CFD_Turb_M0.1 \
+  --root-folder ./data/external/pdebench \
+  --download \
+  --skip-existing
+```
+
+### 1.5 PDEBench 下游算子评估
+
+训练好 AE 后，可以比较“原始数据经过 PDEBench 算子”和“AE 重建数据经过同一算子”的输出误差：
+
+```bash
+python ./scripts/evaluate_pdebench_downstream.py \
+  --hdf5-path /path/to/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5 \
+  --fields density,pressure,Vx,Vy \
+  --sample-indices 0,1 \
+  --compressor-checkpoint ./outputs/runs/<run>/checkpoints/best.pt \
+  --batch-size 1 \
+  --forward-operator-type callable \
+  --forward-operator-spec ./path/to/your_forward_wrapper.py:forward_operator \
+  --inverse-operator-type callable \
+  --inverse-operator-spec ./path/to/your_inverse_wrapper.py:inverse_operator
+```
+
+`forward_operator` 和 `inverse_operator` 都接收一个 `payload: dict`，其中最重要的字段是：
+
+- `payload["data"]`：形状为 `[height, width, time, channel]` 的 `torch.Tensor`
+- `payload["grid"]`：形状为 `[height, width, 2]` 的坐标网格，如果 HDF5 中有 `x-coordinate/y-coordinate`
+- `payload["t_coordinates"]`：时间坐标，PDEBench CFD 文件中可能比实际数据时间步多一个边界点
+- `payload["field_names"]`：例如 `("density", "pressure", "Vx", "Vy")`
+
+脚本会分别对 `original` 和 `reconstructed` 调用同一个算子，并输出重建本身的 `mse/mae/relative_l1/psnr`，以及 `forward/...`、`inverse/...` 前缀下的算子输出误差。完整 JSON 默认写入 `outputs/pdebench_downstream/`。
+
+注意：训练阶段的 `tensor_folder_2d` 会把 `[N, T, H, W]` 展开为单帧 `[C, H, W]` 样本；评估阶段的 `evaluate_pdebench_downstream.py` 会重新读取同一个 HDF5 文件，把某个样本的完整时间序列整理为 `[H, W, T, C]`，逐帧通过 AE 重建后再送入下游算子。
+
+如果要直接使用 PDEBench 官方 FNO / UNet 类，可以使用内建 wrapper，但需要提供官方 checkpoint 和架构参数：
+
+```bash
+python ./scripts/evaluate_pdebench_downstream.py \
+  --hdf5-path /path/to/file.hdf5 \
+  --fields density,pressure,Vx,Vy \
+  --sample-indices 0 \
+  --compressor-checkpoint ./outputs/runs/<run>/checkpoints/best.pt \
+  --forward-operator-type pdebench-fno \
+  --forward-checkpoint /path/to/2D_CFD_..._FNO.pt \
+  --pdebench-root ./PDEBench_code/PDEBench-main \
+  --num-channels 4 \
+  --initial-step 10 \
+  --t-train 21 \
+  --modes 12 \
+  --width 20
+```
 
 ## 2. 仓库结构
 
@@ -162,6 +243,8 @@ tensor compression2.0/
 │     └─ test/
 ├─ outputs/
 ├─ scripts/
+│  ├─ evaluate_pdebench_downstream.py
+│  ├─ pdebench_download_helper.py
 │  └─ train_compressor.py
 ├─ src/
 │  └─ tensor_compression/
@@ -494,56 +577,8 @@ base_channels: 32
 
 表示同样的空间位置上，现在每个位置不再只有 1 个数，而是有 32 个特征值。
 
-#### 5.3.2 下采样后为什么残差还能连接
 
-当前残差块 `ResidualBlock2D` 的结构是：
-
-```text
-输入 -> Conv -> Norm -> Act -> Conv -> Norm -> 与原输入相加 -> Act
-```
-
-关键点是：
-
-- 残差块内部不会改变空间分辨率。
-- 残差块内部也不会改变 channel 数。
-
-也就是说，进入残差块前后的张量形状完全一致，所以可以直接做：
-
-```text
-inputs + block(inputs)
-```
-
-例如：
-
-```text
-[B, 64, 128, 128]
-```
-
-经过一个残差块之后，输出仍然是：
-
-```text
-[B, 64, 128, 128]
-```
-
-真正发生尺寸变化的是前面的下采样卷积，而不是残差块本身。
-
-以当前编码器为例：
-
-```text
-[B, 32, 512, 512]
-  -> stride=2 conv
-[B, 32, 256, 256]
-  -> residual blocks
-[B, 32, 256, 256]
-```
-
-也就是说：
-
-- 先用下采样卷积把分辨率从 `512x512` 变成 `256x256`
-- 再在这个新尺度上堆叠残差块
-- 残差连接只发生在“同一尺度、同一 channel 数”内部
-
-#### 5.3.3 当前配置下从样本到 latent 的形状变化
+#### 5.3.2 当前配置下从样本到 latent 的形状变化
 
 以当前常见配置为例：
 
@@ -596,7 +631,7 @@ flatten + transpose          [B, 1024, 128]      <- latent_tokens
 - `latent_tokens` 是把空间维展平成 token 后的表示。
 - 因为 `32 * 32 = 1024`，所以 token 数是 `1024`。
 
-#### 5.3.4 压缩率如何计算
+#### 5.3.3 压缩率如何计算
 
 这套模型里常见有两种压缩率口径：
 
@@ -655,7 +690,7 @@ latent_grid = [32, 32]
 - token 压缩率高，不代表真实内存压缩率也同样高。
 - 当前 latent 仍然是连续浮点张量，没有做量化或熵编码，所以按内存算的压缩率会更保守。
 
-#### 5.3.5 哪些 config 会影响压缩率
+#### 5.3.4 哪些 config 会影响压缩率
 
 最关键的是两个：
 
@@ -807,7 +842,7 @@ channel_multipliers: [1, 2, 4, 8, 8]
 - token 压缩率从 `256:1` 提高到 `1024:1`
 - 若 `latent_dim` 仍为 `128`，则内存压缩率从 `2:1` 提高到 `8:1`
 
-#### 5.3.6 推荐压缩率分档
+#### 5.3.5 推荐压缩率分档
 
 下面给出几组常见配置档位，便于按压缩率做实验。
 
@@ -965,13 +1000,15 @@ latent_dim: 64
 `configs/compressor_2d.yaml` 里的当前示例配置是：
 
 - `data.source_roots.all_primary`：直接指向一个 PDEBench `.hdf5` 文件
-- `data.dataset.hdf5_dataset_key`：当前设为 `Vx`
+- `data.dataset.hdf5_dataset_key`：当前设为 `null`
+- `data.dataset.hdf5_dataset_keys`：当前设为 `density / pressure / Vx / Vy`
 - `data.dataset.hdf5_index_mode`：当前设为 `sample`
 - `data.dataset.hdf5_sample_axes`：当前设为 `[0, 1]`
+- `data.dataset.channels`、`model.in_channels`、`model.out_channels`：当前均设为 `4`
 
-这表示当前默认把 PDEBench 的 `Vx` 字段作为训练输入，并将常见的 `[sample, time, height, width]` 结构展开成多个 2D 样本。
+这表示当前默认把 PDEBench 2D CFD 中需要压缩重建的 `density / pressure / Vx / Vy` 四个字段作为一个 4 通道样本训练，并将常见的 `[sample, time, height, width]` 结构展开成多个 2D 时刻样本。
 
-如果你换成 PDEBench 中的其他字段，例如 `Vy`、`density` 或 `pressure`，最稳妥的做法是先运行 `tests/test_inspect_pdebench_hdf5.py` 看实际 key 和 shape，再改 `hdf5_dataset_key`。
+如果你只想训练单个物理量，例如只压缩 `Vx`，最稳妥的做法是先运行 `tests/test_inspect_pdebench_hdf5.py` 看实际 key 和 shape，再把 `hdf5_dataset_key` 改成 `Vx`、删除或置空 `hdf5_dataset_keys`，并把 `channels / in_channels / out_channels` 改回 `1`。
 
 ### 6.2 通用目录放置方式
 
@@ -1140,21 +1177,23 @@ data:
 
 - `mode: auto` 后，程序会扫描 `all_primary` 和 `all_extra` 中的文件，再自动分成 `train / val / test`。
 - 这个切分是文件级切分，所以适合“一个文件对应一个样本”的场景。
-- 如果一个 HDF5 文件里本身包含很多子样本，当前代码不会自动在文件内部继续切分；那种情况建议后续单独扩展 dataset 类。
+- 如果一个 HDF5 文件里本身包含很多子样本，可以使用 `hdf5_index_mode: sample` 配合 `hdf5_sample_axis` 或 `hdf5_sample_axes` 在文件内部展开样本。
 
 ### 7.3 HDF5 dataset 选择规则
 
 当前读取顺序是：
 
-1. 如果配置了 `hdf5_dataset_key`，优先读取它。
-2. 否则按 `hdf5_key_candidates` 的顺序尝试。
-3. 如果还没找到，就自动遍历文件，选择第一个“数值型且维度为 2D / 3D / 4D”的 dataset。
+1. 如果配置了 `hdf5_dataset_keys`，会把这些 dataset 按配置顺序读取，并堆叠成通道维。
+2. 否则如果配置了 `hdf5_dataset_key`，优先读取它。
+3. 否则按 `hdf5_key_candidates` 的顺序尝试。
+4. 如果还没找到，就自动遍历文件，选择第一个“数值型且维度为 2D / 3D / 4D / 5D”的 dataset。
 
 对 2D 数据加载器来说：
 
 - 2D dataset 会被视为单通道张量场。
 - 3D dataset 会被尝试解释为带通道的 2D 张量。
 - 4D dataset 在合适配置下可以被解释为“单文件多样本 2D 数据”。
+- 多个 HDF5 dataset 通过 `hdf5_dataset_keys` 堆叠时，所有字段 shape 必须一致，例如 PDEBench 2D CFD 的 `density / pressure / Vx / Vy` 均为 `[N, T, H, W]`。
 
 如果你的 HDF5 结构比较复杂，最稳妥的方式仍然是直接指定 `hdf5_dataset_key`。
 
@@ -1169,11 +1208,14 @@ data:
 - `[N, C, H, W]`
 - `[N, H, W, C]`
 
-对当前项目正在使用的 PDEBench 2D 数据来说，像 `Vx` 这样的字段通常更接近 `[N, T, H, W]`，因此当前配置才会使用：
+对当前项目正在使用的 PDEBench 2D CFD 数据来说，`density / pressure / Vx / Vy` 这些字段通常都接近 `[N, T, H, W]`，因此当前配置才会使用：
 
 ```yaml
+hdf5_dataset_key: null
+hdf5_dataset_keys: [density, pressure, Vx, Vy]
 hdf5_index_mode: sample
 hdf5_sample_axes: [0, 1]
+channels: 4
 ```
 
 其中：

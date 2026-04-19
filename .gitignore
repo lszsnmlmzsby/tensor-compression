@@ -34,6 +34,8 @@ wandb/
 *.temp
 
 # Local data
+PDEBench_code/
+
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/all/
@@ -60,4 +62,3 @@ data/external/*
 .env
 .env.*
 configs/local_*.yaml
-

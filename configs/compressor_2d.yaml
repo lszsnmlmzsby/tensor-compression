@@ -52,25 +52,30 @@ data:
     #   - .tif
     #   - .tiff
     npz_key: null
-    hdf5_dataset_key: Vx
+    hdf5_dataset_key: null
     # Backward-compatible alias supported by code:
     # field_key: Vx
     # Original default:
     # hdf5_dataset_key: null
+    hdf5_dataset_keys:
+      - density
+      - pressure
+      - Vx
+      - Vy
     hdf5_key_candidates: []
     detect_hdf5_by_signature: true
     hdf5_index_mode: sample
     # Original default:
     # hdf5_index_mode: auto
     hdf5_sample_axes: [0, 1]
-    # PDEBench Vx often behaves like [sample, time, height, width].
+    # PDEBench 2D CFD fields often behave like [sample, time, height, width].
     # Original single-axis default:
     # hdf5_sample_axes: null
     hdf5_sample_axis: 0
     allow_images: false
     # Original default:
     # allow_images: true
-    channels: 1
+    channels: 4
     input_size: [512, 512]
     # Original default:
     # input_size: [128, 128]
@@ -96,8 +101,8 @@ data:
 
 model:
   name: conv_token_autoencoder_2d
-  in_channels: 1
-  out_channels: 1
+  in_channels: 4
+  out_channels: 4
   input_size: [512, 512]
   # Original default:
   # input_size: [128, 128]

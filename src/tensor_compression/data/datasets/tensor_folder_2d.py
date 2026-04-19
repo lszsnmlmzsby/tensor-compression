@@ -32,6 +32,13 @@ class TensorFolder2DDataset(BaseTensorDataset):
             self.dataset_cfg.get("hdf5_dataset_key")
             or self.dataset_cfg.get("field_key")
         )
+        raw_hdf5_dataset_keys = self.dataset_cfg.get("hdf5_dataset_keys", [])
+        if raw_hdf5_dataset_keys is None:
+            self.hdf5_dataset_keys = []
+        elif isinstance(raw_hdf5_dataset_keys, (list, tuple)):
+            self.hdf5_dataset_keys = [str(key) for key in raw_hdf5_dataset_keys]
+        else:
+            self.hdf5_dataset_keys = [str(raw_hdf5_dataset_keys)]
         self.hdf5_key_candidates = list(self.dataset_cfg.get("hdf5_key_candidates", []))
         self.detect_hdf5_by_signature = bool(self.dataset_cfg.get("detect_hdf5_by_signature", True))
         self.hdf5_index_mode = str(self.dataset_cfg.get("hdf5_index_mode", "auto")).lower()
@@ -93,6 +100,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
                     "path": path,
                     "kind": "file",
                     "dataset_path": None,
+                    "dataset_paths": None,
                     "sample_indices": None,
                     "sample_axes": None,
                 }
@@ -101,35 +109,53 @@ class TensorFolder2DDataset(BaseTensorDataset):
 
     def _build_hdf5_samples(self, path: Path) -> list[dict]:
         with h5py.File(path, "r") as handle:
-            dataset_path = self._select_hdf5_dataset_path(handle)
-            if dataset_path is None:
+            dataset_paths = self._select_hdf5_dataset_paths(handle)
+            if not dataset_paths:
                 available = self._list_hdf5_datasets(handle)
                 raise ValueError(
                     "No suitable numeric 2D/3D/4D/5D dataset found in "
                     f"{path}. Available datasets: {available}"
                 )
-            dataset = handle[dataset_path]
-            mode = self._resolve_hdf5_index_mode(dataset.shape)
+            for dataset_path in dataset_paths:
+                if not self._is_supported_hdf5_dataset(handle[dataset_path]):
+                    raise ValueError(
+                        f"HDF5 dataset {dataset_path!r} is not a supported numeric 2D/3D/4D/5D tensor."
+                    )
+            reference_dataset = handle[dataset_paths[0]]
+            reference_shape = tuple(int(dim) for dim in reference_dataset.shape)
+            for dataset_path in dataset_paths[1:]:
+                dataset = handle[dataset_path]
+                shape = tuple(int(dim) for dim in dataset.shape)
+                if shape != reference_shape:
+                    raise ValueError(
+                        "All HDF5 datasets selected via `hdf5_dataset_keys` must have matching "
+                        f"shapes. Got {dataset_paths[0]!r}={reference_shape} and "
+                        f"{dataset_path!r}={shape} in {path}."
+                    )
+
+            mode = self._resolve_hdf5_index_mode(reference_shape)
+            samples: list[dict] = []
             if mode == "file":
                 return [
                     {
                         "path": path,
                         "kind": "hdf5_file",
-                        "dataset_path": dataset_path,
+                        "dataset_path": dataset_paths[0] if len(dataset_paths) == 1 else None,
+                        "dataset_paths": tuple(dataset_paths),
                         "sample_indices": None,
                         "sample_axes": None,
                     }
                 ]
 
-            sample_axes = self._resolve_hdf5_sample_axes(dataset.shape)
-            sample_ranges = [range(int(dataset.shape[axis])) for axis in sample_axes]
-            samples: list[dict] = []
+            sample_axes = self._resolve_hdf5_sample_axes(reference_shape)
+            sample_ranges = [range(int(reference_shape[axis])) for axis in sample_axes]
             for sample_indices in product(*sample_ranges):
                 samples.append(
                     {
                         "path": path,
                         "kind": "hdf5_sample",
-                        "dataset_path": dataset_path,
+                        "dataset_path": dataset_paths[0] if len(dataset_paths) == 1 else None,
+                        "dataset_paths": tuple(dataset_paths),
                         "sample_indices": tuple(int(index) for index in sample_indices),
                         "sample_axes": tuple(sample_axes),
                     }
@@ -149,6 +175,14 @@ class TensorFolder2DDataset(BaseTensorDataset):
         tensor = self._load_tensor(sample)
         tensor = self._normalize(tensor)
         sample_id = path.stem
+        dataset_path = sample.get("dataset_path")
+        dataset_paths = sample.get("dataset_paths")
+        if dataset_paths and len(dataset_paths) > 1:
+            dataset_label = "+".join(str(item).replace("/", "_") for item in dataset_paths)
+            sample_id = f"{sample_id}:{dataset_label}"
+        if dataset_path:
+            dataset_label = str(dataset_path).replace("/", "_")
+            sample_id = f"{sample_id}:{dataset_label}"
         if sample["sample_indices"] is not None:
             indices = "-".join(str(index) for index in sample["sample_indices"])
             sample_id = f"{sample_id}#{indices}"
@@ -157,6 +191,8 @@ class TensorFolder2DDataset(BaseTensorDataset):
             "target": tensor.clone(),
             "sample_id": sample_id,
             "path": str(path),
+            "dataset_path": dataset_path,
+            "dataset_paths": list(dataset_paths) if dataset_paths else None,
             "dimensions": 2,
         }
 
@@ -178,6 +214,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
             array = self._load_hdf5_array(
                 path=path,
                 dataset_path=sample.get("dataset_path"),
+                dataset_paths=sample.get("dataset_paths"),
                 sample_indices=sample.get("sample_indices"),
                 sample_axes=sample.get("sample_axes"),
             )
@@ -201,29 +238,54 @@ class TensorFolder2DDataset(BaseTensorDataset):
         self,
         path: Path,
         dataset_path: str | None = None,
+        dataset_paths: tuple[str, ...] | list[str] | None = None,
         sample_indices: tuple[int, ...] | None = None,
         sample_axes: tuple[int, ...] | None = None,
     ) -> np.ndarray:
         with h5py.File(path, "r") as handle:
-            dataset_path = dataset_path or self._select_hdf5_dataset_path(handle)
-            if dataset_path is None:
+            if dataset_paths is not None:
+                resolved_dataset_paths = list(dataset_paths)
+            elif dataset_path is not None:
+                resolved_dataset_paths = [dataset_path]
+            else:
+                resolved_dataset_paths = list(self._select_hdf5_dataset_paths(handle))
+            if not resolved_dataset_paths:
                 available = self._list_hdf5_datasets(handle)
                 raise ValueError(
                     "No suitable numeric 2D/3D/4D/5D dataset found in "
                     f"{path}. Available datasets: {available}"
                 )
-            dataset = handle[dataset_path]
-            if sample_indices is None:
-                array = dataset[()]
-            else:
-                resolved_axes = self._resolve_hdf5_sample_axes(dataset.shape, sample_axes)
-                indexer = [slice(None)] * dataset.ndim
-                for axis, index in zip(resolved_axes, sample_indices):
-                    indexer[axis] = index
-                array = dataset[tuple(indexer)]
-        return np.asarray(array, dtype=np.float32)
+            arrays: list[np.ndarray] = []
+            for selected_path in resolved_dataset_paths:
+                dataset = handle[selected_path]
+                if sample_indices is None:
+                    array = dataset[()]
+                else:
+                    resolved_axes = self._resolve_hdf5_sample_axes(dataset.shape, sample_axes)
+                    indexer = [slice(None)] * dataset.ndim
+                    for axis, index in zip(resolved_axes, sample_indices):
+                        indexer[axis] = index
+                    array = dataset[tuple(indexer)]
+                arrays.append(np.asarray(array, dtype=np.float32))
+        if len(arrays) == 1:
+            return arrays[0]
+        return np.stack(arrays, axis=-1)
 
-    def _select_hdf5_dataset_path(self, handle: h5py.File) -> str | None:
+    def _select_hdf5_dataset_paths(self, handle: h5py.File) -> list[str]:
+        if self.hdf5_dataset_keys:
+            selected: list[str] = []
+            for key in self.hdf5_dataset_keys:
+                if key not in handle:
+                    raise KeyError(
+                        f"HDF5 dataset key {key!r} not found. "
+                        f"Available datasets: {self._list_hdf5_datasets(handle)}"
+                    )
+                dataset = handle[key]
+                if not isinstance(dataset, h5py.Dataset):
+                    raise ValueError(f"HDF5 key {key!r} exists but is not a dataset.")
+                selected.append(key)
+            return selected
+
         if self.hdf5_dataset_key:
             if self.hdf5_dataset_key not in handle:
                 raise KeyError(
@@ -235,12 +297,12 @@ class TensorFolder2DDataset(BaseTensorDataset):
                 raise ValueError(
                     f"HDF5 key {self.hdf5_dataset_key!r} exists but is not a dataset."
                 )
-            return self.hdf5_dataset_key
+            return [self.hdf5_dataset_key]
 
         for key in self.hdf5_key_candidates:
             if key in handle and isinstance(handle[key], h5py.Dataset):
                 if self._is_supported_hdf5_dataset(handle[key]):
-                    return key
+                    return [key]
 
         candidates: list[str] = []
 
@@ -249,7 +311,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
                 candidates.append(name)
 
         handle.visititems(visitor)
-        return candidates[0] if candidates else None
+        return candidates[:1]
 
     def _is_supported_hdf5_dataset(self, dataset: h5py.Dataset) -> bool:
         if not np.issubdtype(dataset.dtype, np.number):
@@ -342,9 +404,10 @@ class TensorFolder2DDataset(BaseTensorDataset):
             return True
         if len(remaining) != 3:
             return False
+        channel_hints = {self.channels, 1, 3, 4}
         return (
-            remaining[0] in (self.channels, 1, 3, 4)
-            or remaining[-1] in (self.channels, 1, 3, 4)
+            remaining[0] in channel_hints
+            or remaining[-1] in channel_hints
         )
 
     def _normalize_sample_axis(self, axis: int, ndim: int) -> int:
@@ -355,12 +418,13 @@ class TensorFolder2DDataset(BaseTensorDataset):
         return axis
 
     def _ensure_chw(self, tensor: torch.Tensor) -> torch.Tensor:
+        channel_hints = {self.channels, 1, 3, 4}
         if tensor.ndim == 2:
             tensor = tensor.unsqueeze(0)
         elif tensor.ndim == 3:
-            if tensor.shape[0] in (1, 3, 4):
+            if tensor.shape[0] in channel_hints:
                 pass
-            elif tensor.shape[-1] in (1, 3, 4):
+            elif tensor.shape[-1] in channel_hints:
                 tensor = tensor.permute(2, 0, 1)
             else:
                 raise ValueError(
