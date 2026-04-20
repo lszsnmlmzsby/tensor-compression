@@ -147,13 +147,9 @@ data:
     hdf5_dataset_keys: [density, pressure, Vx, Vy]
     hdf5_index_mode: sample
     hdf5_sample_axes: [0, 1]
-    channels: 4
-model:
-  in_channels: 4
-  out_channels: 4
 ```
 
-也就是把 PDEBench 常见的 `[sample, time, height, width]` 展开成 `sample * time` 个 2D 样本，并把 `density/pressure/Vx/Vy` 堆叠为通道维。若显存不够，可以退回单字段训练：设置 `hdf5_dataset_key: Vx`、删除或置空 `hdf5_dataset_keys`，并把 `channels / in_channels / out_channels` 改回 `1`。
+也就是把 PDEBench 常见的 `[sample, time, height, width]` 展开成 `sample * time` 个 2D 样本，并把 `density/pressure/Vx/Vy` 堆叠为通道维。当前代码会根据 `hdf5_dataset_keys` 的长度自动同步 `data.dataset.channels`、`model.in_channels`、`model.out_channels`，所以从 4 通道扩到 `n` 通道时，通常只需要改字段列表本身。若显存不够，可以退回单字段训练：设置 `hdf5_dataset_key: Vx`、删除或置空 `hdf5_dataset_keys`，代码会自动把通道数回退到 `1`。
 
 ### 1.4 PDEBench 下载辅助
 
@@ -501,6 +497,9 @@ tensor compression2.0/
 ##### `data.dataset.normalization`
 
 - `mode`：归一化方式。当前支持 `none`、`minmax`、`zscore`。
+- `scope`：归一化作用范围。当前支持 `global`、`channel`。
+  - `global`：对整个样本一起统计均值/方差或最小值/最大值。
+  - `channel`：对每个通道分别统计，更适合 `density / pressure / Vx / Vy` 这类多物理量输入。
 - `stats_path`：预留给离线统计文件路径。
 - `clip_min`：最小裁剪值。
 - `clip_max`：最大裁剪值。
@@ -535,6 +534,12 @@ tensor compression2.0/
 - `input_size` 变成 `[D, H, W]`
 - `latent_grid` 变成 `[D_lat, H_lat, W_lat]`
 - `name` 可切换为 `conv_token_autoencoder_3d`
+
+补充说明：
+
+- 当配置了 `data.dataset.hdf5_dataset_keys` 时，代码会自动把 `data.dataset.channels`、`model.in_channels`、`model.out_channels` 同步为字段个数，并在配置不一致时直接报错。
+- 当配置了单个 `hdf5_dataset_key` 或 `field_key` 时，代码会自动按单通道处理，并校验 `channels == in_channels == out_channels == 1`。
+- `latent_dim` 不会按通道数自动扩张。原因是 latent 容量和压缩率目标直接相关，不同任务对“保真优先”还是“压缩优先”的取舍差别很大，自动改大往往会掩盖真实压缩率变化。
 
 #### 5.3.1 `conv_token_autoencoder_2d` 结构直观说明
 
@@ -1019,11 +1024,18 @@ latent_dim: 64
 - `data.dataset.hdf5_dataset_keys`：当前设为 `density / pressure / Vx / Vy`
 - `data.dataset.hdf5_index_mode`：当前设为 `sample`
 - `data.dataset.hdf5_sample_axes`：当前设为 `[0, 1]`
-- `data.dataset.channels`、`model.in_channels`、`model.out_channels`：当前均设为 `4`
+- `data.dataset.normalization`：当前默认设为 `mode: zscore` 且 `scope: channel`
+- `model.norm`：当前默认设为 `group`
 
 这表示当前默认把 PDEBench 2D CFD 中需要压缩重建的 `density / pressure / Vx / Vy` 四个字段作为一个 4 通道样本训练，并将常见的 `[sample, time, height, width]` 结构展开成多个 2D 时刻样本。
 
-如果你只想训练单个物理量，例如只压缩 `Vx`，最稳妥的做法是先运行 `tests/test_inspect_pdebench_hdf5.py` 看实际 key 和 shape，再把 `hdf5_dataset_key` 改成 `Vx`、删除或置空 `hdf5_dataset_keys`，并把 `channels / in_channels / out_channels` 改回 `1`。
+现在切换通道数时，最稳妥的做法是优先改 `hdf5_dataset_keys` 或 `hdf5_dataset_key`，让代码自动同步通道数。比如如果你只想训练单个物理量，例如只压缩 `Vx`，可以先运行 `tests/test_inspect_pdebench_hdf5.py` 看实际 key 和 shape，再把 `hdf5_dataset_key` 改成 `Vx`、删除或置空 `hdf5_dataset_keys`，其余通道配置会自动回到单通道语义。
+
+对于多物理量输入，当前默认推荐：
+
+- 使用 `normalization.mode: zscore` 且 `normalization.scope: channel`，避免不同量纲的通道互相干扰。
+- 在小 batch 训练下优先使用 `model.norm: group`，比 `batch` 更稳。
+- `latent_dim` 和 `latent_grid` 仍然按你的压缩目标手动设定；仓库不会因为通道变多就自动增大 latent。
 
 ### 6.2 通用目录放置方式
 
@@ -1112,6 +1124,7 @@ data:
     resize_mode: bilinear
     normalization:
       mode: zscore
+      scope: global
       stats_path: null
       clip_min: null
       clip_max: null
@@ -1183,6 +1196,7 @@ data:
     resize_mode: bilinear
     normalization:
       mode: none
+      scope: global
       stats_path: null
       clip_min: null
       clip_max: null
@@ -1272,6 +1286,7 @@ data:
     resize_mode: bilinear
     normalization:
       mode: none
+      scope: global
       stats_path: null
       clip_min: null
       clip_max: null
@@ -1296,6 +1311,33 @@ hdf5_index_mode: file
 ```yaml
 hdf5_index_mode: auto
 ```
+
+### 7.5 适配 `n` 通道输入的建议
+
+当前代码已经针对 `n` 通道输入做了两类自动适配：
+
+- 如果使用 `hdf5_dataset_keys`，通道数会自动从字段列表长度推断，不需要再手动同步 `channels / in_channels / out_channels`。
+- 如果使用单个 `hdf5_dataset_key`，代码会自动按单通道处理，并校验配置一致性。
+
+推荐做法：
+
+```yaml
+data:
+  dataset:
+    hdf5_dataset_keys: [field_0, field_1, field_2, field_3, field_4]
+    normalization:
+      mode: zscore
+      scope: channel
+model:
+  norm: group
+```
+
+这样做的原因是：
+
+- 多个物理量往往量纲不同，按通道归一化更稳。
+- 小 batch 下 `GroupNorm` 通常比 `BatchNorm` 更适合多通道张量重建。
+
+当前没有自动适配的部分是 `latent_dim` 和 `latent_grid`。这两项仍建议人工确定，因为它们直接决定压缩率和保真度之间的权衡。通道数从 `1` 增加到 `n` 时，如果仍保持相同 latent，总瓶颈容量会被更多通道共享，重建难度通常会上升；但是否要增大 latent，取决于你更看重压缩率还是重建质量。
 
 ## 8. 后续扩展建议
 

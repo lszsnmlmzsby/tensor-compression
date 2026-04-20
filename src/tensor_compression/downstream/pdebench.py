@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from tensor_compression.config import load_config
+from tensor_compression.data.normalization import denormalize_tensor, normalize_tensor
 from tensor_compression.metrics import compute_reconstruction_metrics
 from tensor_compression.models import build_model
 
@@ -92,6 +93,7 @@ class CheckpointReconstructor:
         self.model.eval()
         self.input_size = tuple(int(dim) for dim in self.config["model"]["input_size"])
         self.channels = int(self.config["model"]["in_channels"])
+        self.normalization_cfg = dict(self.config.get("data", {}).get("dataset", {}).get("normalization", {}))
 
     @torch.no_grad()
     def reconstruct_frames(self, frames: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
@@ -105,10 +107,25 @@ class CheckpointReconstructor:
         original_hw = tuple(int(dim) for dim in frames.shape[-2:])
         frames = frames.to(self.device, dtype=torch.float32)
         resized = resize_chw_batch(frames, self.input_size)
+        normalized_frames: list[torch.Tensor] = []
+        normalization_states: list[dict[str, torch.Tensor | float | str | None]] = []
+        for frame in resized:
+            normalized_frame, state = normalize_tensor(frame.cpu(), self.normalization_cfg)
+            normalized_frames.append(normalized_frame)
+            normalization_states.append(state)
+        normalized = torch.stack([frame.to(self.device) for frame in normalized_frames], dim=0)
         outputs: list[torch.Tensor] = []
-        for start in range(0, resized.shape[0], max(1, batch_size)):
-            batch = resized[start : start + max(1, batch_size)]
+        for start in range(0, normalized.shape[0], max(1, batch_size)):
+            batch = normalized[start : start + max(1, batch_size)]
             reconstruction = self.model(batch)["reconstruction"]
+            batch_states = normalization_states[start : start + max(1, batch_size)]
+            reconstruction = torch.stack(
+                [
+                    denormalize_tensor(sample, state)
+                    for sample, state in zip(reconstruction, batch_states)
+                ],
+                dim=0,
+            )
             if tuple(reconstruction.shape[-2:]) != original_hw:
                 reconstruction = F.interpolate(
                     reconstruction,

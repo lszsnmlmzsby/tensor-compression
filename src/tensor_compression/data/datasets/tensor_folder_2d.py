@@ -11,6 +11,7 @@ from PIL import Image
 
 from tensor_compression.data.datasets.base import BaseTensorDataset
 from tensor_compression.data.datasets import DATASET_REGISTRY
+from tensor_compression.data.normalization import denormalize_tensor, normalize_tensor
 
 
 @DATASET_REGISTRY.register("tensor_folder_2d")
@@ -173,7 +174,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
         sample = self.samples[index]
         path = sample["path"]
         tensor = self._load_tensor(sample)
-        tensor = self._normalize(tensor)
+        tensor, _ = self.normalize_tensor(tensor)
         sample_id = path.stem
         dataset_path = sample.get("dataset_path")
         dataset_paths = sample.get("dataset_paths")
@@ -471,20 +472,15 @@ class TensorFolder2DDataset(BaseTensorDataset):
         return tensor.squeeze(0)
 
     def _normalize(self, tensor: torch.Tensor) -> torch.Tensor:
-        mode = str(self.normalization_cfg.get("mode", "none")).lower()
-        clip_min = self.normalization_cfg.get("clip_min")
-        clip_max = self.normalization_cfg.get("clip_max")
-        if clip_min is not None or clip_max is not None:
-            tensor = torch.clamp(tensor, min=clip_min, max=clip_max)
+        normalized, _ = self.normalize_tensor(tensor)
+        return normalized
 
-        if mode == "none":
-            return tensor
-        if mode == "minmax":
-            min_value = tensor.amin()
-            max_value = tensor.amax()
-            return (tensor - min_value) / (max_value - min_value + 1.0e-6)
-        if mode == "zscore":
-            mean = tensor.mean()
-            std = tensor.std(unbiased=False)
-            return (tensor - mean) / (std + 1.0e-6)
-        raise ValueError(f"Unsupported normalization mode: {mode}")
+    def normalize_tensor(self, tensor: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor | float | str | None]]:
+        return normalize_tensor(tensor, self.normalization_cfg)
+
+    def denormalize_tensor(
+        self,
+        tensor: torch.Tensor,
+        state: dict[str, torch.Tensor | float | str | None],
+    ) -> torch.Tensor:
+        return denormalize_tensor(tensor, state)
