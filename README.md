@@ -523,6 +523,10 @@ tensor compression2.0/
 - `channel_multipliers`：各层通道倍率，长度也决定下采样层数。
 - `num_res_blocks`：每个尺度上的残差块个数。
 - `latent_dim`：latent map 的通道维度。
+- `latent_dim_base`：当启用按通道数自动扩张 latent 时，作为“参考基准”的 latent 维度。
+- `latent_dim_scale_with_channels`：是否按输入通道数自动放大 `latent_dim`。
+- `latent_dim_reference_channels`：`latent_dim_base` 对应的参考通道数，通常设为 `1`。
+- `latent_dim_round_to`：自动扩张后向上取整到指定倍数，便于保持整齐的网络宽度。
 - `latent_grid`：latent map 的空间尺寸。
 - `dropout`：残差块内 dropout。
 - `norm`：归一化类型，当前支持 `batch`、`group`、`identity`。
@@ -539,7 +543,8 @@ tensor compression2.0/
 
 - 当配置了 `data.dataset.hdf5_dataset_keys` 时，代码会自动把 `data.dataset.channels`、`model.in_channels`、`model.out_channels` 同步为字段个数，并在配置不一致时直接报错。
 - 当配置了单个 `hdf5_dataset_key` 或 `field_key` 时，代码会自动按单通道处理，并校验 `channels == in_channels == out_channels == 1`。
-- `latent_dim` 不会按通道数自动扩张。原因是 latent 容量和压缩率目标直接相关，不同任务对“保真优先”还是“压缩优先”的取舍差别很大，自动改大往往会掩盖真实压缩率变化。
+- 如果启用了 `latent_dim_scale_with_channels`，代码会基于 `latent_dim_base * in_channels / latent_dim_reference_channels` 自动放大 `latent_dim`，并按 `latent_dim_round_to` 向上取整。
+- 如果你更在意固定压缩率，也可以关闭 `latent_dim_scale_with_channels`，继续手动控制 `latent_dim`。
 
 #### 5.3.1 `conv_token_autoencoder_2d` 结构直观说明
 
@@ -1026,6 +1031,7 @@ latent_dim: 64
 - `data.dataset.hdf5_sample_axes`：当前设为 `[0, 1]`
 - `data.dataset.normalization`：当前默认设为 `mode: zscore` 且 `scope: channel`
 - `model.norm`：当前默认设为 `group`
+- `model.latent_dim_scale_with_channels`：当前默认设为 `true`
 
 这表示当前默认把 PDEBench 2D CFD 中需要压缩重建的 `density / pressure / Vx / Vy` 四个字段作为一个 4 通道样本训练，并将常见的 `[sample, time, height, width]` 结构展开成多个 2D 时刻样本。
 
@@ -1035,7 +1041,8 @@ latent_dim: 64
 
 - 使用 `normalization.mode: zscore` 且 `normalization.scope: channel`，避免不同量纲的通道互相干扰。
 - 在小 batch 训练下优先使用 `model.norm: group`，比 `batch` 更稳。
-- `latent_dim` 和 `latent_grid` 仍然按你的压缩目标手动设定；仓库不会因为通道变多就自动增大 latent。
+- 对 2D 默认配置，`latent_dim` 会按通道数自动扩张；例如单通道基准为 `128` 时，4 通道会自动扩成 `512`。
+- `latent_grid` 仍然建议按你的压缩目标手动设定；如果你更想固定真实压缩率，也可以关闭自动扩张并手动设置 `latent_dim`。
 
 ### 6.2 通用目录放置方式
 
@@ -1318,6 +1325,7 @@ hdf5_index_mode: auto
 
 - 如果使用 `hdf5_dataset_keys`，通道数会自动从字段列表长度推断，不需要再手动同步 `channels / in_channels / out_channels`。
 - 如果使用单个 `hdf5_dataset_key`，代码会自动按单通道处理，并校验配置一致性。
+- 如果启用了 `latent_dim_scale_with_channels`，`latent_dim` 会按通道数自动扩张，减少“多通道共享同一瓶颈导致明显变糊”的问题。
 
 推荐做法：
 
@@ -1330,14 +1338,19 @@ data:
       scope: channel
 model:
   norm: group
+  latent_dim: 128
+  latent_dim_scale_with_channels: true
+  latent_dim_reference_channels: 1
+  latent_dim_round_to: 32
 ```
 
 这样做的原因是：
 
 - 多个物理量往往量纲不同，按通道归一化更稳。
 - 小 batch 下 `GroupNorm` 通常比 `BatchNorm` 更适合多通道张量重建。
+- 保持单通道基准 latent 不变的同时，按通道数自动扩张 latent，比每次手动重算更不容易漏改。
 
-当前没有自动适配的部分是 `latent_dim` 和 `latent_grid`。这两项仍建议人工确定，因为它们直接决定压缩率和保真度之间的权衡。通道数从 `1` 增加到 `n` 时，如果仍保持相同 latent，总瓶颈容量会被更多通道共享，重建难度通常会上升；但是否要增大 latent，取决于你更看重压缩率还是重建质量。
+当前仍然建议人工确定的部分主要是 `latent_grid`，以及是否启用 `latent_dim_scale_with_channels`。如果你更想维持与单通道近似的每通道表示预算，可以打开自动扩张；如果你更看重固定压缩率，可以关闭它并手动设定 `latent_dim`。
 
 ## 8. 后续扩展建议
 

@@ -23,6 +23,80 @@ def _write_config(path: Path, payload: dict) -> None:
 
 
 class TestConfigSynchronization(unittest.TestCase):
+    def test_scales_latent_dim_with_channel_count_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            _write_config(
+                config_path,
+                {
+                    "data": {
+                        "dataset": {
+                            "hdf5_dataset_keys": ["density", "pressure", "Vx", "Vy"],
+                            "normalization": {"mode": "zscore", "scope": "channel"},
+                        }
+                    },
+                    "model": {
+                        "name": "conv_token_autoencoder_2d",
+                        "input_size": [32, 32],
+                        "latent_grid": [2, 2],
+                        "channel_multipliers": [1, 2, 4, 8],
+                        "base_channels": 8,
+                        "num_res_blocks": 1,
+                        "latent_dim": 128,
+                        "latent_dim_base": 128,
+                        "latent_dim_scale_with_channels": True,
+                        "latent_dim_reference_channels": 1,
+                        "latent_dim_round_to": 32,
+                        "dropout": 0.0,
+                        "norm": "group",
+                        "activation": "gelu",
+                        "output_activation": "identity",
+                    },
+                },
+            )
+
+            config = load_config(config_path, base_root=PROJECT_ROOT)
+
+        self.assertEqual(config["model"]["in_channels"], 4)
+        self.assertEqual(config["model"]["latent_dim_base"], 128)
+        self.assertEqual(config["model"]["latent_dim"], 512)
+
+    def test_keeps_base_latent_dim_for_single_channel_when_scaling_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            _write_config(
+                config_path,
+                {
+                    "data": {
+                        "dataset": {
+                            "hdf5_dataset_key": "Vx",
+                            "normalization": {"mode": "zscore", "scope": "channel"},
+                        }
+                    },
+                    "model": {
+                        "name": "conv_token_autoencoder_2d",
+                        "input_size": [32, 32],
+                        "latent_grid": [2, 2],
+                        "channel_multipliers": [1, 2, 4, 8],
+                        "base_channels": 8,
+                        "num_res_blocks": 1,
+                        "latent_dim": 128,
+                        "latent_dim_scale_with_channels": True,
+                        "latent_dim_reference_channels": 1,
+                        "latent_dim_round_to": 32,
+                        "dropout": 0.0,
+                        "norm": "group",
+                        "activation": "gelu",
+                        "output_activation": "identity",
+                    },
+                },
+            )
+
+            config = load_config(config_path, base_root=PROJECT_ROOT)
+
+        self.assertEqual(config["model"]["in_channels"], 1)
+        self.assertEqual(config["model"]["latent_dim"], 128)
+
     def test_inferrs_channels_when_explicit_values_are_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"

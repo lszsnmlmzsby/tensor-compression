@@ -108,6 +108,10 @@ model:
   channel_multipliers: [1, 2, 4, 8]
   num_res_blocks: 2
   latent_dim: 128
+  latent_dim_base: 128
+  latent_dim_scale_with_channels: true
+  latent_dim_reference_channels: 1
+  latent_dim_round_to: 32
   latent_grid: [32, 32]
   # Original default:
   # latent_grid: [8, 8]
