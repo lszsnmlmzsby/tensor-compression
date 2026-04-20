@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +17,7 @@ class ReconstructionVisualizer2D:
         self.field_cmap = str(vis_cfg["field_cmap"])
         self.error_cmap = str(vis_cfg["error_cmap"])
         self.robust_percentile = float(vis_cfg["robust_percentile"])
-        self.display_channel = int(vis_cfg["display_channel"])
+        self.display_channel = self._parse_display_channel(vis_cfg["display_channel"])
         self.add_colorbar = bool(vis_cfg["add_colorbar"])
         self.output_dir = run_dir / vis_cfg["save_dirname"]
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -34,30 +35,38 @@ class ReconstructionVisualizer2D:
         inputs = inputs.detach().cpu()
         reconstructions = reconstructions.detach().cpu()
         count = min(self.num_samples, inputs.shape[0])
-        fig, axes = plt.subplots(count, 3, figsize=(12, 4 * count), constrained_layout=True)
-        if count == 1:
-            axes = [axes]
+        if count == 0:
+            raise ValueError("No samples available for visualization.")
+        channel_indices = self._resolve_channel_indices(inputs[0].shape[0])
+        rows = count * len(channel_indices)
+        fig, axes = plt.subplots(rows, 3, figsize=(12, 4 * rows), constrained_layout=True)
+        axes = np.asarray(axes)
+        if axes.ndim == 1:
+            axes = axes.reshape(1, 3)
         for row in range(count):
-            inp = self._to_scalar_field(inputs[row])
-            rec = self._to_scalar_field(reconstructions[row])
-            err = np.abs(rec - inp)
-            field_vmin, field_vmax = self._robust_range(np.concatenate([inp.ravel(), rec.ravel()]))
-            err_vmin, err_vmax = 0.0, self._robust_upper(err)
+            for channel_offset, channel_index in enumerate(channel_indices):
+                axis_row = row * len(channel_indices) + channel_offset
+                inp = self._to_scalar_field(inputs[row], channel_index)
+                rec = self._to_scalar_field(reconstructions[row], channel_index)
+                err = np.abs(rec - inp)
+                field_vmin, field_vmax = self._robust_range(np.concatenate([inp.ravel(), rec.ravel()]))
+                err_vmin, err_vmax = 0.0, self._robust_upper(err)
 
-            im0 = axes[row][0].imshow(inp, cmap=self.field_cmap, vmin=field_vmin, vmax=field_vmax)
-            im1 = axes[row][1].imshow(rec, cmap=self.field_cmap, vmin=field_vmin, vmax=field_vmax)
-            im2 = axes[row][2].imshow(err, cmap=self.error_cmap, vmin=err_vmin, vmax=err_vmax)
+                im0 = axes[axis_row][0].imshow(inp, cmap=self.field_cmap, vmin=field_vmin, vmax=field_vmax)
+                im1 = axes[axis_row][1].imshow(rec, cmap=self.field_cmap, vmin=field_vmin, vmax=field_vmax)
+                im2 = axes[axis_row][2].imshow(err, cmap=self.error_cmap, vmin=err_vmin, vmax=err_vmax)
 
-            axes[row][0].set_title("original field")
-            axes[row][1].set_title("reconstructed field")
-            axes[row][2].set_title("absolute difference")
+                title_suffix = f" (ch {channel_index})" if len(channel_indices) > 1 else ""
+                axes[axis_row][0].set_title(f"original field{title_suffix}")
+                axes[axis_row][1].set_title(f"reconstructed field{title_suffix}")
+                axes[axis_row][2].set_title(f"absolute difference{title_suffix}")
 
-            if self.add_colorbar:
-                fig.colorbar(im0, ax=axes[row][0], fraction=0.046, pad=0.04)
-                fig.colorbar(im1, ax=axes[row][1], fraction=0.046, pad=0.04)
-                fig.colorbar(im2, ax=axes[row][2], fraction=0.046, pad=0.04)
-            for col in range(3):
-                axes[row][col].axis("off")
+                if self.add_colorbar:
+                    fig.colorbar(im0, ax=axes[axis_row][0], fraction=0.046, pad=0.04)
+                    fig.colorbar(im1, ax=axes[axis_row][1], fraction=0.046, pad=0.04)
+                    fig.colorbar(im2, ax=axes[axis_row][2], fraction=0.046, pad=0.04)
+                for col in range(3):
+                    axes[axis_row][col].axis("off")
         return fig
 
     def save_figure(self, fig, epoch: int) -> Path:
@@ -65,11 +74,20 @@ class ReconstructionVisualizer2D:
         fig.savefig(path, dpi=150, bbox_inches="tight")
         return path
 
-    def _to_scalar_field(self, tensor: torch.Tensor) -> np.ndarray:
+    def _to_scalar_field(self, tensor: torch.Tensor, channel_index: int) -> np.ndarray:
         if tensor.ndim != 3:
             raise ValueError(f"Expected CHW tensor for visualization, got {tuple(tensor.shape)}.")
-        channel_index = min(self.display_channel, tensor.shape[0] - 1)
         return tensor[channel_index].numpy()
+
+    def _parse_display_channel(self, value: Any) -> int | str:
+        if isinstance(value, str) and value.lower() == "all":
+            return "all"
+        return int(value)
+
+    def _resolve_channel_indices(self, num_channels: int) -> list[int]:
+        if self.display_channel == "all":
+            return list(range(num_channels))
+        return [min(int(self.display_channel), num_channels - 1)]
 
     def _robust_range(self, values: np.ndarray) -> tuple[float, float]:
         low = np.percentile(values, self.robust_percentile)
@@ -101,7 +119,7 @@ class ReconstructionVisualizer3D:
         self.field_cmap = str(vis_cfg["field_cmap"])
         self.error_cmap = str(vis_cfg["error_cmap"])
         self.robust_percentile = float(vis_cfg["robust_percentile"])
-        self.display_channel = int(vis_cfg["display_channel"])
+        self.display_channel = self._parse_display_channel(vis_cfg["display_channel"])
         self.add_colorbar = bool(vis_cfg["add_colorbar"])
         self.output_dir = run_dir / vis_cfg["save_dirname"]
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -119,69 +137,76 @@ class ReconstructionVisualizer3D:
         inputs = inputs.detach().cpu()
         reconstructions = reconstructions.detach().cpu()
         count = min(self.num_samples, inputs.shape[0])
+        if count == 0:
+            raise ValueError("No samples available for visualization.")
+        channel_indices = self._resolve_channel_indices(inputs[0].shape[0])
+        row_blocks = count * len(channel_indices)
 
         fig, axes = plt.subplots(
-            count * 3,
+            row_blocks * 3,
             3,
-            figsize=(12, 4 * count * 3),
+            figsize=(12, 4 * row_blocks * 3),
             constrained_layout=True,
         )
         axes = np.asarray(axes)
         if axes.ndim == 1:
             axes = axes.reshape(1, 3)
-        axes = axes.reshape(count, 3, 3)
+        axes = axes.reshape(row_blocks, 3, 3)
 
         for sample_idx in range(count):
-            inp = self._to_scalar_volume(inputs[sample_idx])
-            rec = self._to_scalar_volume(reconstructions[sample_idx])
-            err = np.abs(rec - inp)
+            for channel_offset, channel_index in enumerate(channel_indices):
+                block_index = sample_idx * len(channel_indices) + channel_offset
+                inp = self._to_scalar_volume(inputs[sample_idx], channel_index)
+                rec = self._to_scalar_volume(reconstructions[sample_idx], channel_index)
+                err = np.abs(rec - inp)
 
-            field_vmin, field_vmax = self._robust_range(
-                np.concatenate([inp.ravel(), rec.ravel()])
-            )
-            err_vmin, err_vmax = 0.0, self._robust_upper(err)
-
-            for view_idx, axis_name in enumerate(self.AXIS_NAMES):
-                inp_slice = self._extract_mid_slice(inp, view_idx)
-                rec_slice = self._extract_mid_slice(rec, view_idx)
-                err_slice = self._extract_mid_slice(err, view_idx)
-
-                row_axes = axes[sample_idx, view_idx]
-                im0 = row_axes[0].imshow(
-                    inp_slice,
-                    cmap=self.field_cmap,
-                    vmin=field_vmin,
-                    vmax=field_vmax,
-                    origin="lower",
+                field_vmin, field_vmax = self._robust_range(
+                    np.concatenate([inp.ravel(), rec.ravel()])
                 )
-                im1 = row_axes[1].imshow(
-                    rec_slice,
-                    cmap=self.field_cmap,
-                    vmin=field_vmin,
-                    vmax=field_vmax,
-                    origin="lower",
-                )
-                im2 = row_axes[2].imshow(
-                    err_slice,
-                    cmap=self.error_cmap,
-                    vmin=err_vmin,
-                    vmax=err_vmax,
-                    origin="lower",
-                )
+                err_vmin, err_vmax = 0.0, self._robust_upper(err)
 
-                titles = (
-                    f"{axis_name}: original",
-                    f"{axis_name}: reconstruction",
-                    f"{axis_name}: abs diff",
-                )
-                for col_idx, title in enumerate(titles):
-                    row_axes[col_idx].set_title(title)
-                    row_axes[col_idx].axis("off")
+                for view_idx, axis_name in enumerate(self.AXIS_NAMES):
+                    inp_slice = self._extract_mid_slice(inp, view_idx)
+                    rec_slice = self._extract_mid_slice(rec, view_idx)
+                    err_slice = self._extract_mid_slice(err, view_idx)
 
-                if self.add_colorbar:
-                    fig.colorbar(im0, ax=row_axes[0], fraction=0.046, pad=0.04)
-                    fig.colorbar(im1, ax=row_axes[1], fraction=0.046, pad=0.04)
-                    fig.colorbar(im2, ax=row_axes[2], fraction=0.046, pad=0.04)
+                    row_axes = axes[block_index, view_idx]
+                    im0 = row_axes[0].imshow(
+                        inp_slice,
+                        cmap=self.field_cmap,
+                        vmin=field_vmin,
+                        vmax=field_vmax,
+                        origin="lower",
+                    )
+                    im1 = row_axes[1].imshow(
+                        rec_slice,
+                        cmap=self.field_cmap,
+                        vmin=field_vmin,
+                        vmax=field_vmax,
+                        origin="lower",
+                    )
+                    im2 = row_axes[2].imshow(
+                        err_slice,
+                        cmap=self.error_cmap,
+                        vmin=err_vmin,
+                        vmax=err_vmax,
+                        origin="lower",
+                    )
+
+                    title_suffix = f" (ch {channel_index})" if len(channel_indices) > 1 else ""
+                    titles = (
+                        f"{axis_name}: original{title_suffix}",
+                        f"{axis_name}: reconstruction{title_suffix}",
+                        f"{axis_name}: abs diff{title_suffix}",
+                    )
+                    for col_idx, title in enumerate(titles):
+                        row_axes[col_idx].set_title(title)
+                        row_axes[col_idx].axis("off")
+
+                    if self.add_colorbar:
+                        fig.colorbar(im0, ax=row_axes[0], fraction=0.046, pad=0.04)
+                        fig.colorbar(im1, ax=row_axes[1], fraction=0.046, pad=0.04)
+                        fig.colorbar(im2, ax=row_axes[2], fraction=0.046, pad=0.04)
 
         return fig
 
@@ -190,11 +215,20 @@ class ReconstructionVisualizer3D:
         fig.savefig(path, dpi=150, bbox_inches="tight")
         return path
 
-    def _to_scalar_volume(self, tensor: torch.Tensor) -> np.ndarray:
+    def _to_scalar_volume(self, tensor: torch.Tensor, channel_index: int) -> np.ndarray:
         if tensor.ndim != 4:
             raise ValueError(f"Expected CDHW tensor for visualization, got {tuple(tensor.shape)}.")
-        channel_index = min(self.display_channel, tensor.shape[0] - 1)
         return tensor[channel_index].numpy()
+
+    def _parse_display_channel(self, value: Any) -> int | str:
+        if isinstance(value, str) and value.lower() == "all":
+            return "all"
+        return int(value)
+
+    def _resolve_channel_indices(self, num_channels: int) -> list[int]:
+        if self.display_channel == "all":
+            return list(range(num_channels))
+        return [min(int(self.display_channel), num_channels - 1)]
 
     def _extract_mid_slice(self, volume: np.ndarray, axis: int) -> np.ndarray:
         mid_index = volume.shape[axis] // 2

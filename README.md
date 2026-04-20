@@ -975,7 +975,7 @@ latent_dim: 64
 - `field_cmap`：原场和重建场使用的色图。
 - `error_cmap`：误差图使用的色图。
 - `robust_percentile`：用于稳健裁剪显示范围的百分位数。
-- `display_channel`：多通道输入时，选择哪个通道进行可视化。
+- `display_channel`：多通道输入时，选择哪个通道进行可视化。可写单个整数索引，例如 `0`；也可写 `all`，一次输出所有通道。
 - `add_colorbar`：是否为每个子图添加色条。
 - `save_dirname`：可视化图像输出目录名。
 
