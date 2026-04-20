@@ -188,7 +188,6 @@ python ./scripts/pdebench_download_helper.py \
 ```bash
 python ./scripts/evaluate_pdebench_downstream.py \
   --hdf5-path /path/to/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5 \
-  --fields density,pressure,Vx,Vy \
   --sample-indices 0,1 \
   --compressor-checkpoint ./outputs/runs/<run>/checkpoints/best.pt \
   --batch-size 1 \
@@ -198,12 +197,29 @@ python ./scripts/evaluate_pdebench_downstream.py \
   --inverse-operator-spec ./path/to/your_inverse_wrapper.py:inverse_operator
 ```
 
+当提供 `--compressor-checkpoint` 时，脚本会优先使用 checkpoint 中保存的训练字段顺序，例如训练时如果是 `hdf5_dataset_keys: [density, pressure, Vx, Vy]`，评估和导出也会自动沿用这个顺序。这样可以避免通道语义错位。此时如果你仍然显式传入 `--fields`，它必须与训练顺序完全一致，否则脚本会直接报错，而不是带着错误通道顺序继续运行。
+
+如果还希望生成一个新的 HDF5 文件，里面只把 `--fields` 指定的数据集替换成 AE 重建结果，其他数据集和文件元信息保持原样，可以额外加：
+
+```bash
+python ./scripts/evaluate_pdebench_downstream.py \
+  --hdf5-path /path/to/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5 \
+  --sample-indices all \
+  --compressor-checkpoint ./outputs/runs/<run>/checkpoints/best.pt \
+  --batch-size 1 \
+  --reconstructed-hdf5-output ./outputs/pdebench_downstream/reconstructed_all.hdf5
+```
+
+对类似 `density/pressure/Vx/Vy: [sample, time, height, width]`、`t-coordinate: [22]`、`x-coordinate/y-coordinate: [512]` 的 PDEBench 2D CFD 文件，这个导出会复制原始 HDF5，再只覆盖 `density/pressure/Vx/Vy` 中 `--sample-indices` 和可选 `--time-start/--time-stop/--time-step` 对应的切片。`--sample-indices all` 表示覆盖所有 sample；也可以写 `0,1,2` 只导出部分样本。`t-coordinate`、`x-coordinate`、`y-coordinate` 以及其他未指定数据集会保留为原文件内容，便于后续直接把原始文件和重建文件分别送入同一个科学计算算子做对比。若输出路径已存在，需要显式加 `--overwrite-reconstructed-hdf5`。
+
 `forward_operator` 和 `inverse_operator` 都接收一个 `payload: dict`，其中最重要的字段是：
 
 - `payload["data"]`：形状为 `[height, width, time, channel]` 的 `torch.Tensor`
 - `payload["grid"]`：形状为 `[height, width, 2]` 的坐标网格，如果 HDF5 中有 `x-coordinate/y-coordinate`
 - `payload["t_coordinates"]`：时间坐标，PDEBench CFD 文件中可能比实际数据时间步多一个边界点
 - `payload["field_names"]`：例如 `("density", "pressure", "Vx", "Vy")`
+
+建议：如果你是从训练好的 checkpoint 出发做 PDEBench 评估或导出，优先不要手写 `--fields`，直接让脚本从 checkpoint 继承训练时的字段顺序。这是当前最不容易出错的用法。
 
 脚本会分别对 `original` 和 `reconstructed` 调用同一个算子，并输出重建本身的 `mse/mae/relative_l1/psnr`，以及 `forward/...`、`inverse/...` 前缀下的算子输出误差。完整 JSON 默认写入 `outputs/pdebench_downstream/`。
 
@@ -214,7 +230,6 @@ python ./scripts/evaluate_pdebench_downstream.py \
 ```bash
 python ./scripts/evaluate_pdebench_downstream.py \
   --hdf5-path /path/to/file.hdf5 \
-  --fields density,pressure,Vx,Vy \
   --sample-indices 0 \
   --compressor-checkpoint ./outputs/runs/<run>/checkpoints/best.pt \
   --forward-operator-type pdebench-fno \

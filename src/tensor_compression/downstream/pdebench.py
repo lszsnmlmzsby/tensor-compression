@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import math
+import shutil
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -446,6 +447,62 @@ def read_time_coordinates(handle: h5py.File, time_slice: slice | None = None) ->
     return torch.as_tensor(values, dtype=torch.float32)
 
 
+def build_pdebench_record(
+    hdf5_path: str | Path,
+    field_keys: Sequence[str],
+    sample_index: int,
+    reconstructor: CheckpointReconstructor | None = None,
+    batch_size: int = 1,
+    time_slice: slice | None = None,
+    spatial_stride: int = 1,
+) -> PDEBenchRecord:
+    original, grid, t_coordinates = read_pdebench_sample(
+        hdf5_path=hdf5_path,
+        field_keys=field_keys,
+        sample_index=sample_index,
+        time_slice=time_slice,
+        spatial_stride=spatial_stride,
+    )
+    reconstructed = original.clone()
+    if reconstructor is not None:
+        frames = pdebench_to_chw_frames(original)
+        reconstructed_frames = reconstructor.reconstruct_frames(frames, batch_size=batch_size)
+        reconstructed = chw_frames_to_pdebench(
+            reconstructed_frames,
+            spatial_shape=original.shape[:-2],
+            time_steps=original.shape[-2],
+        )
+    return PDEBenchRecord(
+        sample_index=sample_index,
+        original=original,
+        reconstructed=reconstructed,
+        grid=grid,
+        t_coordinates=t_coordinates,
+        field_names=tuple(field_keys),
+    )
+
+
+def generate_pdebench_records(
+    hdf5_path: str | Path,
+    field_keys: Sequence[str],
+    sample_indices: Iterable[int],
+    reconstructor: CheckpointReconstructor | None = None,
+    batch_size: int = 1,
+    time_slice: slice | None = None,
+    spatial_stride: int = 1,
+):
+    for sample_index in sample_indices:
+        yield build_pdebench_record(
+            hdf5_path=hdf5_path,
+            field_keys=field_keys,
+            sample_index=sample_index,
+            reconstructor=reconstructor,
+            batch_size=batch_size,
+            time_slice=time_slice,
+            spatial_stride=spatial_stride,
+        )
+
+
 def iter_pdebench_records(
     hdf5_path: str | Path,
     field_keys: Sequence[str],
@@ -455,35 +512,129 @@ def iter_pdebench_records(
     time_slice: slice | None = None,
     spatial_stride: int = 1,
 ) -> list[PDEBenchRecord]:
-    records: list[PDEBenchRecord] = []
-    for sample_index in sample_indices:
-        original, grid, t_coordinates = read_pdebench_sample(
+    return list(
+        generate_pdebench_records(
             hdf5_path=hdf5_path,
             field_keys=field_keys,
-            sample_index=sample_index,
+            sample_indices=sample_indices,
+            reconstructor=reconstructor,
+            batch_size=batch_size,
             time_slice=time_slice,
             spatial_stride=spatial_stride,
         )
-        reconstructed = original.clone()
-        if reconstructor is not None:
-            frames = pdebench_to_chw_frames(original)
-            reconstructed_frames = reconstructor.reconstruct_frames(frames, batch_size=batch_size)
-            reconstructed = chw_frames_to_pdebench(
-                reconstructed_frames,
-                spatial_shape=original.shape[:-2],
-                time_steps=original.shape[-2],
+    )
+
+
+def export_reconstructed_hdf5(
+    hdf5_path: str | Path,
+    output_path: str | Path,
+    records: Sequence[PDEBenchRecord],
+    field_keys: Sequence[str],
+    time_slice: slice | None = None,
+    spatial_stride: int = 1,
+    overwrite: bool = False,
+) -> Path:
+    target_path = prepare_reconstructed_hdf5_output(
+        hdf5_path=hdf5_path,
+        output_path=output_path,
+        overwrite=overwrite,
+    )
+    with h5py.File(target_path, "r+") as target:
+        for record in records:
+            write_reconstructed_record_to_hdf5(
+                target=target,
+                record=record,
+                field_keys=field_keys,
+                time_slice=time_slice,
+                spatial_stride=spatial_stride,
             )
-        records.append(
-            PDEBenchRecord(
-                sample_index=sample_index,
-                original=original,
-                reconstructed=reconstructed,
-                grid=grid,
-                t_coordinates=t_coordinates,
-                field_names=tuple(field_keys),
-            )
+
+    return target_path
+
+
+def prepare_reconstructed_hdf5_output(
+    hdf5_path: str | Path,
+    output_path: str | Path,
+    overwrite: bool = False,
+) -> Path:
+    source_path = Path(hdf5_path).expanduser().resolve()
+    target_path = Path(output_path).expanduser().resolve()
+    if source_path == target_path:
+        raise ValueError("Refusing to overwrite the source HDF5 file in place.")
+    if target_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output HDF5 already exists: {target_path}. "
+            "Pass overwrite=True or choose a new path."
         )
-    return records
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        target_path.unlink()
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
+def write_reconstructed_record_to_hdf5(
+    target: h5py.File,
+    record: PDEBenchRecord,
+    field_keys: Sequence[str],
+    time_slice: slice | None = None,
+    spatial_stride: int = 1,
+) -> None:
+    if spatial_stride <= 0:
+        raise ValueError(f"spatial_stride must be positive, got {spatial_stride}")
+    for key in field_keys:
+        if key not in target or not isinstance(target[key], h5py.Dataset):
+            raise KeyError(f"HDF5 dataset key {key!r} not found in copied output.")
+
+    if tuple(record.field_names) != tuple(field_keys):
+        raise ValueError(
+            "Record field_names must match the export field_keys. "
+            f"Got record={record.field_names}, export={tuple(field_keys)}."
+        )
+    reconstructed = record.reconstructed.detach().cpu()
+    if reconstructed.ndim < 3:
+        raise ValueError(
+            "Expected reconstructed PDEBench tensor shaped "
+            f"[spatial..., time, channel], got {tuple(reconstructed.shape)}."
+        )
+    if int(reconstructed.shape[-1]) != len(field_keys):
+        raise ValueError(
+            f"Reconstructed tensor has {reconstructed.shape[-1]} channels, "
+            f"but field_keys has {len(field_keys)} entries."
+        )
+
+    for channel_index, key in enumerate(field_keys):
+        dataset = target[key]
+        indexer = build_sample_indexer(
+            dataset.ndim,
+            record.sample_index,
+            time_slice,
+            spatial_stride,
+        )
+        field_data = reconstructed[..., channel_index].numpy()
+        dataset_payload = np.moveaxis(field_data, -1, 0).astype(dataset.dtype, copy=False)
+        expected_shape = hdf5_selection_shape(dataset.shape, indexer)
+        if tuple(dataset_payload.shape) != expected_shape:
+            raise ValueError(
+                f"Reconstructed data for field {key!r} has shape "
+                f"{tuple(dataset_payload.shape)}, but target slice shape is "
+                f"{expected_shape}."
+            )
+        dataset[tuple(indexer)] = dataset_payload
+
+
+def hdf5_selection_shape(
+    shape: Sequence[int],
+    indexer: Sequence[int | slice],
+) -> tuple[int, ...]:
+    selected_shape: list[int] = []
+    for dim_size, item in zip(shape, indexer):
+        if isinstance(item, int):
+            continue
+        start, stop, step = item.indices(int(dim_size))
+        selected_shape.append(len(range(start, stop, step)))
+    return tuple(selected_shape)
 
 
 def pdebench_to_chw_frames(data: torch.Tensor) -> torch.Tensor:
@@ -740,6 +891,68 @@ def parse_fields(raw: str | Sequence[str] | None) -> list[str] | None:
         values = [part.strip() for part in raw.split(",") if part.strip()]
         return values or None
     return [str(item) for item in raw]
+
+
+def resolve_checkpoint_field_keys(config: Mapping[str, Any] | None) -> list[str] | None:
+    if not isinstance(config, Mapping):
+        return None
+    data_cfg = config.get("data")
+    if not isinstance(data_cfg, Mapping):
+        return None
+    dataset_cfg = data_cfg.get("dataset")
+    if not isinstance(dataset_cfg, Mapping):
+        return None
+
+    multi_keys = parse_fields(dataset_cfg.get("hdf5_dataset_keys"))
+    if multi_keys:
+        return multi_keys
+    single_key = dataset_cfg.get("hdf5_dataset_key") or dataset_cfg.get("field_key")
+    if single_key:
+        return [str(single_key)]
+    return None
+
+
+def validate_checkpoint_field_keys_against_model(
+    config: Mapping[str, Any] | None,
+    field_keys: Sequence[str] | None,
+) -> None:
+    if not isinstance(config, Mapping) or not field_keys:
+        return
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, Mapping):
+        return
+    in_channels = model_cfg.get("in_channels")
+    if in_channels is None:
+        return
+    if int(in_channels) != len(field_keys):
+        raise ValueError(
+            "Checkpoint field order is inconsistent with model.in_channels. "
+            f"field_keys={list(field_keys)}, in_channels={in_channels}."
+        )
+
+
+def resolve_field_keys_for_evaluation(
+    *,
+    cli_field_keys: Sequence[str] | None,
+    checkpoint_field_keys: Sequence[str] | None,
+    discovered_field_keys: Sequence[str],
+) -> list[str]:
+    if checkpoint_field_keys:
+        checkpoint_resolved = [str(item) for item in checkpoint_field_keys]
+        if cli_field_keys is None:
+            return checkpoint_resolved
+        cli_resolved = [str(item) for item in cli_field_keys]
+        if cli_resolved != checkpoint_resolved:
+            raise ValueError(
+                "The provided --fields order does not match the compressor checkpoint field order. "
+                f"CLI={cli_resolved}, checkpoint={checkpoint_resolved}. "
+                "To avoid channel-order mistakes, either omit --fields and use the checkpoint order "
+                "automatically, or pass the exact same order as training."
+            )
+        return checkpoint_resolved
+    if cli_field_keys is not None:
+        return [str(item) for item in cli_field_keys]
+    return [str(item) for item in discovered_field_keys]
 
 
 def parse_time_slice(start: int | None, stop: int | None, step: int | None = None) -> slice | None:

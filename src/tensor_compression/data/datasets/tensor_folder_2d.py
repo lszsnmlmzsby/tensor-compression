@@ -191,8 +191,8 @@ class TensorFolder2DDataset(BaseTensorDataset):
             "target": tensor.clone(),
             "sample_id": sample_id,
             "path": str(path),
-            "dataset_path": dataset_path,
-            "dataset_paths": list(dataset_paths) if dataset_paths else None,
+            "dataset_path": str(dataset_path) if dataset_path else "",
+            "dataset_paths": ",".join(str(item) for item in dataset_paths) if dataset_paths else "",
             "dimensions": 2,
         }
 
