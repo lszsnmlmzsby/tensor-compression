@@ -238,6 +238,73 @@ python ./scripts/evaluate_pdebench_downstream.py \
   --width 20
 ```
 
+### 1.6 命令行参数说明
+
+本节覆盖 README 中出现的主要命令行参数。`<path>`、`<int>`、`<float>`、`<string>` 表示需要替换成你自己的路径、整数、浮点数或字符串。
+
+#### 通用安装、测试命令
+
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `python -m <module>` | 让 Python 以模块方式启动工具。 | `pip`、`unittest`、`venv` 等 Python 模块名 | `pip` 表示启动包管理器；`unittest` 表示启动 Python 标准测试框架；`venv` 表示创建虚拟环境。 |
+| `pip install -r <file>` | 按依赖清单安装包。 | `<file>` | 指向 requirements 文件；本项目示例为 `requirements.txt`。 |
+| `pip install --upgrade <package>` | 升级指定包。 | `<package>` | 示例里的 `pip` 表示升级 pip 自身。 |
+| `python3.10 -m venv <dir>` | 用 Python 3.10 创建虚拟环境。 | `<dir>` | 虚拟环境目录；示例 `.venv` 表示在项目根目录创建 `.venv`。 |
+| `python -` | 从标准输入读取并执行 Python 代码。 | `-` | `-` 是固定写法，表示代码来自后续输入而不是 `.py` 文件。 |
+| `python -m unittest discover -s <dir>` | 指定 unittest 自动发现测试的起始目录。 | `<dir>` | 示例 `tests` 表示从 `tests/` 目录开始搜索测试。 |
+| `python -m unittest discover -p <pattern>` | 指定测试文件名匹配模式。 | `<glob>` | 示例 `test_inspect_pdebench_hdf5.py` 表示只运行这个测试文件。 |
+| `python -m unittest discover -v` | 打印更详细的测试输出。 | 无值开关 | 写上 `-v` 表示 verbose；不写则使用默认简略输出。 |
+| `pip install --index-url <url>` | 指定 pip 主包索引。 | `<url>` | README 示例里的 `https://download.pytorch.org/whl/cu124` 表示优先从 PyTorch CUDA 12.4 wheel 源安装。 |
+
+#### `scripts/train_compressor.py`
+
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `--config` | 指定训练 YAML 配置文件。 | `<path>` | 指向任意 YAML 配置；示例 `./configs/compressor_2d.yaml` 表示使用默认 2D 配置。 |
+| `--dry-run` | 只构建模型、损失、数据集并校验配置，不启动训练。 | 无值开关 | 写上 `--dry-run` 表示检查配置；不写则正式训练。 |
+
+#### `scripts/pdebench_download_helper.py`
+
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `--pdebench-root` | PDEBench 官方仓库根目录。 | `<path>` | 指向包含 `pdebench/data_download/pdebench_data_urls.csv` 的目录；默认是 `./PDEBench_code/PDEBench-main`。 |
+| `--pde-name` | 按 PDE 类型过滤下载条目。 | `<string>`，可重复传入 | 示例 `2d_cfd` 表示只匹配 CSV 中 PDE 列为 `2d_cfd` 的文件；重复传入表示允许多个 PDE 类型。 |
+| `--filename-contains` | 按文件名子串过滤。 | `null` 或 `<string>` | 不传表示不过滤文件名；传入 `2D_CFD_Turb_M0.1` 表示只保留文件名包含该子串的条目。 |
+| `--root-folder` | 下载目标根目录，也用于打印官方下载命令。 | `<path>` | 示例 `./data/external/pdebench` 表示把 PDEBench 数据放到该目录下。 |
+| `--download` | 是否由本脚本直接下载匹配文件。 | 无值开关 | 写上表示实际下载并在 CSV 有 MD5 时校验；不写只列出匹配条目和下载命令。 |
+| `--skip-existing` | 下载时是否跳过已存在文件。 | 无值开关 | 写上表示目标文件已存在时跳过；不写则重新下载并覆盖写入目标文件。 |
+
+#### `scripts/evaluate_pdebench_downstream.py`
+
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `--hdf5-path` | 待评估的 PDEBench HDF5 文件。 | `<path>` | 必填；指向原始 `.h5/.hdf5` 文件。 |
+| `--fields` | 指定参与评估和导出的 HDF5 字段顺序。 | `null` 或逗号分隔字段名 | 不传时优先使用 checkpoint 中的训练字段顺序；没有 checkpoint 顺序时自动发现字段；传入如 `density,pressure,Vx,Vy` 时必须与 checkpoint 顺序一致。 |
+| `--sample-indices` | 指定评估哪些 sample。 | `all` 或逗号分隔整数 | `all` 表示所有 sample；`0,1,2` 表示只评估第 0、1、2 个 sample；默认 `0`。 |
+| `--time-start` | 时间切片起点。 | `null` 或 `<int>` | 不传表示从第一个时间步开始；传整数表示 Python slice 的 start。 |
+| `--time-stop` | 时间切片终点。 | `null` 或 `<int>` | 不传表示直到最后；传整数表示 Python slice 的 stop，左闭右开。 |
+| `--time-step` | 时间切片步长。 | `null` 或 `<int>` | 不传表示步长为 1；传 `2` 表示每隔一个时间步取一次。 |
+| `--spatial-stride` | 空间下采样步长。 | 正整数 | `1` 表示不下采样；`2` 表示空间维每隔一个点取一次。 |
+| `--compressor-checkpoint` | 训练好的 AE checkpoint。 | `null` 或 `<path>` | 不传时把重建视为恒等复制，只评估原始流程；传入 `best.pt/last.pt` 时会先用 AE 重建再评估。 |
+| `--compressor-config` | checkpoint 内没有 config 时额外提供训练配置。 | `null` 或 `<path>` | 不传表示从 checkpoint 的 `config` 字段读取；传入 YAML 时用该配置构建 AE。 |
+| `--batch-size` | AE 逐帧重建时的 batch 大小。 | 正整数 | 数值越大通常越快但占用显存越多；默认 `1`。 |
+| `--device` | 评估设备。 | `auto`、`cpu`、`cuda`、其他 PyTorch 设备字符串 | `auto` 表示有 CUDA 就用 GPU，否则用 CPU；`cpu` 强制 CPU；`cuda` 使用默认 CUDA 设备；`cuda:1` 等字符串可指定具体 GPU。 |
+| `--forward-operator-type` | 正问题算子类型。 | `none`、`callable`、`pdebench-fno`、`pdebench-unet` | `none` 表示不评估 forward；`callable` 表示加载你提供的 Python callable；`pdebench-fno` 表示加载 PDEBench 官方 FNO；`pdebench-unet` 表示加载 PDEBench 官方 UNet。 |
+| `--forward-operator-spec` | callable forward 算子位置。 | `null`、`module.py:function`、`import.path:function`、`<torch-load-path>` | `module.py:function` 从文件加载函数或类；`import.path:function` 从 Python import 路径加载；无冒号时用 `torch.load`，对象必须可调用。 |
+| `--forward-checkpoint` | PDEBench forward 算子的 checkpoint。 | `null` 或 `<path>` | 使用 `pdebench-fno` 或 `pdebench-unet` 时必填；`none/callable` 时不用。 |
+| `--inverse-operator-type` | 反问题算子类型。 | `none`、`callable` | `none` 表示不评估 inverse；`callable` 表示加载你提供的 callable wrapper。 |
+| `--inverse-operator-spec` | callable inverse 算子位置。 | `null`、`module.py:function`、`import.path:function`、`<torch-load-path>` | 含义同 `--forward-operator-spec`，但用于 inverse 算子。 |
+| `--pdebench-root` | PDEBench 官方仓库根目录。 | `<path>` | 使用 `pdebench-fno/pdebench-unet` 时用于 import 官方模型；默认 `./PDEBench_code/PDEBench-main`。 |
+| `--num-channels` | PDEBench 官方模型输入/输出物理字段数。 | `null` 或正整数 | 不传时使用当前字段数；传 `4` 表示 `density/pressure/Vx/Vy` 四通道。 |
+| `--initial-step` | PDEBench autoregressive 模型使用的历史时间步数。 | 正整数 | 示例 `10` 表示用前 10 个时间步预测后续时间步。 |
+| `--t-train` | PDEBench 算子 rollout 的时间长度上限。 | `null` 或正整数 | 不传表示使用数据里可用时间长度；传 `21` 表示最多 rollout 到第 21 个时间步。 |
+| `--modes` | FNO 频域 mode 数。 | 正整数 | 仅 `pdebench-fno` 使用；数值越大频域容量越高，需与官方 checkpoint 架构一致。 |
+| `--width` | FNO 网络宽度。 | 正整数 | 仅 `pdebench-fno` 使用；需与官方 checkpoint 架构一致。 |
+| `--init-features` | UNet 初始特征通道数。 | 正整数 | 仅 `pdebench-unet` 使用；需与官方 checkpoint 架构一致。 |
+| `--output` | 评估结果 JSON 输出路径。 | `null` 或 `<path>` | 不传时写入 `outputs/pdebench_downstream/<timestamp>_pdebench_downstream.json`；传入路径则写到指定文件。 |
+| `--reconstructed-hdf5-output` | 是否额外导出替换了重建字段的新 HDF5。 | `null` 或 `<path>` | 不传表示不导出 HDF5；传入路径表示复制原文件并覆盖指定字段切片。 |
+| `--overwrite-reconstructed-hdf5` | 允许覆盖已存在的重建 HDF5 输出。 | 无值开关 | 写上表示目标存在时可覆盖；不写且目标存在会报错。 |
+
 ## 2. 仓库结构
 
 ```text
@@ -410,18 +477,24 @@ tensor compression2.0/
 
 主配置文件为 `configs/compressor_2d.yaml`。
 
+本节按“意义 / 可选值 / 每个可选值的意义”说明配置项。没有固定枚举的参数会写成类型或范围，例如 `<path>`、`<int>`、`<float>`、`true/false`、`null`。
+
 ### 5.1 `experiment`
 
-- `name`：实验名称，用于输出目录和 W&B run 名称。
-- `output_root`：训练输出根目录。
-- `seed`：随机种子。
-- `device`：训练设备，可设为 `auto`、`cpu`、`cuda`。
-- `save_top_k`：预留参数，后续可扩展为保留多个最优 checkpoint。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `name` | 实验名称，用于输出目录名和 W&B run 名称。 | `<string>` | 任意非空字符串；例如 `compressor_2d_baseline` 会生成类似 `<timestamp>_compressor_2d_baseline` 的 run 目录。 |
+| `output_root` | 训练输出根目录。 | `<path>` | 可写相对路径或绝对路径；以 `./` 开头的相对路径会按项目根目录解析。 |
+| `seed` | 随机种子，用于 Python、NumPy、PyTorch 和自动切分。 | `<int>` | 相同数据和相同 seed 下，自动切分与大部分初始化更可复现。 |
+| `device` | 训练设备。 | `auto`、`cpu`、`cuda`、其他 PyTorch 设备字符串 | `auto` 表示 CUDA 可用时用 GPU，否则用 CPU；`cpu` 强制 CPU；`cuda` 使用默认 CUDA 设备；`cuda:0`、`cuda:1` 等可指定 GPU。 |
+| `save_top_k` | 预留参数，当前训练代码未实际使用。 | `<int>` | 当前无运行效果；默认 `1` 表示未来可扩展为保留 1 个最优 checkpoint。 |
 
 ### 5.2 `data`
 
-- `dimensions`：张量维度标记。当前 `2` 表示 2D 数据。
-- `dataset_name`：数据集注册名。当前使用 `tensor_folder_2d`。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `dimensions` | 张量空间维度标记，也决定可视化器类型。 | `2`、`3`、其他整数 | `2` 表示 2D 张量场，使用 2D 可视化；`3` 表示 3D 体数据，使用三视图切片可视化；其他整数当前不会报错但只会得到未实现可视化器。 |
+| `dataset_name` | 数据集注册名，用于从项目 registry 构建数据集。 | `tensor_folder_2d`、`tensor_folder_3d`、`tensor_folder_4d` | `tensor_folder_2d` 已实现 2D 文件夹/HDF5/图片读取；`tensor_folder_3d` 已实现 3D `.npy/.npz/.h5/.hdf5` baseline；`tensor_folder_4d` 只是预留入口，当前会抛 `NotImplementedError`。 |
 
 说明：
 
@@ -429,18 +502,21 @@ tensor compression2.0/
 - 它是本项目里单独定义并注册的一种通用 2D 数据读取逻辑。
 - 当前对应实现文件是 `src/tensor_compression/data/datasets/tensor_folder_2d.py`。
 - 这个读取器负责统一处理 `.npy / .npz / .h5 / .hdf5 / 图片` 等 2D 数据源，并完成样本索引、HDF5 dataset 选择、通道整理、resize、归一化等步骤。
+- `dataset_name` 和 `dimensions` 应保持一致：2D 推荐 `dimensions: 2` + `tensor_folder_2d`；3D 推荐 `dimensions: 3` + `tensor_folder_3d`。
 
 #### `data.source_roots`
 
-- `all_primary`：当 `data.split.mode: auto` 时，作为未切分数据池的主目录。
-- `all_extra`：当 `data.split.mode: auto` 时，作为未切分数据池的额外目录列表。
-- `train_primary`：主训练目录。
-- `train_extra`：额外训练目录列表，可放其他来源数据。
-- `val_primary`：主验证目录。
-- `val_extra`：额外验证目录列表。
-- `test_primary`：主测试目录。
-- `test_extra`：额外测试目录列表。
-- `external_reference_roots`：预留给外部参考数据源。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `all_primary` | `data.split.mode: auto` 时的主数据池。 | `null` 或 `<path>` | `null` 表示不使用主数据池；路径可指目录或单个文件。 |
+| `all_extra` | `data.split.mode: auto` 时的额外数据池列表。 | `[]` 或路径列表 | `[]` 表示没有额外数据源；列表中的每个路径都会和 `all_primary` 合并后再自动切分。 |
+| `train_primary` | `data.split.mode: predefined` 时的主训练数据源。 | `null` 或 `<path>` | `null` 表示无主训练源；路径可指训练目录或单个训练文件。 |
+| `train_extra` | `predefined` 模式下的额外训练数据源列表。 | `[]` 或路径列表 | `[]` 表示没有额外训练源；路径列表会追加到训练集扫描范围。 |
+| `val_primary` | `predefined` 模式下的主验证数据源。 | `null` 或 `<path>` | 含义同 `train_primary`，但用于验证集。 |
+| `val_extra` | `predefined` 模式下的额外验证数据源列表。 | `[]` 或路径列表 | 含义同 `train_extra`，但用于验证集。 |
+| `test_primary` | `predefined` 模式下的主测试数据源。 | `null` 或 `<path>` | 含义同 `train_primary`，但用于测试集。 |
+| `test_extra` | `predefined` 模式下的额外测试数据源列表。 | `[]` 或路径列表 | 含义同 `train_extra`，但用于测试集。 |
+| `external_reference_roots` | 外部参考数据源预留字段。 | `[]` 或路径列表 | 当前代码不会读取该字段；保留给后续评估、对齐或外部参考数据。 |
 
 说明：
 
@@ -449,19 +525,14 @@ tensor compression2.0/
 
 #### `data.split`
 
-- `mode`：数据切分模式。
-  - `predefined`：从 `train / val / test` 目录直接读取。
-  - `auto`：从 `all_primary / all_extra` 统一扫描后，按比例自动切分。
-
-- `seed`：自动切分随机种子。
-
-- `shuffle`：自动切分前是否先打乱文件顺序。
-
-- `train_ratio`：自动切分时训练集比例。
-
-- `val_ratio`：自动切分时验证集比例。
-
-- `test_ratio`：自动切分时测试集比例。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `mode` | 数据切分模式。 | `predefined`、`auto` | `predefined` 表示分别读取 `train/val/test` 数据源；`auto` 表示从 `all_primary/all_extra` 扫描出全部样本后按比例切分。 |
+| `seed` | 自动切分随机种子。 | `<int>` | 仅 `mode: auto` 且 `shuffle: true` 时影响样本顺序。 |
+| `shuffle` | 自动切分前是否打乱样本列表。 | `true`、`false` | `true` 表示用 `seed` 打乱后再切分；`false` 表示按扫描排序结果直接切分。 |
+| `train_ratio` | 自动切分训练集比例。 | `0.0` 到 `1.0` 的 `<float>` | 例如 `0.8` 表示 80% 样本进入训练集。 |
+| `val_ratio` | 自动切分验证集比例。 | `0.0` 到 `1.0` 的 `<float>` | 例如 `0.1` 表示 10% 样本进入验证集。 |
+| `test_ratio` | 自动切分测试集比例。 | `0.0` 到 `1.0` 的 `<float>` | 例如 `0.1` 表示剩余 10% 样本进入测试集。 |
 
 说明：
 
@@ -469,69 +540,73 @@ tensor compression2.0/
 - 自动切分是按“最终样本列表”做的。
 - 对普通 `.npy / .npz / 图片` 文件来说，最终样本通常就是文件本身。
 - 对 HDF5 来说，如果 `hdf5_index_mode: file`，则按文件内选中的整个 dataset 作为一个样本切分。
-- 对 HDF5 来说，如果 `hdf5_index_mode: sample`，则会先按 `hdf5_sample_axis` 展开文件内多个样本，再按展开后的样本切分。
+- 对 HDF5 来说，如果 `hdf5_index_mode: sample`，则会先按 `hdf5_sample_axes` 或 `hdf5_sample_axis` 展开文件内多个样本，再按展开后的样本切分。
 - 自动切分结果是确定性的：同一组文件、同一个 `seed` 会得到同样的切分。
 
 #### `data.dataset`
 
-- `recursive`：是否递归扫描子目录。
-- `allow_empty`：是否允许目录为空。默认 `true`，方便先搭工程。
-- `extensions`：支持读取的文件后缀。
-- `npz_key`：`.npz` 文件中要读取的 key；为 `null` 时读取第一个数组。
-- `hdf5_dataset_key`：指定 `.h5/.hdf5` 文件中要读取的 dataset 路径。
-- `field_key`：`hdf5_dataset_key` 的兼容别名，方便兼容旧配置写法。
-- `hdf5_key_candidates`：当 `hdf5_dataset_key` 为空时，按顺序尝试的候选 dataset 路径列表。
-- `detect_hdf5_by_signature`：是否通过文件头自动识别 HDF5。开启后，即使后缀写得不标准，也会尽量识别。
-- `hdf5_index_mode`：HDF5 索引模式。
-  - `file`：整个 HDF5 dataset 当成一个样本。
-  - `sample`：按 `hdf5_sample_axis` 将一个 HDF5 dataset 展开成多个样本。
-  - `auto`：自动判断是否应展开为多个样本。
-- `hdf5_sample_axes`：可选的“多个样本维”配置，例如 `[0, 1]` 可将 `[N, T, H, W]` 展开成 `N*T` 个 2D 样本。
-- `hdf5_sample_axis`：当 `hdf5_index_mode: sample` 时，指定样本维。
-- `allow_images`：是否允许图片类文件作为 2D 输入读取。
-- `channels`：输入通道数。
-- `input_size`：模型输入尺寸。
-- `strict_size`：尺寸不匹配时是否直接报错。
-- `resize_mode`：resize 插值方法。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `recursive` | 扫描目录时是否递归进入子目录。 | `true`、`false` | `true` 表示扫描所有层级子目录；`false` 表示只扫描当前目录第一层文件。 |
+| `allow_empty` | 是否允许当前 split 没有样本。 | `true`、`false` | `true` 允许先搭工程但训练时 train/val 为空仍会停止；`false` 表示数据集构建阶段就报错。 |
+| `extensions` | 按文件后缀筛选可读取文件。 | 后缀字符串列表 | 2D 已支持 `.npy/.npz/.h5/.hdf5/.png/.jpg/.jpeg/.bmp/.tif/.tiff`；3D 已支持 `.npy/.npz/.h5/.hdf5`。 |
+| `npz_key` | `.npz` 文件中读取哪个数组。 | `null` 或 `<string>` | `null` 表示读取 `.npz` 中第一个数组；字符串表示读取同名 key。 |
+| `hdf5_dataset_key` | 单字段 HDF5 dataset 路径。 | `null` 或 `<string>` | `null` 表示不显式指定单字段；字符串如 `Vx` 或 `/fields/pressure` 表示读取该 dataset，并按单通道处理。 |
+| `field_key` | `hdf5_dataset_key` 的兼容别名。 | `null` 或 `<string>` | 旧配置可继续用该字段；当 `hdf5_dataset_key` 为空时生效。 |
+| `hdf5_dataset_keys` | 多字段 HDF5 dataset 路径列表。 | `null`、`[]`、字符串或字符串列表 | `null/[]` 表示不启用多字段；字符串会被当成单元素列表；列表如 `[density, pressure, Vx, Vy]` 会按顺序读取并堆叠成通道维。 |
+| `hdf5_key_candidates` | 自动选择 HDF5 dataset 时的候选路径。 | `[]` 或字符串列表 | `[]` 表示不设置候选；列表会按顺序尝试，找到第一个存在且数值型的 dataset。 |
+| `detect_hdf5_by_signature` | 是否通过文件头识别 HDF5。 | `true`、`false` | `true` 表示即使后缀不标准也尝试识别 HDF5；`false` 表示主要按后缀和 HDF5-like 后缀判断。 |
+| `hdf5_index_mode` | HDF5 样本索引模式。 | `auto`、`file`、`sample` | `auto` 根据 dataset 维度和通道数推断；`file` 把整个 dataset 当一个样本；`sample` 按样本轴展开为多个样本。 |
+| `hdf5_sample_axes` | 多个样本维配置。 | `null`、单个整数、整数列表 | `null` 表示使用 `hdf5_sample_axis` 并自动补足；`0` 表示第 0 维是样本维；`[0, 1]` 表示第 0 和第 1 维都展开，如 `[N,T,H,W]` 展开为 `N*T` 个样本。 |
+| `hdf5_sample_axis` | 单个样本维配置。 | 整数，支持负索引 | 仅在 `hdf5_sample_axes: null` 时作为初始样本轴；`0` 表示第 0 维；`-1` 表示最后一维，但必须保证剩余维度能组成合法样本。 |
+| `allow_images` | 2D 数据集是否允许读取图片。 | `true`、`false` | `true` 表示允许 `.png/.jpg/.jpeg/.bmp/.tif/.tiff`；`false` 表示遇到图片会报错。3D 数据集不读取图片。 |
+| `channels` | 数据输入通道数。 | 正整数，或由 HDF5 字段自动推断 | 手写时表示最终输入通道数；配置 `hdf5_dataset_keys` 时会自动等于字段个数；配置单个 `hdf5_dataset_key/field_key` 时必须为 `1`。 |
+| `input_size` | 数据加载后送入模型前的空间尺寸。 | 2D `[H, W]`，3D `[D, H, W]` | 样本尺寸不一致且 `strict_size: false` 时会 resize 到该尺寸；应与 `model.input_size` 保持一致。 |
+| `strict_size` | 尺寸不匹配时是否直接报错。 | `true`、`false` | `true` 表示样本尺寸必须已经等于 `input_size`；`false` 表示自动 resize。 |
+| `resize_mode` | PyTorch `F.interpolate` 插值模式。 | 2D 常用 `nearest`、`bilinear`、`bicubic`、`area`；3D 常用 `nearest`、`trilinear`、`area` | `nearest` 最近邻；`bilinear` 2D 双线性；`bicubic` 2D 双三次；`trilinear` 3D 三线性；`area` 面积插值。 |
 
 ##### `data.dataset.normalization`
 
-- `mode`：归一化方式。当前支持 `none`、`minmax`、`zscore`。
-- `scope`：归一化作用范围。当前支持 `global`、`channel`。
-  - `global`：对整个样本一起统计均值/方差或最小值/最大值。
-  - `channel`：对每个通道分别统计，更适合 `density / pressure / Vx / Vy` 这类多物理量输入。
-- `stats_path`：预留给离线统计文件路径。
-- `clip_min`：最小裁剪值。
-- `clip_max`：最大裁剪值。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `mode` | 归一化方式。 | `none`、`minmax`、`zscore` | `none` 不归一化；`minmax` 按最小值/最大值缩放到约 `[0,1]`；`zscore` 按均值和标准差标准化。 |
+| `scope` | 统计归一化参数的范围。 | `global`、`channel` | `global` 对整个样本一起统计；`channel` 对每个通道分别统计，更适合不同量纲的多物理量。 |
+| `stats_path` | 离线统计文件路径预留字段。 | `null` 或 `<path>` | 当前代码未读取该字段；`null` 表示不用离线统计，路径值留给后续扩展。 |
+| `clip_min` | 归一化前的最小裁剪值。 | `null` 或 `<float>` | `null` 表示不设下界；浮点数表示低于该值的输入会被裁到该值。 |
+| `clip_max` | 归一化前的最大裁剪值。 | `null` 或 `<float>` | `null` 表示不设上界；浮点数表示高于该值的输入会被裁到该值。 |
 
 #### `data.loader`
 
-- `batch_size`：batch 大小。
-- `num_workers`：DataLoader worker 数。
-- `shuffle_train`：训练集是否打乱。
-- `pin_memory`：是否启用 pinned memory。
-- `drop_last`：训练集是否丢弃最后一个不足 batch 的样本。
-- `persistent_workers`：是否保留 worker 进程。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `batch_size` | DataLoader 每个 batch 的样本数。 | 正整数 | 越大吞吐可能越高但显存占用越高；显存不足时先降到 `1` 或 `2`。 |
+| `num_workers` | DataLoader 子进程数量。 | 非负整数 | `0` 表示主进程读取数据；大于 `0` 表示用多个 worker 并行加载。 |
+| `shuffle_train` | 训练集 DataLoader 是否打乱样本。 | `true`、`false` | `true` 表示每个 epoch 打乱训练样本；`false` 表示按数据集顺序读取。 |
+| `pin_memory` | 是否启用 pinned memory。 | `true`、`false` | `true` 通常有利于 CPU 到 GPU 拷贝；CPU 训练或内存紧张时可设 `false`。 |
+| `drop_last` | 训练集是否丢弃最后一个不足 batch 的批次。 | `true`、`false` | `true` 保持训练 batch 尺寸一致；`false` 保留所有样本。验证和测试当前总是不丢弃。 |
+| `persistent_workers` | 多 worker 时是否在 epoch 间保留 worker 进程。 | `true`、`false` | `true` 且 `num_workers > 0` 时减少重复启动开销；`false` 每轮按默认方式管理 worker。 |
 
 ### 5.3 `model`
 
-- `name`：模型注册名。当前 2D 使用 `conv_token_autoencoder_2d`。
-- `in_channels`：输入通道数。
-- `out_channels`：输出通道数。
-- `input_size`：输入分辨率，需要与 `latent_grid` 和总下采样因子匹配。
-- `base_channels`：主干起始通道数。
-- `channel_multipliers`：各层通道倍率，长度也决定下采样层数。
-- `num_res_blocks`：每个尺度上的残差块个数。
-- `latent_dim`：latent map 的通道维度。
-- `latent_dim_base`：当启用按通道数自动扩张 latent 时，作为“参考基准”的 latent 维度。
-- `latent_dim_scale_with_channels`：是否按输入通道数自动放大 `latent_dim`。
-- `latent_dim_reference_channels`：`latent_dim_base` 对应的参考通道数，通常设为 `1`。
-- `latent_dim_round_to`：自动扩张后向上取整到指定倍数，便于保持整齐的网络宽度。
-- `latent_grid`：latent map 的空间尺寸。
-- `dropout`：残差块内 dropout。
-- `norm`：归一化类型，当前支持 `batch`、`group`、`identity`。
-- `activation`：激活函数，当前支持 `relu`、`gelu`、`silu`。
-- `output_activation`：输出层激活，当前支持 `identity`、`sigmoid`、`tanh`。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `name` | 模型注册名。 | `conv_token_autoencoder_2d`、`conv_token_autoencoder_3d`、`factorized_autoencoder_4d` | `conv_token_autoencoder_2d` 已实现 2D 卷积 token autoencoder；`conv_token_autoencoder_3d` 已实现 3D baseline；`factorized_autoencoder_4d` 只是预留入口，当前会抛 `NotImplementedError`。 |
+| `in_channels` | 模型输入通道数。 | 正整数，或由配置加载自动同步 | 多字段 HDF5 会自动设为 `hdf5_dataset_keys` 个数；单字段 HDF5 必须为 `1`。 |
+| `out_channels` | 模型输出通道数。 | 正整数，或由配置加载自动同步 | 压缩-重建任务通常应等于 `in_channels`；不一致会导致目标通道不匹配。 |
+| `input_size` | 模型输入空间尺寸。 | 2D `[H, W]`，3D `[D, H, W]` | 必须与 `data.dataset.input_size` 对齐，并满足 `input_size = latent_grid * 2^len(channel_multipliers)`。 |
+| `base_channels` | 主干网络起始通道数。 | 正整数 | 数值越大模型容量越强、显存和计算开销越高。 |
+| `channel_multipliers` | 每个下采样层的通道倍率列表。 | 正整数列表 | 列表长度决定下采样层数；每个元素 `m` 表示该层输出通道为 `base_channels * m`。 |
+| `num_res_blocks` | 每个尺度上的残差块数量。 | 非负整数 | `0` 表示每个尺度不加残差块；更大值增加容量和计算量。 |
+| `latent_dim` | latent map 的通道维度，也是每个 latent token 的特征维。 | 正整数 | 越小压缩率越高但表达能力越弱；启用自动扩张时会被重写为缩放后的值。 |
+| `latent_dim_base` | 自动扩张 latent 时使用的基准 latent 维度。 | `null` 或正整数 | `null` 时代码会以 `latent_dim` 作为基准；正整数表示参考通道数下的 latent 维度。 |
+| `latent_dim_scale_with_channels` | 是否按输入通道数自动扩张 `latent_dim`。 | `true`、`false` | `true` 表示按 `latent_dim_base * in_channels / latent_dim_reference_channels` 放大；`false` 表示完全使用手写 `latent_dim`。 |
+| `latent_dim_reference_channels` | `latent_dim_base` 对应的参考通道数。 | 正整数 | 通常为 `1`，表示单通道时的 latent 预算。 |
+| `latent_dim_round_to` | 自动扩张后向上取整的倍数。 | 正整数 | `1` 表示不额外取整；`32` 表示向上取到 32 的倍数。 |
+| `latent_grid` | latent map 的空间尺寸。 | 2D `[H_lat, W_lat]`，3D `[D_lat, H_lat, W_lat]` | 与 `input_size` 和下采样层数严格绑定；越小 token 数越少、压缩越强。 |
+| `dropout` | 残差块内部 dropout 概率。 | `0.0` 到 `1.0` 的 `<float>` | `0.0` 表示关闭 dropout；更大值增强正则但可能降低重建细节。 |
+| `norm` | 网络归一化层类型。 | `batch`、`group`、`identity` | `batch` 使用 BatchNorm2d/3d；`group` 使用最多 8 组的 GroupNorm，小 batch 更稳；`identity` 不使用归一化。 |
+| `activation` | 隐藏层激活函数。 | `relu`、`gelu`、`silu` | `relu` 经典 ReLU；`gelu` 平滑激活，当前默认；`silu` 也称 Swish。 |
+| `output_activation` | 输出层激活函数。 | `identity`、`sigmoid`、`tanh` | `identity` 不限制输出范围，适合标准化后的数值场；`sigmoid` 把输出限制到 `[0,1]`；`tanh` 把输出限制到 `[-1,1]`。 |
 
 3D baseline 使用同一套参数语义，只是：
 
@@ -939,45 +1014,55 @@ latent_dim: 64
 
 ### 5.4 `loss`
 
-- `name`：当前损失函数名，固定为组合重建损失。
-- `weights.mse`：MSE 权重。
-- `weights.l1`：L1 权重。
-- `weights.relative_l1`：相对误差权重。
-- `weights.gradient`：梯度差异损失权重。
-- `eps`：相对误差计算中的数值稳定项。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `name` | 损失函数注册名。 | `composite_reconstruction_loss` | 当前唯一支持值，表示组合重建损失。 |
+| `weights.mse` | MSE 损失权重。 | 非负浮点数 | `0` 表示关闭该项；大于 `0` 表示加入总 loss。 |
+| `weights.l1` | L1 损失权重。 | 非负浮点数 | `0` 表示关闭该项；大于 `0` 表示约束平均绝对误差。 |
+| `weights.relative_l1` | 相对 L1 损失权重。 | 非负浮点数 | `0` 表示关闭该项；大于 `0` 表示按目标幅值归一化误差。 |
+| `weights.gradient` | 梯度差异损失权重。 | 非负浮点数 | `0` 表示关闭该项；大于 `0` 表示约束局部变化、边缘和场梯度。 |
+| `eps` | 相对误差计算中的数值稳定项。 | 正浮点数 | 防止目标值接近 0 时除零；常用 `1.0e-6`。 |
 
 ### 5.5 `optimizer`
 
-- `name`：当前支持 `adamw`、`adam`。
-- `lr`：学习率。
-- `weight_decay`：权重衰减。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `name` | 优化器类型。 | `adamw`、`adam` | `adamw` 使用解耦权重衰减，当前默认；`adam` 使用经典 Adam。 |
+| `lr` | 学习率。 | 正浮点数 | 控制参数更新步长；过大可能发散，过小训练慢。 |
+| `weight_decay` | 权重衰减系数。 | 非负浮点数 | `0` 表示不做权重衰减；大于 `0` 表示加入 L2/解耦衰减正则。 |
 
 ### 5.6 `scheduler`
 
-- `name`：当前支持 `cosine`、`none`。
-- `t_max`：cosine 调度周期。
-- `min_lr`：最小学习率。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `name` | 学习率调度器类型。 | `cosine`、`none` | `cosine` 使用 `CosineAnnealingLR`；`none` 表示不使用调度器。 |
+| `t_max` | cosine 调度周期。 | 正整数 | 仅 `name: cosine` 生效；通常可设为总 epoch 数。 |
+| `min_lr` | cosine 调度最低学习率。 | 非负浮点数 | 仅 `name: cosine` 生效；表示退火末端的最小学习率。 |
 
 ### 5.7 `training`
 
-- `epochs`：总训练轮数。
-- `mixed_precision`：是否启用混合精度，仅在 GPU 上生效。
-- `grad_clip_norm`：梯度裁剪阈值。
-- `log_interval`：训练阶段 step 级日志间隔。
-- `val_interval`：预留参数，后续可扩展为控制验证频率。
-- `checkpoint_interval`：预留参数，后续可扩展为控制 checkpoint 保存频率。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `epochs` | 总训练轮数。 | 正整数 | 训练循环会从第 1 个 epoch 运行到该值。 |
+| `mixed_precision` | 是否启用自动混合精度。 | `true`、`false` | `true` 且设备为 CUDA 时启用 AMP；CPU 上即使为 `true` 也不会启用 CUDA AMP；`false` 全精度训练。 |
+| `grad_clip_norm` | 梯度范数裁剪阈值。 | `null`、`0`、正浮点数 | `null/0` 表示不裁剪；正数表示把梯度范数裁到该上限。 |
+| `log_interval` | 训练 step 级日志间隔。 | 正整数 | 每隔多少个 training step 向 W&B 记录一次精简指标。 |
+| `val_interval` | 验证频率预留字段。 | 正整数 | 当前代码每个 epoch 都验证，该字段暂未实际使用。 |
+| `checkpoint_interval` | checkpoint 保存频率预留字段。 | 正整数 | 当前代码每个 epoch 都保存 `last.pt`，并在验证更优时保存 `best.pt`；该字段暂未实际使用。 |
 
 ### 5.8 `visualization`
 
-- `enabled`：是否保存重建可视化。
-- `num_samples`：每次验证可视化的样本数。
-- `every_n_epochs`：每隔多少个 epoch 保存一次图像。
-- `field_cmap`：原场和重建场使用的色图。
-- `error_cmap`：误差图使用的色图。
-- `robust_percentile`：用于稳健裁剪显示范围的百分位数。
-- `display_channel`：多通道输入时，选择哪个通道进行可视化。可写单个整数索引，例如 `0`；也可写 `all`，一次输出所有通道。
-- `add_colorbar`：是否为每个子图添加色条。
-- `save_dirname`：可视化图像输出目录名。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `enabled` | 是否保存重建可视化。 | `true`、`false` | `true` 表示按周期保存图像；`false` 表示不保存。 |
+| `num_samples` | 每次验证可视化的样本数。 | 正整数 | 实际数量为 `min(num_samples, 当前验证 batch 大小)`。 |
+| `every_n_epochs` | 可视化保存间隔。 | 正整数 | `1` 表示每个 epoch 保存；`10` 表示每 10 个 epoch 保存一次。 |
+| `field_cmap` | 原场和重建场的 Matplotlib colormap。 | 任意 Matplotlib colormap 名称 | 示例 `turbo` 适合数值场；也可用 `viridis`、`plasma`、`gray` 等。 |
+| `error_cmap` | 误差图的 Matplotlib colormap。 | 任意 Matplotlib colormap 名称 | 示例 `inferno` 用于强调误差强度；也可用其他 Matplotlib 色图。 |
+| `robust_percentile` | 稳健显示范围裁剪百分位。 | `0.0` 到小于 `50.0` 的浮点数 | `0.0` 接近使用全范围；`1.0` 表示忽略两端约 1% 极端值，避免色条被异常值支配。 |
+| `display_channel` | 多通道输入时可视化哪些通道。 | `all` 或非负整数 | `all` 表示所有通道都输出；`0` 表示第 0 通道；整数超过通道数时会被截到最后一个通道。 |
+| `add_colorbar` | 是否为每个子图添加色条。 | `true`、`false` | `true` 更便于读数但图更占空间；`false` 更紧凑。 |
+| `save_dirname` | 可视化图像输出目录名。 | `<string>` 或相对目录名 | 会在每个 run 目录下创建该子目录；默认 `reconstructions`。 |
 
 说明：
 
@@ -990,15 +1075,16 @@ latent_dim: 64
 
 ### 5.9 `wandb`
 
-- `enabled`：是否启用 W&B。
-- `api_key`：W&B 登录 API Key。若填写，代码会在初始化前调用 `wandb.login(key=...)`。
-- 若 `api_key` 为空，代码会自动尝试读取环境变量 `WANDB_API_KEY`。
-- `project`：W&B project 名称。
-- `entity`：W&B entity。
-- `group`：W&B 分组名。
-- `tags`：W&B 标签。
-- `mode`：W&B 运行模式，例如 `offline`、`online`、`disabled`。
-- `log_model`：预留参数，当前代码未启用 model artifact 上传。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `enabled` | 是否启用 W&B 日志。 | `true`、`false` | `true` 会初始化 W&B 并记录指标/图片；`false` 不调用 W&B。 |
+| `api_key` | W&B 登录 API Key。 | `null` 或 `<string>` | `null` 表示尝试读取环境变量 `WANDB_API_KEY`；字符串表示显式用该 key 登录。 |
+| `project` | W&B project 名称。 | `<string>` | 指定 run 归属的项目名，例如 `tensor-compression`。 |
+| `entity` | W&B entity/team/user。 | `null` 或 `<string>` | `null` 使用 W&B 默认 entity；字符串表示指定团队或用户名。 |
+| `group` | W&B run 分组名。 | `null` 或 `<string>` | `null` 表示不分组；字符串表示同组实验，例如 `compression`。 |
+| `tags` | W&B 标签列表。 | `[]` 或字符串列表 | `[]` 表示无标签；列表如 `[compression, reconstruction, 2d]` 便于筛选。 |
+| `mode` | W&B 运行模式。 | `online`、`offline`、`disabled` 等 wandb 支持值 | `online` 实时上传；`offline` 本地记录后续可同步；`disabled` 禁用 W&B 运行。 |
+| `log_model` | 模型 artifact 上传预留字段。 | `true`、`false` | 当前代码未使用；`false` 表示不上传模型 artifact，`true` 当前也不会产生额外效果。 |
 
 说明：
 
@@ -1011,10 +1097,17 @@ latent_dim: 64
 
 这是后续扩展保留的命名空间：
 
-- `future.adapters`：后续 latent -> prompt adapter 的配置入口。
-- `future.llm`：后续接入 LLM 的配置入口。
-- `future.tensor_3d`：3D 数据与模型注册名预留。
-- `future.tensor_4d`：4D 数据与模型注册名预留。
+| 参数 | 意义 | 可选值 | 每个可选值的意义 |
+|---|---|---|---|
+| `future.adapters.enabled` | 是否启用 latent -> prompt adapter 的预留开关。 | `true`、`false` | 当前代码未读取；`false` 表示不启用，`true` 仅作为未来配置意图。 |
+| `future.adapters.module_name` | adapter 模块名预留字段。 | `null` 或 `<string>` | 当前代码未读取；未来可用于指定 adapter 实现。 |
+| `future.llm.enabled` | 是否启用 LLM 接入的预留开关。 | `true`、`false` | 当前代码未读取；`false` 表示不接入，`true` 仅作为未来配置意图。 |
+| `future.llm.model_name` | LLM 模型名预留字段。 | `null` 或 `<string>` | 当前代码未读取；未来可用于指定 LLM。 |
+| `future.llm.prompt_token_count` | prompt token 数预留字段。 | 正整数 | 当前代码未读取；未来可表示 latent 转换出的 soft prompt token 数。 |
+| `future.tensor_3d.model_name` | 3D 模型注册名预留/提示字段。 | `conv_token_autoencoder_3d` 或其他未来注册模型名 | 当前只是记录推荐 3D 模型名；不会自动切换主 `model.name`。 |
+| `future.tensor_3d.dataset_name` | 3D 数据集注册名预留/提示字段。 | `tensor_folder_3d` 或其他未来注册数据集名 | 当前只是记录推荐 3D 数据集名；不会自动切换主 `data.dataset_name`。 |
+| `future.tensor_4d.model_name` | 4D 模型注册名预留/提示字段。 | `factorized_autoencoder_4d` 或其他未来注册模型名 | 当前 `factorized_autoencoder_4d` 已注册但未实现。 |
+| `future.tensor_4d.dataset_name` | 4D 数据集注册名预留/提示字段。 | `tensor_folder_4d` 或其他未来注册数据集名 | 当前 `tensor_folder_4d` 已注册但未实现。 |
 
 ## 6. 当前数据来源与放置方式
 
