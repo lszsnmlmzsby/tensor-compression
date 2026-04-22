@@ -55,6 +55,34 @@ class PDEBenchRecord:
         }
 
 
+@dataclass(frozen=True)
+class ProgressEvent:
+    phase: str
+    sample_index: int | None = None
+    sample_position: int | None = None
+    sample_total: int | None = None
+    operator_name: str | None = None
+    variant: str | None = None
+    step: int | None = None
+    total_steps: int | None = None
+    batch_index: int | None = None
+    total_batches: int | None = None
+    message: str | None = None
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def emit_progress(
+    progress_callback: ProgressCallback | None,
+    phase: str,
+    **kwargs: Any,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(ProgressEvent(phase=phase, **kwargs))
+
+
 class CheckpointReconstructor:
     def __init__(
         self,
@@ -96,7 +124,13 @@ class CheckpointReconstructor:
         self.normalization_cfg = dict(self.config.get("data", {}).get("dataset", {}).get("normalization", {}))
 
     @torch.no_grad()
-    def reconstruct_frames(self, frames: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
+    def reconstruct_frames(
+        self,
+        frames: torch.Tensor,
+        batch_size: int = 1,
+        progress_callback: ProgressCallback | None = None,
+        sample_index: int | None = None,
+    ) -> torch.Tensor:
         if frames.ndim != 4:
             raise ValueError(f"Expected frames shaped [frames, channels, H, W], got {tuple(frames.shape)}")
         if frames.shape[1] != self.channels:
@@ -115,10 +149,20 @@ class CheckpointReconstructor:
             normalization_states.append(state)
         normalized = torch.stack([frame.to(self.device) for frame in normalized_frames], dim=0)
         outputs: list[torch.Tensor] = []
-        for start in range(0, normalized.shape[0], max(1, batch_size)):
-            batch = normalized[start : start + max(1, batch_size)]
+        batch_size = max(1, int(batch_size))
+        total_frames = int(normalized.shape[0])
+        total_batches = int(math.ceil(total_frames / batch_size)) if total_frames else 0
+        emit_progress(
+            progress_callback,
+            "reconstruction_started",
+            sample_index=sample_index,
+            total_steps=total_frames,
+            total_batches=total_batches,
+        )
+        for batch_index, start in enumerate(range(0, total_frames, batch_size), start=1):
+            batch = normalized[start : start + batch_size]
             reconstruction = self.model(batch)["reconstruction"]
-            batch_states = normalization_states[start : start + max(1, batch_size)]
+            batch_states = normalization_states[start : start + batch_size]
             reconstruction = torch.stack(
                 [
                     denormalize_tensor(sample, state)
@@ -134,6 +178,22 @@ class CheckpointReconstructor:
                     align_corners=False,
                 )
             outputs.append(reconstruction.detach().cpu())
+            emit_progress(
+                progress_callback,
+                "reconstruction_batch_completed",
+                sample_index=sample_index,
+                step=min(start + batch.shape[0], total_frames),
+                total_steps=total_frames,
+                batch_index=batch_index,
+                total_batches=total_batches,
+            )
+        emit_progress(
+            progress_callback,
+            "reconstruction_completed",
+            sample_index=sample_index,
+            total_steps=total_frames,
+            total_batches=total_batches,
+        )
         return torch.cat(outputs, dim=0)
 
 
@@ -186,6 +246,10 @@ class PDEBenchFNOForwardOperator:
             payload["data"],
             already_batched=bool(payload.get("batched", False)),
         ).to(self.device)
+        progress_callback = payload.get("progress_callback")
+        sample_index = payload.get("sample_index")
+        operator_name = payload.get("progress_operator_name")
+        variant = payload.get("progress_variant")
         grid = payload.get("grid")
         if grid is None:
             grid = make_unit_grid(data.shape[1:-2], self.device)
@@ -205,11 +269,21 @@ class PDEBenchFNOForwardOperator:
         history = data[..., : self.initial_step, :]
         prediction = data[..., : self.initial_step, :]
         input_shape = list(history.shape[:-2]) + [-1]
-        for _ in range(self.initial_step, t_limit):
+        rollout_steps = max(0, t_limit - self.initial_step)
+        for rollout_step, _ in enumerate(range(self.initial_step, t_limit), start=1):
             inp = history.reshape(input_shape)
             next_frame = model(inp, grid)
             prediction = torch.cat((prediction, next_frame), dim=-2)
             history = torch.cat((history[..., 1:, :], next_frame), dim=-2)
+            emit_progress(
+                progress_callback,
+                "operator_rollout_step",
+                sample_index=sample_index,
+                operator_name=operator_name,
+                variant=variant,
+                step=rollout_step,
+                total_steps=rollout_steps,
+            )
         return prediction.detach().cpu()
 
     def _ensure_model(self, spatial_dim: int) -> torch.nn.Module:
@@ -284,6 +358,10 @@ class PDEBenchUNetForwardOperator:
             payload["data"],
             already_batched=bool(payload.get("batched", False)),
         ).to(self.device)
+        progress_callback = payload.get("progress_callback")
+        sample_index = payload.get("sample_index")
+        operator_name = payload.get("progress_operator_name")
+        variant = payload.get("progress_variant")
         spatial_dim = data.ndim - 3
         model = self._ensure_model(spatial_dim)
         t_limit = min(int(self.t_train or data.shape[-2]), data.shape[-2])
@@ -295,7 +373,8 @@ class PDEBenchUNetForwardOperator:
         history = data[..., : self.initial_step, :]
         prediction = data[..., : self.initial_step, :]
         input_shape = list(history.shape[:-2]) + [-1]
-        for _ in range(self.initial_step, t_limit):
+        rollout_steps = max(0, t_limit - self.initial_step)
+        for rollout_step, _ in enumerate(range(self.initial_step, t_limit), start=1):
             inp = history.reshape(input_shape)
             permutation = [0, -1, *range(1, inp.ndim - 1)]
             inp = inp.permute(permutation)
@@ -303,6 +382,15 @@ class PDEBenchUNetForwardOperator:
             next_frame = model(inp).permute(inverse_permutation).unsqueeze(-2)
             prediction = torch.cat((prediction, next_frame), dim=-2)
             history = torch.cat((history[..., 1:, :], next_frame), dim=-2)
+            emit_progress(
+                progress_callback,
+                "operator_rollout_step",
+                sample_index=sample_index,
+                operator_name=operator_name,
+                variant=variant,
+                step=rollout_step,
+                total_steps=rollout_steps,
+            )
         return prediction.detach().cpu()
 
     def _ensure_model(self, spatial_dim: int) -> torch.nn.Module:
@@ -472,7 +560,17 @@ def build_pdebench_record(
     batch_size: int = 1,
     time_slice: slice | None = None,
     spatial_stride: int = 1,
+    progress_callback: ProgressCallback | None = None,
+    sample_position: int | None = None,
+    sample_total: int | None = None,
 ) -> PDEBenchRecord:
+    emit_progress(
+        progress_callback,
+        "sample_started",
+        sample_index=sample_index,
+        sample_position=sample_position,
+        sample_total=sample_total,
+    )
     original, grid, t_coordinates = read_pdebench_sample(
         hdf5_path=hdf5_path,
         field_keys=field_keys,
@@ -480,10 +578,22 @@ def build_pdebench_record(
         time_slice=time_slice,
         spatial_stride=spatial_stride,
     )
+    emit_progress(
+        progress_callback,
+        "sample_loaded",
+        sample_index=sample_index,
+        sample_position=sample_position,
+        sample_total=sample_total,
+    )
     reconstructed = original.clone()
     if reconstructor is not None:
         frames = pdebench_to_chw_frames(original)
-        reconstructed_frames = reconstructor.reconstruct_frames(frames, batch_size=batch_size)
+        reconstructed_frames = reconstructor.reconstruct_frames(
+            frames,
+            batch_size=batch_size,
+            progress_callback=progress_callback,
+            sample_index=sample_index,
+        )
         reconstructed = chw_frames_to_pdebench(
             reconstructed_frames,
             spatial_shape=original.shape[:-2],
@@ -507,8 +617,13 @@ def generate_pdebench_records(
     batch_size: int = 1,
     time_slice: slice | None = None,
     spatial_stride: int = 1,
+    progress_callback: ProgressCallback | None = None,
 ):
-    for sample_index in sample_indices:
+    try:
+        sample_total = len(sample_indices)  # type: ignore[arg-type]
+    except TypeError:
+        sample_total = None
+    for sample_position, sample_index in enumerate(sample_indices, start=1):
         yield build_pdebench_record(
             hdf5_path=hdf5_path,
             field_keys=field_keys,
@@ -517,6 +632,9 @@ def generate_pdebench_records(
             batch_size=batch_size,
             time_slice=time_slice,
             spatial_stride=spatial_stride,
+            progress_callback=progress_callback,
+            sample_position=sample_position,
+            sample_total=sample_total,
         )
 
 
@@ -528,6 +646,7 @@ def iter_pdebench_records(
     batch_size: int = 1,
     time_slice: slice | None = None,
     spatial_stride: int = 1,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[PDEBenchRecord]:
     return list(
         generate_pdebench_records(
@@ -538,6 +657,7 @@ def iter_pdebench_records(
             batch_size=batch_size,
             time_slice=time_slice,
             spatial_stride=spatial_stride,
+            progress_callback=progress_callback,
         )
     )
 
@@ -691,6 +811,7 @@ def resize_chw_batch(frames: torch.Tensor, input_size: Sequence[int]) -> torch.T
 def evaluate_records(
     records: Sequence[PDEBenchRecord],
     operators: Mapping[str, Callable[[dict[str, Any]], Any]],
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     aggregate: dict[str, list[float]] = {}
@@ -710,8 +831,45 @@ def evaluate_records(
         add_to_aggregate(aggregate, direct_metrics)
 
         for name, operator in operators.items():
-            original_output = operator(record.as_payload("original"))
-            reconstructed_output = operator(record.as_payload("reconstructed"))
+            emit_progress(
+                progress_callback,
+                "operator_started",
+                sample_index=record.sample_index,
+                operator_name=name,
+                variant="original",
+            )
+            original_payload = record.as_payload("original")
+            original_payload["progress_callback"] = progress_callback
+            original_payload["progress_operator_name"] = name
+            original_payload["progress_variant"] = "original"
+            original_output = operator(original_payload)
+            emit_progress(
+                progress_callback,
+                "operator_completed",
+                sample_index=record.sample_index,
+                operator_name=name,
+                variant="original",
+            )
+
+            emit_progress(
+                progress_callback,
+                "operator_started",
+                sample_index=record.sample_index,
+                operator_name=name,
+                variant="reconstructed",
+            )
+            reconstructed_payload = record.as_payload("reconstructed")
+            reconstructed_payload["progress_callback"] = progress_callback
+            reconstructed_payload["progress_operator_name"] = name
+            reconstructed_payload["progress_variant"] = "reconstructed"
+            reconstructed_output = operator(reconstructed_payload)
+            emit_progress(
+                progress_callback,
+                "operator_completed",
+                sample_index=record.sample_index,
+                operator_name=name,
+                variant="reconstructed",
+            )
             operator_metrics = prefix_metrics(
                 compare_outputs(original_output, reconstructed_output),
                 name,

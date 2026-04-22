@@ -146,6 +146,7 @@ class TensorFolder3DDataset(BaseTensorDataset):
         sample = self.samples[index]
         path = sample["path"]
         tensor = self._load_tensor(sample)
+        physical_target = tensor.clone()
         tensor, _ = self.normalize_tensor(tensor)
         sample_id = path.stem
         if sample["sample_indices"] is not None:
@@ -154,6 +155,7 @@ class TensorFolder3DDataset(BaseTensorDataset):
         return {
             "input": tensor,
             "target": tensor.clone(),
+            "target_physical": physical_target,
             "sample_id": sample_id,
             "path": str(path),
             "dimensions": 3,

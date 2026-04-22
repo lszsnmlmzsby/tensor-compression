@@ -217,7 +217,9 @@ python ./scripts/evaluate_pdebench_downstream.py \
 
 建议：如果你是从训练好的 checkpoint 出发做 PDEBench 评估或导出，优先不要手写 `--fields`，直接让脚本从 checkpoint 继承训练时的字段顺序。这是当前最不容易出错的用法。
 
-脚本会分别对 `original` 和 `reconstructed` 调用同一个算子，并输出重建本身的 `mse/mae/relative_l1/psnr`，以及 `forward/...`、`inverse/...` 前缀下的算子输出误差。完整 JSON 默认写入 `outputs/pdebench_downstream/`。
+脚本会分别对 `original` 和 `reconstructed` 调用同一个算子，并输出重建本身的 `mse/mae/relative_l1/psnr`，以及 `forward/...`、`inverse/...` 前缀下的算子输出误差。这里的 downstream `reconstruction/*` 是在反归一化后的原始物理量空间上计算的。完整 JSON 默认写入 `outputs/pdebench_downstream/`。
+
+默认情况下，脚本还会在终端显示一个 `tqdm` 进度条，并持续更新当前 sample、AE 重建帧批次、算子阶段以及 PDEBench rollout 步数；如果你在日志重定向场景下不想看到这些进度输出，可以额外传 `--no-progress`。
 
 注意：训练阶段的 `tensor_folder_2d` 会把 `[N, T, H, W]` 展开为单帧 `[C, H, W]` 样本；评估阶段的 `evaluate_pdebench_downstream.py` 会重新读取同一个 HDF5 文件，把某个样本的完整时间序列整理为 `[H, W, T, C]`，逐帧通过 AE 重建后再送入下游算子。
 
@@ -304,6 +306,7 @@ python ./scripts/evaluate_pdebench_downstream.py \
 | `--output` | 评估结果 JSON 输出路径。 | `null` 或 `<path>` | 不传时写入 `outputs/pdebench_downstream/<timestamp>_pdebench_downstream.json`；传入路径则写到指定文件。 |
 | `--reconstructed-hdf5-output` | 是否额外导出替换了重建字段的新 HDF5。 | `null` 或 `<path>` | 不传表示不导出 HDF5；传入路径表示复制原文件并覆盖指定字段切片。 |
 | `--overwrite-reconstructed-hdf5` | 允许覆盖已存在的重建 HDF5 输出。 | 无值开关 | 写上表示目标存在时可覆盖；不写且目标存在会报错。 |
+| `--no-progress` | 关闭评估阶段的进度条和阶段状态输出。 | 无值开关 | 默认会显示 sample 级 `tqdm` 和阶段状态；写上后改为静默执行，仅保留最终结果输出。 |
 
 ## 2. 仓库结构
 
@@ -442,11 +445,8 @@ tensor compression2.0/
 当前默认保留的 `train_step/*` 指标含义如下：
 
 - `loss_total`：总目标函数值，等于各损失项按权重加权后的结果，是训练时真正反向传播的目标。
-- `psnr`：峰值信噪比，越高越好，用于衡量整体重建质量。
-- `mse`：均方误差，越低越好。
-- `mae`：平均绝对误差，越低越好。
-- `relative_l1`：相对绝对误差，越低越好，适合目标尺度变化较大的场数据。
-- `max_abs_error`：最大绝对误差，越低越好，用于观察最坏点误差。
+- `psnr` / `mse` / `mae` / `relative_l1` / `max_abs_error`：训练阶段默认指标，都是在归一化后的张量空间上计算的，适合观察优化是否稳定。
+- `physical_psnr` / `physical_mse` / `physical_mae` / `physical_relative_l1` / `physical_max_abs_error`：把每个样本先反归一化回原始物理量空间后再计算，更适合与 PDEBench downstream 评估结果对齐。
 - `loss_gradient`：梯度差损失，越低越好，用于约束局部变化和边缘结构。
 
 当前已去掉的重复项如下：
@@ -454,6 +454,11 @@ tensor compression2.0/
 - `loss_mse` 与 `mse` 数值相同。
 - `loss_l1` 与 `mae` 数值相同。
 - `loss_relative_l1` 与 `relative_l1` 数值相同。
+
+如果你问“哪个更合理”，答案通常是两个都合理，但用途不同：
+
+- 看训练是否收敛、不同实验是否更好优化：优先看归一化空间指标，也就是默认的 `mse/mae/relative_l1/psnr`。
+- 看科学量纲下到底重建得怎样、以及和 downstream 误差是否一致：优先看 `physical_*` 指标。
 
 ## 4. 可视化设计
 

@@ -174,6 +174,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
         sample = self.samples[index]
         path = sample["path"]
         tensor = self._load_tensor(sample)
+        physical_target = tensor.clone()
         tensor, _ = self.normalize_tensor(tensor)
         sample_id = path.stem
         dataset_path = sample.get("dataset_path")
@@ -190,6 +191,7 @@ class TensorFolder2DDataset(BaseTensorDataset):
         return {
             "input": tensor,
             "target": tensor.clone(),
+            "target_physical": physical_target,
             "sample_id": sample_id,
             "path": str(path),
             "dataset_path": str(dataset_path) if dataset_path else "",

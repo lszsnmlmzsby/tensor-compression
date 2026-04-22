@@ -17,6 +17,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from tensor_compression.data.datasets.tensor_folder_2d import TensorFolder2DDataset
 from tensor_compression.downstream.pdebench import (
+    ProgressEvent,
     evaluate_records,
     export_reconstructed_hdf5,
     inspect_pdebench_fields,
@@ -234,11 +235,13 @@ class TestPDEBenchDownstream(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = Path(tmpdir) / "synthetic.hdf5"
             _write_synthetic_pdebench_file(file_path)
+            progress_events: list[ProgressEvent] = []
             records = iter_pdebench_records(
                 hdf5_path=file_path,
                 field_keys=["density", "pressure", "Vx", "Vy"],
                 sample_indices=[0],
                 reconstructor=None,
+                progress_callback=progress_events.append,
             )
             records[0].reconstructed = records[0].original + 1.0
 
@@ -251,6 +254,7 @@ class TestPDEBenchDownstream(unittest.TestCase):
             results = evaluate_records(
                 records,
                 {"forward": forward_operator, "inverse": inverse_operator},
+                progress_callback=progress_events.append,
             )
 
         self.assertEqual(len(results["samples"]), 1)
@@ -261,6 +265,23 @@ class TestPDEBenchDownstream(unittest.TestCase):
         self.assertAlmostEqual(metrics["forward/mse"], 16.0)
         self.assertIn("inverse/mse", metrics)
         self.assertAlmostEqual(metrics["inverse/mse"], 1.0)
+        self.assertGreaterEqual(len(progress_events), 6)
+        self.assertEqual(progress_events[0].phase, "sample_started")
+        self.assertEqual(progress_events[1].phase, "sample_loaded")
+        operator_start_pairs = [
+            (event.operator_name, event.variant)
+            for event in progress_events
+            if event.phase == "operator_started"
+        ]
+        self.assertEqual(
+            operator_start_pairs,
+            [
+                ("forward", "original"),
+                ("forward", "reconstructed"),
+                ("inverse", "original"),
+                ("inverse", "reconstructed"),
+            ],
+        )
 
 
 if __name__ == "__main__":

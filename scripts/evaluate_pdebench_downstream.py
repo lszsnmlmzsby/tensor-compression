@@ -16,7 +16,9 @@ if str(SRC_ROOT) not in sys.path:
 
 from tensor_compression.downstream.pdebench import (
     CheckpointReconstructor,
+    ProgressEvent,
     build_operator,
+    emit_progress,
     evaluate_records,
     generate_pdebench_records,
     inspect_pdebench_fields,
@@ -30,6 +32,7 @@ from tensor_compression.downstream.pdebench import (
     write_reconstructed_record_to_hdf5,
 )
 from tensor_compression.utils import dump_json
+from tqdm.auto import tqdm
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +138,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow overwriting --reconstructed-hdf5-output if it already exists.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress display and stage updates during evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -147,19 +155,133 @@ def parse_sample_indices(raw: str, fields) -> list[int]:
     return list(range(int(fields[0].shape[0])))
 
 
-def evaluate_record_stream(records, operators: dict, reconstructed_hdf5_output, field_keys, args, time_slice):
+class EvaluationProgressReporter:
+    def __init__(self, total_samples: int, enabled: bool = True) -> None:
+        self.enabled = bool(enabled)
+        self._last_refresh_at = 0.0
+        self._refresh_interval = 0.2
+        self.bar = tqdm(
+            total=total_samples,
+            desc="PDEBench eval",
+            unit="sample",
+            dynamic_ncols=True,
+            leave=True,
+            disable=not self.enabled,
+        )
+
+    def __call__(self, event: ProgressEvent) -> None:
+        if not self.enabled:
+            return
+        self.bar.set_postfix_str(self._format_event(event), refresh=False)
+        if event.phase == "sample_completed":
+            self.bar.update(1)
+            return
+        if self._should_refresh(event.phase):
+            self.bar.update(0)
+
+    def close(self) -> None:
+        self.bar.close()
+
+    def _should_refresh(self, phase: str) -> bool:
+        now = time.monotonic()
+        if phase in {
+            "sample_started",
+            "sample_loaded",
+            "reconstruction_started",
+            "reconstruction_completed",
+            "operator_started",
+            "operator_completed",
+            "hdf5_write_started",
+            "hdf5_write_completed",
+        }:
+            self._last_refresh_at = now
+            return True
+        if now - self._last_refresh_at >= self._refresh_interval:
+            self._last_refresh_at = now
+            return True
+        return False
+
+    def _format_event(self, event: ProgressEvent) -> str:
+        sample_label = self._format_sample_label(event)
+        if event.phase == "sample_started":
+            return f"{sample_label} loading"
+        if event.phase == "sample_loaded":
+            return f"{sample_label} loaded"
+        if event.phase == "reconstruction_started":
+            total = event.total_steps or 0
+            return f"{sample_label} reconstruct 0/{total} frames"
+        if event.phase == "reconstruction_batch_completed":
+            done = event.step or 0
+            total = event.total_steps or 0
+            batch_index = event.batch_index or 0
+            total_batches = event.total_batches or 0
+            return (
+                f"{sample_label} reconstruct {done}/{total} frames "
+                f"(batch {batch_index}/{total_batches})"
+            )
+        if event.phase == "reconstruction_completed":
+            total = event.total_steps or 0
+            return f"{sample_label} reconstruction done ({total} frames)"
+        if event.phase == "operator_started":
+            return f"{sample_label} {event.operator_name}/{event.variant}"
+        if event.phase == "operator_rollout_step":
+            step = event.step or 0
+            total = event.total_steps or 0
+            return f"{sample_label} {event.operator_name}/{event.variant} rollout {step}/{total}"
+        if event.phase == "operator_completed":
+            return f"{sample_label} {event.operator_name}/{event.variant} done"
+        if event.phase == "hdf5_write_started":
+            return f"{sample_label} writing reconstructed HDF5"
+        if event.phase == "hdf5_write_completed":
+            return f"{sample_label} reconstructed HDF5 updated"
+        if event.phase == "sample_completed":
+            return f"{sample_label} completed"
+        return sample_label
+
+    @staticmethod
+    def _format_sample_label(event: ProgressEvent) -> str:
+        if event.sample_position is not None and event.sample_total is not None:
+            return f"sample {event.sample_position}/{event.sample_total} (idx={event.sample_index})"
+        if event.sample_index is not None:
+            return f"sample idx={event.sample_index}"
+        return "sample"
+
+
+def evaluate_record_stream(
+    records,
+    operators: dict,
+    reconstructed_hdf5_output,
+    field_keys,
+    args,
+    time_slice,
+    progress_callback=None,
+):
     samples = []
     aggregate: dict[str, list[float]] = {}
     if reconstructed_hdf5_output is None:
         for record in records:
-            sample_payload = evaluate_records([record], operators)["samples"][0]
+            sample_payload = evaluate_records(
+                [record],
+                operators,
+                progress_callback=progress_callback,
+            )["samples"][0]
             samples.append(sample_payload)
             for key, value in sample_payload["metrics"].items():
                 if math.isfinite(float(value)):
                     aggregate.setdefault(key, []).append(float(value))
+            emit_progress(
+                progress_callback,
+                "sample_completed",
+                sample_index=record.sample_index,
+            )
     else:
         with h5py.File(reconstructed_hdf5_output, "r+") as target:
             for record in records:
+                emit_progress(
+                    progress_callback,
+                    "hdf5_write_started",
+                    sample_index=record.sample_index,
+                )
                 write_reconstructed_record_to_hdf5(
                     target=target,
                     record=record,
@@ -167,11 +289,25 @@ def evaluate_record_stream(records, operators: dict, reconstructed_hdf5_output, 
                     time_slice=time_slice,
                     spatial_stride=args.spatial_stride,
                 )
-                sample_payload = evaluate_records([record], operators)["samples"][0]
+                emit_progress(
+                    progress_callback,
+                    "hdf5_write_completed",
+                    sample_index=record.sample_index,
+                )
+                sample_payload = evaluate_records(
+                    [record],
+                    operators,
+                    progress_callback=progress_callback,
+                )["samples"][0]
                 samples.append(sample_payload)
                 for key, value in sample_payload["metrics"].items():
                     if math.isfinite(float(value)):
                         aggregate.setdefault(key, []).append(float(value))
+                emit_progress(
+                    progress_callback,
+                    "sample_completed",
+                    sample_index=record.sample_index,
+                )
 
     return {
         "samples": samples,
@@ -239,23 +375,38 @@ def main() -> None:
 
     sample_indices = parse_sample_indices(args.sample_indices, fields)
     time_slice = parse_time_slice(args.time_start, args.time_stop, args.time_step)
-    records_iter = generate_pdebench_records(
-        hdf5_path=args.hdf5_path,
-        field_keys=field_keys,
-        sample_indices=sample_indices,
-        reconstructor=reconstructor,
-        batch_size=args.batch_size,
-        time_slice=time_slice,
-        spatial_stride=args.spatial_stride,
+    operator_names = sorted(operators) if operators else ["reconstruction-only"]
+    print(
+        "Starting PDEBench downstream evaluation: "
+        f"samples={len(sample_indices)}, fields={field_keys}, operators={operator_names}, "
+        f"batch_size={args.batch_size}, spatial_stride={args.spatial_stride}"
     )
-    results = evaluate_record_stream(
-        records=records_iter,
-        operators=operators,
-        reconstructed_hdf5_output=reconstructed_hdf5_output,
-        field_keys=field_keys,
-        args=args,
-        time_slice=time_slice,
+    progress_reporter = EvaluationProgressReporter(
+        total_samples=len(sample_indices),
+        enabled=not args.no_progress,
     )
+    try:
+        records_iter = generate_pdebench_records(
+            hdf5_path=args.hdf5_path,
+            field_keys=field_keys,
+            sample_indices=sample_indices,
+            reconstructor=reconstructor,
+            batch_size=args.batch_size,
+            time_slice=time_slice,
+            spatial_stride=args.spatial_stride,
+            progress_callback=progress_reporter,
+        )
+        results = evaluate_record_stream(
+            records=records_iter,
+            operators=operators,
+            reconstructed_hdf5_output=reconstructed_hdf5_output,
+            field_keys=field_keys,
+            args=args,
+            time_slice=time_slice,
+            progress_callback=progress_reporter,
+        )
+    finally:
+        progress_reporter.close()
     results["metadata"] = {
         "hdf5_path": str(Path(args.hdf5_path).expanduser().resolve()),
         "fields": [field.__dict__ for field in fields],

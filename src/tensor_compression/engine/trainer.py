@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 from tensor_compression.data import build_dataloaders
 from tensor_compression.integrations import WandbLogger
 from tensor_compression.losses import build_loss
-from tensor_compression.metrics import compute_reconstruction_metrics
+from tensor_compression.metrics import compute_training_reconstruction_metrics
 from tensor_compression.models import build_model
 from tensor_compression.utils import (
     build_visualizer,
@@ -181,8 +181,7 @@ class CompressionTrainer:
         return redacted
 
     def _build_train_step_wandb_payload(self, metrics: dict[str, float]) -> dict[str, float]:
-        # Keep only non-duplicated metrics in W&B. The removed keys are:
-        # loss_mse == mse, loss_l1 == mae, loss_relative_l1 == relative_l1.
+        # Keep only a compact, interpretable subset in W&B.
         keep_order = [
             "loss_total",
             "psnr",
@@ -190,6 +189,11 @@ class CompressionTrainer:
             "mae",
             "relative_l1",
             "max_abs_error",
+            "physical_psnr",
+            "physical_mse",
+            "physical_mae",
+            "physical_relative_l1",
+            "physical_max_abs_error",
             "loss_gradient",
         ]
         payload: dict[str, float] = {}
@@ -234,7 +238,12 @@ class CompressionTrainer:
             scaler.step(optimizer)
             scaler.update()
 
-            metrics = compute_reconstruction_metrics(outputs["reconstruction"].detach(), targets.detach())
+            metrics = compute_training_reconstruction_metrics(
+                outputs["reconstruction"].detach(),
+                targets.detach(),
+                physical_target=batch.get("target_physical"),
+                normalization_cfg=getattr(dataloader.dataset, "normalization_cfg", None),
+            )
             step_metrics = {
                 "loss_total": float(loss_dict["total"].detach().cpu().item()),
                 **{f"loss_{k}": float(v.detach().cpu().item()) for k, v in loss_dict.items() if k != "total"},
@@ -270,7 +279,12 @@ class CompressionTrainer:
             targets = batch["target"].to(self.device)
             outputs = model(inputs)
             loss_dict = criterion(outputs["reconstruction"], targets)
-            metrics = compute_reconstruction_metrics(outputs["reconstruction"], targets)
+            metrics = compute_training_reconstruction_metrics(
+                outputs["reconstruction"],
+                targets,
+                physical_target=batch.get("target_physical"),
+                normalization_cfg=getattr(dataloader.dataset, "normalization_cfg", None),
+            )
             step_metrics = {
                 "loss_total": float(loss_dict["total"].detach().cpu().item()),
                 **{f"loss_{k}": float(v.detach().cpu().item()) for k, v in loss_dict.items() if k != "total"},
