@@ -1,0 +1,66 @@
+experiment:
+  name: tensor_editor_2d_mvp
+  output_root: ./outputs/runs
+  seed: 42
+  device: auto
+
+editor:
+  data:
+    jsonl_path: ./data/processed/tensor_editor_mvp/train.jsonl
+    input_size: [512, 512]
+    channels: 1
+    validation_ratio: 0.1
+    loader:
+      batch_size: 1
+      num_workers: 0
+      pin_memory: true
+      persistent_workers: false
+
+  compressor:
+    checkpoint_path: ./outputs/runs/<ae_run>/checkpoints/best.pt
+    config_path: null
+    freeze: true
+
+  text:
+    vocab_size: 8192
+    embed_dim: 128
+    hidden_dim: 128
+    max_length: 160
+    dropout: 0.05
+
+  model:
+    name: conditional_tensor_editor_2d
+    # input_size / latent_grid / latent_dim / out_channels /
+    # channel_multipliers are inherited from the AE checkpoint config.
+    base_channels: 32
+    num_res_blocks: 1
+    condition_dim: 256
+    activation: gelu
+    dropout: 0.05
+    use_base_reconstruction: true
+    residual_output: true
+
+loss:
+  name: composite_reconstruction_loss
+  weights:
+    mse: 1.0
+    l1: 0.1
+    relative_l1: 0.0
+    gradient: 0.05
+  eps: 1.0e-6
+
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+
+scheduler:
+  name: cosine
+  t_max: 20
+  min_lr: 1.0e-6
+
+training:
+  epochs: 20
+  mixed_precision: true
+  grad_clip_norm: 1.0
+  num_saved_val_examples: 8

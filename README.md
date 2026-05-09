@@ -193,6 +193,25 @@ python ./scripts/evaluate_pdebench_downstream.py \
   --inverse-operator-spec ./path/to/your_inverse_wrapper.py:inverse_operator
 ```
 
+例
+```bash
+python ./scripts/evaluate_pdebench_downstream.py \
+  --hdf5-path /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5 \
+  --sample-indices all \
+  --compressor-checkpoint ./outputs/runs/20260421_123902_compressor_2d_baseline/checkpoints/best.pt \
+  --batch-size 16 \
+  --reconstructed-hdf5-output /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Reconstructed.hdf5 \
+  --forward-operator-type pdebench-fno \
+  --forward-checkpoint /data/PiERN/PDEbench/model/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train_FNO.pt \
+  --pdebench-root ../PDEBench-main \
+  --num-channels 4 \
+  --initial-step 10 \
+  --t-train 21 \
+  --modes 12 \
+  --width 20 \
+  --output ./outputs/pdebench_downstream/all_samples.json
+```
+
 当提供 `--compressor-checkpoint` 时，脚本会优先使用 checkpoint 中保存的训练字段顺序，例如训练时如果是 `hdf5_dataset_keys: [density, pressure, Vx, Vy]`，评估和导出也会自动沿用这个顺序。这样可以避免通道语义错位。此时如果你仍然显式传入 `--fields`，它必须与训练顺序完全一致，否则脚本会直接报错，而不是带着错误通道顺序继续运行。
 
 如果还希望生成一个新的 HDF5 文件，里面只把 `--fields` 指定的数据集替换成 AE 重建结果，其他数据集和文件元信息保持原样，可以额外加：
@@ -1461,11 +1480,228 @@ model:
 5. 接入 adapter 与 LLM。
 6. 增加下游任务训练脚本。
 
+## 8.1 中文指令张量还原 MVP
+
+本仓库新增了一个最小可行的 **text-conditioned tensor editor** 入口，用于训练：
+
+```text
+污染后的 tensor + 中文还原说明 -> 干净 tensor
+```
+
+当前 MVP 面向固定形状单通道二维张量：
+
+```text
+input:  [1, 512, 512]
+label:  [1, 512, 512]
+prompt: 中文还原说明
+meta:   变量、样本索引、时间步、扰动类型和参数等记录
+```
+
+该入口复用已经训练好的整体 AE。训练时先用 AE encoder 把污染 tensor 压缩成 latent，再用一个轻量中文字符级 prompt encoder 生成条件向量，最后训练 FiLM 条件化的 residual CNN decoder 输出干净 tensor。默认会冻结 AE，避免破坏已经训练好的压缩器。
+
+### 8.1.1 JSONL 数据格式
+
+训练数据是一个 JSONL 文件，每一行是一条样本。最直接的内联格式如下。下面为了可读性省略了大部分数值，真实 JSONL 中 `tensor` 和 `label` 必须是纯数字数组：
+
+```json
+{"prompt":"电平恢复：信号电平被抬高了 0.2。请减去 0.2 对齐标准。","tensor":[[0.31,0.32,0.33]],"label":[[0.11,0.12,0.13]],"meta":{"variable":"u","sample_index":0,"time_step":3,"perturbation_type":"offset","params":{"offset":0.2}}}
+```
+
+字段说明：
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `prompt` | 是 | 中文还原说明。当前代码使用字符级哈希编码器，因此不需要额外 tokenizer 或外部中文模型。 |
+| `tensor` | 是，除非提供 `tensor_path` | 污染后的输入 tensor。可写成 `[512,512]`，代码会自动补成 `[1,512,512]`；也可写成 `[1,512,512]`。 |
+| `label` | 是，除非提供 `label_path` | 干净目标 tensor，形状规则与 `tensor` 相同。 |
+| `meta` | 否 | 任意 JSON object，用于记录变量名、样本索引、时间步、扰动类型和参数。训练不直接读取这些字段，但会写入验证样例摘要。 |
+| `sample_id` | 否 | 样本 ID。不提供时会自动用 `<jsonl文件名>:<行号>`。 |
+
+如果内联 JSONL 太大，也可以把 tensor 存成 `.npy`、`.npz`、`.pt` 或 `.pth`，JSONL 中只写路径：
+
+```json
+{"sample_id":"case_000001","prompt":"截距去除：输入值包含了 -0.2 的截距项。请减去它以获取纯净变量。","tensor_path":"inputs/case_000001.npy","label_path":"labels/case_000001.npy","meta":{"variable":"u","sample_index":1,"time_step":0,"perturbation_type":"intercept","params":{"intercept":-0.2}}}
+```
+
+相对路径会按 JSONL 文件所在目录解析。例如 JSONL 位于：
+
+```text
+data/processed/tensor_editor_mvp/train.jsonl
+```
+
+则 `inputs/case_000001.npy` 会解析为：
+
+```text
+data/processed/tensor_editor_mvp/inputs/case_000001.npy
+```
+
+### 8.1.2 配置文件
+
+默认配置在：
+
+```text
+configs/tensor_editor_2d.yaml
+```
+
+最少需要改两个位置：
+
+```yaml
+editor:
+  data:
+    jsonl_path: ./data/processed/tensor_editor_mvp/train.jsonl
+  compressor:
+    checkpoint_path: ./outputs/runs/<ae_run>/checkpoints/best.pt
+```
+
+重要参数说明：
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `experiment.name` | `tensor_editor_2d_mvp` | 输出 run 目录名的一部分。 |
+| `experiment.output_root` | `./outputs/runs` | 训练输出根目录。 |
+| `experiment.device` | `auto` | 可设为 `cuda:0`、`cuda:7`、`cpu`。 |
+| `editor.data.jsonl_path` | `./data/processed/tensor_editor_mvp/train.jsonl` | JSONL 训练文件路径。 |
+| `editor.data.input_size` | `[512,512]` | 输入/输出二维空间尺寸。MVP 固定为 512×512。 |
+| `editor.data.channels` | `1` | 输入/输出通道数。MVP 是单通道，且必须与 AE checkpoint 的 `model.in_channels` 一致。 |
+| `editor.data.validation_ratio` | `0.1` | 从同一个 JSONL 中随机切出验证集的比例。约 1000 条数据时默认约 100 条验证。 |
+| `editor.data.loader.batch_size` | `1` | 512×512 且 decoder 较重，建议先从 1 开始。显存充足再调到 2 或 4。 |
+| `editor.compressor.checkpoint_path` | 占位路径 | 已训练 AE 的 `best.pt` 或 `last.pt`。 |
+| `editor.compressor.config_path` | `null` | checkpoint 内没有 `config` 字段时，手动指定 AE 的 YAML 配置。 |
+| `editor.compressor.freeze` | `true` | 是否冻结 AE。MVP 建议保持 `true`。 |
+| `editor.text.vocab_size` | `8192` | 字符哈希词表大小。不是外部 tokenizer 词表。 |
+| `editor.text.max_length` | `160` | prompt 最大字符数，超出会截断。 |
+| `editor.model.latent_grid` | 从 AE checkpoint 继承 | AE latent map 空间尺寸。不要在 editor 配置里手动覆盖，代码会从 checkpoint config 继承。 |
+| `editor.model.latent_dim` | 从 AE checkpoint 继承 | AE latent 通道维度。单通道 AE 常见是 128/256/1024，实际以 checkpoint 为准。 |
+| `editor.model.channel_multipliers` | 从 AE checkpoint 继承 | 条件 decoder 的上采样层级，需和 AE encoder 的下采样层级一致。 |
+| `editor.model.condition_dim` | `256` | prompt 条件向量维度。 |
+| `editor.model.residual_output` | `true` | 输出 `AE重建结果 + 条件decoder预测的残差`。 |
+| `loss.weights.mse` | `1.0` | MSE loss 权重。 |
+| `loss.weights.l1` | `0.1` | L1 loss 权重。 |
+| `loss.weights.gradient` | `0.05` | 空间梯度差异 loss 权重。 |
+| `optimizer.lr` | `1.0e-4` | editor 训练学习率。 |
+| `training.epochs` | `20` | 训练轮数。 |
+| `training.mixed_precision` | `true` | CUDA 上启用 AMP。 |
+
+### 8.1.3 训练命令
+
+先做 dry run，检查 JSONL、AE checkpoint、模型形状和参数量：
+
+```bash
+python ./scripts/train_tensor_editor.py \
+  --config ./configs/tensor_editor_2d.yaml \
+  --jsonl-path ./data/processed/tensor_editor_mvp/train.jsonl \
+  --compressor-checkpoint ./outputs/runs/<ae_run>/checkpoints/best.pt \
+  --dry-run
+```
+
+dry run 会创建一个 run 目录，并写出：
+
+```text
+outputs/runs/<timestamp>_tensor_editor_2d_mvp/
+  config_resolved.yaml
+  setup_summary.json
+```
+
+`setup_summary.json` 中包含：
+
+- `dataset_sizes`：自动切分后的 train/val 数量
+- `total_parameters`：包含冻结 AE 在内的总参数量
+- `trainable_parameters`：实际参与训练的参数量
+- `device`：实际使用设备
+
+正式训练：
+
+```bash
+python ./scripts/train_tensor_editor.py \
+  --config ./configs/tensor_editor_2d.yaml \
+  --jsonl-path ./data/processed/tensor_editor_mvp/train.jsonl \
+  --compressor-checkpoint ./outputs/runs/<ae_run>/checkpoints/best.pt \
+  --device cuda:7 \
+  --batch-size 1 \
+  --epochs 20
+```
+
+命令行参数说明：
+
+| 参数 | 是否必需 | 说明 |
+|---|---|---|
+| `--config` | 是 | tensor editor YAML 配置路径。通常使用 `./configs/tensor_editor_2d.yaml`。 |
+| `--dry-run` | 否 | 只构建 dataset/model 并写出 `setup_summary.json`，不开始训练。 |
+| `--jsonl-path` | 否 | 覆盖 `editor.data.jsonl_path`。适合在不改 YAML 的情况下切换数据文件。 |
+| `--compressor-checkpoint` | 否 | 覆盖 `editor.compressor.checkpoint_path`。指向已有 AE 的 `best.pt` 或 `last.pt`。 |
+| `--compressor-config` | 否 | 覆盖 `editor.compressor.config_path`。当 AE checkpoint 没有内嵌 `config` 字段时使用。 |
+| `--device` | 否 | 覆盖 `experiment.device`，例如 `cuda:0`、`cuda:7`、`cpu`、`auto`。 |
+| `--output-root` | 否 | 覆盖 `experiment.output_root`，控制 run 输出目录。 |
+| `--epochs` | 否 | 覆盖 `training.epochs`。 |
+| `--batch-size` | 否 | 覆盖 `editor.data.loader.batch_size`。显存不够时设为 `1`。 |
+| `--validation-ratio` | 否 | 覆盖 `editor.data.validation_ratio`。例如 `0.1` 表示 10% 数据作为验证集。 |
+
+训练输出：
+
+```text
+outputs/runs/<timestamp>_tensor_editor_2d_mvp/
+  config_resolved.yaml
+  metrics_latest.json
+  val_examples_latest.json
+  checkpoints/
+    best.pt
+    last.pt
+```
+
+文件说明：
+
+| 文件 | 说明 |
+|---|---|
+| `config_resolved.yaml` | 路径解析后的完整配置。 |
+| `metrics_latest.json` | 每个 epoch 的 train/val loss、MSE、MAE、relative L1、max error、PSNR。 |
+| `val_examples_latest.json` | 若干验证样本的 prompt、meta、输入均值、目标均值、预测均值和 MAE 摘要。 |
+| `checkpoints/best.pt` | 验证集 `loss_total` 最低的 editor checkpoint。 |
+| `checkpoints/last.pt` | 最后一个 epoch 的 editor checkpoint。 |
+
+### 8.1.4 常见报错
+
+如果报错提示：
+
+```text
+Tensor editor input channels must match the pretrained compressor
+```
+
+说明 JSONL 配置是单通道 `editor.data.channels: 1`，但 AE checkpoint 是 4 通道或其他通道数。MVP 需要使用单通道 AE checkpoint；或者把 JSONL 数据和配置都改成与 checkpoint 一致的通道数。
+
+如果报错提示：
+
+```text
+Compressor checkpoint does not contain an embedded config
+```
+
+说明 checkpoint 里没有保存 AE 配置。需要在 `configs/tensor_editor_2d.yaml` 中显式指定：
+
+```yaml
+editor:
+  compressor:
+    config_path: ./configs/compressor_2d.yaml
+```
+
+如果显存不足，优先调整：
+
+```yaml
+editor:
+  data:
+    loader:
+      batch_size: 1
+training:
+  mixed_precision: true
+```
+
+若仍不足，可降低 `editor.model.num_res_blocks` 或 `editor.model.base_channels`，但这会降低 decoder 表达能力。
+
 ## 9. 相关文档
 
 - `training_workflow.md`：完整训练流程文档。
 - `./configs/compressor_2d.yaml`：默认 2D 配置。
 - `./scripts/train_compressor.py`：训练入口。
+- `./configs/tensor_editor_2d.yaml`：中文指令张量还原 MVP 配置。
+- `./scripts/train_tensor_editor.py`：中文指令张量还原训练入口。
 
 ## 10. PyTorch 安装说明
 
