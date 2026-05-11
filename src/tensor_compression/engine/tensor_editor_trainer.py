@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset
@@ -22,7 +23,7 @@ from tensor_compression.metrics import compute_reconstruction_metrics
 from tensor_compression.models import build_model
 from tensor_compression.models.editors import EDITOR_REGISTRY
 from tensor_compression.models.editors.conditional_tensor_editor_2d import (
-    infer_decoder_config_from_compressor,
+    infer_latent_editor_config_from_compressor,
 )
 from tensor_compression.utils import dump_json, dump_yaml, save_checkpoint, seed_everything
 
@@ -216,7 +217,7 @@ class TensorEditorTrainer:
             )
         editor_name = self.config["editor"]["model"]["name"]
         editor_cls = EDITOR_REGISTRY.get(editor_name)
-        self.config["editor"]["model"] = infer_decoder_config_from_compressor(
+        self.config["editor"]["model"] = infer_latent_editor_config_from_compressor(
             compressor=compressor,
             base_model_cfg=compressor_cfg["model"],
             editor_model_cfg=self.config["editor"]["model"],
@@ -311,6 +312,7 @@ class TensorEditorTrainer:
             with torch.amp.autocast(device_type=self.device.type, enabled=scaler.is_enabled()):
                 outputs = model(inputs, prompts)
                 loss_dict = criterion(outputs["reconstruction"], targets)
+                loss_dict = self._add_latent_loss(model, outputs, targets, loss_dict)
             scaler.scale(loss_dict["total"]).backward()
             if self.config["training"]["grad_clip_norm"]:
                 scaler.unscale_(optimizer)
@@ -339,6 +341,7 @@ class TensorEditorTrainer:
             targets = batch["target"].to(self.device)
             outputs = model(inputs, batch["prompt"])
             loss_dict = criterion(outputs["reconstruction"], targets)
+            loss_dict = self._add_latent_loss(model, outputs, targets, loss_dict)
             step_metrics = self._build_step_metrics(loss_dict, outputs["reconstruction"], targets)
             for key, value in step_metrics.items():
                 running[key] = running.get(key, 0.0) + value
@@ -367,6 +370,25 @@ class TensorEditorTrainer:
             },
             **metrics,
         }
+
+    def _add_latent_loss(
+        self,
+        model,
+        outputs: dict[str, torch.Tensor],
+        targets: torch.Tensor,
+        loss_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        latent_weight = float(self.config["loss"]["weights"].get("latent_mse", 0.0))
+        if latent_weight <= 0.0:
+            return loss_dict
+        if "edited_latent_map" not in outputs:
+            raise KeyError("Editor outputs must include edited_latent_map when loss.weights.latent_mse > 0.")
+        target_latent = model.encode_target(targets)
+        latent_mse = F.mse_loss(outputs["edited_latent_map"], target_latent["latent_map"])
+        merged = dict(loss_dict)
+        merged["latent_mse"] = latent_mse
+        merged["total"] = merged["total"] + latent_weight * latent_mse
+        return merged
 
     def _summarize_examples(self, batch: dict[str, Any], prediction: torch.Tensor) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []

@@ -1497,7 +1497,16 @@ prompt: 中文还原说明
 meta:   变量、样本索引、时间步、扰动类型和参数等记录
 ```
 
-该入口复用已经训练好的整体 AE。训练时先用 AE encoder 把污染 tensor 压缩成 latent，再用一个轻量中文字符级 prompt encoder 生成条件向量，最后训练 FiLM 条件化的 residual CNN decoder 输出干净 tensor。默认会冻结 AE，避免破坏已经训练好的压缩器。
+该入口复用已经训练好的整体 AE。训练时先用 AE encoder 把污染 tensor 压缩成 `z_noisy`，用轻量中文字符级 prompt encoder 得到条件向量，再由 latent editor 预测 `delta_z`：
+
+```text
+x_noisy -> frozen E -> z_noisy
+prompt  -> T        -> p
+[z_noisy, p] -> G   -> z_edit = z_noisy + delta_z
+z_edit  -> frozen D -> y_hat
+```
+
+默认会冻结 AE，让 decoder 只负责把 edited latent 渲染回张量；文本条件只进入 latent editor，不直接操纵高分辨率 decoder feature。
 
 ### 8.1.1 JSONL 数据格式
 
@@ -1572,9 +1581,12 @@ editor:
 | `editor.text.max_length` | `160` | prompt 最大字符数，超出会截断。 |
 | `editor.model.latent_grid` | 从 AE checkpoint 继承 | AE latent map 空间尺寸。不要在 editor 配置里手动覆盖，代码会从 checkpoint config 继承。 |
 | `editor.model.latent_dim` | 从 AE checkpoint 继承 | AE latent 通道维度。单通道 AE 常见是 128/256/1024，实际以 checkpoint 为准。 |
-| `editor.model.channel_multipliers` | 从 AE checkpoint 继承 | 条件 decoder 的上采样层级，需和 AE encoder 的下采样层级一致。 |
+| `editor.model.latent_hidden_dim` | `256` | latent editor 的隐藏通道数；作用在 `[B, latent_dim, H_lat, W_lat]` 上，不改变 latent 空间分辨率。 |
 | `editor.model.condition_dim` | `256` | prompt 条件向量维度。 |
-| `editor.model.residual_output` | `true` | 输出 `AE重建结果 + 条件decoder预测的残差`。 |
+| `editor.model.residual_latent` | `true` | 输出 `z_edit = z_noisy + delta_z`。若设为 `false`，editor 直接预测完整 `z_edit`。 |
+| `editor.model.latent_delta_scale` | `1.0` | 对 `delta_z` 的缩放系数。训练初期不稳定时可调小。 |
+| `editor.model.zero_init_delta` | `true` | 将 `delta_z` 输出层零初始化，使训练起点接近原 AE 重建。 |
+| `loss.weights.latent_mse` | `0.2` | `z_edit` 与 `E(label)` 的 latent MSE 权重。成对数据建议开启。 |
 | `loss.weights.mse` | `1.0` | MSE loss 权重。 |
 | `loss.weights.l1` | `0.1` | L1 loss 权重。 |
 | `loss.weights.gradient` | `0.05` | 空间梯度差异 loss 权重。 |
@@ -1693,7 +1705,7 @@ training:
   mixed_precision: true
 ```
 
-若仍不足，可降低 `editor.model.num_res_blocks` 或 `editor.model.base_channels`，但这会降低 decoder 表达能力。
+若仍不足，可降低 `editor.model.num_res_blocks` 或 `editor.model.latent_hidden_dim`，但这会降低 latent editor 表达能力。
 
 ## 9. 相关文档
 

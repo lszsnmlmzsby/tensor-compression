@@ -30,15 +30,18 @@ editor:
 
   model:
     name: conditional_tensor_editor_2d
-    # input_size / latent_grid / latent_dim / out_channels /
-    # channel_multipliers are inherited from the AE checkpoint config.
-    base_channels: 32
-    num_res_blocks: 1
+    # input_size / latent_grid / latent_dim are inherited from the AE checkpoint config.
+    # The editor predicts delta_z on the AE latent map, then the frozen AE decoder renders y_hat.
+    latent_hidden_dim: 256
+    num_res_blocks: 2
     condition_dim: 256
     activation: gelu
     dropout: 0.05
     use_base_reconstruction: true
-    residual_output: true
+    residual_latent: true
+    latent_delta_scale: 1.0
+    zero_init_delta: true
+    detach_latent_target: true
 
 loss:
   name: composite_reconstruction_loss
@@ -47,6 +50,7 @@ loss:
     l1: 0.1
     relative_l1: 0.0
     gradient: 0.05
+    latent_mse: 0.2
   eps: 1.0e-6
 
 optimizer:

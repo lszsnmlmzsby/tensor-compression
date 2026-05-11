@@ -132,77 +132,48 @@ class FiLMResidualBlock2D(nn.Module):
         return features * (1.0 + gamma) + beta
 
 
-class ConditionalDecoder2D(nn.Module):
+class LatentResidualEditor2D(nn.Module):
     def __init__(self, editor_cfg: dict) -> None:
         super().__init__()
-        self.input_size = tuple(int(x) for x in editor_cfg["input_size"])
         self.latent_grid = tuple(int(x) for x in editor_cfg["latent_grid"])
         self.latent_dim = int(editor_cfg["latent_dim"])
-        self.out_channels = int(editor_cfg.get("out_channels", 1))
-        self.base_channels = int(editor_cfg.get("base_channels", 32))
-        self.multipliers = [int(x) for x in editor_cfg["channel_multipliers"]]
+        self.hidden_channels = int(editor_cfg.get("latent_hidden_dim", self.latent_dim))
         self.num_res_blocks = int(editor_cfg.get("num_res_blocks", 1))
         self.condition_dim = int(editor_cfg["condition_dim"])
         self.activation_name = str(editor_cfg.get("activation", "gelu"))
         self.dropout = float(editor_cfg.get("dropout", 0.0))
+        self.delta_scale = float(editor_cfg.get("latent_delta_scale", 1.0))
+        self.zero_init_delta = bool(editor_cfg.get("zero_init_delta", True))
+        if self.hidden_channels <= 0:
+            raise ValueError("editor.model.latent_hidden_dim must be positive.")
+        if self.latent_grid[0] <= 0 or self.latent_grid[1] <= 0:
+            raise ValueError("editor.model.latent_grid must contain positive dimensions.")
 
-        down_factor = 2 ** len(self.multipliers)
-        expected_input_size = (
-            self.latent_grid[0] * down_factor,
-            self.latent_grid[1] * down_factor,
-        )
-        if self.input_size != expected_input_size:
-            raise ValueError(
-                "editor.model.input_size must equal latent_grid multiplied by "
-                f"2^len(channel_multipliers). Got input_size={self.input_size}, "
-                f"latent_grid={self.latent_grid}, down_factor={down_factor}."
-            )
-
-        current_channels = self.base_channels * self.multipliers[-1]
         self.input_projection = nn.Sequential(
-            nn.Conv2d(self.latent_dim, current_channels, kernel_size=3, padding=1),
+            nn.Conv2d(self.latent_dim, self.hidden_channels, kernel_size=3, padding=1),
             _make_activation(self.activation_name),
         )
-        reversed_multipliers = list(reversed(self.multipliers))
         blocks: list[nn.Module] = []
-        for idx, _ in enumerate(reversed_multipliers):
-            out_channels = (
-                self.base_channels * reversed_multipliers[idx + 1]
-                if idx + 1 < len(reversed_multipliers)
-                else self.base_channels
-            )
+        for _block_idx in range(self.num_res_blocks):
             blocks.append(
-                nn.ConvTranspose2d(
-                    current_channels,
-                    out_channels,
-                    kernel_size=4,
-                    stride=2,
-                    padding=1,
+                FiLMResidualBlock2D(
+                    channels=self.hidden_channels,
+                    condition_dim=self.condition_dim,
+                    activation=self.activation_name,
+                    dropout=self.dropout,
                 )
             )
-            blocks.append(_make_group_norm(out_channels))
-            blocks.append(_make_activation(self.activation_name))
-            for _block_idx in range(self.num_res_blocks):
-                blocks.append(
-                    FiLMResidualBlock2D(
-                        channels=out_channels,
-                        condition_dim=self.condition_dim,
-                        activation=self.activation_name,
-                        dropout=self.dropout,
-                    )
-                )
-            current_channels = out_channels
         self.blocks = nn.ModuleList(blocks)
-        self.output_projection = nn.Conv2d(current_channels, self.out_channels, kernel_size=3, padding=1)
+        self.output_projection = nn.Conv2d(self.hidden_channels, self.latent_dim, kernel_size=3, padding=1)
+        if self.zero_init_delta:
+            nn.init.zeros_(self.output_projection.weight)
+            nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, latent_map: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         hidden = self.input_projection(latent_map)
         for block in self.blocks:
-            if isinstance(block, FiLMResidualBlock2D):
-                hidden = block(hidden, condition)
-            else:
-                hidden = block(hidden)
-        return self.output_projection(hidden)
+            hidden = block(hidden, condition)
+        return self.output_projection(hidden) * self.delta_scale
 
 
 @EDITOR_REGISTRY.register("conditional_tensor_editor_2d")
@@ -214,7 +185,8 @@ class ConditionalTensorEditor2D(nn.Module):
         text_cfg = config["editor"].get("text", {})
         self.freeze_compressor = bool(config["editor"]["compressor"].get("freeze", True))
         self.use_base_reconstruction = bool(editor_cfg.get("use_base_reconstruction", True))
-        self.residual_output = bool(editor_cfg.get("residual_output", True))
+        self.residual_latent = bool(editor_cfg.get("residual_latent", True))
+        self.detach_latent_target = bool(editor_cfg.get("detach_latent_target", True))
 
         prompt_encoder = CharacterPromptEncoder(
             vocab_size=int(text_cfg.get("vocab_size", 8192)),
@@ -230,7 +202,7 @@ class ConditionalTensorEditor2D(nn.Module):
             nn.Dropout(float(editor_cfg.get("dropout", 0.0))),
             nn.Linear(int(editor_cfg["condition_dim"]), int(editor_cfg["condition_dim"])),
         )
-        self.decoder = ConditionalDecoder2D(editor_cfg)
+        self.latent_editor = LatentResidualEditor2D(editor_cfg)
         if self.freeze_compressor:
             for parameter in self.compressor.parameters():
                 parameter.requires_grad = False
@@ -255,23 +227,36 @@ class ConditionalTensorEditor2D(nn.Module):
 
         prompt_features = self.prompt_encoder(prompts, inputs.device)
         condition = self.condition(prompt_features)
-        edited = self.decoder(latent["latent_map"], condition)
-        if self.residual_output:
-            reconstruction = base_reconstruction + edited
-            delta = edited
+        latent_delta = self.latent_editor(latent["latent_map"], condition)
+        if self.residual_latent:
+            edited_latent_map = latent["latent_map"] + latent_delta
         else:
-            reconstruction = edited
-            delta = edited - base_reconstruction
+            edited_latent_map = latent_delta
+        edited_latent = {
+            **latent,
+            "latent_map": edited_latent_map,
+            "latent_tokens": edited_latent_map.flatten(2).transpose(1, 2),
+        }
+        reconstruction = self.compressor.decode(edited_latent)
         return {
             "reconstruction": reconstruction,
-            "delta": delta,
+            "delta": reconstruction - base_reconstruction,
             "base_reconstruction": base_reconstruction,
             "latent_map": latent["latent_map"],
+            "edited_latent_map": edited_latent_map,
+            "edited_latent_tokens": edited_latent["latent_tokens"],
+            "latent_delta": latent_delta,
             "condition": condition,
         }
 
+    def encode_target(self, targets: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.freeze_compressor or self.detach_latent_target:
+            with torch.no_grad():
+                return self.compressor.encode(targets)
+        return self.compressor.encode(targets)
 
-def infer_decoder_config_from_compressor(
+
+def infer_latent_editor_config_from_compressor(
     compressor: nn.Module,
     base_model_cfg: dict,
     editor_model_cfg: dict,
@@ -281,7 +266,8 @@ def infer_decoder_config_from_compressor(
     resolved["latent_grid"] = base_model_cfg["latent_grid"]
     resolved["latent_dim"] = getattr(compressor, "latent_dim", base_model_cfg["latent_dim"])
     resolved["out_channels"] = base_model_cfg.get("out_channels", 1)
-    resolved["channel_multipliers"] = base_model_cfg["channel_multipliers"]
-    resolved.setdefault("base_channels", base_model_cfg.get("base_channels", 32))
     resolved.setdefault("activation", base_model_cfg.get("activation", "gelu"))
     return resolved
+
+
+infer_decoder_config_from_compressor = infer_latent_editor_config_from_compressor
