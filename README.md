@@ -1573,6 +1573,7 @@ editor:
 | `editor.data.input_size` | `[512,512]` | 输入/输出二维空间尺寸。MVP 固定为 512×512。 |
 | `editor.data.channels` | `1` | 输入/输出通道数。MVP 是单通道，且必须与 AE checkpoint 的 `model.in_channels` 一致。 |
 | `editor.data.validation_ratio` | `0.1` | 从同一个 JSONL 中随机切出验证集的比例。约 1000 条数据时默认约 100 条验证。 |
+| `editor.data.fix_prompt_mojibake` | `false` | 若 JSONL 中中文 prompt 已经变成 GBK/CP936 mojibake，可设为 `true` 尝试修复；正常 UTF-8 数据保持 `false`。 |
 | `editor.data.loader.batch_size` | `1` | 512×512 且 decoder 较重，建议先从 1 开始。显存充足再调到 2 或 4。 |
 | `editor.compressor.checkpoint_path` | 占位路径 | 已训练 AE 的 `best.pt` 或 `last.pt`。 |
 | `editor.compressor.config_path` | `null` | checkpoint 内没有 `config` 字段时，手动指定 AE 的 YAML 配置。 |
@@ -1593,6 +1594,9 @@ editor:
 | `optimizer.lr` | `1.0e-4` | editor 训练学习率。 |
 | `training.epochs` | `20` | 训练轮数。 |
 | `training.mixed_precision` | `true` | CUDA 上启用 AMP。 |
+| `training.log_interval` | `50` | 每隔多少个训练 step 向 W&B 记录一次紧凑训练指标。 |
+| `wandb.enabled` | `false` | 是否启用 W&B。训练机上可设为 `true`。 |
+| `wandb.mode` | `offline` | W&B 运行模式；可改成 `online` 实时上传。 |
 
 ### 8.1.3 训练命令
 
@@ -1633,6 +1637,22 @@ python ./scripts/train_tensor_editor.py \
   --epochs 20
 ```
 
+如需启用 W&B，可在配置中设置：
+
+```yaml
+wandb:
+  enabled: true
+  project: tensor-compression
+  group: tensor-editor
+  mode: online
+```
+
+API key 建议通过环境变量提供：
+
+```bash
+export WANDB_API_KEY=your_key
+```
+
 命令行参数说明：
 
 | 参数 | 是否必需 | 说明 |
@@ -1665,10 +1685,24 @@ outputs/runs/<timestamp>_tensor_editor_2d_mvp/
 | 文件 | 说明 |
 |---|---|
 | `config_resolved.yaml` | 路径解析后的完整配置。 |
-| `metrics_latest.json` | 每个 epoch 的 train/val loss、MSE、MAE、relative L1、max error、PSNR。 |
-| `val_examples_latest.json` | 若干验证样本的 prompt、meta、输入均值、目标均值、预测均值和 MAE 摘要。 |
+| `metrics_latest.json` | 每个 epoch 的 train/val loss、editor/input/base 三路误差、gain 指标、latent delta 范数、以及验证集按 `meta.type` 分组的 `by_type` 指标。 |
+| `val_examples_latest.json` | 若干验证样本的 prompt、raw_prompt、meta、输入/AE base/预测均值、三路 MAE 和 gain 摘要。 |
 | `checkpoints/best.pt` | 验证集 `loss_total` 最低的 editor checkpoint。 |
 | `checkpoints/last.pt` | 最后一个 epoch 的 editor checkpoint。 |
+
+关键验证指标建议优先看：
+
+```text
+input_mae          = MAE(x_noisy, y)
+base_mae           = MAE(D(E(x_noisy)), y)
+editor_mae         = MAE(y_hat, y)
+gain_vs_input_mae  = 1 - editor_mae / input_mae
+gain_vs_base_mae   = 1 - editor_mae / base_mae
+mae_reduction_vs_input = input_mae - editor_mae
+mae_reduction_vs_base  = base_mae - editor_mae
+```
+
+`gain_vs_input_mae > 0` 表示 editor 比原始污染输入更接近 label；`gain_vs_base_mae > 0` 表示 editor 比只做 AE 重建更有用。对于 `normal` 样本，`input_mae` 可能接近 0，此时更关注 editor 是否没有明显破坏输入。
 
 ### 8.1.4 常见报错
 

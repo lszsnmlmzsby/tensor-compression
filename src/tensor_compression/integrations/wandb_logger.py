@@ -8,7 +8,8 @@ from typing import Any
 
 class WandbLogger:
     def __init__(self, config: dict, run_dir: Path) -> None:
-        self.enabled = bool(config["wandb"]["enabled"])
+        wandb_cfg = config.get("wandb", {})
+        self.enabled = bool(wandb_cfg.get("enabled", False))
         self.run = None
         self._wandb = None
         if not self.enabled:
@@ -16,13 +17,12 @@ class WandbLogger:
 
         import wandb
 
-        wandb_cfg = config["wandb"]
         self._wandb = wandb
         api_key = wandb_cfg.get("api_key") or os.getenv("WANDB_API_KEY")
         if api_key:
             wandb.login(key=api_key)
         self.run = wandb.init(
-            project=wandb_cfg["project"],
+            project=wandb_cfg.get("project", "tensor-compression"),
             entity=wandb_cfg.get("entity"),
             group=wandb_cfg.get("group"),
             tags=wandb_cfg.get("tags"),

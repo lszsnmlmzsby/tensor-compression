@@ -67,7 +67,7 @@ class TestLatentTensorEditor(unittest.TestCase):
         model = ConditionalTensorEditor2D(compressor=DummyCompressor2D(), config=_editor_config())
         inputs = torch.randn(2, 1, 4, 4)
 
-        outputs = model(inputs, ["加 0.2", "去偏置"])
+        outputs = model(inputs, ["add 0.2", "remove bias"])
 
         self.assertEqual(outputs["reconstruction"].shape, inputs.shape)
         self.assertEqual(outputs["latent_delta"].shape, outputs["latent_map"].shape)
@@ -103,6 +103,47 @@ class TestLatentTensorEditor(unittest.TestCase):
 
         self.assertAlmostEqual(float(merged["latent_mse"].item()), 1.0, places=6)
         self.assertAlmostEqual(float(merged["total"].item()), 1.5, places=6)
+
+    def test_step_metrics_compare_input_base_and_editor(self) -> None:
+        trainer = object.__new__(TensorEditorTrainer)
+        trainer.config = {"loss": {"eps": 1.0e-6}}
+        target = torch.zeros(1, 1, 2, 2)
+        inputs = torch.ones_like(target) * 2.0
+        outputs = {
+            "reconstruction": torch.ones_like(target) * 0.5,
+            "base_reconstruction": torch.ones_like(target),
+            "latent_map": torch.ones(1, 2, 1, 1),
+            "edited_latent_map": torch.ones(1, 2, 1, 1) * 1.5,
+            "latent_delta": torch.ones(1, 2, 1, 1) * 0.5,
+        }
+
+        metrics = TensorEditorTrainer._build_step_metrics(
+            trainer,
+            loss_dict=None,
+            outputs=outputs,
+            inputs=inputs,
+            target=target,
+        )
+
+        self.assertAlmostEqual(metrics["input_mae"], 2.0, places=6)
+        self.assertAlmostEqual(metrics["base_mae"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["editor_mae"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["gain_vs_input_mae"], 0.75, places=6)
+        self.assertAlmostEqual(metrics["gain_vs_base_mae"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["mae_reduction_vs_input"], 1.5, places=6)
+        self.assertAlmostEqual(metrics["mae_reduction_vs_base"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["latent_delta_rms"], 0.5, places=6)
+
+    def test_groups_validation_indices_by_meta_type(self) -> None:
+        trainer = object.__new__(TensorEditorTrainer)
+        grouped = TensorEditorTrainer._group_batch_indices_by_type(
+            trainer,
+            [{"type": "normal"}, {"type": "add_offset"}, {"perturbation_type": "add_offset"}, {}],
+        )
+
+        self.assertEqual(grouped["normal"], [0])
+        self.assertEqual(grouped["add_offset"], [1, 2])
+        self.assertEqual(grouped["unknown"], [3])
 
 
 if __name__ == "__main__":

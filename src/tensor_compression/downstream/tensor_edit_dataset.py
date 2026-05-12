@@ -17,10 +17,12 @@ class TensorEditJsonlDataset(Dataset):
         jsonl_path: str | Path,
         input_size: tuple[int, int] = (512, 512),
         channels: int = 1,
+        fix_prompt_mojibake: bool = False,
     ) -> None:
         self.jsonl_path = Path(jsonl_path)
         self.input_size = tuple(int(x) for x in input_size)
         self.channels = int(channels)
+        self.fix_prompt_mojibake = bool(fix_prompt_mojibake)
         if self.channels <= 0:
             raise ValueError("channels must be positive.")
         if not self.jsonl_path.exists():
@@ -46,7 +48,8 @@ class TensorEditJsonlDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self._read_record(index)
-        prompt = str(record.get("prompt", ""))
+        raw_prompt = str(record.get("prompt", ""))
+        prompt = self._fix_mojibake(raw_prompt) if self.fix_prompt_mojibake else raw_prompt
         if not prompt:
             raise ValueError(f"Record {index} in {self.jsonl_path} has an empty prompt.")
 
@@ -67,9 +70,23 @@ class TensorEditJsonlDataset(Dataset):
             "input": input_tensor,
             "target": target_tensor,
             "prompt": prompt,
+            "raw_prompt": raw_prompt,
             "meta": meta,
             "sample_id": sample_id,
         }
+
+    def _fix_mojibake(self, text: str) -> str:
+        for encoding in ("gbk", "cp936", "latin1"):
+            try:
+                repaired = text.encode(encoding).decode("utf-8")
+            except UnicodeError:
+                continue
+            if self._count_cjk(repaired) >= self._count_cjk(text) and repaired != text:
+                return repaired
+        return text
+
+    def _count_cjk(self, text: str) -> int:
+        return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
 
     def _read_record(self, index: int) -> dict[str, Any]:
         with self.jsonl_path.open("rb") as handle:
@@ -164,6 +181,7 @@ def tensor_edit_collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "input": torch.stack([sample["input"] for sample in samples], dim=0),
         "target": torch.stack([sample["target"] for sample in samples], dim=0),
         "prompt": [sample["prompt"] for sample in samples],
+        "raw_prompt": [sample["raw_prompt"] for sample in samples],
         "meta": [sample["meta"] for sample in samples],
         "sample_id": [sample["sample_id"] for sample in samples],
     }

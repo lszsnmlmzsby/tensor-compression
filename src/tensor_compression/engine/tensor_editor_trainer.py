@@ -18,6 +18,7 @@ from tensor_compression.downstream.tensor_edit_dataset import (
     TensorEditJsonlDataset,
     tensor_edit_collate_fn,
 )
+from tensor_compression.integrations import WandbLogger
 from tensor_compression.losses.composite import CompositeReconstructionLoss
 from tensor_compression.metrics import compute_reconstruction_metrics
 from tensor_compression.models import build_model
@@ -37,6 +38,7 @@ class TensorEditorTrainer:
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.run_dir / "metrics_latest.json"
+        self.wandb_logger = WandbLogger(config=self.config, run_dir=self.run_dir)
         seed_everything(int(self.config["experiment"]["seed"]))
         dump_yaml(self.run_dir / "config_resolved.yaml", self._redacted_config())
 
@@ -55,20 +57,23 @@ class TensorEditorTrainer:
         return run_dir
 
     def validate_setup(self) -> None:
-        dataloaders = self._build_dataloaders()
-        model = self._build_model().to(self.device)
-        sizes = {split: len(loader.dataset) for split, loader in dataloaders.items()}
-        trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_parameters = sum(p.numel() for p in model.parameters())
-        dump_json(
-            self.run_dir / "setup_summary.json",
-            {
-                "dataset_sizes": sizes,
-                "total_parameters": total_parameters,
-                "trainable_parameters": trainable_parameters,
-                "device": str(self.device),
-            },
-        )
+        try:
+            dataloaders = self._build_dataloaders()
+            model = self._build_model().to(self.device)
+            sizes = {split: len(loader.dataset) for split, loader in dataloaders.items()}
+            trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_parameters = sum(p.numel() for p in model.parameters())
+            dump_json(
+                self.run_dir / "setup_summary.json",
+                {
+                    "dataset_sizes": sizes,
+                    "total_parameters": total_parameters,
+                    "trainable_parameters": trainable_parameters,
+                    "device": str(self.device),
+                },
+            )
+        finally:
+            self.wandb_logger.finish()
 
     def fit(self) -> None:
         dataloaders = self._build_dataloaders()
@@ -89,38 +94,52 @@ class TensorEditorTrainer:
         epochs = int(self.config["training"]["epochs"])
         train_steps_per_epoch = max(1, len(dataloaders["train"]))
 
-        for epoch in range(1, epochs + 1):
-            train_metrics = self._run_epoch(
-                model=model,
-                criterion=criterion,
-                dataloader=dataloaders["train"],
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-            )
-            val_metrics, val_examples = self._run_validation(
-                model=model,
-                criterion=criterion,
-                dataloader=dataloaders["val"],
-                epoch=epoch,
-            )
-            if scheduler is not None:
-                scheduler.step()
+        try:
+            for epoch in range(1, epochs + 1):
+                train_metrics = self._run_epoch(
+                    model=model,
+                    criterion=criterion,
+                    dataloader=dataloaders["train"],
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                )
+                val_metrics, val_examples = self._run_validation(
+                    model=model,
+                    criterion=criterion,
+                    dataloader=dataloaders["val"],
+                    epoch=epoch,
+                )
+                if scheduler is not None:
+                    scheduler.step()
 
-            merged = {
-                "epoch": epoch,
-                "train": train_metrics,
-                "val": val_metrics,
-                "lr": float(optimizer.param_groups[0]["lr"]),
-            }
-            all_metrics[f"epoch_{epoch:04d}"] = merged
-            dump_json(self.metrics_path, all_metrics)
-            dump_json(self.run_dir / "val_examples_latest.json", {"examples": val_examples})
+                merged = {
+                    "epoch": epoch,
+                    "train": train_metrics,
+                    "val": val_metrics,
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                }
+                all_metrics[f"epoch_{epoch:04d}"] = merged
+                dump_json(self.metrics_path, all_metrics)
+                dump_json(self.run_dir / "val_examples_latest.json", {"examples": val_examples})
 
-            if val_metrics["loss_total"] < best_val_loss:
-                best_val_loss = val_metrics["loss_total"]
+                log_step = epoch * train_steps_per_epoch
+                self._log_epoch_to_wandb(merged, step=log_step)
+
+                if val_metrics["loss_total"] < best_val_loss:
+                    best_val_loss = val_metrics["loss_total"]
+                    save_checkpoint(
+                        path=self.checkpoint_dir / "best.pt",
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        best_metric=best_val_loss,
+                        config=self._redacted_config(),
+                    )
+
                 save_checkpoint(
-                    path=self.checkpoint_dir / "best.pt",
+                    path=self.checkpoint_dir / "last.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -129,19 +148,11 @@ class TensorEditorTrainer:
                     config=self._redacted_config(),
                 )
 
-            save_checkpoint(
-                path=self.checkpoint_dir / "last.pt",
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                best_metric=best_val_loss,
-                config=self._redacted_config(),
-            )
-
-            completed_steps = epoch * train_steps_per_epoch
-            if completed_steps <= 0:
-                raise RuntimeError("No training steps were completed.")
+                completed_steps = epoch * train_steps_per_epoch
+                if completed_steps <= 0:
+                    raise RuntimeError("No training steps were completed.")
+        finally:
+            self.wandb_logger.finish()
 
     def _build_dataloaders(self) -> dict[str, DataLoader]:
         data_cfg = self.config["editor"]["data"]
@@ -149,6 +160,7 @@ class TensorEditorTrainer:
             jsonl_path=data_cfg["jsonl_path"],
             input_size=tuple(int(x) for x in data_cfg.get("input_size", [512, 512])),
             channels=int(data_cfg.get("channels", 1)),
+            fix_prompt_mojibake=bool(data_cfg.get("fix_prompt_mojibake", False)),
         )
         val_ratio = float(data_cfg.get("validation_ratio", 0.1))
         if not 0.0 < val_ratio < 1.0:
@@ -288,7 +300,53 @@ class TensorEditorTrainer:
         raise ValueError(f"Unsupported scheduler: {scheduler_cfg['name']}")
 
     def _redacted_config(self) -> dict:
-        return copy.deepcopy(self.config)
+        redacted = copy.deepcopy(self.config)
+        wandb_cfg = redacted.get("wandb", {})
+        if wandb_cfg.get("api_key"):
+            wandb_cfg["api_key"] = "***REDACTED***"
+        return redacted
+
+    def _build_train_step_wandb_payload(self, metrics: dict[str, float]) -> dict[str, float]:
+        keep_order = [
+            "loss_total",
+            "loss_mse",
+            "loss_l1",
+            "loss_gradient",
+            "loss_latent_mse",
+            "editor_mae",
+            "base_mae",
+            "input_mae",
+            "gain_vs_input_mae",
+            "gain_vs_base_mae",
+            "mae_reduction_vs_input",
+            "mae_reduction_vs_base",
+            "latent_delta_rms",
+            "latent_edit_ratio",
+            "psnr",
+        ]
+        return {
+            f"train_step/{key}": float(metrics[key])
+            for key in keep_order
+            if key in metrics and isinstance(metrics[key], (int, float))
+        }
+
+    def _log_epoch_to_wandb(self, merged: dict[str, Any], step: int) -> None:
+        payload: dict[str, float] = {"epoch": float(merged["epoch"]), "lr": float(merged["lr"])}
+        payload.update(self._flatten_metrics("train", merged["train"]))
+        payload.update(self._flatten_metrics("val", merged["val"]))
+        self.wandb_logger.log(payload, step=step)
+
+    def _flatten_metrics(self, prefix: str, metrics: dict[str, Any]) -> dict[str, float]:
+        flattened: dict[str, float] = {}
+        for key, value in metrics.items():
+            metric_key = f"{prefix}/{key}"
+            if isinstance(value, dict):
+                flattened.update(self._flatten_metrics(metric_key, value))
+            elif isinstance(value, bool):
+                continue
+            elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+                flattened[metric_key] = float(value)
+        return flattened
 
     def _run_epoch(
         self,
@@ -302,7 +360,7 @@ class TensorEditorTrainer:
         model.train()
         if getattr(model, "freeze_compressor", False):
             model.compressor.eval()
-        running: dict[str, float] = {}
+        running = _MetricAccumulator()
         progress = tqdm(dataloader, desc=f"Epoch {epoch:03d} [editor-train]", leave=False)
         for step, batch in enumerate(progress, start=1):
             inputs = batch["input"].to(self.device)
@@ -323,17 +381,29 @@ class TensorEditorTrainer:
             scaler.step(optimizer)
             scaler.update()
 
-            step_metrics = self._build_step_metrics(loss_dict, outputs["reconstruction"].detach(), targets.detach())
-            for key, value in step_metrics.items():
-                running[key] = running.get(key, 0.0) + value
-            averages = {key: value / step for key, value in running.items()}
+            step_metrics = self._build_step_metrics(
+                loss_dict,
+                outputs,
+                inputs.detach(),
+                targets.detach(),
+            )
+            running.update(step_metrics, weight=inputs.shape[0])
+            averages = running.averages()
             progress.set_postfix(loss=f"{averages['loss_total']:.4f}", psnr=f"{averages['psnr']:.2f}")
-        return {key: value / max(1, len(dataloader)) for key, value in running.items()}
+            if step % int(self.config["training"].get("log_interval", 50)) == 0:
+                payload = self._build_train_step_wandb_payload(averages)
+                if payload:
+                    self.wandb_logger.log(
+                        payload,
+                        step=(epoch - 1) * len(dataloader) + step,
+                    )
+        return running.averages()
 
     @torch.no_grad()
     def _run_validation(self, model, criterion, dataloader, epoch: int):
         model.eval()
-        running: dict[str, float] = {}
+        running = _MetricAccumulator()
+        running_by_type: dict[str, _MetricAccumulator] = {}
         examples: list[dict[str, Any]] = []
         progress = tqdm(dataloader, desc=f"Epoch {epoch:03d} [editor-val]", leave=False)
         for step, batch in enumerate(progress, start=1):
@@ -342,34 +412,136 @@ class TensorEditorTrainer:
             outputs = model(inputs, batch["prompt"])
             loss_dict = criterion(outputs["reconstruction"], targets)
             loss_dict = self._add_latent_loss(model, outputs, targets, loss_dict)
-            step_metrics = self._build_step_metrics(loss_dict, outputs["reconstruction"], targets)
-            for key, value in step_metrics.items():
-                running[key] = running.get(key, 0.0) + value
-            averages = {key: value / step for key, value in running.items()}
+            step_metrics = self._build_step_metrics(loss_dict, outputs, inputs, targets)
+            running.update(step_metrics, weight=inputs.shape[0])
+            for type_name, type_indices in self._group_batch_indices_by_type(batch["meta"]).items():
+                type_metrics = self._build_step_metrics(
+                    loss_dict=None,
+                    outputs=outputs,
+                    inputs=inputs,
+                    target=targets,
+                    indices=type_indices,
+                )
+                running_by_type.setdefault(type_name, _MetricAccumulator()).update(
+                    type_metrics,
+                    weight=len(type_indices),
+                )
+            averages = running.averages()
             progress.set_postfix(loss=f"{averages['loss_total']:.4f}", psnr=f"{averages['psnr']:.2f}")
             if len(examples) < int(self.config["training"].get("num_saved_val_examples", 8)):
-                examples.extend(self._summarize_examples(batch, outputs["reconstruction"]))
+                examples.extend(self._summarize_examples(batch, outputs))
         return (
-            {key: value / max(1, len(dataloader)) for key, value in running.items()},
+            {
+                **running.averages(),
+                "by_type": {
+                    type_name: accumulator.averages()
+                    for type_name, accumulator in sorted(running_by_type.items())
+                },
+            },
             examples[: int(self.config["training"].get("num_saved_val_examples", 8))],
         )
 
     def _build_step_metrics(
         self,
-        loss_dict: dict[str, torch.Tensor],
-        prediction: torch.Tensor,
+        loss_dict: dict[str, torch.Tensor] | None,
+        outputs: dict[str, torch.Tensor],
+        inputs: torch.Tensor,
         target: torch.Tensor,
+        indices: list[int] | None = None,
     ) -> dict[str, float]:
+        if indices is not None:
+            original_batch_size = int(target.shape[0])
+            index_tensor = torch.as_tensor(indices, dtype=torch.long, device=target.device)
+            inputs = inputs.index_select(0, index_tensor)
+            target = target.index_select(0, index_tensor)
+            outputs = self._select_output_batch(outputs, index_tensor, original_batch_size)
+        prediction = outputs["reconstruction"].detach()
+        base_reconstruction = outputs.get("base_reconstruction")
+        if base_reconstruction is not None:
+            base_reconstruction = base_reconstruction.detach()
+        inputs = inputs.detach()
+        target = target.detach()
         metrics = compute_reconstruction_metrics(prediction, target)
-        return {
-            "loss_total": float(loss_dict["total"].detach().cpu().item()),
-            **{
+        input_metrics = compute_reconstruction_metrics(inputs, target)
+        result = {
+            **self._prefix_metrics("editor", metrics),
+            **self._prefix_metrics("input", input_metrics),
+            "gain_vs_input_mse": self._relative_gain(input_metrics["mse"], metrics["mse"]),
+            "gain_vs_input_mae": self._relative_gain(input_metrics["mae"], metrics["mae"]),
+            "mse_reduction_vs_input": input_metrics["mse"] - metrics["mse"],
+            "mae_reduction_vs_input": input_metrics["mae"] - metrics["mae"],
+            "mse": metrics["mse"],
+            "mae": metrics["mae"],
+            "relative_l1": metrics["relative_l1"],
+            "max_abs_error": metrics["max_abs_error"],
+            "psnr": metrics["psnr"],
+        }
+        if base_reconstruction is not None:
+            base_metrics = compute_reconstruction_metrics(base_reconstruction, target)
+            result.update(self._prefix_metrics("base", base_metrics))
+            result["gain_vs_base_mse"] = self._relative_gain(base_metrics["mse"], metrics["mse"])
+            result["gain_vs_base_mae"] = self._relative_gain(base_metrics["mae"], metrics["mae"])
+            result["mse_reduction_vs_base"] = base_metrics["mse"] - metrics["mse"]
+            result["mae_reduction_vs_base"] = base_metrics["mae"] - metrics["mae"]
+        if "latent_delta" in outputs:
+            result["latent_delta_rms"] = self._rms(outputs["latent_delta"].detach())
+        if "edited_latent_map" in outputs and "latent_map" in outputs:
+            result["latent_edit_ratio"] = self._safe_ratio(
+                self._rms_tensor(outputs["edited_latent_map"].detach() - outputs["latent_map"].detach()),
+                self._rms_tensor(outputs["latent_map"].detach()),
+            )
+        if loss_dict is not None:
+            result.update(
+                {
+                    "loss_total": float(loss_dict["total"].detach().cpu().item()),
+                    **{
                 f"loss_{key}": float(value.detach().cpu().item())
                 for key, value in loss_dict.items()
                 if key != "total"
-            },
-            **metrics,
-        }
+                    },
+                }
+            )
+        return result
+
+    def _select_output_batch(
+        self,
+        outputs: dict[str, torch.Tensor],
+        index_tensor: torch.Tensor,
+        original_batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        selected: dict[str, torch.Tensor] = {}
+        for key, value in outputs.items():
+            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == original_batch_size:
+                selected[key] = value.index_select(0, index_tensor)
+        return selected
+
+    def _prefix_metrics(self, prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+        return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+    def _relative_gain(self, baseline: float, edited: float) -> float:
+        eps = float(self.config["loss"].get("eps", 1.0e-6))
+        if abs(baseline) <= eps:
+            return 0.0
+        return 1.0 - edited / baseline
+
+    def _rms_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(torch.mean(torch.square(tensor.detach().float())))
+
+    def _rms(self, tensor: torch.Tensor) -> float:
+        return float(self._rms_tensor(tensor).detach().cpu().item())
+
+    def _safe_ratio(self, numerator: torch.Tensor, denominator: torch.Tensor) -> float:
+        eps = float(self.config["loss"].get("eps", 1.0e-6))
+        return float((numerator / torch.clamp(denominator, min=eps)).detach().cpu().item())
+
+    def _group_batch_indices_by_type(self, metas: list[dict[str, Any]]) -> dict[str, list[int]]:
+        grouped: dict[str, list[int]] = {}
+        for index, meta in enumerate(metas):
+            type_name = "unknown"
+            if isinstance(meta, dict):
+                type_name = str(meta.get("type") or meta.get("perturbation_type") or "unknown")
+            grouped.setdefault(type_name, []).append(index)
+        return grouped
 
     def _add_latent_loss(
         self,
@@ -390,24 +562,93 @@ class TensorEditorTrainer:
         merged["total"] = merged["total"] + latent_weight * latent_mse
         return merged
 
-    def _summarize_examples(self, batch: dict[str, Any], prediction: torch.Tensor) -> list[dict[str, Any]]:
+    def _summarize_examples(self, batch: dict[str, Any], outputs: dict[str, torch.Tensor]) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
-        prediction_cpu = prediction.detach().cpu()
+        prediction_cpu = outputs["reconstruction"].detach().cpu()
+        base_cpu = outputs.get("base_reconstruction")
+        if base_cpu is not None:
+            base_cpu = base_cpu.detach().cpu()
+        latent_delta_cpu = outputs.get("latent_delta")
+        if latent_delta_cpu is not None:
+            latent_delta_cpu = latent_delta_cpu.detach().cpu()
         for row, sample_id in enumerate(batch["sample_id"]):
             pred = prediction_cpu[row]
             target = batch["target"][row]
             inp = batch["input"][row]
+            input_mae = float(torch.mean(torch.abs(inp - target)).item())
+            prediction_mae = float(torch.mean(torch.abs(pred - target)).item())
+            summary = {
+                "sample_id": str(sample_id),
+                "prompt": batch["prompt"][row],
+                "raw_prompt": batch.get("raw_prompt", batch["prompt"])[row],
+                "prompt_was_repaired": batch.get("raw_prompt", batch["prompt"])[row] != batch["prompt"][row],
+                "meta": batch["meta"][row],
+                "type": self._sample_type(batch["meta"][row]),
+                "input_mean": float(inp.mean().item()),
+                "target_mean": float(target.mean().item()),
+                "prediction_mean": float(pred.mean().item()),
+                "prediction_min": float(pred.min().item()),
+                "prediction_max": float(pred.max().item()),
+                "input_mae": input_mae,
+                "prediction_mae": prediction_mae,
+                "mae": prediction_mae,
+                "gain_vs_input_mae": self._relative_gain(input_mae, prediction_mae),
+                "mae_reduction_vs_input": input_mae - prediction_mae,
+            }
+            if base_cpu is not None:
+                base = base_cpu[row]
+                base_mae = float(torch.mean(torch.abs(base - target)).item())
+                summary.update(
+                    {
+                        "base_mean": float(base.mean().item()),
+                        "base_mae": base_mae,
+                        "gain_vs_base_mae": self._relative_gain(base_mae, prediction_mae),
+                        "mae_reduction_vs_base": base_mae - prediction_mae,
+                    }
+                )
+            if latent_delta_cpu is not None:
+                summary["latent_delta_rms"] = float(
+                    torch.sqrt(torch.mean(torch.square(latent_delta_cpu[row].float()))).item()
+                )
             summaries.append(
-                {
-                    "sample_id": str(sample_id),
-                    "prompt": batch["prompt"][row],
-                    "meta": batch["meta"][row],
-                    "input_mean": float(inp.mean().item()),
-                    "target_mean": float(target.mean().item()),
-                    "prediction_mean": float(pred.mean().item()),
-                    "prediction_min": float(pred.min().item()),
-                    "prediction_max": float(pred.max().item()),
-                    "mae": float(torch.mean(torch.abs(pred - target)).item()),
-                }
+                summary
             )
         return summaries
+
+    def _sample_type(self, meta: Any) -> str:
+        if isinstance(meta, dict):
+            return str(meta.get("type") or meta.get("perturbation_type") or "unknown")
+        return "unknown"
+
+
+class _MetricAccumulator:
+    def __init__(self) -> None:
+        self.totals: dict[str, float] = {}
+        self.weights: dict[str, float] = {}
+        self.sample_count = 0.0
+
+    def update(self, metrics: dict[str, float], weight: int | float) -> None:
+        numeric_weight = float(weight)
+        if numeric_weight <= 0.0:
+            return
+        self.sample_count += numeric_weight
+        for key, value in metrics.items():
+            if isinstance(value, bool):
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric_value):
+                continue
+            self.totals[key] = self.totals.get(key, 0.0) + numeric_value * numeric_weight
+            self.weights[key] = self.weights.get(key, 0.0) + numeric_weight
+
+    def averages(self) -> dict[str, float]:
+        averages = {
+            key: self.totals[key] / self.weights[key]
+            for key in sorted(self.totals)
+            if self.weights.get(key, 0.0) > 0.0
+        }
+        averages["sample_count"] = self.sample_count
+        return averages

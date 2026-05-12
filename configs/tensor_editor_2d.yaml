@@ -10,6 +10,8 @@ editor:
     input_size: [512, 512]
     channels: 1
     validation_ratio: 0.1
+    # Set true only when prompts were accidentally decoded as GBK/CP936 mojibake.
+    fix_prompt_mojibake: false
     loader:
       batch_size: 1
       num_workers: 0
@@ -67,4 +69,18 @@ training:
   epochs: 20
   mixed_precision: true
   grad_clip_norm: 1.0
+  log_interval: 50
   num_saved_val_examples: 8
+
+wandb:
+  enabled: false
+  api_key: null
+  project: tensor-compression
+  entity: null
+  group: tensor-editor
+  tags:
+    - tensor-editor
+    - latent-editor
+    - 2d
+  mode: offline
+  log_model: false
