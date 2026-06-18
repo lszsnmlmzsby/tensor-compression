@@ -76,17 +76,79 @@ class TensorEditJsonlDataset(Dataset):
         }
 
     def _fix_mojibake(self, text: str) -> str:
+        best_text = text
+        best_score = self._prompt_quality_score(text)
         for encoding in ("gbk", "cp936", "latin1"):
             try:
                 repaired = text.encode(encoding).decode("utf-8")
             except UnicodeError:
                 continue
-            if self._count_cjk(repaired) >= self._count_cjk(text) and repaired != text:
-                return repaired
-        return text
+            if repaired == text:
+                continue
+            repaired_score = self._prompt_quality_score(repaired)
+            if repaired_score > best_score + 1.0:
+                best_text = repaired
+                best_score = repaired_score
+        return best_text
 
-    def _count_cjk(self, text: str) -> int:
-        return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    def _prompt_quality_score(self, text: str) -> float:
+        score = 0.0
+        score += 0.1 * sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        score += 2.0 * sum(1 for char in text if char in "，。；：！？、（）")
+        score += 0.5 * sum(1 for char in text if char in "请将对输入输出恢复保持真实干净速度场变量系统误差加减乘除")
+        for token in ("tensor", "Vx", "512x512", "Navier-Stokes"):
+            score += 1.0 * text.count(token)
+        score -= 4.0 * self._count_mojibake_markers(text)
+        return score
+
+    def _count_mojibake_markers(self, text: str) -> int:
+        marker_count = 0
+        for char in text:
+            codepoint = ord(char)
+            if char == "\ufffd":
+                marker_count += 2
+            elif 0xE000 <= codepoint <= 0xF8FF:
+                marker_count += 2
+            elif 0x3100 <= codepoint <= 0x312F:
+                marker_count += 1
+            elif 0x00C0 <= codepoint <= 0x00FF:
+                marker_count += 1
+        mojibake_fragments = (
+            "锟斤拷",
+            "浼",
+            "犳",
+            "鍣",
+            "摼",
+            "璺",
+            "浜",
+            "庢",
+            "爣",
+            "鍑",
+            "寮",
+            "忥",
+            "紝",
+            "璇",
+            "绘",
+            "暟",
+            "娌",
+            "绯",
+            "荤",
+            "粺",
+            "樊",
+            "銆",
+            "傝",
+            "灏",
+            "缃",
+            "戞",
+            "牸",
+            "瑙",
+            "嗕",
+            "鐪",
+            "鐘",
+            "併",
+        )
+        marker_count += sum(text.count(fragment) for fragment in mojibake_fragments)
+        return marker_count
 
     def _read_record(self, index: int) -> dict[str, Any]:
         with self.jsonl_path.open("rb") as handle:
