@@ -1,4 +1,4 @@
-# Tensor Compression 2.0
+﻿# Tensor Compression 2.0
 
 本仓库当前按三个功能块组织：
 
@@ -561,10 +561,8 @@ PDEBench HDF5
 推荐复制模板配置：
 
 ```bash
-cp configs/tensor_llm_adapter_pipeline.yaml configs/local_tensor_llm_adapter_pipeline.yaml
+cp configs/tensor_llm_adapter_pipeline.yaml configs/tensor_llm_adapter_pipeline.yaml
 ```
-
-`configs/local_*.yaml` 已被 `.gitignore` 忽略，适合写服务器真实路径和 checkpoint。
 
 ### 3.2 准备模型与缓存目录
 
@@ -574,7 +572,7 @@ cp configs/tensor_llm_adapter_pipeline.yaml configs/local_tensor_llm_adapter_pip
 
 ```bash
 python scripts/prepare_tensor_llm_assets.py \
-  --config configs/local_tensor_llm_adapter_pipeline.yaml \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
   --create-dirs \
   --download-model
 ```
@@ -718,7 +716,7 @@ python scripts/prepare_tensor_llm_assets.py \
 
 ```bash
 python scripts/build_tensor_readout_qa.py \
-  --config configs/local_tensor_llm_adapter_pipeline.yaml
+  --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
 直接传参：
@@ -771,7 +769,7 @@ python scripts/build_tensor_readout_qa.py \
 
 ```bash
 python scripts/export_tensor_readout_latents.py \
-  --config configs/local_tensor_llm_adapter_pipeline.yaml
+  --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
 命令行参数：
@@ -800,7 +798,7 @@ python scripts/export_tensor_readout_latents.py \
 ```bash
 source /data/wyx/tensor_llm_assets/env_tensor_llm.sh
 CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
-  --config configs/local_tensor_llm_adapter_pipeline.yaml
+  --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
 命令行参数：
