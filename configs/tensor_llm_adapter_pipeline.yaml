@@ -1,0 +1,116 @@
+# Template for the tensor-latent -> soft-prompt -> frozen-LLM pipeline.
+# Copy this file to configs/local_tensor_llm_adapter_pipeline.yaml on the server
+# and fill in machine-specific paths there. configs/local_*.yaml is gitignored.
+
+storage:
+  candidate_roots:
+    - /data
+    - /scratch
+    - /mnt
+    - /home
+  min_free_gb: 100
+  asset_root: /data/wyx/tensor_llm_assets
+  hf_home: /data/wyx/hf_cache
+  output_root: /data/wyx/tensor_llm_outputs
+
+runtime:
+  seed: 42
+  device: auto
+
+data:
+  hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
+  fields:
+    - Vx
+  qa_dir: /data/wyx/tensor_llm_assets/tensor_readout_qa_vx
+  latent_dir: /data/wyx/tensor_llm_assets/tensor_readout_latents_vx_2x
+
+compressor:
+  config: ./configs/compressor_2d_vx_2x.yaml
+  checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/checkpoints/best.pt
+
+model:
+  name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  local_dir: null
+  revision: main
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  allow_patterns:
+    - "*.json"
+    - "*.safetensors"
+    - "*.txt"
+    - "*.model"
+    - "*.py"
+    - "tokenizer.*"
+  ignore_patterns:
+    - "*.h5"
+    - "*.onnx"
+    - "*.msgpack"
+
+qa_generation:
+  sample_indices: all
+  time_indices: all
+  max_states: 21000
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  spatial_stride: 1
+  num_bins: 10
+  quantile_samples_per_state: 4096
+  patch_size: 32
+  point_bin_per_state: 15
+  point_compare_per_state: 10
+  patch_compare_per_state: 10
+  max_quadrant_per_state: 0
+  global_stat_bin_per_state: 0
+  compare_min_bin_distance: 1
+  compare_max_attempts: 32
+  include_oracle: true
+
+latent_export:
+  splits:
+    - train
+    - val
+    - test
+  batch_size: 4
+  device: auto
+  spatial_stride: 1
+  storage_dtype: float16
+  allow_field_mismatch: false
+  overwrite: false
+
+adapter:
+  soft_prompt_tokens: 32
+  adapter_dim: 512
+  adapter_layers: 2
+  adapter_heads: 8
+  dropout: 0.1
+
+llm_training:
+  run_name: tensor_llm_adapter_vx_2x_qwen25_1p5b
+  output_root: /data/wyx/tensor_llm_outputs/runs
+  train_split: train
+  val_split: val
+  test_split: test
+  max_train_records: null
+  max_val_records: null
+  max_test_records: null
+  prefer_record_latent_ref: false
+  device: auto
+  torch_dtype: bfloat16
+  epochs: 3
+  batch_size: 2
+  eval_batch_size: 2
+  eval_choice_batch_size: 16
+  gradient_accumulation_steps: 1
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip_norm: 1.0
+  max_prompt_tokens: 192
+  max_target_tokens: 8
+  append_eos: true
+  eval_baselines:
+    - correct
+    - no_latent
+    - shuffled
+  choice_score: mean
+  log_interval: 20

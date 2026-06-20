@@ -24,6 +24,14 @@ from tensor_compression.downstream.pdebench import (  # noqa: E402
     read_pdebench_sample,
 )
 from tensor_compression.utils import dump_json  # noqa: E402
+from tensor_compression.utils.pipeline_config import (  # noqa: E402
+    first_nested,
+    load_yaml_mapping,
+    require_args,
+    resolve_path_string,
+    set_default,
+    value_to_csv,
+)
 
 
 DEFAULT_FIELDS = ("density", "pressure", "Vx", "Vy")
@@ -65,29 +73,30 @@ def parse_args() -> argparse.Namespace:
             "computed directly from the source tensor."
         )
     )
-    parser.add_argument("--hdf5-path", type=str, required=True, help="PDEBench HDF5 file path.")
+    parser.add_argument("--config", type=str, default=None, help="Optional tensor-LLM pipeline YAML config.")
+    parser.add_argument("--hdf5-path", type=str, default=None, help="PDEBench HDF5 file path.")
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./data/processed/tensor_readout_qa",
+        default=None,
         help="Directory for train.jsonl, val.jsonl, test.jsonl, and metadata.json.",
     )
     parser.add_argument(
         "--fields",
         type=str,
-        default=",".join(DEFAULT_FIELDS),
+        default=None,
         help="Comma-separated HDF5 field keys, e.g. density,pressure,Vx,Vy.",
     )
     parser.add_argument(
         "--sample-indices",
         type=str,
-        default="all",
+        default=None,
         help="Comma-separated sample indices or 'all'.",
     )
     parser.add_argument(
         "--time-indices",
         type=str,
-        default="all",
+        default=None,
         help="Comma-separated time indices or 'all'.",
     )
     parser.add_argument(
@@ -96,26 +105,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on total states after sample/time expansion.",
     )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--test-ratio", type=float, default=0.15)
-    parser.add_argument("--spatial-stride", type=int, default=1)
-    parser.add_argument("--num-bins", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--train-ratio", type=float, default=None)
+    parser.add_argument("--val-ratio", type=float, default=None)
+    parser.add_argument("--test-ratio", type=float, default=None)
+    parser.add_argument("--spatial-stride", type=int, default=None)
+    parser.add_argument("--num-bins", type=int, default=None)
     parser.add_argument(
         "--quantile-samples-per-state",
         type=int,
-        default=4096,
+        default=None,
         help="Maximum random point values sampled per state for field quantile bins.",
     )
-    parser.add_argument("--patch-size", type=int, default=32)
-    parser.add_argument("--point-bin-per-state", type=int, default=15)
-    parser.add_argument("--point-compare-per-state", type=int, default=10)
-    parser.add_argument("--patch-compare-per-state", type=int, default=10)
+    parser.add_argument("--patch-size", type=int, default=None)
+    parser.add_argument("--point-bin-per-state", type=int, default=None)
+    parser.add_argument("--point-compare-per-state", type=int, default=None)
+    parser.add_argument("--patch-compare-per-state", type=int, default=None)
     parser.add_argument(
         "--max-quadrant-per-state",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Number of max-speed quadrant questions per state. This task is deterministic "
             "for a state, so values above 1 are capped to avoid duplicate questions."
@@ -124,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-stat-bin-per-state",
         type=int,
-        default=3,
+        default=None,
         help=(
             "Number of speed-stat bin questions per state. The current statistics are "
             "mean_speed, max_speed, and std_speed, so values above 3 are capped."
@@ -133,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare-min-bin-distance",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Minimum quantile-bin distance between A and B for comparison tasks. "
             "A value of 1 rejects near-ties that fall in the same bin."
@@ -142,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare-max-attempts",
         type=int,
-        default=32,
+        default=None,
         help="Maximum resampling attempts for non-ambiguous comparison questions.",
     )
     parser.add_argument(
@@ -157,10 +166,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-oracle",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Include exact oracle values for debugging and evaluation.",
     )
-    return parser.parse_args()
+    return apply_config_defaults(parser.parse_args())
+
+
+def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    config = load_yaml_mapping(args.config)
+    path_defaults = {
+        "hdf5_path": first_nested(config, ["data.hdf5_path"]),
+        "output_dir": first_nested(config, ["qa_generation.output_dir", "data.qa_dir"]),
+        "latent_root": first_nested(config, ["qa_generation.latent_root", "data.latent_dir"]),
+    }
+    for attr, value in path_defaults.items():
+        if getattr(args, attr, None) is None and value is not None:
+            setattr(args, attr, resolve_path_string(value, PROJECT_ROOT))
+
+    set_default(args, "fields", value_to_csv(first_nested(config, ["data.fields"])), ",".join(DEFAULT_FIELDS))
+    set_default(args, "sample_indices", value_to_csv(first_nested(config, ["qa_generation.sample_indices"])), "all")
+    set_default(args, "time_indices", value_to_csv(first_nested(config, ["qa_generation.time_indices"])), "all")
+    set_default(args, "max_states", first_nested(config, ["qa_generation.max_states"]), None)
+    set_default(args, "seed", first_nested(config, ["qa_generation.seed", "runtime.seed"]), 42)
+    set_default(args, "train_ratio", first_nested(config, ["qa_generation.train_ratio"]), 0.7)
+    set_default(args, "val_ratio", first_nested(config, ["qa_generation.val_ratio"]), 0.15)
+    set_default(args, "test_ratio", first_nested(config, ["qa_generation.test_ratio"]), 0.15)
+    set_default(args, "spatial_stride", first_nested(config, ["qa_generation.spatial_stride"]), 1)
+    set_default(args, "num_bins", first_nested(config, ["qa_generation.num_bins"]), 10)
+    set_default(
+        args,
+        "quantile_samples_per_state",
+        first_nested(config, ["qa_generation.quantile_samples_per_state"]),
+        4096,
+    )
+    set_default(args, "patch_size", first_nested(config, ["qa_generation.patch_size"]), 32)
+    set_default(args, "point_bin_per_state", first_nested(config, ["qa_generation.point_bin_per_state"]), 15)
+    set_default(
+        args,
+        "point_compare_per_state",
+        first_nested(config, ["qa_generation.point_compare_per_state"]),
+        10,
+    )
+    set_default(
+        args,
+        "patch_compare_per_state",
+        first_nested(config, ["qa_generation.patch_compare_per_state"]),
+        10,
+    )
+    set_default(args, "max_quadrant_per_state", first_nested(config, ["qa_generation.max_quadrant_per_state"]), 1)
+    set_default(args, "global_stat_bin_per_state", first_nested(config, ["qa_generation.global_stat_bin_per_state"]), 3)
+    set_default(
+        args,
+        "compare_min_bin_distance",
+        first_nested(config, ["qa_generation.compare_min_bin_distance"]),
+        1,
+    )
+    set_default(args, "compare_max_attempts", first_nested(config, ["qa_generation.compare_max_attempts"]), 32)
+    set_default(args, "include_oracle", first_nested(config, ["qa_generation.include_oracle"]), True)
+    require_args(args, ["hdf5_path", "output_dir"])
+    return args
 
 
 def parse_csv(raw: str | Sequence[str] | None) -> list[str]:

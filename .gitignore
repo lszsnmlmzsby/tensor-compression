@@ -61,6 +61,11 @@ data/processed/*
 data/external/*
 !data/external/.gitkeep
 
+# Local model/cache directories
+models/
+hf_cache/
+tensor_llm_assets/
+
 # Sensitive local overrides
 .env
 .env.*

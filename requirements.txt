@@ -9,3 +9,7 @@ tqdm==4.67.1
 wandb==0.19.11
 Pillow==11.1.0
 h5py==3.12.1
+transformers>=4.45.0
+accelerate>=0.34.0
+safetensors>=0.4.5
+huggingface_hub>=0.24.0
