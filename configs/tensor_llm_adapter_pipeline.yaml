@@ -17,15 +17,15 @@ runtime:
   seed: 42
   device: auto
 
-data:
+data:？
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
     - Vx
   qa_dir: /data/wyx/tensor_llm_assets/tensor_readout_qa_vx
   latent_dir: /data/wyx/tensor_llm_assets/tensor_readout_latents_vx_2x
 
-compressor:
-  config: ./configs/compressor_2d_vx_2x.yaml
+compressor:？
+  config: ./configs/compressor_2d.yaml
   checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/checkpoints/best.pt
 
 model:
