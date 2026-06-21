@@ -24,6 +24,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
+from tensor_compression.integrations import WandbLogger  # noqa: E402
 from tensor_compression.utils import dump_json  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
     first_nested,
@@ -265,6 +266,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument(
+        "--prompt-template",
+        type=str,
+        default=None,
+        choices=("generic", "task_specific"),
+        help="Text prompt template used before the answer target.",
+    )
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
     parser.add_argument("--max-target-tokens", type=int, default=None)
     parser.add_argument("--append-eos", action=argparse.BooleanOptionalAction, default=None)
@@ -282,6 +290,24 @@ def parse_args() -> argparse.Namespace:
         help="Normalize candidate NLL by target-token count or not.",
     )
     parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--wandb-api-key", type=str, default=None)
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        default=None,
+        help="Comma-separated W&B tags.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=None,
+        choices=("online", "offline", "disabled"),
+    )
+    parser.add_argument("--wandb-log-model", action=argparse.BooleanOptionalAction, default=None)
     return apply_config_defaults(parser.parse_args())
 
 
@@ -343,7 +369,13 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "adapter_layers", first_nested(config, ["adapter.adapter_layers"]), 2)
     set_default(args, "adapter_heads", first_nested(config, ["adapter.adapter_heads"]), 8)
     set_default(args, "dropout", first_nested(config, ["adapter.dropout"]), 0.1)
-    set_default(args, "max_prompt_tokens", first_nested(config, ["llm_training.max_prompt_tokens"]), 192)
+    set_default(
+        args,
+        "prompt_template",
+        first_nested(config, ["llm_training.prompt_template", "prompt.template"]),
+        "task_specific",
+    )
+    set_default(args, "max_prompt_tokens", first_nested(config, ["llm_training.max_prompt_tokens"]), 256)
     set_default(args, "max_target_tokens", first_nested(config, ["llm_training.max_target_tokens"]), 8)
     set_default(args, "append_eos", first_nested(config, ["llm_training.append_eos"]), True)
     set_default(
@@ -354,6 +386,14 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(args, "choice_score", first_nested(config, ["llm_training.choice_score"]), "mean")
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
+    set_default(args, "wandb_enabled", first_nested(config, ["wandb.enabled"]), False)
+    set_default(args, "wandb_api_key", first_nested(config, ["wandb.api_key"]), None)
+    set_default(args, "wandb_project", first_nested(config, ["wandb.project"]), "tensor-compression")
+    set_default(args, "wandb_entity", first_nested(config, ["wandb.entity"]), None)
+    set_default(args, "wandb_group", first_nested(config, ["wandb.group"]), "adapter")
+    set_default(args, "wandb_tags", value_to_csv(first_nested(config, ["wandb.tags"])), "adapter,tensor-llm")
+    set_default(args, "wandb_mode", first_nested(config, ["wandb.mode"]), "offline")
+    set_default(args, "wandb_log_model", first_nested(config, ["wandb.log_model"]), False)
     require_args(args, ["qa_dir", "latent_dir", "model_name_or_path"])
     return args
 
@@ -441,15 +481,60 @@ def qa_path(qa_dir: str | Path, split: str) -> Path:
     return path
 
 
-def build_prompt(record: Mapping[str, Any]) -> str:
+def task_specific_instruction(record: Mapping[str, Any]) -> str:
+    task_type = str(record.get("task_type", "")).strip()
+    if task_type == "point_bin":
+        return (
+            "Rule: read the requested field value at the given row and col from the tensor soft tokens. "
+            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high. "
+            "Return exactly one listed choice."
+        )
+    if task_type == "point_compare":
+        return (
+            "Rule: compare the requested field value at point A with point B using the tensor soft tokens. "
+            "Return A if A is greater than or tied with B; otherwise return B. "
+            "Return exactly one listed choice."
+        )
+    if task_type == "patch_compare":
+        return (
+            "Rule: compare the mean requested field value over patch A with patch B using the tensor soft tokens. "
+            "Return A if patch A has greater or tied mean; otherwise return B. "
+            "Return exactly one listed choice."
+        )
+    if task_type == "max_speed_quadrant":
+        return (
+            "Rule: find the grid cell with maximum speed magnitude from the tensor soft tokens. "
+            "Return the quadrant label of that cell. Return exactly one listed choice."
+        )
+    if task_type == "global_stat_bin":
+        return (
+            "Rule: compute the requested global speed statistic from the tensor soft tokens. "
+            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high. "
+            "Return exactly one listed choice."
+        )
+    return "Rule: answer the tensor readout query using the tensor soft tokens. Return exactly one listed choice."
+
+
+def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
     query = str(record.get("query") or record.get("question") or "")
     choices = record.get("choices")
     if not isinstance(choices, Sequence) or isinstance(choices, str):
         choices = []
     choice_text = ", ".join(str(choice) for choice in choices)
+    if prompt_template == "generic":
+        return (
+            "Tensor-state soft tokens are prepended before this text.\n"
+            "Answer the tensor readout query with exactly one choice label.\n\n"
+            f"Query: {query}\n"
+            f"Choices: {choice_text}\n"
+            "Answer:"
+        )
+    if prompt_template != "task_specific":
+        raise ValueError(f"Unsupported prompt template: {prompt_template}")
     return (
-        "Tensor-state soft tokens are prepended before this text.\n"
-        "Answer the tensor readout query with exactly one choice label.\n\n"
+        "Tensor soft tokens before this text encode the tensor state.\n"
+        f"{task_specific_instruction(record)}\n"
+        "Do not answer from coordinate or label priors alone; use the tensor soft tokens for numeric values.\n\n"
         f"Query: {query}\n"
         f"Choices: {choice_text}\n"
         "Answer:"
@@ -463,9 +548,10 @@ def encode_example(
     max_prompt_tokens: int,
     max_target_tokens: int,
     append_eos: bool,
+    prompt_template: str,
 ) -> tuple[list[int], list[int]]:
     prompt_ids = tokenizer(
-        build_prompt(record),
+        build_prompt(record, prompt_template=prompt_template),
         add_special_tokens=True,
         truncation=False,
     )["input_ids"]
@@ -492,6 +578,7 @@ def build_text_tensors(
     max_prompt_tokens: int,
     max_target_tokens: int,
     append_eos: bool,
+    prompt_template: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     encoded = [
         encode_example(
@@ -501,6 +588,7 @@ def build_text_tensors(
             max_prompt_tokens=max_prompt_tokens,
             max_target_tokens=max_target_tokens,
             append_eos=append_eos,
+            prompt_template=prompt_template,
         )
         for record, answer in zip(records, answers)
     ]
@@ -545,6 +633,7 @@ def forward_loss(
     max_prompt_tokens: int,
     max_target_tokens: int,
     append_eos: bool,
+    prompt_template: str,
     soft_prompt_mode: str = "correct",
 ) -> torch.Tensor:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
@@ -554,6 +643,7 @@ def forward_loss(
         max_prompt_tokens=max_prompt_tokens,
         max_target_tokens=max_target_tokens,
         append_eos=append_eos,
+        prompt_template=prompt_template,
     )
     input_ids = input_ids.to(device)
     text_attention_mask = text_attention_mask.to(device)
@@ -592,6 +682,7 @@ def score_candidate_batch(
     max_prompt_tokens: int,
     max_target_tokens: int,
     append_eos: bool,
+    prompt_template: str,
     soft_prompt_mode: str,
     choice_score: str,
 ) -> list[float]:
@@ -602,6 +693,7 @@ def score_candidate_batch(
         max_prompt_tokens=max_prompt_tokens,
         max_target_tokens=max_target_tokens,
         append_eos=append_eos,
+        prompt_template=prompt_template,
     )
     input_ids = input_ids.to(device)
     text_attention_mask = text_attention_mask.to(device)
@@ -680,6 +772,7 @@ def collect_candidate_scores(
             max_prompt_tokens=int(args.max_prompt_tokens),
             max_target_tokens=int(args.max_target_tokens),
             append_eos=bool(args.append_eos),
+            prompt_template=str(args.prompt_template),
             soft_prompt_mode=mode,
             choice_score=str(args.choice_score),
         )
@@ -783,12 +876,109 @@ def save_adapter_checkpoint(
 ) -> None:
     payload = {
         "adapter_state_dict": adapter.state_dict(),
-        "args": vars(args),
+        "args": redacted_args(args),
         "latent_shape_chw": list(int(dim) for dim in latent_shape),
         "llm_hidden_size": int(llm_hidden_size),
         "metrics": dict(metrics or {}),
     }
     torch.save(payload, path)
+
+
+def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
+    payload = dict(vars(args))
+    if payload.get("wandb_api_key"):
+        payload["wandb_api_key"] = "***REDACTED***"
+    return payload
+
+
+def flatten_numeric_metrics(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
+    flattened: dict[str, float] = {}
+    for key, value in metrics.items():
+        metric_key = f"{prefix}/{key}"
+        if isinstance(value, Mapping):
+            flattened.update(flatten_numeric_metrics(metric_key, value))
+        elif isinstance(value, bool):
+            continue
+        elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+            flattened[metric_key] = float(value)
+    return flattened
+
+
+def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[str, float]) -> None:
+    correct = metrics.get("correct")
+    if not isinstance(correct, Mapping) or not isinstance(correct.get("accuracy"), (int, float)):
+        return
+    correct_accuracy = float(correct["accuracy"])
+    for baseline in ("no_latent", "shuffled", "random"):
+        baseline_metrics = metrics.get(baseline)
+        if isinstance(baseline_metrics, Mapping) and isinstance(baseline_metrics.get("accuracy"), (int, float)):
+            payload[f"{prefix}/correct_minus_{baseline}_accuracy"] = correct_accuracy - float(
+                baseline_metrics["accuracy"]
+            )
+
+
+def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "experiment": {"name": str(args.run_name)},
+        "data": {
+            "qa_dir": str(args.qa_dir),
+            "latent_dir": str(args.latent_dir),
+            "train_split": str(args.train_split),
+            "val_split": str(args.val_split),
+            "test_split": str(args.test_split),
+            "max_train_records": args.max_train_records,
+            "max_val_records": args.max_val_records,
+            "max_test_records": args.max_test_records,
+        },
+        "model": {
+            "name_or_path": str(args.model_name_or_path),
+            "torch_dtype": str(args.torch_dtype),
+            "trust_remote_code": bool(args.trust_remote_code),
+        },
+        "adapter": {
+            "soft_prompt_tokens": int(args.soft_prompt_tokens),
+            "adapter_dim": int(args.adapter_dim),
+            "adapter_layers": int(args.adapter_layers),
+            "adapter_heads": int(args.adapter_heads),
+            "dropout": float(args.dropout),
+        },
+        "llm_training": {
+            "prompt_template": str(args.prompt_template),
+            "epochs": int(args.epochs),
+            "batch_size": int(args.batch_size),
+            "eval_batch_size": int(args.eval_batch_size),
+            "eval_choice_batch_size": int(args.eval_choice_batch_size),
+            "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "grad_clip_norm": float(args.grad_clip_norm),
+            "max_prompt_tokens": int(args.max_prompt_tokens),
+            "max_target_tokens": int(args.max_target_tokens),
+            "append_eos": bool(args.append_eos),
+            "eval_baselines": parse_csv(args.eval_baselines),
+            "choice_score": str(args.choice_score),
+            "log_interval": int(args.log_interval),
+        },
+        "run_summary": dict(summary or {}),
+        "wandb": {
+            "enabled": bool(args.wandb_enabled),
+            "api_key": args.wandb_api_key,
+            "project": str(args.wandb_project),
+            "entity": args.wandb_entity,
+            "group": args.wandb_group,
+            "tags": parse_csv(args.wandb_tags),
+            "mode": str(args.wandb_mode),
+            "log_model": bool(args.wandb_log_model),
+        },
+    }
+
+
+def log_adapter_artifact(wandb_logger: WandbLogger, path: Path, name: str) -> None:
+    if wandb_logger.run is None or wandb_logger._wandb is None or not path.exists():
+        return
+    artifact = wandb_logger._wandb.Artifact(name=name, type="adapter-checkpoint")
+    artifact.add_file(str(path))
+    wandb_logger.run.log_artifact(artifact)
 
 
 def main() -> None:
@@ -797,7 +987,7 @@ def main() -> None:
     seed_everything(int(args.seed))
     device = resolve_device(args.device)
     run_dir = build_run_dir(args.output_root, args.run_name)
-    dump_json(run_dir / "args.json", vars(args))
+    dump_json(run_dir / "args.json", redacted_args(args))
 
     tokenizer, llm, model_dtype = load_tokenizer_and_llm(args, device)
     llm_hidden_size = int(llm.get_input_embeddings().embedding_dim)
@@ -863,100 +1053,131 @@ def main() -> None:
     }
     dump_json(run_dir / "run_summary.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    wandb_logger = WandbLogger(config=build_wandb_config(args, summary), run_dir=run_dir)
 
     best_val_accuracy = -math.inf
     history: dict[str, Any] = {}
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     global_step = 0
+    try:
+        for epoch in range(1, int(args.epochs) + 1):
+            adapter.train()
+            running_loss = 0.0
+            optimizer.zero_grad(set_to_none=True)
+            progress = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]")
+            for step, batch in enumerate(progress, start=1):
+                answers = [str(record["answer"]) for record in batch["records"]]
+                loss = forward_loss(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    records=batch["records"],
+                    answers=answers,
+                    latent_map=batch["latent_map"],
+                    device=device,
+                    max_prompt_tokens=int(args.max_prompt_tokens),
+                    max_target_tokens=int(args.max_target_tokens),
+                    append_eos=bool(args.append_eos),
+                    prompt_template=str(args.prompt_template),
+                )
+                (loss / accumulation_steps).backward()
+                current_loss = float(loss.detach().cpu().item())
+                running_loss += current_loss
 
-    for epoch in range(1, int(args.epochs) + 1):
-        adapter.train()
-        running_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
-        progress = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]")
-        for step, batch in enumerate(progress, start=1):
-            answers = [str(record["answer"]) for record in batch["records"]]
-            loss = forward_loss(
+                if step % accumulation_steps == 0 or step == len(train_loader):
+                    if float(args.grad_clip_norm) > 0:
+                        torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(args.grad_clip_norm))
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                average_loss = running_loss / step
+                progress.set_postfix(loss=f"{average_loss:.4f}")
+                if step % max(1, int(args.log_interval)) == 0:
+                    step_payload = {
+                        "epoch": epoch,
+                        "step": step,
+                        "global_step": global_step,
+                        "train_loss": average_loss,
+                    }
+                    history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
+                    dump_json(run_dir / "metrics_latest.json", history)
+                    wandb_logger.log(
+                        {
+                            "train_step/loss": average_loss,
+                            "train_step/current_loss": current_loss,
+                            "train_step/epoch": float(epoch),
+                            "train_step/epoch_step": float(step),
+                            "train_step/lr": float(optimizer.param_groups[0]["lr"]),
+                        },
+                        step=global_step,
+                    )
+
+            train_loss = running_loss / max(1, len(train_loader))
+            val_metrics = evaluate_choice_accuracy(
                 llm=llm,
                 adapter=adapter,
                 tokenizer=tokenizer,
-                records=batch["records"],
-                answers=answers,
-                latent_map=batch["latent_map"],
+                dataset=val_dataset,
                 device=device,
-                max_prompt_tokens=int(args.max_prompt_tokens),
-                max_target_tokens=int(args.max_target_tokens),
-                append_eos=bool(args.append_eos),
+                args=args,
+                baseline_modes=baseline_modes,
             )
-            (loss / accumulation_steps).backward()
-            running_loss += float(loss.detach().cpu().item())
-
-            if step % accumulation_steps == 0 or step == len(train_loader):
-                if float(args.grad_clip_norm) > 0:
-                    torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(args.grad_clip_norm))
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-            average_loss = running_loss / step
-            progress.set_postfix(loss=f"{average_loss:.4f}")
-            if step % max(1, int(args.log_interval)) == 0:
-                history[f"epoch_{epoch:04d}_step_{step:06d}"] = {
-                    "epoch": epoch,
-                    "step": step,
-                    "global_step": global_step,
-                    "train_loss": average_loss,
-                }
-                dump_json(run_dir / "metrics_latest.json", history)
-
-        train_loss = running_loss / max(1, len(train_loader))
-        val_metrics = evaluate_choice_accuracy(
-            llm=llm,
-            adapter=adapter,
-            tokenizer=tokenizer,
-            dataset=val_dataset,
-            device=device,
-            args=args,
-            baseline_modes=baseline_modes,
-        )
-        epoch_payload = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val": val_metrics,
-        }
-        history[f"epoch_{epoch:04d}"] = epoch_payload
-        dump_json(run_dir / "metrics_latest.json", history)
-        save_adapter_checkpoint(
-            run_dir / "adapter_last.pt",
-            adapter=adapter,
-            args=args,
-            latent_shape=latent_shape,
-            llm_hidden_size=llm_hidden_size,
-            metrics=epoch_payload,
-        )
-        val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
-        if val_accuracy > best_val_accuracy:
-            best_val_accuracy = val_accuracy
+            epoch_payload = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val": val_metrics,
+            }
+            history[f"epoch_{epoch:04d}"] = epoch_payload
+            dump_json(run_dir / "metrics_latest.json", history)
             save_adapter_checkpoint(
-                run_dir / "adapter_best.pt",
+                run_dir / "adapter_last.pt",
                 adapter=adapter,
                 args=args,
                 latent_shape=latent_shape,
                 llm_hidden_size=llm_hidden_size,
                 metrics=epoch_payload,
             )
+            val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
+            wandb_payload = {
+                "epoch": float(epoch),
+                "train/loss": float(train_loss),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "best_val/correct_accuracy": float(max(best_val_accuracy, val_accuracy)),
+            }
+            wandb_payload.update(flatten_numeric_metrics("val", val_metrics))
+            add_accuracy_deltas("val", val_metrics, wandb_payload)
+            wandb_logger.log(wandb_payload, step=global_step)
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                save_adapter_checkpoint(
+                    run_dir / "adapter_best.pt",
+                    adapter=adapter,
+                    args=args,
+                    latent_shape=latent_shape,
+                    llm_hidden_size=llm_hidden_size,
+                    metrics=epoch_payload,
+                )
 
-    test_metrics = evaluate_choice_accuracy(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        dataset=test_dataset,
-        device=device,
-        args=args,
-        baseline_modes=baseline_modes,
-    )
-    dump_json(run_dir / "test_metrics.json", test_metrics)
-    print(json.dumps({"run_dir": str(run_dir), "test": test_metrics}, indent=2, ensure_ascii=False))
+        test_metrics = evaluate_choice_accuracy(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            dataset=test_dataset,
+            device=device,
+            args=args,
+            baseline_modes=baseline_modes,
+        )
+        dump_json(run_dir / "test_metrics.json", test_metrics)
+        test_payload = flatten_numeric_metrics("test", test_metrics)
+        add_accuracy_deltas("test", test_metrics, test_payload)
+        wandb_logger.log(test_payload, step=global_step)
+        if bool(args.wandb_log_model):
+            log_adapter_artifact(wandb_logger, run_dir / "adapter_best.pt", f"{args.run_name}-best")
+            log_adapter_artifact(wandb_logger, run_dir / "adapter_last.pt", f"{args.run_name}-last")
+        print(json.dumps({"run_dir": str(run_dir), "test": test_metrics}, indent=2, ensure_ascii=False))
+    finally:
+        wandb_logger.finish()
 
 
 if __name__ == "__main__":

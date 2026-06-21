@@ -703,12 +703,28 @@ python scripts/prepare_tensor_llm_assets.py \
 | `lr` | adapter 学习率。 | 正数 | - |
 | `weight_decay` | 权重衰减。 | 非负数 | - |
 | `grad_clip_norm` | 梯度裁剪范数。 | 非负数 | `0`：不裁剪。 |
+| `prompt_template` | Adapter 训练用文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按 `task_type` 写明读数/比较/bin 规则；`generic`：旧版通用提示。 |
 | `max_prompt_tokens` | 文本 prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `max_target_tokens` | 答案最大 token 数。 | 正整数 | - |
 | `append_eos` | target 后是否追加 EOS。 | `true`、`false` | - |
 | `eval_baselines` | 评估 baseline 列表。 | `correct`、`no_latent`、`shuffled`、`random` | `correct`：正确 latent；`no_latent`：零 soft prompt；`shuffled`：错配 latent；`random`：随机 latent。 |
 | `choice_score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 数平均；`sum`：总 NLL。 |
 | `log_interval` | 训练日志间隔。 | 正整数 | - |
+
+#### `wandb`
+
+Adapter 训练脚本也支持 W&B。默认 `enabled: false`；服务器上建议先确认 `WANDB_API_KEY` 环境变量或在 offline 模式试跑。
+
+| 参数 | 说明 | 可选值 | 可选值说明 |
+|---|---|---|---|
+| `enabled` | 是否启用 W&B。 | `true`、`false` | `false`：只写本地 JSON 指标。 |
+| `api_key` | W&B API key。 | 字符串、`null` | `null`：从 `WANDB_API_KEY` 读取。 |
+| `project` | W&B project 名称。 | 字符串 | - |
+| `entity` | W&B entity/team。 | 字符串、`null` | `null`：使用账号默认 entity。 |
+| `group` | W&B run group。 | 字符串、`null` | 用于把同一组实验聚合。 |
+| `tags` | W&B tags。 | 字符串列表 | - |
+| `mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：实时上传；`offline`：本地缓存；`disabled`：禁用。 |
+| `log_model` | 是否上传 adapter checkpoint artifact。 | `true`、`false` | 大文件或频繁试验建议 `false`。 |
 
 ### 3.4 生成 Tensor Readout QA
 
@@ -837,12 +853,21 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--adapter-layers` | adapter 层数。 | 正整数 | - |
 | `--adapter-heads` | adapter heads。 | 正整数 | - |
 | `--dropout` | adapter dropout。 | 0 到 1 | - |
+| `--prompt-template` | 文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按任务写规则；`generic`：旧版通用提示。 |
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `--max-target-tokens` | target 最大 token 数。 | 正整数 | - |
 | `--append-eos` / `--no-append-eos` | target 后是否追加 EOS。 | 布尔开关 | - |
 | `--eval-baselines` | 评估 baseline 列表。 | 逗号分隔字符串 | 可包含 `correct,no_latent,shuffled,random`。 |
 | `--choice-score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 平均；`sum`：累加。 |
 | `--log-interval` | 训练日志间隔。 | 正整数 | - |
+| `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | - |
+| `--wandb-api-key` | W&B API key。 | 字符串、`null` | 不建议写进命令历史；优先用环境变量。 |
+| `--wandb-project` | W&B project 名称。 | 字符串 | - |
+| `--wandb-entity` | W&B entity/team。 | 字符串、`null` | - |
+| `--wandb-group` | W&B run group。 | 字符串、`null` | - |
+| `--wandb-tags` | W&B tags。 | 逗号分隔字符串 | 例如 `adapter,tensor-llm,vx`。 |
+| `--wandb-mode` | W&B 模式。 | `online`、`offline`、`disabled` | - |
+| `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 adapter checkpoint artifact。 | 布尔开关 | - |
 
 ### 3.7 模型选择建议
 

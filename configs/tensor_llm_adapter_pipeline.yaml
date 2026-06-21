@@ -105,7 +105,8 @@ llm_training:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
-  max_prompt_tokens: 192
+  prompt_template: task_specific
+  max_prompt_tokens: 256
   max_target_tokens: 8
   append_eos: true
   eval_baselines:
@@ -114,3 +115,16 @@ llm_training:
     - shuffled
   choice_score: mean
   log_interval: 20
+
+wandb:
+  enabled: false
+  api_key: null
+  project: tensor-compression
+  entity: null
+  group: adapter
+  tags:
+    - adapter
+    - tensor-llm
+    - soft-prompt
+  mode: offline
+  log_model: false
