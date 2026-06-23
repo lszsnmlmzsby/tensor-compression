@@ -869,7 +869,53 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--wandb-mode` | W&B 模式。 | `online`、`offline`、`disabled` | - |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 adapter checkpoint artifact。 | 布尔开关 | - |
 
-### 3.7 模型选择建议
+### 3.7 Adapter 过拟合 Sanity Check
+
+这个检查用于回答一个基础问题：当前 adapter+LLM 接口是否至少能在很小的数据集上学会依赖 tensor latent。它把同一个 split 的前 N 条记录同时作为 train/val/test，因此不是正式泛化评估。
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --records 2048 \
+  --epochs 5 \
+  --run-name tensor_llm_adapter_overfit_vx
+```
+
+需要透传主训练脚本参数时，直接追加即可：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --records 2048 \
+  --epochs 5 \
+  --soft-prompt-tokens 256 \
+  --adapter-layers 4 \
+  --batch-size 16
+```
+
+命令行参数：
+
+| 参数 | 说明 | 可选值 | 可选值说明 |
+|---|---|---|---|
+| `--config` | Adapter pipeline 配置路径。 | 路径 | 默认 `configs/tensor_llm_adapter_pipeline.yaml`。 |
+| `--source-split` | 用作 train/val/test 的原始 split。 | split 名 | 默认 `train`。 |
+| `--records` | 取前 N 条记录做过拟合检查。 | 正整数 | 建议先用 `1024` 或 `2048`。 |
+| `--epochs` | 过拟合训练轮数。 | 正整数 | 建议 `5` 起步。 |
+| `--run-name` | 输出 run 名称。 | 字符串 | 建议包含 `overfit`。 |
+| `--eval-baselines` | baseline 列表。 | 逗号分隔字符串 | 默认 `correct,no_latent,shuffled`。 |
+| `--dry-run` | 只打印实际调用命令，不执行。 | 开关 | 用于检查透传参数是否正确。 |
+
+结果解读：
+
+| 现象 | 说明 | 下一步 |
+|---|---|---|
+| `correct` 明显高于 `no_latent/shuffled` | adapter 至少能在小数据上利用正确 latent。 | 再讨论泛化、任务设计和数据规模。 |
+| `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标没有迫使模型使用 latent。 | 优先改结构，例如 latent 2D 位置编码、question-conditioned adapter、ranking/contrastive loss。 |
+| train loss 降但 `correct` 不涨 | 模型主要学到输出格式或标签先验。 | 不应只靠继续加 epoch 解决。 |
+
+### 3.8 模型选择建议
 
 | 阶段 | 模型 | 说明 |
 |---|---|---|
@@ -879,7 +925,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 
 当前 QA 是英文 DSL，第一阶段不强依赖中文能力；后续如果要中文提问，优先选 Qwen 系列。
 
-### 3.8 评估逻辑
+### 3.9 评估逻辑
 
 训练脚本默认做 choice likelihood 评估，而不是只看 loss。
 
