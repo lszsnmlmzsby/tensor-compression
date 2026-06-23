@@ -915,7 +915,39 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 | `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标没有迫使模型使用 latent。 | 优先改结构，例如 latent 2D 位置编码、question-conditioned adapter、ranking/contrastive loss。 |
 | train loss 降但 `correct` 不涨 | 模型主要学到输出格式或标签先验。 | 不应只靠继续加 epoch 解决。 |
 
-### 3.8 模型选择建议
+### 3.8 配置模型对话 Smoke Test
+
+`tests/chat_with_config_model.py` 会读取 `configs/tensor_llm_adapter_pipeline.yaml` 中的 `model.local_dir` 或 `model.name_or_path`，并使用同一份配置里的 `storage.hf_home`、`model.torch_dtype`、`model.trust_remote_code` 加载模型。这个脚本是手动检查下载模型是否能正常加载和生成文本，不属于自动单元测试。
+
+单轮对话：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --prompt "用一句话解释什么是 soft prompt。"
+```
+
+交互式对话：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+常用参数：
+
+| 参数 | 说明 | 可选值 | 可选值说明 |
+|---|---|---|---|
+| `--config` | Adapter pipeline 配置路径。 | 路径 | 默认 `configs/tensor_llm_adapter_pipeline.yaml`。 |
+| `--prompt` | 单轮用户输入。 | 字符串、`null` | 不传则进入交互式模式。 |
+| `--system` | system prompt。 | 字符串 | 默认 `You are a helpful assistant.` |
+| `--device` | 推理设备。 | `auto`、`cpu`、`cuda`、`cuda:N` | 不传则读 `runtime.device`。 |
+| `--max-new-tokens` | 最大生成 token 数。 | 正整数 | 默认 128。 |
+| `--temperature` | 采样温度。 | 正数 | 越低越确定。 |
+| `--top-p` | nucleus sampling 阈值。 | 0 到 1 | - |
+| `--do-sample` / `--no-do-sample` | 是否采样生成。 | 布尔开关 | `--no-do-sample`：贪心/确定性生成。 |
+
+### 3.9 模型选择建议
 
 | 阶段 | 模型 | 说明 |
 |---|---|---|
@@ -925,7 +957,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 
 当前 QA 是英文 DSL，第一阶段不强依赖中文能力；后续如果要中文提问，优先选 Qwen 系列。
 
-### 3.9 评估逻辑
+### 3.10 评估逻辑
 
 训练脚本默认做 choice likelihood 评估，而不是只看 loss。
 
