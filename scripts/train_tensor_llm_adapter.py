@@ -92,10 +92,32 @@ class TensorSoftPromptAdapter(nn.Module):
         adapter_layers: int,
         adapter_heads: int,
         dropout: float,
+        latent_pos_encoding: str,
+        question_conditioning: bool,
+        question_condition_gate_init: float,
     ) -> None:
         super().__init__()
         self.soft_prompt_tokens = int(soft_prompt_tokens)
+        self.latent_pos_encoding = str(latent_pos_encoding)
+        self.question_conditioning = bool(question_conditioning)
         self.input_projection = nn.Linear(int(latent_channels), int(adapter_dim))
+        if self.latent_pos_encoding == "grid":
+            self.position_projection = nn.Linear(2, int(adapter_dim))
+        elif self.latent_pos_encoding == "none":
+            self.position_projection = None
+        else:
+            raise ValueError(f"Unsupported latent_pos_encoding: {latent_pos_encoding}")
+        if self.question_conditioning:
+            self.question_projection = nn.Sequential(
+                nn.LayerNorm(int(llm_hidden_size)),
+                nn.Linear(int(llm_hidden_size), int(adapter_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_dim), int(adapter_dim)),
+            )
+            self.question_gate = nn.Parameter(torch.tensor(float(question_condition_gate_init)))
+        else:
+            self.question_projection = None
+            self.register_parameter("question_gate", None)
         self.query_tokens = nn.Parameter(torch.randn(1, self.soft_prompt_tokens, int(adapter_dim)) * 0.02)
         self.blocks = nn.ModuleList(
             [
@@ -110,16 +132,69 @@ class TensorSoftPromptAdapter(nn.Module):
         self.output_norm = nn.LayerNorm(int(adapter_dim))
         self.output_projection = nn.Linear(int(adapter_dim), int(llm_hidden_size))
 
-    def forward(self, latent_map: torch.Tensor) -> torch.Tensor:
+    def _grid_position_tokens(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        rows = torch.linspace(-1.0, 1.0, int(height), device=device, dtype=dtype)
+        cols = torch.linspace(-1.0, 1.0, int(width), device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(rows, cols, indexing="ij")
+        coords = torch.stack([yy, xx], dim=-1).reshape(1, int(height) * int(width), 2)
+        coords = coords.expand(int(batch_size), -1, -1)
+        return self.position_projection(coords)
+
+    def _question_condition(
+        self,
+        question_embeds: torch.Tensor | None,
+        question_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not self.question_conditioning or question_embeds is None or self.question_projection is None:
+            return None
+        if question_mask is None:
+            question_mask = torch.ones(
+                question_embeds.shape[:2],
+                dtype=torch.bool,
+                device=question_embeds.device,
+            )
+        mask = question_mask.to(device=question_embeds.device, dtype=question_embeds.dtype).unsqueeze(-1)
+        pooled = (question_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        # One-way valve: text can condition query slots, but gradients and updates do not flow into text embeddings.
+        pooled = pooled.detach().to(dtype=self.input_projection.weight.dtype)
+        return self.question_projection(pooled)
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor | None = None,
+        question_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if latent_map.ndim == 4:
+            batch_size, _channels, height, width = latent_map.shape
             latent_tokens = latent_map.flatten(2).transpose(1, 2).contiguous()
         elif latent_map.ndim == 3:
+            batch_size = latent_map.shape[0]
+            height = width = None
             latent_tokens = latent_map
         else:
             raise ValueError(f"Expected latent_map [B,C,H,W] or latent_tokens [B,N,C], got {latent_map.shape}.")
         latent_tokens = latent_tokens.to(dtype=self.input_projection.weight.dtype)
         latents = self.input_projection(latent_tokens)
-        queries = self.query_tokens.expand(latent_map.shape[0], -1, -1)
+        if self.position_projection is not None and height is not None and width is not None:
+            latents = latents + self._grid_position_tokens(
+                batch_size=int(batch_size),
+                height=int(height),
+                width=int(width),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+        queries = self.query_tokens.expand(int(batch_size), -1, -1)
+        question_condition = self._question_condition(question_embeds, question_mask)
+        if question_condition is not None:
+            queries = queries + self.question_gate.to(dtype=queries.dtype) * question_condition.unsqueeze(1)
         for block in self.blocks:
             queries = block(queries, latents)
         return self.output_projection(self.output_norm(queries))
@@ -267,6 +342,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument(
+        "--latent-pos-encoding",
+        type=str,
+        default=None,
+        choices=("none", "grid"),
+        help="Positional encoding added to latent tokens before adapter cross-attention.",
+    )
+    parser.add_argument("--question-conditioning", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--question-condition-gate-init", type=float, default=None)
+    parser.add_argument(
         "--prompt-template",
         type=str,
         default=None,
@@ -369,6 +453,14 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "adapter_layers", first_nested(config, ["adapter.adapter_layers"]), 2)
     set_default(args, "adapter_heads", first_nested(config, ["adapter.adapter_heads"]), 8)
     set_default(args, "dropout", first_nested(config, ["adapter.dropout"]), 0.1)
+    set_default(args, "latent_pos_encoding", first_nested(config, ["adapter.latent_pos_encoding"]), "grid")
+    set_default(args, "question_conditioning", first_nested(config, ["adapter.question_conditioning"]), True)
+    set_default(
+        args,
+        "question_condition_gate_init",
+        first_nested(config, ["adapter.question_condition_gate_init"]),
+        1.0,
+    )
     set_default(
         args,
         "prompt_template",
@@ -610,15 +702,25 @@ def adapter_soft_embeds(
     adapter: TensorSoftPromptAdapter,
     latent_map: torch.Tensor,
     text_embeds: torch.Tensor,
+    question_embeds: torch.Tensor | None,
+    question_mask: torch.Tensor | None,
     mode: str,
 ) -> torch.Tensor:
     if mode == "correct":
-        return adapter(latent_map).to(dtype=text_embeds.dtype)
+        return adapter(
+            latent_map,
+            question_embeds=question_embeds,
+            question_mask=question_mask,
+        ).to(dtype=text_embeds.dtype)
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
         return text_embeds.new_zeros((batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1]))
     if mode in {"shuffled", "random"}:
-        return adapter(latent_map).to(dtype=text_embeds.dtype)
+        return adapter(
+            latent_map,
+            question_embeds=question_embeds,
+            question_mask=question_mask,
+        ).to(dtype=text_embeds.dtype)
     raise ValueError(f"Unsupported soft prompt mode: {mode}")
 
 
@@ -651,7 +753,15 @@ def forward_loss(
     latent_map = latent_map.to(device)
 
     text_embeds = llm.get_input_embeddings()(input_ids)
-    soft_embeds = adapter_soft_embeds(adapter, latent_map, text_embeds, soft_prompt_mode)
+    prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
+    soft_embeds = adapter_soft_embeds(
+        adapter,
+        latent_map,
+        text_embeds,
+        question_embeds=text_embeds,
+        question_mask=prompt_mask,
+        mode=soft_prompt_mode,
+    )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_embeds.shape[1]),
@@ -701,7 +811,15 @@ def score_candidate_batch(
     latent_map = latent_map.to(device)
 
     text_embeds = llm.get_input_embeddings()(input_ids)
-    soft_embeds = adapter_soft_embeds(adapter, latent_map, text_embeds, soft_prompt_mode)
+    prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
+    soft_embeds = adapter_soft_embeds(
+        adapter,
+        latent_map,
+        text_embeds,
+        question_embeds=text_embeds,
+        question_mask=prompt_mask,
+        mode=soft_prompt_mode,
+    )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_embeds.shape[1]),
@@ -941,6 +1059,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "adapter_layers": int(args.adapter_layers),
             "adapter_heads": int(args.adapter_heads),
             "dropout": float(args.dropout),
+            "latent_pos_encoding": str(args.latent_pos_encoding),
+            "question_conditioning": bool(args.question_conditioning),
+            "question_condition_gate_init": float(args.question_condition_gate_init),
         },
         "llm_training": {
             "prompt_template": str(args.prompt_template),
@@ -1022,6 +1143,9 @@ def main() -> None:
         adapter_layers=int(args.adapter_layers),
         adapter_heads=int(args.adapter_heads),
         dropout=float(args.dropout),
+        latent_pos_encoding=str(args.latent_pos_encoding),
+        question_conditioning=bool(args.question_conditioning),
+        question_condition_gate_init=float(args.question_condition_gate_init),
     ).to(device)
 
     train_loader = DataLoader(
@@ -1048,6 +1172,11 @@ def main() -> None:
         "train_records": len(train_dataset),
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
+        "soft_prompt_tokens": int(args.soft_prompt_tokens),
+        "adapter_layers": int(args.adapter_layers),
+        "latent_pos_encoding": str(args.latent_pos_encoding),
+        "question_conditioning": bool(args.question_conditioning),
+        "question_condition_gate_init": float(args.question_condition_gate_init),
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }

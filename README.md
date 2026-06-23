@@ -679,6 +679,11 @@ python scripts/prepare_tensor_llm_assets.py \
 | `adapter_layers` | cross-attention block 数。 | 正整数 | - |
 | `adapter_heads` | adapter attention heads。 | 正整数 | - |
 | `dropout` | adapter dropout。 | 0 到 1 | - |
+| `latent_pos_encoding` | 是否给 latent token 加二维位置编码。 | `grid`、`none` | `grid`：根据 latent 的 H、W 坐标加入可学习投影；`none`：不加入位置。 |
+| `question_conditioning` | 是否让文本问题条件化 adapter query token。 | `true`、`false` | `true`：同一个 tensor 面对不同问题会产生不同 soft prompt；`false`：同一个 tensor 的 soft prompt 与问题无关。 |
+| `question_condition_gate_init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭，但训练中仍可学习。 |
+
+当前 adapter 的信息流是单向的：文本 prompt 的冻结 embedding 只用于生成 query 条件，latent token 仍然是 cross-attention 的唯一 key/value 来源，并且文本 embedding 在进入条件分支前会 detach。因此文本可以告诉 adapter “应该读哪里/读什么”，但训练梯度不会更新 LLM，也不会把 tensor latent 和文本 embedding 混成同一个可写空间。
 
 #### `llm_training`
 
@@ -853,6 +858,9 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--adapter-layers` | adapter 层数。 | 正整数 | - |
 | `--adapter-heads` | adapter heads。 | 正整数 | - |
 | `--dropout` | adapter dropout。 | 0 到 1 | - |
+| `--latent-pos-encoding` | latent 位置编码方式。 | `grid`、`none` | `grid`：给二维 latent token 加坐标投影；`none`：不加位置。 |
+| `--question-conditioning` / `--no-question-conditioning` | 是否用文本问题条件化 adapter query。 | 布尔开关 | 开启后同一 tensor 的 soft prompt 会随问题变化。 |
+| `--question-condition-gate-init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭。 |
 | `--prompt-template` | 文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按任务写规则；`generic`：旧版通用提示。 |
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `--max-target-tokens` | target 最大 token 数。 | 正整数 | - |
@@ -912,7 +920,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 | 现象 | 说明 | 下一步 |
 |---|---|---|
 | `correct` 明显高于 `no_latent/shuffled` | adapter 至少能在小数据上利用正确 latent。 | 再讨论泛化、任务设计和数据规模。 |
-| `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标没有迫使模型使用 latent。 | 优先改结构，例如 latent 2D 位置编码、question-conditioned adapter、ranking/contrastive loss。 |
+| `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标仍没有迫使模型使用 latent。 | 新结构已包含 latent 2D 位置编码和 question-conditioned adapter；若仍失败，优先考虑 ranking/contrastive loss 或任务重构。 |
 | train loss 降但 `correct` 不涨 | 模型主要学到输出格式或标签先验。 | 不应只靠继续加 epoch 解决。 |
 
 ### 3.8 配置模型对话 Smoke Test

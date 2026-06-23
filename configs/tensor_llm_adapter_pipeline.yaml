@@ -84,6 +84,9 @@ adapter:
   adapter_layers: 2
   adapter_heads: 8
   dropout: 0.1
+  latent_pos_encoding: grid
+  question_conditioning: true
+  question_condition_gate_init: 1.0
 
 llm_training:
   run_name: tensor_llm_adapter_vx_2x_qwen25_1p5b
