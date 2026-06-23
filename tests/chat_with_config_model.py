@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -94,21 +95,28 @@ def apply_hf_environment(config: dict[str, Any]) -> tuple[str | None, str | None
     return resolved_hf_home, resolved_cache_dir
 
 
-def build_inputs(tokenizer, prompt: str, system_prompt: str, device: torch.device) -> torch.Tensor:
+def build_model_inputs(tokenizer, prompt: str, system_prompt: str, device: torch.device) -> dict[str, torch.Tensor]:
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        input_ids = tokenizer.apply_chat_template(
+        encoded = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             return_tensors="pt",
         )
     else:
         text = f"System: {system_prompt}\nUser: {prompt}\nAssistant:"
-        input_ids = tokenizer(text, return_tensors="pt")["input_ids"]
-    return input_ids.to(device)
+        encoded = tokenizer(text, return_tensors="pt")
+    if isinstance(encoded, torch.Tensor):
+        return {"input_ids": encoded.to(device)}
+    if isinstance(encoded, Mapping):
+        return {key: value.to(device) for key, value in encoded.items() if isinstance(value, torch.Tensor)}
+    input_ids = torch.as_tensor(encoded, dtype=torch.long, device=device)
+    if input_ids.ndim == 1:
+        input_ids = input_ids.unsqueeze(0)
+    return {"input_ids": input_ids}
 
 
 @torch.no_grad()
@@ -123,9 +131,9 @@ def generate_reply(
     top_p: float,
     do_sample: bool,
 ) -> str:
-    input_ids = build_inputs(tokenizer, prompt=prompt, system_prompt=system_prompt, device=device)
+    model_inputs = build_model_inputs(tokenizer, prompt=prompt, system_prompt=system_prompt, device=device)
     outputs = model.generate(
-        input_ids=input_ids,
+        **model_inputs,
         max_new_tokens=int(max_new_tokens),
         do_sample=bool(do_sample),
         temperature=float(temperature),
@@ -133,7 +141,8 @@ def generate_reply(
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
-    new_tokens = outputs[0, input_ids.shape[1] :]
+    prompt_length = int(model_inputs["input_ids"].shape[1])
+    new_tokens = outputs[0, prompt_length:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
