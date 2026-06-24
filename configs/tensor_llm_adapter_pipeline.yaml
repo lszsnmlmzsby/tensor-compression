@@ -100,6 +100,7 @@ llm_training:
   prefer_record_latent_ref: false
   device: auto
   torch_dtype: bfloat16
+  shuffle_seed: 42
   epochs: 3
   batch_size: 2
   eval_batch_size: 2
@@ -108,8 +109,11 @@ llm_training:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
+  ranking_loss_weight: 0.2
+  ranking_loss_margin: 0.1
+  ranking_loss_negative: shuffled
   prompt_template: task_specific
-  max_prompt_tokens: 256
+  max_prompt_tokens: 512
   max_target_tokens: 8
   append_eos: true
   eval_baselines:

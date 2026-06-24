@@ -207,6 +207,7 @@ class TensorReadoutQADataset(Dataset):
         latent_dir: str | Path,
         max_records: int | None = None,
         prefer_record_latent_ref: bool = False,
+        shuffle_seed: int = 42,
     ) -> None:
         self.jsonl_path = Path(jsonl_path)
         self.latent_dir = Path(latent_dir)
@@ -216,7 +217,7 @@ class TensorReadoutQADataset(Dataset):
             self.records = self.records[: max(0, int(max_records))]
         if not self.records:
             raise RuntimeError(f"No QA records found in {self.jsonl_path}.")
-        self._next_different_indices = self._build_next_different_indices()
+        self._random_different_indices = self._build_random_different_indices(int(shuffle_seed))
 
     @staticmethod
     def _load_records(path: Path) -> list[dict[str, Any]]:
@@ -232,17 +233,27 @@ class TensorReadoutQADataset(Dataset):
                 records.append(payload)
         return records
 
-    def _build_next_different_indices(self) -> list[int]:
-        indices: list[int] = []
+    def _build_random_different_indices(self, seed: int) -> list[int]:
         total = len(self.records)
+        unique_states = {str(record.get("state_ref", "")) for record in self.records}
+        if len(unique_states) < 2:
+            raise RuntimeError(
+                "Cannot build shuffled latent baseline: every record belongs to the same state_ref."
+            )
+        rng = random.Random(seed)
+        indices: list[int] = []
         for index, record in enumerate(self.records):
             state_ref = str(record.get("state_ref", ""))
-            candidate = (index + 1) % total
+            candidate = rng.randrange(total)
             attempts = 0
-            while attempts < total and str(self.records[candidate].get("state_ref", "")) == state_ref:
-                candidate = (candidate + 1) % total
+            while str(self.records[candidate].get("state_ref", "")) == state_ref:
+                candidate = rng.randrange(total)
                 attempts += 1
-            indices.append(candidate)
+                if attempts > total * 4:
+                    raise RuntimeError(
+                        "Failed to sample a different-state shuffled latent; check QA state distribution."
+                    )
+            indices.append(int(candidate))
         return indices
 
     def __len__(self) -> int:
@@ -287,8 +298,12 @@ class TensorReadoutQADataset(Dataset):
         return latent.to(dtype=torch.float32)
 
     def load_shuffled_latent(self, index: int) -> torch.Tensor:
-        other_index = self._next_different_indices[int(index)]
+        other_index = self._random_different_indices[int(index)]
         return self.load_latent_for_record(self.records[other_index])
+
+    def shuffled_record_for_index(self, index: int) -> Mapping[str, Any]:
+        other_index = self._random_different_indices[int(index)]
+        return self.records[other_index]
 
 
 def collate_tensor_readout(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -328,6 +343,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--shuffle-seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
@@ -336,6 +352,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
+    parser.add_argument("--ranking-loss-weight", type=float, default=None)
+    parser.add_argument("--ranking-loss-margin", type=float, default=None)
+    parser.add_argument(
+        "--ranking-loss-negative",
+        type=str,
+        default=None,
+        choices=("shuffled", "random", "no_latent"),
+    )
     parser.add_argument("--soft-prompt-tokens", type=int, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
@@ -435,6 +459,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "torch_dtype", first_nested(config, ["llm_training.torch_dtype", "model.torch_dtype"]), "auto")
     set_default(args, "trust_remote_code", first_nested(config, ["model.trust_remote_code"]), False)
     set_default(args, "seed", first_nested(config, ["llm_training.seed", "runtime.seed"]), 42)
+    set_default(args, "shuffle_seed", first_nested(config, ["llm_training.shuffle_seed", "runtime.seed"]), 42)
     set_default(args, "epochs", first_nested(config, ["llm_training.epochs"]), 3)
     set_default(args, "batch_size", first_nested(config, ["llm_training.batch_size"]), 2)
     set_default(args, "eval_batch_size", first_nested(config, ["llm_training.eval_batch_size"]), 2)
@@ -448,6 +473,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "lr", first_nested(config, ["llm_training.lr"]), 1.0e-4)
     set_default(args, "weight_decay", first_nested(config, ["llm_training.weight_decay"]), 1.0e-2)
     set_default(args, "grad_clip_norm", first_nested(config, ["llm_training.grad_clip_norm"]), 1.0)
+    set_default(args, "ranking_loss_weight", first_nested(config, ["llm_training.ranking_loss_weight"]), 0.2)
+    set_default(args, "ranking_loss_margin", first_nested(config, ["llm_training.ranking_loss_margin"]), 0.1)
+    set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
     set_default(args, "soft_prompt_tokens", first_nested(config, ["adapter.soft_prompt_tokens"]), 32)
     set_default(args, "adapter_dim", first_nested(config, ["adapter.adapter_dim"]), 512)
     set_default(args, "adapter_layers", first_nested(config, ["adapter.adapter_layers"]), 2)
@@ -578,33 +606,63 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
     if task_type == "point_bin":
         return (
             "Rule: read the requested field value at the given row and col from the tensor soft tokens. "
-            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high. "
-            "Return exactly one listed choice."
+            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high: "
+            "B00 means the lowest value range, larger bin numbers mean larger value ranges, and the last bin "
+            "means the highest value range. Return exactly one listed label and no extra text."
         )
     if task_type == "point_compare":
         return (
             "Rule: compare the requested field value at point A with point B using the tensor soft tokens. "
-            "Return A if A is greater than or tied with B; otherwise return B. "
-            "Return exactly one listed choice."
+            "Choice A means point A is greater than or tied with point B. "
+            "Choice B means point B is strictly greater than point A. "
+            "Return exactly A or B and no extra text."
         )
     if task_type == "patch_compare":
         return (
             "Rule: compare the mean requested field value over patch A with patch B using the tensor soft tokens. "
-            "Return A if patch A has greater or tied mean; otherwise return B. "
-            "Return exactly one listed choice."
+            "Choice A means patch A has greater or tied mean. "
+            "Choice B means patch B has strictly greater mean. "
+            "Return exactly A or B and no extra text."
         )
     if task_type == "max_speed_quadrant":
         return (
             "Rule: find the grid cell with maximum speed magnitude from the tensor soft tokens. "
-            "Return the quadrant label of that cell. Return exactly one listed choice."
+            "Return the quadrant label of that cell. Return exactly one listed label and no extra text."
         )
     if task_type == "global_stat_bin":
         return (
             "Rule: compute the requested global speed statistic from the tensor soft tokens. "
-            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high. "
-            "Return exactly one listed choice."
+            "Return its quantile-bin label. Bin labels B00,B01,... are ordered from low to high: "
+            "B00 means the lowest value range, larger bin numbers mean larger value ranges, and the last bin "
+            "means the highest value range. Return exactly one listed label and no extra text."
         )
-    return "Rule: answer the tensor readout query using the tensor soft tokens. Return exactly one listed choice."
+    return "Rule: answer the tensor readout query using the tensor soft tokens. Return exactly one listed label and no extra text."
+
+
+def choice_semantics(record: Mapping[str, Any]) -> str:
+    task_type = str(record.get("task_type", "")).strip()
+    choices = record.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, str):
+        choices = []
+    labels = [str(choice) for choice in choices]
+    if task_type in {"point_bin", "global_stat_bin"} and labels:
+        return (
+            "Choice meanings: "
+            + "; ".join(
+                f"{label}=quantile bin {index} of {len(labels) - 1}, ordered from low to high"
+                for index, label in enumerate(labels)
+            )
+            + "."
+        )
+    if task_type == "point_compare":
+        return "Choice meanings: A=point A is greater than or tied with point B; B=point B is strictly greater than point A."
+    if task_type == "patch_compare":
+        return "Choice meanings: A=patch A mean is greater than or tied with patch B mean; B=patch B mean is strictly greater than patch A mean."
+    if task_type == "max_speed_quadrant":
+        return "Choice meanings: quadrant labels refer to the location of the maximum-speed grid cell."
+    if labels:
+        return "Choice meanings: choose exactly one of the listed labels."
+    return ""
 
 
 def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
@@ -629,6 +687,8 @@ def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
         "Do not answer from coordinate or label priors alone; use the tensor soft tokens for numeric values.\n\n"
         f"Query: {query}\n"
         f"Choices: {choice_text}\n"
+        f"{choice_semantics(record)}\n"
+        "Output format: one choice label only, such as A, B, B00, B01, B02, ... .\n"
         "Answer:"
     )
 
@@ -778,6 +838,161 @@ def forward_loss(
     labels = torch.cat([soft_labels, text_labels], dim=1)
     outputs = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
     return outputs.loss
+
+
+def forward_answer_nll(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    answers: Sequence[str],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    max_prompt_tokens: int,
+    max_target_tokens: int,
+    append_eos: bool,
+    prompt_template: str,
+    soft_prompt_mode: str = "correct",
+    reduction: str = "mean",
+) -> torch.Tensor:
+    input_ids, text_attention_mask, text_labels = build_text_tensors(
+        records=records,
+        answers=answers,
+        tokenizer=tokenizer,
+        max_prompt_tokens=max_prompt_tokens,
+        max_target_tokens=max_target_tokens,
+        append_eos=append_eos,
+        prompt_template=prompt_template,
+    )
+    input_ids = input_ids.to(device)
+    text_attention_mask = text_attention_mask.to(device)
+    text_labels = text_labels.to(device)
+    latent_map = latent_map.to(device)
+
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
+    soft_embeds = adapter_soft_embeds(
+        adapter,
+        latent_map,
+        text_embeds,
+        question_embeds=text_embeds,
+        question_mask=prompt_mask,
+        mode=soft_prompt_mode,
+    )
+    inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
+    soft_attention = torch.ones(
+        (input_ids.shape[0], soft_embeds.shape[1]),
+        dtype=text_attention_mask.dtype,
+        device=device,
+    )
+    attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
+    soft_labels = torch.full(
+        (input_ids.shape[0], soft_embeds.shape[1]),
+        IGNORE_INDEX,
+        dtype=text_labels.dtype,
+        device=device,
+    )
+    labels = torch.cat([soft_labels, text_labels], dim=1)
+
+    logits = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = labels[:, 1:]
+    target_mask = shift_labels.ne(IGNORE_INDEX)
+    safe_labels = shift_labels.masked_fill(~target_mask, 0)
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    nll = -(token_log_probs * target_mask).sum(dim=1)
+    if reduction == "mean":
+        nll = nll / target_mask.sum(dim=1).clamp_min(1)
+    elif reduction != "sum":
+        raise ValueError(f"Unsupported NLL reduction: {reduction}")
+    return nll
+
+
+def training_loss(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    dataset: TensorReadoutQADataset,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    records = batch["records"]
+    answers = [str(record["answer"]) for record in records]
+    ce_loss = forward_loss(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        answers=answers,
+        latent_map=batch["latent_map"],
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+    )
+    ranking_weight = float(args.ranking_loss_weight)
+    if ranking_weight <= 0.0:
+        return ce_loss, {
+            "loss": float(ce_loss.detach().cpu().item()),
+            "ce_loss": float(ce_loss.detach().cpu().item()),
+            "ranking_loss": 0.0,
+            "ranking_margin_mean": 0.0,
+        }
+
+    positive_nll = forward_answer_nll(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        answers=answers,
+        latent_map=batch["latent_map"],
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+        soft_prompt_mode="correct",
+        reduction=str(args.choice_score),
+    )
+    negative_mode = str(args.ranking_loss_negative)
+    if negative_mode == "shuffled":
+        negative_latents = baseline_latents("shuffled", batch, dataset)
+    elif negative_mode == "random":
+        negative_latents = baseline_latents("random", batch, dataset)
+    elif negative_mode == "no_latent":
+        negative_latents = batch["latent_map"]
+    else:
+        raise ValueError(f"Unsupported ranking_loss_negative: {negative_mode}")
+    negative_nll = forward_answer_nll(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        answers=answers,
+        latent_map=negative_latents,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+        soft_prompt_mode=negative_mode,
+        reduction=str(args.choice_score),
+    )
+    margin = float(args.ranking_loss_margin)
+    ranking_terms = F.relu(margin + positive_nll - negative_nll)
+    ranking_loss = ranking_terms.mean()
+    total_loss = ce_loss + ranking_weight * ranking_loss
+    detached_positive = positive_nll.detach()
+    detached_negative = negative_nll.detach()
+    return total_loss, {
+        "loss": float(total_loss.detach().cpu().item()),
+        "ce_loss": float(ce_loss.detach().cpu().item()),
+        "ranking_loss": float(ranking_loss.detach().cpu().item()),
+        "ranking_margin_mean": float((detached_negative - detached_positive).mean().cpu().item()),
+    }
 
 
 @torch.no_grad()
@@ -1047,6 +1262,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "max_train_records": args.max_train_records,
             "max_val_records": args.max_val_records,
             "max_test_records": args.max_test_records,
+            "shuffle_seed": int(args.shuffle_seed),
         },
         "model": {
             "name_or_path": str(args.model_name_or_path),
@@ -1073,6 +1289,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "lr": float(args.lr),
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
+            "ranking_loss_weight": float(args.ranking_loss_weight),
+            "ranking_loss_margin": float(args.ranking_loss_margin),
+            "ranking_loss_negative": str(args.ranking_loss_negative),
             "max_prompt_tokens": int(args.max_prompt_tokens),
             "max_target_tokens": int(args.max_target_tokens),
             "append_eos": bool(args.append_eos),
@@ -1118,18 +1337,21 @@ def main() -> None:
         latent_dir=args.latent_dir,
         max_records=args.max_train_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
+        shuffle_seed=int(args.shuffle_seed),
     )
     val_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.val_split),
         latent_dir=args.latent_dir,
         max_records=args.max_val_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
+        shuffle_seed=int(args.shuffle_seed),
     )
     test_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.test_split),
         latent_dir=args.latent_dir,
         max_records=args.max_test_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
+        shuffle_seed=int(args.shuffle_seed),
     )
     first_latent = train_dataset[0]["latent_map"]
     latent_shape = tuple(int(dim) for dim in first_latent.shape)
@@ -1172,6 +1394,10 @@ def main() -> None:
         "train_records": len(train_dataset),
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
+        "shuffle_seed": int(args.shuffle_seed),
+        "ranking_loss_weight": float(args.ranking_loss_weight),
+        "ranking_loss_margin": float(args.ranking_loss_margin),
+        "ranking_loss_negative": str(args.ranking_loss_negative),
         "soft_prompt_tokens": int(args.soft_prompt_tokens),
         "adapter_layers": int(args.adapter_layers),
         "latent_pos_encoding": str(args.latent_pos_encoding),
@@ -1192,26 +1418,27 @@ def main() -> None:
         for epoch in range(1, int(args.epochs) + 1):
             adapter.train()
             running_loss = 0.0
+            running_ce_loss = 0.0
+            running_ranking_loss = 0.0
+            running_ranking_margin = 0.0
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]")
             for step, batch in enumerate(progress, start=1):
-                answers = [str(record["answer"]) for record in batch["records"]]
-                loss = forward_loss(
+                loss, loss_parts = training_loss(
                     llm=llm,
                     adapter=adapter,
                     tokenizer=tokenizer,
-                    records=batch["records"],
-                    answers=answers,
-                    latent_map=batch["latent_map"],
+                    dataset=train_dataset,
+                    batch=batch,
                     device=device,
-                    max_prompt_tokens=int(args.max_prompt_tokens),
-                    max_target_tokens=int(args.max_target_tokens),
-                    append_eos=bool(args.append_eos),
-                    prompt_template=str(args.prompt_template),
+                    args=args,
                 )
                 (loss / accumulation_steps).backward()
-                current_loss = float(loss.detach().cpu().item())
+                current_loss = float(loss_parts["loss"])
                 running_loss += current_loss
+                running_ce_loss += float(loss_parts["ce_loss"])
+                running_ranking_loss += float(loss_parts["ranking_loss"])
+                running_ranking_margin += float(loss_parts["ranking_margin_mean"])
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
                     if float(args.grad_clip_norm) > 0:
@@ -1221,20 +1448,36 @@ def main() -> None:
                     global_step += 1
 
                 average_loss = running_loss / step
-                progress.set_postfix(loss=f"{average_loss:.4f}")
+                average_ce_loss = running_ce_loss / step
+                average_ranking_loss = running_ranking_loss / step
+                average_ranking_margin = running_ranking_margin / step
+                progress.set_postfix(
+                    loss=f"{average_loss:.4f}",
+                    ce=f"{average_ce_loss:.4f}",
+                    rank=f"{average_ranking_loss:.4f}",
+                )
                 if step % max(1, int(args.log_interval)) == 0:
                     step_payload = {
                         "epoch": epoch,
                         "step": step,
                         "global_step": global_step,
                         "train_loss": average_loss,
+                        "train_ce_loss": average_ce_loss,
+                        "train_ranking_loss": average_ranking_loss,
+                        "train_ranking_margin": average_ranking_margin,
                     }
                     history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
                     dump_json(run_dir / "metrics_latest.json", history)
                     wandb_logger.log(
                         {
                             "train_step/loss": average_loss,
+                            "train_step/ce_loss": average_ce_loss,
+                            "train_step/ranking_loss": average_ranking_loss,
+                            "train_step/ranking_margin": average_ranking_margin,
                             "train_step/current_loss": current_loss,
+                            "train_step/current_ce_loss": float(loss_parts["ce_loss"]),
+                            "train_step/current_ranking_loss": float(loss_parts["ranking_loss"]),
+                            "train_step/current_ranking_margin": float(loss_parts["ranking_margin_mean"]),
                             "train_step/epoch": float(epoch),
                             "train_step/epoch_step": float(step),
                             "train_step/lr": float(optimizer.param_groups[0]["lr"]),
@@ -1243,6 +1486,9 @@ def main() -> None:
                     )
 
             train_loss = running_loss / max(1, len(train_loader))
+            train_ce_loss = running_ce_loss / max(1, len(train_loader))
+            train_ranking_loss = running_ranking_loss / max(1, len(train_loader))
+            train_ranking_margin = running_ranking_margin / max(1, len(train_loader))
             val_metrics = evaluate_choice_accuracy(
                 llm=llm,
                 adapter=adapter,
@@ -1255,6 +1501,9 @@ def main() -> None:
             epoch_payload = {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "train_ce_loss": train_ce_loss,
+                "train_ranking_loss": train_ranking_loss,
+                "train_ranking_margin": train_ranking_margin,
                 "val": val_metrics,
             }
             history[f"epoch_{epoch:04d}"] = epoch_payload
@@ -1271,6 +1520,9 @@ def main() -> None:
             wandb_payload = {
                 "epoch": float(epoch),
                 "train/loss": float(train_loss),
+                "train/ce_loss": float(train_ce_loss),
+                "train/ranking_loss": float(train_ranking_loss),
+                "train/ranking_margin": float(train_ranking_margin),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "best_val/correct_accuracy": float(max(best_val_accuracy, val_accuracy)),
             }
