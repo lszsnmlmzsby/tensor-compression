@@ -709,6 +709,7 @@ python scripts/prepare_tensor_llm_assets.py \
 | `lr` | adapter 学习率。 | 正数 | - |
 | `weight_decay` | 权重衰减。 | 非负数 | - |
 | `grad_clip_norm` | 梯度裁剪范数。 | 非负数 | `0`：不裁剪。 |
+| `ce_loss_weight` | 普通答案 CE loss 权重。 | 非负数 | 降低该值会相对强调 ranking loss；`0` 表示只用 ranking 项训练答案偏好。 |
 | `ranking_loss_weight` | ranking loss 权重。 | 非负数 | `0`：关闭；大于 0 时要求正确 latent 比错配 latent 更支持正确答案。 |
 | `ranking_loss_margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 希望 `NLL(shuffled)-NLL(correct)` 至少达到该值。 |
 | `ranking_loss_negative` | ranking loss 使用的负样本类型。 | `shuffled`、`random`、`no_latent` | `shuffled`：随机错配 latent；`random`：随机噪声；`no_latent`：零 soft prompt。 |
@@ -858,6 +859,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--lr` | adapter 学习率。 | 正数 | - |
 | `--weight-decay` | 权重衰减。 | 非负数 | - |
 | `--grad-clip-norm` | 梯度裁剪范数。 | 非负数 | `0`：不裁剪。 |
+| `--ce-loss-weight` | 普通答案 CE loss 权重。 | 非负数 | 例如 `0.5` 或 `0.2`。 |
 | `--ranking-loss-weight` | ranking loss 权重。 | 非负数 | `0`：关闭；默认从 config 读取。 |
 | `--ranking-loss-margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 要求正确 latent 的正确答案 NLL 比负样本更低。 |
 | `--ranking-loss-negative` | ranking loss 负样本类型。 | `shuffled`、`random`、`no_latent` | 通常先用 `shuffled`。 |
@@ -888,11 +890,11 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 训练目标默认包含普通 CE 和 ranking 项：
 
 ```text
-loss = CE(answer | correct_latent)
+loss = ce_loss_weight * CE(answer | correct_latent)
      + ranking_loss_weight * max(0, margin + NLL(answer | correct_latent) - NLL(answer | negative_latent))
 ```
 
-这个项用于惩罚“错配 latent 也同样支持正确答案”的情况。做消融时可以设置 `ranking_loss_weight: 0` 或命令行传 `--ranking-loss-weight 0`。
+ranking 项用于惩罚“错配 latent 也同样支持正确答案”的情况。做消融时可以设置 `ranking_loss_weight: 0` 或命令行传 `--ranking-loss-weight 0`。如果 ranking 明显有效但总正确率仍低，可以尝试 `--ce-loss-weight 0.5` 或 `--ce-loss-weight 0.2`，让训练更重视 correct-vs-shuffled 区分。
 
 ### 3.7 Adapter 过拟合 Sanity Check
 
@@ -931,6 +933,10 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 | `--run-name` | 输出 run 名称。 | 字符串 | 建议包含 `overfit`。 |
 | `--eval-baselines` | baseline 列表。 | 逗号分隔字符串 | 默认 `correct,no_latent,shuffled`。 |
 | `--dry-run` | 只打印实际调用命令，不执行。 | 开关 | 用于检查透传参数是否正确。 |
+| `--diagnose` / `--no-diagnose` | 训练成功后是否自动运行 adapter 诊断脚本。 | 布尔开关 | 默认开启，使用 `adapter_best.pt`。 |
+| `--diagnose-records` | 自动诊断输出的 record 数。 | 正整数 | 默认 64。 |
+| `--diagnose-hidden-records` | 自动诊断中保存 hidden state 摘要的 record 数。 | 非负整数 | 默认 16；设 0 可跳过 hidden state。 |
+| `--diagnose-split` | 自动诊断使用的 split。 | split 名、`null` | `null`：使用 `--source-split`。 |
 
 结果解读：
 
@@ -939,6 +945,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 | `correct` 明显高于 `no_latent/shuffled` | adapter 至少能在小数据上利用正确 latent。 | 再讨论泛化、任务设计和数据规模。 |
 | `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标仍没有迫使模型使用 latent。 | 新结构已包含 latent 2D 位置编码和 question-conditioned adapter；若仍失败，优先考虑 ranking/contrastive loss 或任务重构。 |
 | train loss 降但 `correct` 不涨 | 模型主要学到输出格式或标签先验。 | 不应只靠继续加 epoch 解决。 |
+
+过拟合脚本默认会在训练成功后自动运行 `scripts/diagnose_tensor_llm_adapter.py`，输出到本次 run 目录，例如 `adapter_best_diagnostics_train.jsonl` 和对应 summary。若只想训练不诊断，传 `--no-diagnose`。
 
 ### 3.8 Adapter 诊断输出
 

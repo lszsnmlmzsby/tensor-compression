@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
+    parser.add_argument("--ce-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
     parser.add_argument("--ranking-loss-negative", type=str, default=None, choices=("shuffled", "random", "no_latent"))

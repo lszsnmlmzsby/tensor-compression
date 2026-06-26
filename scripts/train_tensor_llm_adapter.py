@@ -352,6 +352,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
+    parser.add_argument("--ce-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
     parser.add_argument(
@@ -473,6 +474,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "lr", first_nested(config, ["llm_training.lr"]), 1.0e-4)
     set_default(args, "weight_decay", first_nested(config, ["llm_training.weight_decay"]), 1.0e-2)
     set_default(args, "grad_clip_norm", first_nested(config, ["llm_training.grad_clip_norm"]), 1.0)
+    set_default(args, "ce_loss_weight", first_nested(config, ["llm_training.ce_loss_weight"]), 0.5)
     set_default(args, "ranking_loss_weight", first_nested(config, ["llm_training.ranking_loss_weight"]), 0.2)
     set_default(args, "ranking_loss_margin", first_nested(config, ["llm_training.ranking_loss_margin"]), 0.1)
     set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
@@ -933,12 +935,16 @@ def training_loss(
         append_eos=bool(args.append_eos),
         prompt_template=str(args.prompt_template),
     )
+    ce_weight = float(args.ce_loss_weight)
     ranking_weight = float(args.ranking_loss_weight)
     if ranking_weight <= 0.0:
-        return ce_loss, {
-            "loss": float(ce_loss.detach().cpu().item()),
+        total_loss = ce_weight * ce_loss
+        return total_loss, {
+            "loss": float(total_loss.detach().cpu().item()),
             "ce_loss": float(ce_loss.detach().cpu().item()),
+            "weighted_ce_loss": float(total_loss.detach().cpu().item()),
             "ranking_loss": 0.0,
+            "weighted_ranking_loss": 0.0,
             "ranking_margin_mean": 0.0,
         }
 
@@ -984,13 +990,17 @@ def training_loss(
     margin = float(args.ranking_loss_margin)
     ranking_terms = F.relu(margin + positive_nll - negative_nll)
     ranking_loss = ranking_terms.mean()
-    total_loss = ce_loss + ranking_weight * ranking_loss
+    weighted_ce_loss = ce_weight * ce_loss
+    weighted_ranking_loss = ranking_weight * ranking_loss
+    total_loss = weighted_ce_loss + weighted_ranking_loss
     detached_positive = positive_nll.detach()
     detached_negative = negative_nll.detach()
     return total_loss, {
         "loss": float(total_loss.detach().cpu().item()),
         "ce_loss": float(ce_loss.detach().cpu().item()),
+        "weighted_ce_loss": float(weighted_ce_loss.detach().cpu().item()),
         "ranking_loss": float(ranking_loss.detach().cpu().item()),
+        "weighted_ranking_loss": float(weighted_ranking_loss.detach().cpu().item()),
         "ranking_margin_mean": float((detached_negative - detached_positive).mean().cpu().item()),
     }
 
@@ -1289,6 +1299,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "lr": float(args.lr),
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
+            "ce_loss_weight": float(args.ce_loss_weight),
             "ranking_loss_weight": float(args.ranking_loss_weight),
             "ranking_loss_margin": float(args.ranking_loss_margin),
             "ranking_loss_negative": str(args.ranking_loss_negative),
@@ -1395,6 +1406,7 @@ def main() -> None:
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
         "shuffle_seed": int(args.shuffle_seed),
+        "ce_loss_weight": float(args.ce_loss_weight),
         "ranking_loss_weight": float(args.ranking_loss_weight),
         "ranking_loss_margin": float(args.ranking_loss_margin),
         "ranking_loss_negative": str(args.ranking_loss_negative),
@@ -1419,7 +1431,9 @@ def main() -> None:
             adapter.train()
             running_loss = 0.0
             running_ce_loss = 0.0
+            running_weighted_ce_loss = 0.0
             running_ranking_loss = 0.0
+            running_weighted_ranking_loss = 0.0
             running_ranking_margin = 0.0
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]")
@@ -1437,7 +1451,9 @@ def main() -> None:
                 current_loss = float(loss_parts["loss"])
                 running_loss += current_loss
                 running_ce_loss += float(loss_parts["ce_loss"])
+                running_weighted_ce_loss += float(loss_parts["weighted_ce_loss"])
                 running_ranking_loss += float(loss_parts["ranking_loss"])
+                running_weighted_ranking_loss += float(loss_parts["weighted_ranking_loss"])
                 running_ranking_margin += float(loss_parts["ranking_margin_mean"])
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
@@ -1449,7 +1465,9 @@ def main() -> None:
 
                 average_loss = running_loss / step
                 average_ce_loss = running_ce_loss / step
+                average_weighted_ce_loss = running_weighted_ce_loss / step
                 average_ranking_loss = running_ranking_loss / step
+                average_weighted_ranking_loss = running_weighted_ranking_loss / step
                 average_ranking_margin = running_ranking_margin / step
                 progress.set_postfix(
                     loss=f"{average_loss:.4f}",
@@ -1463,7 +1481,9 @@ def main() -> None:
                         "global_step": global_step,
                         "train_loss": average_loss,
                         "train_ce_loss": average_ce_loss,
+                        "train_weighted_ce_loss": average_weighted_ce_loss,
                         "train_ranking_loss": average_ranking_loss,
+                        "train_weighted_ranking_loss": average_weighted_ranking_loss,
                         "train_ranking_margin": average_ranking_margin,
                     }
                     history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
@@ -1472,11 +1492,15 @@ def main() -> None:
                         {
                             "train_step/loss": average_loss,
                             "train_step/ce_loss": average_ce_loss,
+                            "train_step/weighted_ce_loss": average_weighted_ce_loss,
                             "train_step/ranking_loss": average_ranking_loss,
+                            "train_step/weighted_ranking_loss": average_weighted_ranking_loss,
                             "train_step/ranking_margin": average_ranking_margin,
                             "train_step/current_loss": current_loss,
                             "train_step/current_ce_loss": float(loss_parts["ce_loss"]),
+                            "train_step/current_weighted_ce_loss": float(loss_parts["weighted_ce_loss"]),
                             "train_step/current_ranking_loss": float(loss_parts["ranking_loss"]),
+                            "train_step/current_weighted_ranking_loss": float(loss_parts["weighted_ranking_loss"]),
                             "train_step/current_ranking_margin": float(loss_parts["ranking_margin_mean"]),
                             "train_step/epoch": float(epoch),
                             "train_step/epoch_step": float(step),
@@ -1487,7 +1511,9 @@ def main() -> None:
 
             train_loss = running_loss / max(1, len(train_loader))
             train_ce_loss = running_ce_loss / max(1, len(train_loader))
+            train_weighted_ce_loss = running_weighted_ce_loss / max(1, len(train_loader))
             train_ranking_loss = running_ranking_loss / max(1, len(train_loader))
+            train_weighted_ranking_loss = running_weighted_ranking_loss / max(1, len(train_loader))
             train_ranking_margin = running_ranking_margin / max(1, len(train_loader))
             val_metrics = evaluate_choice_accuracy(
                 llm=llm,
@@ -1502,7 +1528,9 @@ def main() -> None:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "train_ce_loss": train_ce_loss,
+                "train_weighted_ce_loss": train_weighted_ce_loss,
                 "train_ranking_loss": train_ranking_loss,
+                "train_weighted_ranking_loss": train_weighted_ranking_loss,
                 "train_ranking_margin": train_ranking_margin,
                 "val": val_metrics,
             }
@@ -1521,7 +1549,9 @@ def main() -> None:
                 "epoch": float(epoch),
                 "train/loss": float(train_loss),
                 "train/ce_loss": float(train_ce_loss),
+                "train/weighted_ce_loss": float(train_weighted_ce_loss),
                 "train/ranking_loss": float(train_ranking_loss),
+                "train/weighted_ranking_loss": float(train_weighted_ranking_loss),
                 "train/ranking_margin": float(train_ranking_margin),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "best_val/correct_accuracy": float(max(best_val_accuracy, val_accuracy)),
