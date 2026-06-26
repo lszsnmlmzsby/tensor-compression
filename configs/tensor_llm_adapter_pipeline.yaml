@@ -109,8 +109,9 @@ llm_training:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
-  ce_loss_weight: 0.5
-  ranking_loss_weight: 0.2
+  ce_loss_weight: 0.1
+  choice_ce_loss_weight: 1.0
+  ranking_loss_weight: 0.5
   ranking_loss_margin: 0.1
   ranking_loss_negative: shuffled
   prompt_template: task_specific

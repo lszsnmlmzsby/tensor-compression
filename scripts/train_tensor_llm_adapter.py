@@ -353,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
     parser.add_argument("--ce-loss-weight", type=float, default=None)
+    parser.add_argument("--choice-ce-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
     parser.add_argument(
@@ -475,6 +476,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "weight_decay", first_nested(config, ["llm_training.weight_decay"]), 1.0e-2)
     set_default(args, "grad_clip_norm", first_nested(config, ["llm_training.grad_clip_norm"]), 1.0)
     set_default(args, "ce_loss_weight", first_nested(config, ["llm_training.ce_loss_weight"]), 0.5)
+    set_default(args, "choice_ce_loss_weight", first_nested(config, ["llm_training.choice_ce_loss_weight"]), 0.0)
     set_default(args, "ranking_loss_weight", first_nested(config, ["llm_training.ranking_loss_weight"]), 0.2)
     set_default(args, "ranking_loss_margin", first_nested(config, ["llm_training.ranking_loss_margin"]), 0.1)
     set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
@@ -911,6 +913,71 @@ def forward_answer_nll(
     return nll
 
 
+def choice_ce_loss(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    args: argparse.Namespace,
+    soft_prompt_mode: str = "correct",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    candidate_records: list[Mapping[str, Any]] = []
+    candidate_answers: list[str] = []
+    candidate_latents: list[torch.Tensor] = []
+    candidate_counts: list[int] = []
+    target_indices: list[int] = []
+    for record_index, record in enumerate(records):
+        choices = record.get("choices")
+        if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+            choices = [str(record["answer"])]
+        string_choices = [str(choice) for choice in choices]
+        answer = str(record["answer"])
+        if answer not in string_choices:
+            string_choices = [answer] + string_choices
+        candidate_counts.append(len(string_choices))
+        target_indices.append(string_choices.index(answer))
+        for choice in string_choices:
+            candidate_records.append(record)
+            candidate_answers.append(choice)
+            candidate_latents.append(latent_map[record_index])
+
+    flat_nll = forward_answer_nll(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=candidate_records,
+        answers=candidate_answers,
+        latent_map=torch.stack(candidate_latents, dim=0),
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+        soft_prompt_mode=soft_prompt_mode,
+        reduction=str(args.choice_score),
+    )
+    losses: list[torch.Tensor] = []
+    hard_correct = 0
+    start = 0
+    for count, target_index in zip(candidate_counts, target_indices):
+        scores = -flat_nll[start : start + count]
+        target = torch.tensor([int(target_index)], dtype=torch.long, device=device)
+        losses.append(F.cross_entropy(scores.unsqueeze(0), target))
+        prediction = int(torch.argmax(scores.detach()).item())
+        hard_correct += int(prediction == int(target_index))
+        start += count
+    if not losses:
+        raise ValueError("choice_ce_loss received an empty record batch.")
+    loss = torch.stack(losses).mean()
+    accuracy = hard_correct / max(1, len(losses))
+    return loss, {
+        "choice_accuracy": float(accuracy),
+        "choice_01_loss": float(1.0 - accuracy),
+    }
+
+
 def training_loss(
     llm,
     adapter: TensorSoftPromptAdapter,
@@ -936,13 +1003,36 @@ def training_loss(
         prompt_template=str(args.prompt_template),
     )
     ce_weight = float(args.ce_loss_weight)
+    choice_ce_weight = float(args.choice_ce_loss_weight)
     ranking_weight = float(args.ranking_loss_weight)
+    choice_loss_value = ce_loss.new_zeros(())
+    choice_metrics = {
+        "choice_accuracy": 0.0,
+        "choice_01_loss": 0.0,
+    }
+    if choice_ce_weight > 0.0:
+        choice_loss_value, choice_metrics = choice_ce_loss(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=batch["latent_map"],
+            device=device,
+            args=args,
+            soft_prompt_mode="correct",
+        )
     if ranking_weight <= 0.0:
-        total_loss = ce_weight * ce_loss
+        weighted_ce_loss = ce_weight * ce_loss
+        weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
+        total_loss = weighted_ce_loss + weighted_choice_ce_loss
         return total_loss, {
             "loss": float(total_loss.detach().cpu().item()),
             "ce_loss": float(ce_loss.detach().cpu().item()),
-            "weighted_ce_loss": float(total_loss.detach().cpu().item()),
+            "weighted_ce_loss": float(weighted_ce_loss.detach().cpu().item()),
+            "choice_ce_loss": float(choice_loss_value.detach().cpu().item()),
+            "weighted_choice_ce_loss": float(weighted_choice_ce_loss.detach().cpu().item()),
+            "choice_accuracy": float(choice_metrics["choice_accuracy"]),
+            "choice_01_loss": float(choice_metrics["choice_01_loss"]),
             "ranking_loss": 0.0,
             "weighted_ranking_loss": 0.0,
             "ranking_margin_mean": 0.0,
@@ -991,14 +1081,19 @@ def training_loss(
     ranking_terms = F.relu(margin + positive_nll - negative_nll)
     ranking_loss = ranking_terms.mean()
     weighted_ce_loss = ce_weight * ce_loss
+    weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
     weighted_ranking_loss = ranking_weight * ranking_loss
-    total_loss = weighted_ce_loss + weighted_ranking_loss
+    total_loss = weighted_ce_loss + weighted_choice_ce_loss + weighted_ranking_loss
     detached_positive = positive_nll.detach()
     detached_negative = negative_nll.detach()
     return total_loss, {
         "loss": float(total_loss.detach().cpu().item()),
         "ce_loss": float(ce_loss.detach().cpu().item()),
         "weighted_ce_loss": float(weighted_ce_loss.detach().cpu().item()),
+        "choice_ce_loss": float(choice_loss_value.detach().cpu().item()),
+        "weighted_choice_ce_loss": float(weighted_choice_ce_loss.detach().cpu().item()),
+        "choice_accuracy": float(choice_metrics["choice_accuracy"]),
+        "choice_01_loss": float(choice_metrics["choice_01_loss"]),
         "ranking_loss": float(ranking_loss.detach().cpu().item()),
         "weighted_ranking_loss": float(weighted_ranking_loss.detach().cpu().item()),
         "ranking_margin_mean": float((detached_negative - detached_positive).mean().cpu().item()),
@@ -1300,6 +1395,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
             "ce_loss_weight": float(args.ce_loss_weight),
+            "choice_ce_loss_weight": float(args.choice_ce_loss_weight),
             "ranking_loss_weight": float(args.ranking_loss_weight),
             "ranking_loss_margin": float(args.ranking_loss_margin),
             "ranking_loss_negative": str(args.ranking_loss_negative),
@@ -1407,6 +1503,7 @@ def main() -> None:
         "test_records": len(test_dataset),
         "shuffle_seed": int(args.shuffle_seed),
         "ce_loss_weight": float(args.ce_loss_weight),
+        "choice_ce_loss_weight": float(args.choice_ce_loss_weight),
         "ranking_loss_weight": float(args.ranking_loss_weight),
         "ranking_loss_margin": float(args.ranking_loss_margin),
         "ranking_loss_negative": str(args.ranking_loss_negative),
@@ -1432,6 +1529,10 @@ def main() -> None:
             running_loss = 0.0
             running_ce_loss = 0.0
             running_weighted_ce_loss = 0.0
+            running_choice_ce_loss = 0.0
+            running_weighted_choice_ce_loss = 0.0
+            running_choice_accuracy = 0.0
+            running_choice_01_loss = 0.0
             running_ranking_loss = 0.0
             running_weighted_ranking_loss = 0.0
             running_ranking_margin = 0.0
@@ -1452,6 +1553,10 @@ def main() -> None:
                 running_loss += current_loss
                 running_ce_loss += float(loss_parts["ce_loss"])
                 running_weighted_ce_loss += float(loss_parts["weighted_ce_loss"])
+                running_choice_ce_loss += float(loss_parts["choice_ce_loss"])
+                running_weighted_choice_ce_loss += float(loss_parts["weighted_choice_ce_loss"])
+                running_choice_accuracy += float(loss_parts["choice_accuracy"])
+                running_choice_01_loss += float(loss_parts["choice_01_loss"])
                 running_ranking_loss += float(loss_parts["ranking_loss"])
                 running_weighted_ranking_loss += float(loss_parts["weighted_ranking_loss"])
                 running_ranking_margin += float(loss_parts["ranking_margin_mean"])
@@ -1466,12 +1571,18 @@ def main() -> None:
                 average_loss = running_loss / step
                 average_ce_loss = running_ce_loss / step
                 average_weighted_ce_loss = running_weighted_ce_loss / step
+                average_choice_ce_loss = running_choice_ce_loss / step
+                average_weighted_choice_ce_loss = running_weighted_choice_ce_loss / step
+                average_choice_accuracy = running_choice_accuracy / step
+                average_choice_01_loss = running_choice_01_loss / step
                 average_ranking_loss = running_ranking_loss / step
                 average_weighted_ranking_loss = running_weighted_ranking_loss / step
                 average_ranking_margin = running_ranking_margin / step
                 progress.set_postfix(
                     loss=f"{average_loss:.4f}",
                     ce=f"{average_ce_loss:.4f}",
+                    choice=f"{average_choice_ce_loss:.4f}",
+                    acc=f"{average_choice_accuracy:.3f}",
                     rank=f"{average_ranking_loss:.4f}",
                 )
                 if step % max(1, int(args.log_interval)) == 0:
@@ -1482,6 +1593,10 @@ def main() -> None:
                         "train_loss": average_loss,
                         "train_ce_loss": average_ce_loss,
                         "train_weighted_ce_loss": average_weighted_ce_loss,
+                        "train_choice_ce_loss": average_choice_ce_loss,
+                        "train_weighted_choice_ce_loss": average_weighted_choice_ce_loss,
+                        "train_choice_accuracy": average_choice_accuracy,
+                        "train_choice_01_loss": average_choice_01_loss,
                         "train_ranking_loss": average_ranking_loss,
                         "train_weighted_ranking_loss": average_weighted_ranking_loss,
                         "train_ranking_margin": average_ranking_margin,
@@ -1493,12 +1608,22 @@ def main() -> None:
                             "train_step/loss": average_loss,
                             "train_step/ce_loss": average_ce_loss,
                             "train_step/weighted_ce_loss": average_weighted_ce_loss,
+                            "train_step/choice_ce_loss": average_choice_ce_loss,
+                            "train_step/weighted_choice_ce_loss": average_weighted_choice_ce_loss,
+                            "train_step/choice_accuracy": average_choice_accuracy,
+                            "train_step/choice_01_loss": average_choice_01_loss,
                             "train_step/ranking_loss": average_ranking_loss,
                             "train_step/weighted_ranking_loss": average_weighted_ranking_loss,
                             "train_step/ranking_margin": average_ranking_margin,
                             "train_step/current_loss": current_loss,
                             "train_step/current_ce_loss": float(loss_parts["ce_loss"]),
                             "train_step/current_weighted_ce_loss": float(loss_parts["weighted_ce_loss"]),
+                            "train_step/current_choice_ce_loss": float(loss_parts["choice_ce_loss"]),
+                            "train_step/current_weighted_choice_ce_loss": float(
+                                loss_parts["weighted_choice_ce_loss"]
+                            ),
+                            "train_step/current_choice_accuracy": float(loss_parts["choice_accuracy"]),
+                            "train_step/current_choice_01_loss": float(loss_parts["choice_01_loss"]),
                             "train_step/current_ranking_loss": float(loss_parts["ranking_loss"]),
                             "train_step/current_weighted_ranking_loss": float(loss_parts["weighted_ranking_loss"]),
                             "train_step/current_ranking_margin": float(loss_parts["ranking_margin_mean"]),
@@ -1512,6 +1637,10 @@ def main() -> None:
             train_loss = running_loss / max(1, len(train_loader))
             train_ce_loss = running_ce_loss / max(1, len(train_loader))
             train_weighted_ce_loss = running_weighted_ce_loss / max(1, len(train_loader))
+            train_choice_ce_loss = running_choice_ce_loss / max(1, len(train_loader))
+            train_weighted_choice_ce_loss = running_weighted_choice_ce_loss / max(1, len(train_loader))
+            train_choice_accuracy = running_choice_accuracy / max(1, len(train_loader))
+            train_choice_01_loss = running_choice_01_loss / max(1, len(train_loader))
             train_ranking_loss = running_ranking_loss / max(1, len(train_loader))
             train_weighted_ranking_loss = running_weighted_ranking_loss / max(1, len(train_loader))
             train_ranking_margin = running_ranking_margin / max(1, len(train_loader))
@@ -1529,6 +1658,10 @@ def main() -> None:
                 "train_loss": train_loss,
                 "train_ce_loss": train_ce_loss,
                 "train_weighted_ce_loss": train_weighted_ce_loss,
+                "train_choice_ce_loss": train_choice_ce_loss,
+                "train_weighted_choice_ce_loss": train_weighted_choice_ce_loss,
+                "train_choice_accuracy": train_choice_accuracy,
+                "train_choice_01_loss": train_choice_01_loss,
                 "train_ranking_loss": train_ranking_loss,
                 "train_weighted_ranking_loss": train_weighted_ranking_loss,
                 "train_ranking_margin": train_ranking_margin,
@@ -1550,6 +1683,10 @@ def main() -> None:
                 "train/loss": float(train_loss),
                 "train/ce_loss": float(train_ce_loss),
                 "train/weighted_ce_loss": float(train_weighted_ce_loss),
+                "train/choice_ce_loss": float(train_choice_ce_loss),
+                "train/weighted_choice_ce_loss": float(train_weighted_choice_ce_loss),
+                "train/choice_accuracy": float(train_choice_accuracy),
+                "train/choice_01_loss": float(train_choice_01_loss),
                 "train/ranking_loss": float(train_ranking_loss),
                 "train/weighted_ranking_loss": float(train_weighted_ranking_loss),
                 "train/ranking_margin": float(train_ranking_margin),

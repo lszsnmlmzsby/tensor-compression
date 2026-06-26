@@ -709,7 +709,8 @@ python scripts/prepare_tensor_llm_assets.py \
 | `lr` | adapter 学习率。 | 正数 | - |
 | `weight_decay` | 权重衰减。 | 非负数 | - |
 | `grad_clip_norm` | 梯度裁剪范数。 | 非负数 | `0`：不裁剪。 |
-| `ce_loss_weight` | 普通答案 CE loss 权重。 | 非负数 | 降低该值会相对强调 ranking loss；`0` 表示只用 ranking 项训练答案偏好。 |
+| `ce_loss_weight` | 普通答案 token-level CE loss 权重。 | 非负数 | 该项训练 LLM 在答案 token 位置生成真实答案；权重大时可能更多学习输出格式和标签先验。 |
+| `choice_ce_loss_weight` | 候选项分类 CE loss 权重。 | 非负数 | `0`：关闭；大于 0 时把所有候选答案的 `-NLL` 当作分类 logits，直接优化“选中正确候选项”。 |
 | `ranking_loss_weight` | ranking loss 权重。 | 非负数 | `0`：关闭；大于 0 时要求正确 latent 比错配 latent 更支持正确答案。 |
 | `ranking_loss_margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 希望 `NLL(shuffled)-NLL(correct)` 至少达到该值。 |
 | `ranking_loss_negative` | ranking loss 使用的负样本类型。 | `shuffled`、`random`、`no_latent` | `shuffled`：随机错配 latent；`random`：随机噪声；`no_latent`：零 soft prompt。 |
@@ -859,7 +860,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--lr` | adapter 学习率。 | 正数 | - |
 | `--weight-decay` | 权重衰减。 | 非负数 | - |
 | `--grad-clip-norm` | 梯度裁剪范数。 | 非负数 | `0`：不裁剪。 |
-| `--ce-loss-weight` | 普通答案 CE loss 权重。 | 非负数 | 例如 `0.5` 或 `0.2`。 |
+| `--ce-loss-weight` | 普通答案 token-level CE loss 权重。 | 非负数 | 例如 `0.1`；该项不应长期占主导，否则可能主要学习答案格式。 |
+| `--choice-ce-loss-weight` | 候选项分类 CE loss 权重。 | 非负数 | 例如 `1.0`；该项更接近选择题正确率的可导 surrogate。 |
 | `--ranking-loss-weight` | ranking loss 权重。 | 非负数 | `0`：关闭；默认从 config 读取。 |
 | `--ranking-loss-margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 要求正确 latent 的正确答案 NLL 比负样本更低。 |
 | `--ranking-loss-negative` | ranking loss 负样本类型。 | `shuffled`、`random`、`no_latent` | 通常先用 `shuffled`。 |
@@ -887,14 +889,15 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--wandb-mode` | W&B 模式。 | `online`、`offline`、`disabled` | - |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 adapter checkpoint artifact。 | 布尔开关 | - |
 
-训练目标默认包含普通 CE 和 ranking 项：
+训练目标默认包含普通 CE、候选项分类 CE 和 ranking 项：
 
 ```text
-loss = ce_loss_weight * CE(answer | correct_latent)
+loss = ce_loss_weight * token_CE(answer | correct_latent)
+     + choice_ce_loss_weight * CE(softmax(-NLL(candidate_i | correct_latent)), correct_candidate)
      + ranking_loss_weight * max(0, margin + NLL(answer | correct_latent) - NLL(answer | negative_latent))
 ```
 
-ranking 项用于惩罚“错配 latent 也同样支持正确答案”的情况。做消融时可以设置 `ranking_loss_weight: 0` 或命令行传 `--ranking-loss-weight 0`。如果 ranking 明显有效但总正确率仍低，可以尝试 `--ce-loss-weight 0.5` 或 `--ce-loss-weight 0.2`，让训练更重视 correct-vs-shuffled 区分。
+`choice_01_loss = 1 - choice_accuracy` 会被记录到日志中，但它是硬 argmax 后的不可导指标，不参与反向传播。`choice_ce_loss` 是它的可导替代项，更接近最终 choice accuracy；ranking 项用于惩罚“错配 latent 也同样支持正确答案”的情况。做消融时可以设置 `ranking_loss_weight: 0` 或命令行传 `--ranking-loss-weight 0`。
 
 ### 3.7 Adapter 过拟合 Sanity Check
 
