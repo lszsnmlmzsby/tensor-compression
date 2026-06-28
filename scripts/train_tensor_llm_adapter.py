@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from collections import defaultdict
@@ -45,6 +46,90 @@ except ImportError as exc:  # pragma: no cover - exercised only in missing-depen
 
 
 IGNORE_INDEX = -100
+STRUCTURED_QUERY_FEATURE_DIM = 32
+
+
+def _normalize_coordinate(value: Any, size: int) -> float:
+    if size <= 1:
+        return 0.0
+    clipped = max(0.0, min(float(value), float(size - 1)))
+    return (clipped / float(size - 1)) * 2.0 - 1.0
+
+
+def _normalize_length(value: Any, size: int) -> float:
+    if size <= 0:
+        return 0.0
+    clipped = max(0.0, min(float(value), float(size)))
+    return clipped / float(size)
+
+
+def structured_query_features_for_record(record: Mapping[str, Any]) -> list[float]:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    grid_shape = metadata.get("grid_shape") if isinstance(metadata, Mapping) else None
+    has_grid_shape = isinstance(grid_shape, Sequence) and not isinstance(grid_shape, str)
+    height = int(grid_shape[0]) if has_grid_shape and len(grid_shape) >= 1 else 512
+    width = int(grid_shape[1]) if has_grid_shape and len(grid_shape) >= 2 else 512
+    task_type = str(record.get("task_type", ""))
+    query = str(record.get("query") or record.get("question") or "")
+    choices = record.get("choices")
+    choice_count = len(choices) if isinstance(choices, Sequence) and not isinstance(choices, str) else 0
+
+    features = [0.0] * STRUCTURED_QUERY_FEATURE_DIM
+    task_order = ["point_bin", "point_compare", "patch_compare", "max_speed_quadrant", "global_stat_bin"]
+    if task_type in task_order:
+        features[task_order.index(task_type)] = 1.0
+    features[5] = _normalize_length(choice_count, 16)
+    features[6] = 1.0 if "Vx" in query else 0.0
+    features[7] = 1.0 if "Vy" in query else 0.0
+
+    point = re.search(r"row=(\d+)\s+col=(\d+)", query)
+    if point:
+        row = int(point.group(1))
+        col = int(point.group(2))
+        features[8] = _normalize_coordinate(row, height)
+        features[9] = _normalize_coordinate(col, width)
+        features[10] = _normalize_length(row // max(1, height // 16), 16)
+        features[11] = _normalize_length(col // max(1, width // 16), 16)
+
+    point_pair = re.search(r"A=\((\d+),(\d+)\)\s+B=\((\d+),(\d+)\)", query)
+    if point_pair:
+        row_a, col_a, row_b, col_b = [int(group) for group in point_pair.groups()]
+        features[12] = _normalize_coordinate(row_a, height)
+        features[13] = _normalize_coordinate(col_a, width)
+        features[14] = _normalize_coordinate(row_b, height)
+        features[15] = _normalize_coordinate(col_b, width)
+        features[16] = _normalize_coordinate(row_b - row_a + (height - 1) / 2.0, height)
+        features[17] = _normalize_coordinate(col_b - col_a + (width - 1) / 2.0, width)
+
+    patch_pair = re.search(
+        r"A=\[(\d+):(\d+),(\d+):(\d+)\]\s+B=\[(\d+):(\d+),(\d+):(\d+)\]",
+        query,
+    )
+    if patch_pair:
+        row0_a, row1_a, col0_a, col1_a, row0_b, row1_b, col0_b, col1_b = [
+            int(group) for group in patch_pair.groups()
+        ]
+        center_row_a = (row0_a + row1_a - 1) / 2.0
+        center_col_a = (col0_a + col1_a - 1) / 2.0
+        center_row_b = (row0_b + row1_b - 1) / 2.0
+        center_col_b = (col0_b + col1_b - 1) / 2.0
+        features[18] = _normalize_coordinate(center_row_a, height)
+        features[19] = _normalize_coordinate(center_col_a, width)
+        features[20] = _normalize_coordinate(center_row_b, height)
+        features[21] = _normalize_coordinate(center_col_b, width)
+        features[22] = _normalize_length(row1_a - row0_a, height)
+        features[23] = _normalize_length(col1_a - col0_a, width)
+        features[24] = _normalize_length(row1_b - row0_b, height)
+        features[25] = _normalize_length(col1_b - col0_b, width)
+    return features
+
+
+def structured_query_features(records: Sequence[Mapping[str, Any]], device: torch.device) -> torch.Tensor:
+    return torch.tensor(
+        [structured_query_features_for_record(record) for record in records],
+        dtype=torch.float32,
+        device=device,
+    )
 
 
 class CrossAttentionBlock(nn.Module):
@@ -95,11 +180,15 @@ class TensorSoftPromptAdapter(nn.Module):
         latent_pos_encoding: str,
         question_conditioning: bool,
         question_condition_gate_init: float,
+        structured_query_conditioning: bool,
+        soft_prompt_scale: float,
     ) -> None:
         super().__init__()
         self.soft_prompt_tokens = int(soft_prompt_tokens)
         self.latent_pos_encoding = str(latent_pos_encoding)
         self.question_conditioning = bool(question_conditioning)
+        self.structured_query_conditioning = bool(structured_query_conditioning)
+        self.soft_prompt_scale = float(soft_prompt_scale)
         self.input_projection = nn.Linear(int(latent_channels), int(adapter_dim))
         if self.latent_pos_encoding == "grid":
             self.position_projection = nn.Linear(2, int(adapter_dim))
@@ -118,6 +207,17 @@ class TensorSoftPromptAdapter(nn.Module):
         else:
             self.question_projection = None
             self.register_parameter("question_gate", None)
+        if self.structured_query_conditioning:
+            self.structured_query_projection = nn.Sequential(
+                nn.LayerNorm(STRUCTURED_QUERY_FEATURE_DIM),
+                nn.Linear(STRUCTURED_QUERY_FEATURE_DIM, int(adapter_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_dim), int(adapter_dim)),
+            )
+            self.structured_query_gate = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.structured_query_projection = None
+            self.register_parameter("structured_query_gate", None)
         self.query_tokens = nn.Parameter(torch.randn(1, self.soft_prompt_tokens, int(adapter_dim)) * 0.02)
         self.blocks = nn.ModuleList(
             [
@@ -171,6 +271,7 @@ class TensorSoftPromptAdapter(nn.Module):
         latent_map: torch.Tensor,
         question_embeds: torch.Tensor | None = None,
         question_mask: torch.Tensor | None = None,
+        structured_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if latent_map.ndim == 4:
             batch_size, _channels, height, width = latent_map.shape
@@ -195,9 +296,21 @@ class TensorSoftPromptAdapter(nn.Module):
         question_condition = self._question_condition(question_embeds, question_mask)
         if question_condition is not None:
             queries = queries + self.question_gate.to(dtype=queries.dtype) * question_condition.unsqueeze(1)
+        if (
+            self.structured_query_conditioning
+            and structured_query is not None
+            and self.structured_query_projection is not None
+        ):
+            structured_condition = self.structured_query_projection(
+                structured_query.to(device=queries.device, dtype=self.input_projection.weight.dtype)
+            )
+            queries = queries + self.structured_query_gate.to(dtype=queries.dtype) * structured_condition.unsqueeze(1)
         for block in self.blocks:
             queries = block(queries, latents)
-        return self.output_projection(self.output_norm(queries))
+        soft_prompt = self.output_projection(self.output_norm(queries))
+        if self.soft_prompt_scale > 0.0:
+            soft_prompt = torch.tanh(soft_prompt) * self.soft_prompt_scale
+        return soft_prompt
 
 
 class TensorReadoutQADataset(Dataset):
@@ -376,6 +489,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--question-conditioning", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--question-condition-gate-init", type=float, default=None)
+    parser.add_argument("--structured-query-conditioning", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument(
         "--prompt-template",
         type=str,
@@ -493,6 +608,13 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         first_nested(config, ["adapter.question_condition_gate_init"]),
         1.0,
     )
+    set_default(
+        args,
+        "structured_query_conditioning",
+        first_nested(config, ["adapter.structured_query_conditioning"]),
+        True,
+    )
+    set_default(args, "soft_prompt_scale", first_nested(config, ["adapter.soft_prompt_scale"]), 0.05)
     set_default(
         args,
         "prompt_template",
@@ -768,13 +890,20 @@ def adapter_soft_embeds(
     text_embeds: torch.Tensor,
     question_embeds: torch.Tensor | None,
     question_mask: torch.Tensor | None,
+    records: Sequence[Mapping[str, Any]] | None,
     mode: str,
 ) -> torch.Tensor:
+    structured_query = (
+        structured_query_features(records, text_embeds.device)
+        if records is not None and adapter.structured_query_conditioning
+        else None
+    )
     if mode == "correct":
         return adapter(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
+            structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
@@ -784,6 +913,7 @@ def adapter_soft_embeds(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
+            structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
     raise ValueError(f"Unsupported soft prompt mode: {mode}")
 
@@ -824,6 +954,7 @@ def forward_loss(
         text_embeds,
         question_embeds=text_embeds,
         question_mask=prompt_mask,
+        records=records,
         mode=soft_prompt_mode,
     )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
@@ -881,6 +1012,7 @@ def forward_answer_nll(
         text_embeds,
         question_embeds=text_embeds,
         question_mask=prompt_mask,
+        records=records,
         mode=soft_prompt_mode,
     )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
@@ -1138,6 +1270,7 @@ def score_candidate_batch(
         text_embeds,
         question_embeds=text_embeds,
         question_mask=prompt_mask,
+        records=records,
         mode=soft_prompt_mode,
     )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
@@ -1383,6 +1516,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "latent_pos_encoding": str(args.latent_pos_encoding),
             "question_conditioning": bool(args.question_conditioning),
             "question_condition_gate_init": float(args.question_condition_gate_init),
+            "structured_query_conditioning": bool(args.structured_query_conditioning),
+            "soft_prompt_scale": float(args.soft_prompt_scale),
         },
         "llm_training": {
             "prompt_template": str(args.prompt_template),
@@ -1475,6 +1610,8 @@ def main() -> None:
         latent_pos_encoding=str(args.latent_pos_encoding),
         question_conditioning=bool(args.question_conditioning),
         question_condition_gate_init=float(args.question_condition_gate_init),
+        structured_query_conditioning=bool(args.structured_query_conditioning),
+        soft_prompt_scale=float(args.soft_prompt_scale),
     ).to(device)
 
     train_loader = DataLoader(
@@ -1512,6 +1649,8 @@ def main() -> None:
         "latent_pos_encoding": str(args.latent_pos_encoding),
         "question_conditioning": bool(args.question_conditioning),
         "question_condition_gate_init": float(args.question_condition_gate_init),
+        "structured_query_conditioning": bool(args.structured_query_conditioning),
+        "soft_prompt_scale": float(args.soft_prompt_scale),
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }

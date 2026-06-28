@@ -87,6 +87,8 @@ adapter:
   latent_pos_encoding: grid
   question_conditioning: true
   question_condition_gate_init: 1.0
+  structured_query_conditioning: true
+  soft_prompt_scale: 0.05
 
 llm_training:
   run_name: tensor_llm_adapter_vx_2x_qwen25_1p5b

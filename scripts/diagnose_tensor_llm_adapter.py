@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-pos-encoding", type=str, default=None, choices=("none", "grid"))
     parser.add_argument("--question-conditioning", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--question-condition-gate-init", type=float, default=None)
+    parser.add_argument("--structured-query-conditioning", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument("--prompt-template", type=str, default=None, choices=("generic", "task_specific"))
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
     parser.add_argument("--max-target-tokens", type=int, default=None)
@@ -164,6 +166,8 @@ def make_adapter_from_checkpoint(checkpoint: Mapping[str, Any], latent_channels:
         latent_pos_encoding=str(ckpt_args.get("latent_pos_encoding", "grid")),
         question_conditioning=bool(ckpt_args.get("question_conditioning", True)),
         question_condition_gate_init=float(ckpt_args.get("question_condition_gate_init", 1.0)),
+        structured_query_conditioning=bool(ckpt_args.get("structured_query_conditioning", False)),
+        soft_prompt_scale=float(ckpt_args.get("soft_prompt_scale", 0.0)),
     )
     adapter.load_state_dict(checkpoint["adapter_state_dict"])
     return adapter
@@ -216,6 +220,7 @@ def soft_prompt_for_record(
         text_embeds,
         question_embeds=text_embeds,
         question_mask=prompt_mask,
+        records=[record],
         mode=mode,
     )
     return soft_embeds, text_embeds, text_attention_mask, text_labels

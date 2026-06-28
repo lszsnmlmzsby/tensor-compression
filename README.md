@@ -682,8 +682,10 @@ python scripts/prepare_tensor_llm_assets.py \
 | `latent_pos_encoding` | 是否给 latent token 加二维位置编码。 | `grid`、`none` | `grid`：根据 latent 的 H、W 坐标加入可学习投影；`none`：不加入位置。 |
 | `question_conditioning` | 是否让文本问题条件化 adapter query token。 | `true`、`false` | `true`：同一个 tensor 面对不同问题会产生不同 soft prompt；`false`：同一个 tensor 的 soft prompt 与问题无关。 |
 | `question_condition_gate_init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭，但训练中仍可学习。 |
+| `structured_query_conditioning` | 是否把 query 中的结构化坐标显式编码进 adapter query。 | `true`、`false` | `true`：解析 row/col、A/B 点位、patch 范围、任务类型和选项数；不使用 oracle 数值答案。 |
+| `soft_prompt_scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`，使 soft prompt token 范数接近普通 token embedding；`0`：关闭尺度限制，保留线性输出。 |
 
-当前 adapter 的信息流是单向的：文本 prompt 的冻结 embedding 只用于生成 query 条件，latent token 仍然是 cross-attention 的唯一 key/value 来源，并且文本 embedding 在进入条件分支前会 detach。因此文本可以告诉 adapter “应该读哪里/读什么”，但训练梯度不会更新 LLM，也不会把 tensor latent 和文本 embedding 混成同一个可写空间。
+当前 adapter 的信息流是单向的：文本 prompt 的冻结 embedding 和结构化 query 特征只用于生成 query 条件，latent token 仍然是 cross-attention 的唯一 key/value 来源，并且文本 embedding 在进入条件分支前会 detach。因此文本可以告诉 adapter “应该读哪里/读什么”，但训练梯度不会更新 LLM，也不会把 tensor latent 和文本 embedding 混成同一个可写空间。
 
 #### `llm_training`
 
@@ -873,6 +875,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--latent-pos-encoding` | latent 位置编码方式。 | `grid`、`none` | `grid`：给二维 latent token 加坐标投影；`none`：不加位置。 |
 | `--question-conditioning` / `--no-question-conditioning` | 是否用文本问题条件化 adapter query。 | 布尔开关 | 开启后同一 tensor 的 soft prompt 会随问题变化。 |
 | `--question-condition-gate-init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭。 |
+| `--structured-query-conditioning` / `--no-structured-query-conditioning` | 是否使用结构化 query 条件。 | 布尔开关 | 开启后从 query 字符串解析坐标和任务类型，不读取 oracle 数值。 |
+| `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：推荐默认值；`0`：关闭限制。 |
 | `--prompt-template` | 文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按任务写规则；`generic`：旧版通用提示。 |
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `--max-target-tokens` | target 最大 token 数。 | 正整数 | - |
