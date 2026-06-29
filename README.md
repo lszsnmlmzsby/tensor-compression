@@ -955,7 +955,58 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 
 过拟合脚本默认会在训练成功后自动运行 `scripts/diagnose_tensor_llm_adapter.py`，输出到本次 run 目录，例如 `adapter_best_diagnostics_train.jsonl` 和对应 summary。若只想训练不诊断，传 `--no-diagnose`。
 
-### 3.8 Adapter 诊断输出
+### 3.8 Direct Probe Latent 可读性检查
+
+`scripts/train_tensor_direct_probe.py` 不加载 LLM，也不训练 soft prompt。它直接用 cached AE latent 和结构化 query 特征训练一个小分类器，用来判断 latent 本身是否包含完成 readout QA 的信息。
+
+推荐先做 overfit 检查：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_direct_probe.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --overfit-records 2048 \
+  --epochs 50 \
+  --batch-size 64 \
+  --run-name tensor_direct_probe_overfit_vx
+```
+
+这个命令会把 `train/val/test` 都设为同一个 `--source-split` 的前 2048 条，因此不是泛化评估。它的作用是定位问题：
+
+| 现象 | 说明 | 下一步 |
+|---|---|---|
+| `correct` 能接近 100%，且明显高于 `zero_latent/shuffled` | AE latent 中有足够信息；失败主要在 adapter -> soft prompt -> LLM 接口。 | 给 adapter 加 local addressing 或重新设计 soft prompt 注入方式。 |
+| `correct` 仍很低，且接近 `zero_latent/shuffled` | 当前 AE latent 或任务标签对 probe 也不可读。 | 检查 latent cache、AE 重建质量、bin 标签构造，或降低任务难度。 |
+| `correct` 高但 `shuffled` 也高 | 模型可能利用了答案分布、query 先验或数据泄漏。 | 看分任务结果，必要时重采样更均衡的数据。 |
+
+输出目录位于 `direct_probe.output_root` 或 `llm_training.output_root` 下，主要文件：
+
+| 文件 | 说明 |
+|---|---|
+| `run_summary.json` | latent shape、记录数、probe 参数量。 |
+| `metrics_latest.json` | 每个 epoch 的 train/val 指标。 |
+| `test_metrics.json` | 使用 `probe_best.pt` 在 test split 上的最终指标。 |
+| `probe_best.pt`、`probe_last.pt` | best/last checkpoint。 |
+
+常用参数：
+
+| 参数 | 说明 | 可选值 | 可选值说明 |
+|---|---|---|---|
+| `--config` | Adapter pipeline 配置路径。 | 路径 | 默认可用 `configs/tensor_llm_adapter_pipeline.yaml`。 |
+| `--qa-dir` | QA JSONL 目录。 | 路径 | 不传则读 `data.qa_dir`。 |
+| `--latent-dir` | latent cache 目录。 | 路径 | 不传则读 `data.latent_dir`。 |
+| `--overfit-records` | 使用同一 split 前 N 条作为 train/val/test。 | 正整数、`null` | 用于 sanity check；会覆盖 split 和 max record 设置。 |
+| `--source-split` | overfit 使用的来源 split。 | split 名 | 默认 `train`。 |
+| `--train-split`、`--val-split`、`--test-split` | 正式训练/评估 split。 | split 名 | 不使用 `--overfit-records` 时生效。 |
+| `--max-train-records`、`--max-val-records`、`--max-test-records` | 限制各 split 记录数。 | 正整数、`null` | `null`：使用完整 split。 |
+| `--feature-mode` | probe 使用的 latent 特征。 | `global`、`local`、`local_global` | `global`：只用全局 mean/std；`local`：按 query 坐标采样局部 latent；`local_global`：二者都用。 |
+| `--hidden-dim` | probe MLP 隐层维度。 | 正整数 | 默认 512。 |
+| `--hidden-layers` | probe MLP 隐层数。 | 正整数 | 默认 2。 |
+| `--dropout` | probe dropout。 | 0 到 1 | overfit 检查建议 0。 |
+| `--eval-baselines` | 评估 latent baseline。 | `correct`、`zero_latent`、`shuffled`、`random` | `correct`：正确 latent；`zero_latent`：全 0 latent；`shuffled`：错配 state；`random`：随机噪声。 |
+
+当前 direct probe 的 local 特征会根据 query 显式采样 latent grid：`point_bin` 采样 row/col，`point_compare` 采样 A/B 两点，`patch_compare` 对 A/B patch 位置做局部 pooling。它不读取 `oracle` 数值。
+
+### 3.9 Adapter 诊断输出
 
 `scripts/diagnose_tensor_llm_adapter.py` 用于检查三个问题：QA 记录和 latent 是否对齐、不同 state 的 latent/soft prompt 是否真的不同、正确 latent 是否系统性降低正确答案的 NLL。输出是 JSONL，不会改训练结果。
 
@@ -1002,7 +1053,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/diagnose_tensor_llm_adapter.py \
 | soft prompt 差异大，但 NLL margin 接近 0 | LLM 没有有效使用 soft prompt。 |
 | `answer_margin_shuffled_minus_correct` 多数为正 | 正确 latent 正在降低正确答案 NLL，是有效信号。 |
 
-### 3.9 配置模型对话 Smoke Test
+### 3.10 配置模型对话 Smoke Test
 
 `tests/chat_with_config_model.py` 会读取 `configs/tensor_llm_adapter_pipeline.yaml` 中的 `model.local_dir` 或 `model.name_or_path`，并使用同一份配置里的 `storage.hf_home`、`model.torch_dtype`、`model.trust_remote_code` 加载模型。这个脚本是手动检查下载模型是否能正常加载和生成文本，不属于自动单元测试。
 
@@ -1034,7 +1085,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 | `--top-p` | nucleus sampling 阈值。 | 0 到 1 | - |
 | `--do-sample` / `--no-do-sample` | 是否采样生成。 | 布尔开关 | `--no-do-sample`：贪心/确定性生成。 |
 
-### 3.10 模型选择建议
+### 3.11 模型选择建议
 
 | 阶段 | 模型 | 说明 |
 |---|---|---|
@@ -1044,7 +1095,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 当前 QA 是英文 DSL，第一阶段不强依赖中文能力；后续如果要中文提问，优先选 Qwen 系列。
 
-### 3.11 评估逻辑
+### 3.12 评估逻辑
 
 训练脚本默认做 choice likelihood 评估，而不是只看 loss。
 
@@ -1058,7 +1109,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 只有当 `correct` 明显优于 `zero_latent/shuffled` 时，才说明 adapter 可能学到了读取 tensor latent 的能力。开启 `structured_query_conditioning` 后，`no_latent` 会同时移除 soft prompt 和 query-conditioned adapter 输出，因此不再是唯一关键对照。
 
-### 3.9 LLM Readout Inspection
+### 3.13 LLM Readout Inspection
 
 这个脚本用于回答一个更具体的问题：在答案位置，冻结 LLM 到底更偏向哪些候选项。它不会解释 LLM 的内部语义，只输出可观测的候选答案 NLL、归一化概率、rank，以及 correct latent 相比 `zero_latent/shuffled/no_latent` 对正确答案概率的改变。
 
