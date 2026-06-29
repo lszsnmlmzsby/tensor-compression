@@ -715,12 +715,12 @@ python scripts/prepare_tensor_llm_assets.py \
 | `choice_ce_loss_weight` | 候选项分类 CE loss 权重。 | 非负数 | `0`：关闭；大于 0 时把所有候选答案的 `-NLL` 当作分类 logits，直接优化“选中正确候选项”。 |
 | `ranking_loss_weight` | ranking loss 权重。 | 非负数 | `0`：关闭；大于 0 时要求正确 latent 比错配 latent 更支持正确答案。 |
 | `ranking_loss_margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 希望 `NLL(shuffled)-NLL(correct)` 至少达到该值。 |
-| `ranking_loss_negative` | ranking loss 使用的负样本类型。 | `shuffled`、`random`、`no_latent` | `shuffled`：随机错配 latent；`random`：随机噪声；`no_latent`：零 soft prompt。 |
+| `ranking_loss_negative` | ranking loss 使用的负样本类型。 | `shuffled`、`random`、`no_latent`、`zero_latent` | `shuffled`：随机错配 latent；`random`：随机噪声；`no_latent`：零 soft prompt；`zero_latent`：latent 置零但仍经过 adapter 和 query 条件。 |
 | `prompt_template` | Adapter 训练用文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按 `task_type` 写明读数/比较/bin 规则；`generic`：旧版通用提示。 |
 | `max_prompt_tokens` | 文本 prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `max_target_tokens` | 答案最大 token 数。 | 正整数 | - |
 | `append_eos` | target 后是否追加 EOS。 | `true`、`false` | - |
-| `eval_baselines` | 评估 baseline 列表。 | `correct`、`no_latent`、`shuffled`、`random` | `correct`：正确 latent；`no_latent`：零 soft prompt；`shuffled`：固定 seed 的全局随机错配 latent；`random`：随机噪声 latent。 |
+| `eval_baselines` | 评估 baseline 列表。 | `correct`、`no_latent`、`zero_latent`、`shuffled`、`random` | `correct`：正确 latent；`no_latent`：零 soft prompt；`zero_latent`：latent 置零但保留 adapter 和 query 条件；`shuffled`：固定 seed 的全局随机错配 latent；`random`：随机噪声 latent。 |
 | `choice_score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 数平均；`sum`：总 NLL。 |
 | `log_interval` | 训练日志间隔。 | 正整数 | - |
 
@@ -866,7 +866,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--choice-ce-loss-weight` | 候选项分类 CE loss 权重。 | 非负数 | 例如 `1.0`；该项更接近选择题正确率的可导 surrogate。 |
 | `--ranking-loss-weight` | ranking loss 权重。 | 非负数 | `0`：关闭；默认从 config 读取。 |
 | `--ranking-loss-margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 要求正确 latent 的正确答案 NLL 比负样本更低。 |
-| `--ranking-loss-negative` | ranking loss 负样本类型。 | `shuffled`、`random`、`no_latent` | 通常先用 `shuffled`。 |
+| `--ranking-loss-negative` | ranking loss 负样本类型。 | `shuffled`、`random`、`no_latent`、`zero_latent` | `shuffled`：错配 tensor state；`zero_latent`：更严格地检查是否超过 query 条件先验。 |
 | `--soft-prompt-tokens` | soft prompt token 数。 | 正整数 | - |
 | `--adapter-dim` | adapter 内部维度。 | 正整数 | 必须能被 heads 整除。 |
 | `--adapter-layers` | adapter 层数。 | 正整数 | - |
@@ -881,7 +881,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `--max-target-tokens` | target 最大 token 数。 | 正整数 | - |
 | `--append-eos` / `--no-append-eos` | target 后是否追加 EOS。 | 布尔开关 | - |
-| `--eval-baselines` | 评估 baseline 列表。 | 逗号分隔字符串 | 可包含 `correct,no_latent,shuffled,random`；`shuffled` 是全局随机错配，不是相邻 state。 |
+| `--eval-baselines` | 评估 baseline 列表。 | 逗号分隔字符串 | 可包含 `correct,no_latent,zero_latent,shuffled,random`；`zero_latent` 是新结构下的重要对照。 |
 | `--choice-score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 平均；`sum`：累加。 |
 | `--log-interval` | 训练日志间隔。 | 正整数 | - |
 | `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | - |
@@ -938,7 +938,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 | `--records` | 取前 N 条记录做过拟合检查。 | 正整数 | 建议先用 `1024` 或 `2048`。 |
 | `--epochs` | 过拟合训练轮数。 | 正整数 | 建议 `5` 起步。 |
 | `--run-name` | 输出 run 名称。 | 字符串 | 建议包含 `overfit`。 |
-| `--eval-baselines` | baseline 列表。 | 逗号分隔字符串 | 默认 `correct,no_latent,shuffled`。 |
+| `--eval-baselines` | baseline 列表。 | 逗号分隔字符串 | 默认 `correct,no_latent,zero_latent,shuffled`。 |
 | `--dry-run` | 只打印实际调用命令，不执行。 | 开关 | 用于检查透传参数是否正确。 |
 | `--diagnose` / `--no-diagnose` | 训练成功后是否自动运行 adapter 诊断脚本。 | 布尔开关 | 默认开启，使用 `adapter_best.pt`。 |
 | `--diagnose-records` | 自动诊断输出的 record 数。 | 正整数 | 默认 64。 |
@@ -949,8 +949,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter_overfit.py \
 
 | 现象 | 说明 | 下一步 |
 |---|---|---|
-| `correct` 明显高于 `no_latent/shuffled` | adapter 至少能在小数据上利用正确 latent。 | 再讨论泛化、任务设计和数据规模。 |
-| `correct` 仍接近 `no_latent/shuffled` | 当前结构或训练目标仍没有迫使模型使用 latent。 | 新结构已包含 latent 2D 位置编码和 question-conditioned adapter；若仍失败，优先考虑 ranking/contrastive loss 或任务重构。 |
+| `correct` 明显高于 `zero_latent/shuffled` | adapter 至少能在小数据上利用正确 latent。 | 再讨论泛化、任务设计和数据规模。 |
+| `correct` 仍接近 `zero_latent/shuffled` | 当前结构或训练目标仍没有迫使模型使用 latent。 | 新结构已包含 latent 2D 位置编码、query-conditioned adapter 和结构化 query 条件；若仍失败，优先考虑任务重构或开放 encoder。 |
 | train loss 降但 `correct` 不涨 | 模型主要学到输出格式或标签先验。 | 不应只靠继续加 epoch 解决。 |
 
 过拟合脚本默认会在训练成功后自动运行 `scripts/diagnose_tensor_llm_adapter.py`，输出到本次 run 目录，例如 `adapter_best_diagnostics_train.jsonl` 和对应 summary。若只想训练不诊断，传 `--no-diagnose`。
@@ -990,7 +990,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/diagnose_tensor_llm_adapter.py \
 | `record`、`shuffled_record` | 检查正确样本和随机错配样本的 `state_ref/sample_index/time_index/query/answer/oracle`。 |
 | `latent` | 正确 latent 与 shuffled latent 的统计、L2 距离、cosine similarity。 |
 | `soft_prompt` | 正确 latent、shuffled latent、零 soft prompt 的统计与差异。 |
-| `nll` | 每个候选答案在 correct/shuffled/no_latent 下的 NLL 和正确答案 margin。 |
+| `nll` | 每个候选答案在 correct/shuffled/no_latent/zero_latent 下的 NLL 和正确答案 margin。 |
 | `hidden_states` | 指定 LLM 层的全序列、soft token 区、text token 区 hidden state 摘要。 |
 
 结果解读：
@@ -1052,7 +1052,38 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 |---|---|---|---|
 | `correct` | 使用当前样本的正确 tensor latent。 | baseline 名 | 目标能力。 |
 | `no_latent` | 使用全 0 soft prompt。 | baseline 名 | 检查 LLM 是否只靠文本先验答题。 |
+| `zero_latent` | latent 置零，但仍经过 adapter 和 query 条件。 | baseline 名 | 新结构下更干净地检查“没有 tensor 内容、只有 query 条件”能答到什么程度。 |
 | `shuffled` | 使用其他 state 的 latent。 | baseline 名 | 检查 latent 是否绑定当前 tensor。 |
 | `random` | 使用随机 latent。 | baseline 名 | 可选消融。 |
 
-只有当 `correct` 明显优于 `no_latent/shuffled` 时，才说明 adapter 可能学到了读取 tensor latent 的能力。
+只有当 `correct` 明显优于 `zero_latent/shuffled` 时，才说明 adapter 可能学到了读取 tensor latent 的能力。开启 `structured_query_conditioning` 后，`no_latent` 会同时移除 soft prompt 和 query-conditioned adapter 输出，因此不再是唯一关键对照。
+
+### 3.9 LLM Readout Inspection
+
+这个脚本用于回答一个更具体的问题：在答案位置，冻结 LLM 到底更偏向哪些候选项。它不会解释 LLM 的内部语义，只输出可观测的候选答案 NLL、归一化概率、rank，以及 correct latent 相比 `zero_latent/shuffled/no_latent` 对正确答案概率的改变。
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/inspect_tensor_llm_readout.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --checkpoint /data/wyx/tensor_llm_outputs/runs/<RUN>/adapter_best.pt \
+  --split train \
+  --records 64
+```
+
+输出在 checkpoint 同目录下：
+
+```text
+adapter_best_readout_inspection_train.jsonl
+adapter_best_readout_inspection_train.summary.json
+```
+
+重点看这些字段：
+
+| 字段 | 说明 |
+|---|---|
+| `modes.correct.choices` | 正确 latent 下每个候选答案的 NLL、概率、rank。 |
+| `modes.zero_latent.choices` | 无 tensor 内容但保留 adapter/query 条件时的候选分布。 |
+| `modes.shuffled.choices` | 错配 tensor state 时的候选分布。 |
+| `deltas_from_correct.*.answer_prob_correct_minus_mode` | 正确 latent 是否提高了正确答案概率。 |
+| `deltas_from_correct.*.answer_nll_mode_minus_correct` | 正确 latent 是否降低了正确答案 NLL。 |
+| `soft_prompt.correct_vs_*` | 不同 baseline 的 soft prompt 距离和 cosine。 |

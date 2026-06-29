@@ -82,7 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--choice-ce-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
-    parser.add_argument("--ranking-loss-negative", type=str, default=None, choices=("shuffled", "random", "no_latent"))
+    parser.add_argument(
+        "--ranking-loss-negative",
+        type=str,
+        default=None,
+        choices=("shuffled", "random", "no_latent", "zero_latent"),
+    )
     parser.add_argument("--soft-prompt-tokens", type=int, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
@@ -398,6 +403,16 @@ def main() -> None:
             nll_correct = nll_by_choice(llm, adapter, tokenizer, record, correct_latent, args, device, "correct")
             nll_shuffled = nll_by_choice(llm, adapter, tokenizer, record, shuffled_latent, args, device, "shuffled")
             nll_zero = nll_by_choice(llm, adapter, tokenizer, record, correct_latent, args, device, "no_latent")
+            nll_zero_latent = nll_by_choice(
+                llm,
+                adapter,
+                tokenizer,
+                record,
+                torch.zeros_like(correct_latent),
+                args,
+                device,
+                "zero_latent",
+            )
 
             payload = {
                 "index": int(index),
@@ -428,8 +443,11 @@ def main() -> None:
                     "correct_latent": nll_correct,
                     "shuffled_latent": nll_shuffled,
                     "zero_soft_prompt": nll_zero,
+                    "zero_latent": nll_zero_latent,
                     "answer_margin_shuffled_minus_correct": nll_shuffled["answer_nll"] - nll_correct["answer_nll"],
                     "answer_margin_zero_minus_correct": nll_zero["answer_nll"] - nll_correct["answer_nll"],
+                    "answer_margin_zero_latent_minus_correct": nll_zero_latent["answer_nll"]
+                    - nll_correct["answer_nll"],
                 },
                 "hidden_states": hidden_summary,
             }

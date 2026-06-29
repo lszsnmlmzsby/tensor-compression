@@ -123,6 +123,7 @@ llm_training:
   eval_baselines:
     - correct
     - no_latent
+    - zero_latent
     - shuffled
   choice_score: mean
   log_interval: 20

@@ -473,7 +473,7 @@ def parse_args() -> argparse.Namespace:
         "--ranking-loss-negative",
         type=str,
         default=None,
-        choices=("shuffled", "random", "no_latent"),
+        choices=("shuffled", "random", "no_latent", "zero_latent"),
     )
     parser.add_argument("--soft-prompt-tokens", type=int, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
@@ -505,7 +505,7 @@ def parse_args() -> argparse.Namespace:
         "--eval-baselines",
         type=str,
         default=None,
-        help="Comma-separated: correct,no_latent,shuffled,random.",
+        help="Comma-separated: correct,no_latent,zero_latent,shuffled,random.",
     )
     parser.add_argument(
         "--choice-score",
@@ -628,7 +628,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args,
         "eval_baselines",
         value_to_csv(first_nested(config, ["llm_training.eval_baselines"])),
-        "correct,no_latent,shuffled",
+        "correct,no_latent,zero_latent,shuffled",
     )
     set_default(args, "choice_score", first_nested(config, ["llm_training.choice_score"]), "mean")
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
@@ -908,7 +908,7 @@ def adapter_soft_embeds(
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
         return text_embeds.new_zeros((batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1]))
-    if mode in {"shuffled", "random"}:
+    if mode in {"shuffled", "random", "zero_latent"}:
         return adapter(
             latent_map,
             question_embeds=question_embeds,
@@ -1192,6 +1192,8 @@ def training_loss(
         negative_latents = baseline_latents("random", batch, dataset)
     elif negative_mode == "no_latent":
         negative_latents = batch["latent_map"]
+    elif negative_mode == "zero_latent":
+        negative_latents = torch.zeros_like(batch["latent_map"])
     else:
         raise ValueError(f"Unsupported ranking_loss_negative: {negative_mode}")
     negative_nll = forward_answer_nll(
@@ -1365,6 +1367,8 @@ def baseline_latents(
     latents = batch["latent_map"]
     if mode in {"correct", "no_latent"}:
         return latents
+    if mode == "zero_latent":
+        return torch.zeros_like(latents)
     if mode == "random":
         return torch.randn_like(latents)
     if mode == "shuffled":
@@ -1480,7 +1484,7 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
     if not isinstance(correct, Mapping) or not isinstance(correct.get("accuracy"), (int, float)):
         return
     correct_accuracy = float(correct["accuracy"])
-    for baseline in ("no_latent", "shuffled", "random"):
+    for baseline in ("no_latent", "zero_latent", "shuffled", "random"):
         baseline_metrics = metrics.get(baseline)
         if isinstance(baseline_metrics, Mapping) and isinstance(baseline_metrics.get("accuracy"), (int, float)):
             payload[f"{prefix}/correct_minus_{baseline}_accuracy"] = correct_accuracy - float(
