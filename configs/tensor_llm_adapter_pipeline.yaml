@@ -78,6 +78,91 @@ latent_export:
   allow_field_mismatch: false
   overwrite: false
 
+patch_alignment:
+  # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
+  #   tensor path: patch -> patch AE encoder -> token adapter/Q-Former -> vector
+  #   text path: serialized patch -> frozen LLM middle hidden state -> vector
+  # and the two vectors are trained with contrastive/cosine losses.
+  enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
+  run_name: tensor_patch_text_alignment_vx
+  output_root: /data/wyx/tensor_llm_outputs/runs
+  hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
+  fields:
+    - Vx
+  patch_size: 16
+  # Number of random sample/time/patch records created in-memory per split.
+  train_records: 65536
+  val_records: 4096
+  test_records: 4096
+  sample_indices: all
+  time_indices: all
+  seed: 42
+  device: auto
+  batch_size: 16
+  eval_batch_size: 16
+  epochs: 40
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  num_workers: 0
+  # patch_ae_config: build a patch-sized AE from patch_encoder below.
+  # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
+  encoder_source: patch_ae_config
+  # true: update AE encoder during alignment. For a fresh patch AE this should stay true.
+  # false: freeze a loaded checkpoint encoder and train only the alignment adapter.
+  # To reuse a trained patch AE, set:
+  #   encoder_source: checkpoint
+  #   compressor_checkpoint: /path/to/alignment_best.pt or patch_ae_pretrain_last.pt
+  #   train_patch_ae: false
+  #   patch_ae_pretrain_epochs: 0
+  train_patch_ae: true
+  # Reconstruction-only warmup for a fresh patch AE before contrastive alignment starts.
+  patch_ae_pretrain_epochs: 5
+  # Used only when encoder_source: checkpoint.
+  compressor_checkpoint: null
+  compressor_config: null
+  # With patch_ae_config this should be false. Set true only when loading a checkpoint whose input_size
+  # differs from patch_size, for example the legacy 512x512 compressor.
+  resize_patch_to_compressor_input: false
+  patch_encoder:
+    normalization:
+      mode: zscore
+      scope: channel
+      stats_path: null
+      clip_min: null
+      clip_max: null
+    model:
+      name: conv_token_autoencoder_2d
+      input_size: [16, 16]
+      base_channels: 32
+      channel_multipliers: [1, 2]
+      num_res_blocks: 1
+      latent_dim: 128
+      latent_grid: [4, 4]
+      dropout: 0.0
+      norm: group
+      activation: gelu
+      output_activation: identity
+  adapter_type: qformer
+  adapter_dim: 512
+  query_tokens: 8
+  adapter_layers: 2
+  adapter_heads: 8
+  # null means directly align to the LLM hidden size. This keeps the text teacher side fixed.
+  projection_dim: null
+  dropout: 0.0
+  temperature: 0.07
+  contrastive_loss_weight: 1.0
+  cosine_loss_weight: 0.2
+  # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
+  reconstruction_loss_weight: 1.0
+  text_prompt_template: compact
+  text_decimal_places: 3
+  max_text_tokens: 1024
+  # Qwen2.5-1.5B has 28 decoder layers; hidden_states[14] is a middle-layer teacher.
+  teacher_layer: 14
+  log_interval: 20
+
 adapter:
   soft_prompt_tokens: 32
   adapter_dim: 512
@@ -129,7 +214,7 @@ llm_training:
   log_interval: 20
 
 wandb:
-  enabled: false
+  enabled: true
   api_key: null
   project: tensor-compression
   entity: null
@@ -138,5 +223,6 @@ wandb:
     - adapter
     - tensor-llm
     - soft-prompt
+    - patch-alignment
   mode: offline
-  log_model: false
+  log_model: online

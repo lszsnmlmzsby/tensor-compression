@@ -4,7 +4,7 @@
 
 1. **压缩**：训练 tensor autoencoder，检查 HDF5 数据结构，并用 PDEBench 下游算子验证重建质量。
 2. **Tensor Editor**：基于冻结 AE，在 latent 空间训练一个文本条件编辑器。这是实验性功能。
-3. **Adapter**：导出 AE latent cache，冻结 LLM，训练 soft prompt adapter，让 LLM 回答 tensor readout QA。
+3. **Adapter**：导出 AE latent cache，训练 tensor/LLM 对齐模块，并用 soft prompt adapter 评估 LLM 的 tensor readout QA 能力。
 
 基础安装：
 
@@ -1006,7 +1006,147 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_direct_probe.py \
 
 当前 direct probe 的 local 特征会根据 query 显式采样 latent grid：`point_bin` 采样 row/col，`point_compare` 采样 A/B 两点，`patch_compare` 对 A/B patch 位置做局部 pooling。它不读取 `oracle` 数值。
 
-### 3.9 Adapter 诊断输出
+### 3.9 Tensor-as-Text Patch 对齐
+
+`scripts/train_tensor_patch_text_alignment.py` 用于训练一个更直接的中间表示对齐任务。同一个 PDEBench patch 走两条路径：
+
+```text
+tensor path:
+  patch -> patch AE encoder -> latent tokens -> Q-Former/Transformer adapter -> tensor embedding
+
+text path:
+  patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
+```
+
+当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。默认 prompt 以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，因此配置默认 `teacher_layer: 14`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `8/14/20/-1`。
+
+默认 tensor path 不再把 `16x16` patch resize 到 `512x512`。脚本会按 `patch_alignment.patch_encoder` 构建一个 patch-sized AE：
+
+```text
+16x16 patch -> patch AE -> 4x4 latent tokens
+```
+
+如果 `encoder_source: checkpoint`，则加载 `compressor_checkpoint`；这适合调用已经训练好的 patch AE，或者临时复用旧的 512x512 compressor。只有后一种情况才应设 `resize_patch_to_compressor_input: true`。
+
+默认 patch size 是 `16x16`。`8x8` 信息量偏少，`32x32` 文本 token 开销明显增大；`16x16` 单字段在 Qwen2.5-1.5B 的上下文内比较适合做第一轮实验。
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+小规模 smoke test：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --train-records 128 \
+  --val-records 32 \
+  --test-records 32 \
+  --epochs 1 \
+  --batch-size 4 \
+  --run-name tensor_patch_text_alignment_smoke
+```
+
+主要 loss：
+
+```text
+loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teacher_embedding)
+     + cosine_loss_weight * (1 - cosine_similarity)
+     + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
+```
+
+其中 reconstruction 项只有在 `train_patch_ae: true` 时参与反传；如果 encoder 冻结，它只作为指标记录。
+
+输出文件：
+
+| 文件 | 说明 |
+|---|---|
+| `run_summary.json` | patch 大小、字段、encoder 来源、latent grid、LLM hidden size、teacher layer、adapter 参数量。 |
+| `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
+| `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
+| `patch_ae_pretrain_last.pt` | 可选 patch AE reconstruction warmup 后的 checkpoint。 |
+| `alignment_best.pt`、`alignment_last.pt` | 对齐 adapter checkpoint；若开放 AE 训练，也会保存 compressor state。 |
+
+W&B 曲线：
+
+| 曲线名 | 说明 |
+|---|---|
+| `patch_ae_pretrain_step/reconstruction_loss` | patch AE 预训练阶段的 step-level 平均重建误差。 |
+| `patch_ae_pretrain_step/current_reconstruction_loss` | patch AE 当前 batch 重建误差。 |
+| `patch_ae_pretrain/reconstruction_loss` | patch AE 每个预训练 epoch 的平均重建误差。 |
+| `patch_ae_pretrain/val_reconstruction_loss` | patch AE 每个预训练 epoch 后的验证集重建误差，用于观察过拟合。 |
+| `train/reconstruction_loss` | alignment 阶段训练集重建误差；`train_patch_ae: true` 时可观察 AE 是否继续变化。 |
+| `val/reconstruction_loss` | alignment 阶段验证集重建误差。 |
+| `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
+| `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
+
+要启用 W&B：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --wandb-enabled \
+  --wandb-mode online
+```
+
+已训练 patch AE 可以按路径冻结复用。第一次训练后，优先用 `alignment_best.pt`；如果只想用 reconstruction warmup 后的 AE，则用 `patch_ae_pretrain_last.pt`：
+
+```yaml
+patch_alignment:
+  encoder_source: checkpoint
+  compressor_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+  train_patch_ae: false
+  patch_ae_pretrain_epochs: 0
+  resize_patch_to_compressor_input: false
+```
+
+该 checkpoint 内会保存 `compressor_config` 和 `compressor_state_dict`，因此通常不需要再单独提供 `compressor_config`。如果复用旧的 `scripts/train_compressor.py` 产物，则仍然支持读取其中的 `model_state_dict` 和 `config`。
+
+常用参数：
+
+| 参数 | 说明 | 可选值 | 可选值说明 |
+|---|---|---|---|
+| `--patch-size` | 从 PDEBench 原始场中裁剪的方形 patch 边长。 | 正整数 | 默认 16；建议先在 16 和 32 中比较。 |
+| `--fields` | 使用哪些 HDF5 字段。 | 逗号分隔字段 | 当前建议先用单字段 `Vx`，多字段会显著增加文本长度。 |
+| `--train-records`、`--val-records`、`--test-records` | 随机采样 patch 数。 | 正整数 | 初始 smoke test 用小值，正式训练可增大。 |
+| `--encoder-source` | encoder 从哪里来。 | `patch_ae_config`、`checkpoint` | `patch_ae_config`：按 YAML 构建 patch AE；`checkpoint`：加载 `compressor_checkpoint`。 |
+| `--train-patch-ae` / `--no-train-patch-ae` | 是否更新 AE 参数。 | 布尔开关 | 新建 patch AE 建议 `true`；加载已训练 patch AE 做纯 adapter 对齐时可设 `false`。 |
+| `--patch-ae-pretrain-epochs` | 对齐前 reconstruction-only warmup 轮数。 | 非负整数 | `0`：跳过；大于 0：先训练 patch AE 重建。 |
+| `--compressor-checkpoint` | 已训练 encoder checkpoint。 | 路径、`null` | 仅 `encoder_source: checkpoint` 必需。 |
+| `--resize-patch-to-compressor-input` / `--no-resize-patch-to-compressor-input` | 是否把 patch resize 到 encoder `input_size` 后再编码。 | 布尔开关 | patch AE 应设 `false`；旧 512x512 AE 才设 `true`。 |
+| `--adapter-type` | tensor path 的对齐 adapter。 | `qformer`、`pooled_mlp` | `qformer`：learnable queries cross-attend latent tokens；`pooled_mlp`：mean/std pooling 旧实现，仅作 ablation。 |
+| `--query-tokens` | Q-Former learnable query 数。 | 正整数 | query 越多，tensor path 容量越大，显存也更高。 |
+| `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 默认 2。 |
+| `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
+| `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
+| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 默认 3；位数越多 token 越多。 |
+| `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 默认 1024。 |
+| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 默认 14；`-1` 表示最后一层。 |
+| `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
+| `--projection-dim` | tensor embedding 维度。 | `null` 或 LLM hidden size | 当前 text teacher 不训练 projection，因此必须等于 LLM hidden size；默认 `null` 自动匹配。 |
+| `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | 默认读取 `wandb.enabled`。 |
+| `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
+| `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 patch AE/alignment checkpoint artifact。 | 布尔开关 | 默认读取 `wandb.log_model`。 |
+
+`patch_alignment.patch_encoder` 是新建 patch AE 的模型配置，只有 `encoder_source: patch_ae_config` 时使用。默认单字段 `Vx` 的结构是：
+
+```yaml
+patch_encoder:
+  model:
+    input_size: [16, 16]
+    channel_multipliers: [1, 2]
+    latent_dim: 128
+    latent_grid: [4, 4]
+```
+
+`channel_multipliers` 的长度决定下采样次数。默认长度为 2，因此下采样因子是 `2^2=4`，`16x16` 输入对应 `4x4` latent tokens。
+
+这个脚本不是 QA 训练。它的目标是验证：tensor path 能否学到和“LLM 直接阅读文本形式 patch”一致的中间表示。若这里的 retrieval accuracy 训练不上去，说明 text teacher 表示或 tensor adapter 结构仍有问题；若训练有效，再把这个 adapter 初始化迁移到后续 readout QA。
+
+### 3.10 Adapter 诊断输出
 
 `scripts/diagnose_tensor_llm_adapter.py` 用于检查三个问题：QA 记录和 latent 是否对齐、不同 state 的 latent/soft prompt 是否真的不同、正确 latent 是否系统性降低正确答案的 NLL。输出是 JSONL，不会改训练结果。
 
@@ -1053,7 +1193,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/diagnose_tensor_llm_adapter.py \
 | soft prompt 差异大，但 NLL margin 接近 0 | LLM 没有有效使用 soft prompt。 |
 | `answer_margin_shuffled_minus_correct` 多数为正 | 正确 latent 正在降低正确答案 NLL，是有效信号。 |
 
-### 3.10 配置模型对话 Smoke Test
+### 3.11 配置模型对话 Smoke Test
 
 `tests/chat_with_config_model.py` 会读取 `configs/tensor_llm_adapter_pipeline.yaml` 中的 `model.local_dir` 或 `model.name_or_path`，并使用同一份配置里的 `storage.hf_home`、`model.torch_dtype`、`model.trust_remote_code` 加载模型。这个脚本是手动检查下载模型是否能正常加载和生成文本，不属于自动单元测试。
 
@@ -1085,7 +1225,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 | `--top-p` | nucleus sampling 阈值。 | 0 到 1 | - |
 | `--do-sample` / `--no-do-sample` | 是否采样生成。 | 布尔开关 | `--no-do-sample`：贪心/确定性生成。 |
 
-### 3.11 模型选择建议
+### 3.12 模型选择建议
 
 | 阶段 | 模型 | 说明 |
 |---|---|---|
@@ -1095,7 +1235,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 当前 QA 是英文 DSL，第一阶段不强依赖中文能力；后续如果要中文提问，优先选 Qwen 系列。
 
-### 3.12 评估逻辑
+### 3.13 评估逻辑
 
 训练脚本默认做 choice likelihood 评估，而不是只看 loss。
 
@@ -1109,7 +1249,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 只有当 `correct` 明显优于 `zero_latent/shuffled` 时，才说明 adapter 可能学到了读取 tensor latent 的能力。开启 `structured_query_conditioning` 后，`no_latent` 会同时移除 soft prompt 和 query-conditioned adapter 输出，因此不再是唯一关键对照。
 
-### 3.13 LLM Readout Inspection
+### 3.14 LLM Readout Inspection
 
 这个脚本用于回答一个更具体的问题：在答案位置，冻结 LLM 到底更偏向哪些候选项。它不会解释 LLM 的内部语义，只输出可观测的候选答案 NLL、归一化概率、rank，以及 correct latent 相比 `zero_latent/shuffled/no_latent` 对正确答案概率的改变。
 
