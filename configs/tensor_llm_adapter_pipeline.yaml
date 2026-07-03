@@ -80,7 +80,7 @@ latent_export:
 
 patch_alignment:
   # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
-  #   tensor path: patch -> patch AE encoder -> token adapter/Q-Former -> vector
+  #   tensor path: patch -> patch AE encoder -> Q-Former soft prompt -> frozen LLM hidden state
   #   text path: serialized patch -> frozen LLM middle hidden state -> vector
   # and the two vectors are trained with contrastive/cosine losses.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
@@ -116,6 +116,8 @@ patch_alignment:
   #   train_patch_ae: false
   #   patch_ae_pretrain_epochs: 0
   train_patch_ae: true
+  # true: after reconstruction pretraining, freeze patch AE and train only the Q-Former/soft prompt bridge.
+  freeze_patch_ae_after_pretrain: true
   # Reconstruction-only warmup for a fresh patch AE before contrastive alignment starts.
   patch_ae_pretrain_epochs: 5
   # Used only when encoder_source: checkpoint.
@@ -156,11 +158,13 @@ patch_alignment:
   cosine_loss_weight: 0.2
   # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
+  # compact excludes sample/time/top_left metadata because tensor path cannot observe them.
+  # compact_with_metadata keeps the previous metadata-rich prompt only for ablation.
   text_prompt_template: compact
   text_decimal_places: 3
   max_text_tokens: 1024
   # Qwen2.5-1.5B has 28 decoder layers; hidden_states[14] is a middle-layer teacher.
-  teacher_layer: 14
+  teacher_layer: 8
   log_interval: 20
 
 adapter:
@@ -224,5 +228,5 @@ wandb:
     - tensor-llm
     - soft-prompt
     - patch-alignment
-  mode: offline
-  log_model: online
+  mode: online
+  log_model: false

@@ -320,6 +320,12 @@ class PDEBenchPatchTextDataset(Dataset):
         if self.prompt_template == "compact":
             return (
                 "Represent this PDE tensor patch for numeric reasoning.\n"
+                f"fields={','.join(self.field_keys)} patch_size={self.patch_size}\n"
+                f"{body}\nRepresentation:"
+            )
+        if self.prompt_template == "compact_with_metadata":
+            return (
+                "Represent this PDE tensor patch for numeric reasoning.\n"
                 f"sample={record.sample_index} time={record.time_index} "
                 f"top_left=({record.row},{record.col}) patch_size={self.patch_size}\n"
                 f"{body}\nRepresentation:"
@@ -435,7 +441,7 @@ class TensorPatchAlignmentAdapter(nn.Module):
         nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_pos_embed, mean=0.0, std=0.02)
 
-    def forward_tensor(self, latent_map: torch.Tensor) -> torch.Tensor:
+    def forward_soft_prompts(self, latent_map: torch.Tensor) -> torch.Tensor:
         if self.adapter_type == "qformer":
             latent_tokens = latent_map.flatten(2).transpose(1, 2)
             if int(latent_tokens.shape[1]) != self.latent_token_count:
@@ -447,8 +453,7 @@ class TensorPatchAlignmentAdapter(nn.Module):
             queries = self.query_tokens.expand(latent_map.shape[0], -1, -1)
             for block in self.blocks:
                 queries = block(queries, context)
-            pooled = queries.mean(dim=1)
-            return F.normalize(self.output(pooled), dim=-1)
+            return self.output(queries)
         pooled = torch.cat(
             [
                 latent_map.mean(dim=tuple(range(2, latent_map.ndim))),
@@ -456,7 +461,11 @@ class TensorPatchAlignmentAdapter(nn.Module):
             ],
             dim=-1,
         )
-        return F.normalize(self.projection(pooled), dim=-1)
+        return self.projection(pooled).unsqueeze(1)
+
+    def forward_tensor(self, latent_map: torch.Tensor) -> torch.Tensor:
+        soft_prompts = self.forward_soft_prompts(latent_map)
+        return F.normalize(soft_prompts.mean(dim=1), dim=-1)
 
 
 def symmetric_contrastive_loss(
@@ -487,6 +496,41 @@ def reconstruction_mse(compressor: nn.Module, latent_map: torch.Tensor, target: 
     return F.mse_loss(reconstruction, target)
 
 
+def hidden_at_last_non_padding(
+    hidden_states: Sequence[torch.Tensor],
+    attention_mask: torch.Tensor,
+    teacher_layer: int,
+    prefix_tokens: int = 0,
+) -> torch.Tensor:
+    layer_index = int(teacher_layer)
+    if not -len(hidden_states) <= layer_index < len(hidden_states):
+        raise ValueError(
+            f"teacher_layer={teacher_layer} is out of range for {len(hidden_states)} hidden-state tensors."
+        )
+    hidden = hidden_states[layer_index]
+    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device).unsqueeze(0)
+    last_indices = (attention_mask.long() * positions).amax(dim=1) + int(prefix_tokens)
+    batch_indices = torch.arange(hidden.shape[0], device=hidden.device)
+    return hidden[batch_indices, last_indices]
+
+
+def build_student_anchor_texts(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for record in records:
+        fields = record.get("fields", [])
+        if isinstance(fields, Sequence) and not isinstance(fields, str):
+            field_text = ",".join(str(field) for field in fields)
+        else:
+            field_text = str(fields)
+        patch_size = int(record.get("patch_size", 0))
+        texts.append(
+            "Represent this PDE tensor patch for numeric reasoning.\n"
+            f"fields={field_text} patch_size={patch_size}\n"
+            "Representation:"
+        )
+    return texts
+
+
 @torch.no_grad()
 def text_teacher_hidden(
     llm: nn.Module,
@@ -511,16 +555,48 @@ def text_teacher_hidden(
         output_hidden_states=True,
         use_cache=False,
     )
-    hidden_states = outputs.hidden_states
-    layer_index = int(teacher_layer)
-    if not -len(hidden_states) <= layer_index < len(hidden_states):
-        raise ValueError(
-            f"teacher_layer={teacher_layer} is out of range for {len(hidden_states)} hidden-state tensors."
-        )
-    hidden = hidden_states[layer_index]
-    last_indices = attention_mask.sum(dim=1).clamp_min(1) - 1
-    batch_indices = torch.arange(hidden.shape[0], device=hidden.device)
-    return hidden[batch_indices, last_indices].detach()
+    return hidden_at_last_non_padding(outputs.hidden_states, attention_mask, teacher_layer).detach()
+
+
+def tensor_student_hidden(
+    llm: nn.Module,
+    tokenizer: Any,
+    soft_prompts: torch.Tensor,
+    records: Sequence[Mapping[str, Any]],
+    device: torch.device,
+    max_tokens: int,
+    teacher_layer: int,
+) -> torch.Tensor:
+    encoded = tokenizer(
+        build_student_anchor_texts(records),
+        padding=True,
+        truncation=True,
+        max_length=int(max_tokens),
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"].to(device)
+    text_attention_mask = encoded["attention_mask"].to(device)
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    soft_prompts = soft_prompts.to(device=device, dtype=text_embeds.dtype)
+    inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
+    soft_attention = torch.ones(
+        (input_ids.shape[0], soft_prompts.shape[1]),
+        dtype=text_attention_mask.dtype,
+        device=device,
+    )
+    attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
+    outputs = llm(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return hidden_at_last_non_padding(
+        outputs.hidden_states,
+        text_attention_mask,
+        teacher_layer,
+        prefix_tokens=int(soft_prompts.shape[1]),
+    )
 
 
 def normalize_patch_batch(
@@ -539,6 +615,10 @@ def normalize_patch_batch(
     return torch.stack(normalized, dim=0)
 
 
+def train_compressor_during_alignment(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "alignment_train_patch_ae", args.train_patch_ae))
+
+
 def train_one_epoch(
     *,
     compressor: nn.Module,
@@ -554,7 +634,8 @@ def train_one_epoch(
     epoch: int,
 ) -> dict[str, float]:
     adapter.train()
-    if bool(args.train_patch_ae):
+    train_compressor = train_compressor_during_alignment(args)
+    if train_compressor:
         compressor.train()
     else:
         compressor.eval()
@@ -583,12 +664,22 @@ def train_one_epoch(
                 int(args.max_text_tokens),
                 int(args.teacher_layer),
             )
-        if bool(args.train_patch_ae):
+        if train_compressor:
             latent = compressor.encode(patches)["latent_map"]
         else:
             with torch.no_grad():
                 latent = compressor.encode(patches)["latent_map"]
-        tensor_embedding = adapter.forward_tensor(latent)
+        soft_prompts = adapter.forward_soft_prompts(latent)
+        student_hidden = tensor_student_hidden(
+            llm,
+            tokenizer,
+            soft_prompts,
+            batch["records"],
+            device,
+            int(args.max_text_tokens),
+            int(args.teacher_layer),
+        )
+        tensor_embedding = F.normalize(student_hidden.float(), dim=-1)
         text_embedding = F.normalize(teacher_hidden.to(dtype=tensor_embedding.dtype), dim=-1)
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
@@ -597,7 +688,7 @@ def train_one_epoch(
         )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
-        reconstruction_weight = float(args.reconstruction_loss_weight) if bool(args.train_patch_ae) else 0.0
+        reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.cosine_loss_weight) * cosine
@@ -741,6 +832,7 @@ def evaluate(
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
+    train_compressor = train_compressor_during_alignment(args)
     for batch in tqdm(loader, desc="eval align", leave=False):
         patches = normalize_patch_batch(
             batch["patch"],
@@ -757,7 +849,17 @@ def evaluate(
             int(args.teacher_layer),
         )
         latent = compressor.encode(patches)["latent_map"]
-        tensor_embedding = adapter.forward_tensor(latent)
+        soft_prompts = adapter.forward_soft_prompts(latent)
+        student_hidden = tensor_student_hidden(
+            llm,
+            tokenizer,
+            soft_prompts,
+            batch["records"],
+            device,
+            int(args.max_text_tokens),
+            int(args.teacher_layer),
+        )
+        tensor_embedding = F.normalize(student_hidden.float(), dim=-1)
         text_embedding = F.normalize(teacher_hidden.to(dtype=tensor_embedding.dtype), dim=-1)
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
@@ -766,7 +868,7 @@ def evaluate(
         )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
-        reconstruction_weight = float(args.reconstruction_loss_weight) if bool(args.train_patch_ae) else 0.0
+        reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.cosine_loss_weight) * cosine
@@ -819,6 +921,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--encoder-source", type=str, choices=("checkpoint", "patch_ae_config"), default=None)
     parser.add_argument("--train-patch-ae", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--freeze-patch-ae-after-pretrain", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--patch-ae-pretrain-epochs", type=int, default=None)
     parser.add_argument("--compressor-checkpoint", type=str, default=None)
     parser.add_argument("--compressor-config", type=str, default=None)
@@ -839,7 +942,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--cosine-loss-weight", type=float, default=None)
     parser.add_argument("--reconstruction-loss-weight", type=float, default=None)
-    parser.add_argument("--text-prompt-template", type=str, choices=("compact", "plain"), default=None)
+    parser.add_argument(
+        "--text-prompt-template",
+        type=str,
+        choices=("compact", "compact_with_metadata", "plain"),
+        default=None,
+    )
     parser.add_argument("--text-decimal-places", type=int, default=None)
     parser.add_argument("--max-text-tokens", type=int, default=None)
     parser.add_argument("--teacher-layer", type=int, default=None)
@@ -910,6 +1018,7 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "grad_clip_norm", first_nested(config, ["patch_alignment.grad_clip_norm"]), 1.0)
     set_default(args, "num_workers", first_nested(config, ["patch_alignment.num_workers"]), 0)
     set_default(args, "train_patch_ae", first_nested(config, ["patch_alignment.train_patch_ae"]), args.encoder_source == "patch_ae_config")
+    set_default(args, "freeze_patch_ae_after_pretrain", first_nested(config, ["patch_alignment.freeze_patch_ae_after_pretrain"]), True)
     set_default(args, "patch_ae_pretrain_epochs", first_nested(config, ["patch_alignment.patch_ae_pretrain_epochs"]), 0)
     set_default(
         args,
@@ -1014,6 +1123,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
         "patch_alignment": {
             "encoder_source": str(args.encoder_source),
             "train_patch_ae": bool(args.train_patch_ae),
+            "freeze_patch_ae_after_pretrain": bool(args.freeze_patch_ae_after_pretrain),
+            "alignment_train_patch_ae": bool(getattr(args, "alignment_train_patch_ae", args.train_patch_ae)),
             "patch_ae_pretrain_epochs": int(args.patch_ae_pretrain_epochs),
             "compressor_checkpoint": args.compressor_checkpoint,
             "resize_patch_to_compressor_input": bool(args.resize_patch_to_compressor_input),
@@ -1202,10 +1313,9 @@ def main() -> None:
         adapter_heads=int(args.adapter_heads),
     ).to(device)
 
-    optimizer_params = list(adapter.parameters())
-    if bool(args.train_patch_ae):
-        optimizer_params += [parameter for parameter in compressor.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(optimizer_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
+    args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
+        bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
+    )
 
     run_summary = {
         "hdf5_path": str(args.hdf5_path),
@@ -1217,6 +1327,8 @@ def main() -> None:
         "encoder_source": str(args.encoder_source),
         "compressor_checkpoint": str(args.compressor_checkpoint) if args.compressor_checkpoint else None,
         "train_patch_ae": bool(args.train_patch_ae),
+        "freeze_patch_ae_after_pretrain": bool(args.freeze_patch_ae_after_pretrain),
+        "alignment_train_patch_ae": bool(args.alignment_train_patch_ae),
         "patch_ae_pretrain_epochs": int(args.patch_ae_pretrain_epochs),
         "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
         "resize_patch_to_compressor_input": bool(args.resize_patch_to_compressor_input),
@@ -1232,9 +1344,13 @@ def main() -> None:
         "query_tokens": int(args.query_tokens),
         "adapter_layers": int(args.adapter_layers),
         "adapter_heads": int(args.adapter_heads),
+        "alignment_mode": "input_soft_prompt_hidden",
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
-        "trainable_compressor_parameters": sum(
+        "pretrain_trainable_compressor_parameters": sum(
             parameter.numel() for parameter in compressor.parameters() if parameter.requires_grad
+        ),
+        "alignment_trainable_compressor_parameters": (
+            sum(parameter.numel() for parameter in compressor.parameters()) if bool(args.alignment_train_patch_ae) else 0
         ),
     }
     dump_json(run_dir / "run_summary.json", run_summary)
@@ -1301,6 +1417,18 @@ def main() -> None:
                 f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f}"
             )
 
+    if bool(args.alignment_train_patch_ae):
+        for parameter in compressor.parameters():
+            parameter.requires_grad_(True)
+    else:
+        for parameter in compressor.parameters():
+            parameter.requires_grad_(False)
+        compressor.eval()
+    optimizer_params = list(adapter.parameters())
+    if bool(args.alignment_train_patch_ae):
+        optimizer_params += [parameter for parameter in compressor.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(optimizer_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
+
     best_val = float("inf")
     best_epoch = 0
     for epoch in range(1, int(args.epochs) + 1):
@@ -1365,7 +1493,10 @@ def main() -> None:
         print(
             f"epoch={epoch:04d} train_loss={train_metrics['loss']:.4f} "
             f"train_i2t={train_metrics['i2t_accuracy']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} val_i2t={val_metrics['i2t_accuracy']:.4f}"
+            f"train_t2i={train_metrics['t2i_accuracy']:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_i2t={val_metrics['i2t_accuracy']:.4f} "
+            f"val_t2i={val_metrics['t2i_accuracy']:.4f}"
         )
 
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)

@@ -1012,13 +1012,45 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_direct_probe.py \
 
 ```text
 tensor path:
-  patch -> patch AE encoder -> latent tokens -> Q-Former/Transformer adapter -> tensor embedding
+  patch -> patch AE encoder -> latent tokens -> Q-Former adapter -> soft prompt tokens
+        -> frozen LLM -> middle-layer student hidden state
 
 text path:
   patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
 ```
 
-当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。默认 prompt 以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，因此配置默认 `teacher_layer: 14`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `8/14/20/-1`。
+当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，因此配置默认 `teacher_layer: 14`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `8/14/20/-1`。
+
+注意：Q-Former 不再直接预测 layer-14 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
+
+Prompt 设置：
+
+Teacher branch 的默认 `compact` prompt 包含任务说明、字段名、patch 尺寸、完整数值矩阵和 anchor：
+
+```text
+Represent this PDE tensor patch for numeric reasoning.
+fields=Vx patch_size=16
+Vx=[[...]; [...]; ...]
+Representation:
+```
+
+它不再包含 `sample_index`、`time_index`、`top_left`，因为 tensor path 只能看到 patch 数值，看不到这些采样元数据。旧格式可通过 `text_prompt_template: compact_with_metadata` 复现，但只建议做消融。
+
+Student branch 的短 anchor prompt 不包含数值矩阵：
+
+```text
+Represent this PDE tensor patch for numeric reasoning.
+fields=Vx patch_size=16
+Representation:
+```
+
+实际输入 LLM 的形式是：
+
+```text
+[soft prompt tokens from tensor] + student anchor prompt
+```
+
+因此 student hidden 必须从 soft prompt 中获得数值信息，而不能从文本里偷看数值。
 
 默认 tensor path 不再把 `16x16` patch resize 到 `512x512`。脚本会按 `patch_alignment.patch_encoder` 构建一个 patch-sized AE：
 
@@ -1058,7 +1090,7 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
      + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
-其中 reconstruction 项只有在 `train_patch_ae: true` 时参与反传；如果 encoder 冻结，它只作为指标记录。
+这里的 `tensor_embedding` 实际是 student branch 经过 frozen LLM 后取出的 anchor hidden state。`text_teacher_embedding` 是 teacher branch 读完整数值矩阵文本后的同层 anchor hidden state。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge。
 
 输出文件：
 
@@ -1082,6 +1114,7 @@ W&B 曲线：
 | `val/reconstruction_loss` | alignment 阶段验证集重建误差。 |
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
+| `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
 
 要启用 W&B：
 
@@ -1114,14 +1147,16 @@ patch_alignment:
 | `--train-records`、`--val-records`、`--test-records` | 随机采样 patch 数。 | 正整数 | 初始 smoke test 用小值，正式训练可增大。 |
 | `--encoder-source` | encoder 从哪里来。 | `patch_ae_config`、`checkpoint` | `patch_ae_config`：按 YAML 构建 patch AE；`checkpoint`：加载 `compressor_checkpoint`。 |
 | `--train-patch-ae` / `--no-train-patch-ae` | 是否更新 AE 参数。 | 布尔开关 | 新建 patch AE 建议 `true`；加载已训练 patch AE 做纯 adapter 对齐时可设 `false`。 |
+| `--freeze-patch-ae-after-pretrain` / `--no-freeze-patch-ae-after-pretrain` | AE warmup 后 alignment 阶段是否冻结 AE。 | 布尔开关 | 默认 `true`：减少 encoder 记忆训练集 teacher hidden 的风险。 |
 | `--patch-ae-pretrain-epochs` | 对齐前 reconstruction-only warmup 轮数。 | 非负整数 | `0`：跳过；大于 0：先训练 patch AE 重建。 |
 | `--compressor-checkpoint` | 已训练 encoder checkpoint。 | 路径、`null` | 仅 `encoder_source: checkpoint` 必需。 |
 | `--resize-patch-to-compressor-input` / `--no-resize-patch-to-compressor-input` | 是否把 patch resize 到 encoder `input_size` 后再编码。 | 布尔开关 | patch AE 应设 `false`；旧 512x512 AE 才设 `true`。 |
-| `--adapter-type` | tensor path 的对齐 adapter。 | `qformer`、`pooled_mlp` | `qformer`：learnable queries cross-attend latent tokens；`pooled_mlp`：mean/std pooling 旧实现，仅作 ablation。 |
+| `--adapter-type` | tensor path 的对齐 adapter。 | `qformer`、`pooled_mlp` | `qformer`：learnable queries cross-attend latent tokens 并输出 soft prompt tokens；`pooled_mlp`：mean/std pooling 旧实现，仅作 ablation。 |
 | `--query-tokens` | Q-Former learnable query 数。 | 正整数 | query 越多，tensor path 容量越大，显存也更高。 |
 | `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 默认 2。 |
 | `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
+| `--text-prompt-template` | teacher branch 的数值矩阵 prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | `compact`：不含不可见元数据；`compact_with_metadata`：旧格式，含 sample/time/top_left；`plain`：仅矩阵文本。 |
 | `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 默认 3；位数越多 token 越多。 |
 | `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 默认 1024。 |
 | `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 默认 14；`-1` 表示最后一层。 |
