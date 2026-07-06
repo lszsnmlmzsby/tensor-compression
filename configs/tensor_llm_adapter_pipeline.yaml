@@ -153,17 +153,32 @@ patch_alignment:
   # null means directly align to the LLM hidden size. This keeps the text teacher side fixed.
   projection_dim: null
   dropout: 0.0
+  # Bound each soft prompt dimension with tanh before feeding it to the frozen LLM.
+  # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.
+  soft_prompt_scale: 0.05
   temperature: 0.07
   contrastive_loss_weight: 1.0
-  cosine_loss_weight: 0.2
+  # Keep this at 0 for now: raw cosine can reward shared hidden-space directions without improving retrieval.
+  cosine_loss_weight: 0.0
   # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
+  # normalized: serialize exactly the normalized/resized patch that enters the AE.
+  # raw: serialize the original HDF5 values; useful only as an ablation.
+  teacher_text_source: normalized
+  # Subtract batch means before L2 normalization and InfoNCE to reduce common hidden-space directions.
+  center_embeddings: true
+  # true: fail immediately if tokenization/truncation drops the Representation anchor.
+  fail_on_text_anchor_missing: true
+  # true: fail when a serialized text sequence reaches max_text_tokens, because truncation is then ambiguous.
+  fail_on_text_max_length_hit: true
   # compact excludes sample/time/top_left metadata because tensor path cannot observe them.
   # compact_with_metadata keeps the previous metadata-rich prompt only for ablation.
   text_prompt_template: compact
   text_decimal_places: 3
   max_text_tokens: 1024
-  # Qwen2.5-1.5B has 28 decoder layers; hidden_states[14] is a middle-layer teacher.
+  # Number of training records checked before AE warmup to catch teacher text truncation early.
+  text_preflight_records: 32
+  # Qwen2.5-1.5B has 28 decoder layers; lower-middle layers are usually easier for input-level soft prompts.
   teacher_layer: 8
   log_interval: 20
 

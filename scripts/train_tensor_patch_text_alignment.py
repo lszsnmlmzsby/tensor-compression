@@ -59,6 +59,12 @@ class PatchRecord:
     col: int
 
 
+@dataclass(frozen=True)
+class HiddenBatch:
+    hidden: torch.Tensor
+    metrics: dict[str, float]
+
+
 def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
     if raw is None:
         return []
@@ -252,6 +258,80 @@ def build_patch_records(
     return records
 
 
+def serialize_patch_text(
+    *,
+    record: Mapping[str, Any] | PatchRecord,
+    patch: torch.Tensor,
+    field_keys: Sequence[str],
+    decimal_places: int,
+    prompt_template: str,
+) -> str:
+    decimals = max(0, int(decimal_places))
+    patch_cpu = patch.detach().cpu()
+    field_chunks: list[str] = []
+    for channel, field in enumerate(field_keys):
+        rows: list[str] = []
+        values = patch_cpu[channel]
+        for row in range(values.shape[0]):
+            row_values = ", ".join(f"{float(value):.{decimals}f}" for value in values[row])
+            rows.append(f"[{row_values}]")
+        field_chunks.append(f"{field}=[{'; '.join(rows)}]")
+    body = "\n".join(field_chunks)
+    patch_size = int(patch_cpu.shape[-1])
+    if prompt_template == "compact":
+        return (
+            "Represent this PDE tensor patch for numeric reasoning.\n"
+            f"fields={','.join(str(field) for field in field_keys)} patch_size={patch_size}\n"
+            f"{body}\nRepresentation:"
+        )
+    if prompt_template == "compact_with_metadata":
+        if isinstance(record, PatchRecord):
+            sample_index = int(record.sample_index)
+            time_index = int(record.time_index)
+            row = int(record.row)
+            col = int(record.col)
+        else:
+            sample_index = int(record.get("sample_index", -1))
+            time_index = int(record.get("time_index", -1))
+            row = int(record.get("row", -1))
+            col = int(record.get("col", -1))
+        return (
+            "Represent this PDE tensor patch for numeric reasoning.\n"
+            f"sample={sample_index} time={time_index} "
+            f"top_left=({row},{col}) patch_size={patch_size}\n"
+            f"{body}\nRepresentation:"
+        )
+    if prompt_template == "plain":
+        return body
+    raise ValueError(f"Unsupported text_prompt_template: {prompt_template}")
+
+
+def serialize_patch_batch(
+    *,
+    records: Sequence[Mapping[str, Any]],
+    patches: torch.Tensor,
+    decimal_places: int,
+    prompt_template: str,
+) -> list[str]:
+    texts: list[str] = []
+    for record, patch in zip(records, patches, strict=True):
+        fields = record.get("fields", [])
+        if isinstance(fields, Sequence) and not isinstance(fields, str):
+            field_keys = [str(field) for field in fields]
+        else:
+            field_keys = [str(fields)]
+        texts.append(
+            serialize_patch_text(
+                record=record,
+                patch=patch,
+                field_keys=field_keys,
+                decimal_places=int(decimal_places),
+                prompt_template=str(prompt_template),
+            )
+        )
+    return texts
+
+
 class PDEBenchPatchTextDataset(Dataset):
     def __init__(
         self,
@@ -262,6 +342,7 @@ class PDEBenchPatchTextDataset(Dataset):
         patch_size: int,
         decimal_places: int,
         prompt_template: str,
+        include_raw_text: bool,
     ) -> None:
         self.hdf5_path = Path(hdf5_path).expanduser()
         self.field_keys = [str(field) for field in field_keys]
@@ -269,6 +350,7 @@ class PDEBenchPatchTextDataset(Dataset):
         self.patch_size = int(patch_size)
         self.decimal_places = int(decimal_places)
         self.prompt_template = str(prompt_template)
+        self.include_raw_text = bool(include_raw_text)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -276,7 +358,7 @@ class PDEBenchPatchTextDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[int(index)]
         patch = self._read_patch(record)
-        text = self._serialize_patch(record, patch)
+        text = self._serialize_patch(record, patch) if self.include_raw_text else ""
         return {
             "record": {
                 "sample_index": int(record.sample_index),
@@ -307,32 +389,13 @@ class PDEBenchPatchTextDataset(Dataset):
         return torch.as_tensor(stacked, dtype=torch.float32)
 
     def _serialize_patch(self, record: PatchRecord, patch: torch.Tensor) -> str:
-        decimals = max(0, int(self.decimal_places))
-        field_chunks: list[str] = []
-        for channel, field in enumerate(self.field_keys):
-            rows: list[str] = []
-            values = patch[channel]
-            for row in range(values.shape[0]):
-                row_values = ", ".join(f"{float(value):.{decimals}f}" for value in values[row])
-                rows.append(f"[{row_values}]")
-            field_chunks.append(f"{field}=[{'; '.join(rows)}]")
-        body = "\n".join(field_chunks)
-        if self.prompt_template == "compact":
-            return (
-                "Represent this PDE tensor patch for numeric reasoning.\n"
-                f"fields={','.join(self.field_keys)} patch_size={self.patch_size}\n"
-                f"{body}\nRepresentation:"
-            )
-        if self.prompt_template == "compact_with_metadata":
-            return (
-                "Represent this PDE tensor patch for numeric reasoning.\n"
-                f"sample={record.sample_index} time={record.time_index} "
-                f"top_left=({record.row},{record.col}) patch_size={self.patch_size}\n"
-                f"{body}\nRepresentation:"
-            )
-        if self.prompt_template == "plain":
-            return body
-        raise ValueError(f"Unsupported text_prompt_template: {self.prompt_template}")
+        return serialize_patch_text(
+            record=record,
+            patch=patch,
+            field_keys=self.field_keys,
+            decimal_places=int(self.decimal_places),
+            prompt_template=str(self.prompt_template),
+        )
 
 
 def collate_patch_text(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -400,11 +463,13 @@ class TensorPatchAlignmentAdapter(nn.Module):
         query_tokens: int,
         adapter_layers: int,
         adapter_heads: int,
+        soft_prompt_scale: float,
     ) -> None:
         super().__init__()
         self.adapter_type = str(adapter_type).lower()
         self.latent_grid = tuple(int(dim) for dim in latent_grid)
         self.latent_token_count = int(self.latent_grid[0] * self.latent_grid[1])
+        self.soft_prompt_scale = float(soft_prompt_scale)
         adapter_dim = int(adapter_dim)
         projection_dim = int(projection_dim)
         if adapter_dim % int(adapter_heads) != 0:
@@ -453,7 +518,7 @@ class TensorPatchAlignmentAdapter(nn.Module):
             queries = self.query_tokens.expand(latent_map.shape[0], -1, -1)
             for block in self.blocks:
                 queries = block(queries, context)
-            return self.output(queries)
+            return self.scale_soft_prompts(self.output(queries))
         pooled = torch.cat(
             [
                 latent_map.mean(dim=tuple(range(2, latent_map.ndim))),
@@ -461,7 +526,12 @@ class TensorPatchAlignmentAdapter(nn.Module):
             ],
             dim=-1,
         )
-        return self.projection(pooled).unsqueeze(1)
+        return self.scale_soft_prompts(self.projection(pooled).unsqueeze(1))
+
+    def scale_soft_prompts(self, soft_prompts: torch.Tensor) -> torch.Tensor:
+        if self.soft_prompt_scale <= 0.0:
+            return soft_prompts
+        return torch.tanh(soft_prompts) * self.soft_prompt_scale
 
     def forward_tensor(self, latent_map: torch.Tensor) -> torch.Tensor:
         soft_prompts = self.forward_soft_prompts(latent_map)
@@ -514,7 +584,115 @@ def hidden_at_last_non_padding(
     return hidden[batch_indices, last_indices]
 
 
-def build_student_anchor_texts(records: Sequence[Mapping[str, Any]]) -> list[str]:
+def masked_token_norm(embeddings: torch.Tensor, attention_mask: torch.Tensor) -> float:
+    mask = attention_mask.to(device=embeddings.device, dtype=torch.bool)
+    if not bool(mask.any()):
+        return 0.0
+    norms = embeddings.detach().float().norm(dim=-1)
+    return float(norms[mask].mean().cpu().item())
+
+
+def mean_token_norm(tokens: torch.Tensor) -> float:
+    if tokens.numel() == 0:
+        return 0.0
+    return float(tokens.detach().float().norm(dim=-1).mean().cpu().item())
+
+
+def off_diagonal_cosine_mean(embeddings: torch.Tensor) -> float:
+    if int(embeddings.shape[0]) < 2:
+        return 0.0
+    normalized = F.normalize(embeddings.detach().float(), dim=-1)
+    similarity = normalized @ normalized.T
+    batch_size = int(similarity.shape[0])
+    off_diagonal_sum = similarity.sum() - similarity.diag().sum()
+    return float((off_diagonal_sum / max(1, batch_size * (batch_size - 1))).cpu().item())
+
+
+def tokenizer_anchor_metrics(
+    *,
+    tokenizer: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_tokens: int,
+    anchor_text: str,
+    require_anchor: bool,
+    require_under_max_length: bool,
+    context: str,
+) -> dict[str, float]:
+    lengths = attention_mask.long().sum(dim=1)
+    max_observed = int(lengths.max().item()) if lengths.numel() else 0
+    max_length_hits = int((lengths >= int(max_tokens)).sum().item()) if int(max_tokens) > 0 else 0
+    anchor_missing = 0
+    first_missing_tail = ""
+    if anchor_text:
+        anchor_probe = str(anchor_text).rstrip(":")
+        positions = torch.arange(attention_mask.shape[1]).unsqueeze(0)
+        last_indices = (attention_mask.long().cpu() * positions).amax(dim=1)
+        ids_cpu = input_ids.detach().cpu()
+        for row, last_index_tensor in enumerate(last_indices):
+            last_index = int(last_index_tensor.item())
+            tail_start = max(0, last_index - 24)
+            tail_ids = ids_cpu[row, tail_start : last_index + 1]
+            tail = tokenizer.decode(tail_ids, skip_special_tokens=True)
+            if anchor_probe not in tail:
+                anchor_missing += 1
+                if not first_missing_tail:
+                    first_missing_tail = tail
+    if require_anchor and anchor_missing > 0:
+        raise ValueError(
+            f"{context} lost the anchor text during tokenization. "
+            f"missing={anchor_missing}/{int(input_ids.shape[0])}, max_text_tokens={max_tokens}. "
+            "Increase patch_alignment.max_text_tokens, reduce patch_alignment.patch_size/text_decimal_places, "
+            f"or inspect truncation. First decoded tail: {first_missing_tail!r}"
+        )
+    if require_under_max_length and max_length_hits > 0:
+        raise ValueError(
+            f"{context} reached max_text_tokens for {max_length_hits}/{int(input_ids.shape[0])} sequences. "
+            "This may mean the numeric patch text was truncated. Increase patch_alignment.max_text_tokens, "
+            "reduce patch_alignment.patch_size/text_decimal_places, or pass --no-fail-on-text-max-length-hit "
+            "only for diagnostics."
+        )
+    batch_size = max(1, int(input_ids.shape[0]))
+    return {
+        "token_count_mean": float(lengths.float().mean().item()) if lengths.numel() else 0.0,
+        "token_count_max": float(max_observed),
+        "max_length_hit_fraction": float(max_length_hits / batch_size),
+        "anchor_missing_fraction": float(anchor_missing / batch_size),
+    }
+
+
+def prepare_alignment_embeddings(
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    center_embeddings: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tensor_embedding = student_hidden.float()
+    text_embedding = teacher_hidden.float()
+    if bool(center_embeddings) and int(tensor_embedding.shape[0]) > 1:
+        tensor_embedding = tensor_embedding - tensor_embedding.mean(dim=0, keepdim=True)
+        text_embedding = text_embedding - text_embedding.mean(dim=0, keepdim=True)
+    return F.normalize(tensor_embedding, dim=-1), F.normalize(text_embedding, dim=-1)
+
+
+def add_weighted_metrics(
+    totals: dict[str, float],
+    metrics: Mapping[str, float],
+    batch_size: int,
+    prefix: str,
+) -> None:
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            totals[f"{prefix}{key}"] = totals.get(f"{prefix}{key}", 0.0) + float(value) * int(batch_size)
+
+
+def averaged_metrics(totals: Mapping[str, float], total_records: int) -> dict[str, float]:
+    return {key: float(value) / max(1, int(total_records)) for key, value in totals.items()}
+
+
+def build_student_anchor_texts(
+    records: Sequence[Mapping[str, Any]],
+    patch_size_override: int | None = None,
+) -> list[str]:
     texts: list[str] = []
     for record in records:
         fields = record.get("fields", [])
@@ -522,7 +700,7 @@ def build_student_anchor_texts(records: Sequence[Mapping[str, Any]]) -> list[str
             field_text = ",".join(str(field) for field in fields)
         else:
             field_text = str(fields)
-        patch_size = int(record.get("patch_size", 0))
+        patch_size = int(patch_size_override) if patch_size_override is not None else int(record.get("patch_size", 0))
         texts.append(
             "Represent this PDE tensor patch for numeric reasoning.\n"
             f"fields={field_text} patch_size={patch_size}\n"
@@ -539,7 +717,9 @@ def text_teacher_hidden(
     device: torch.device,
     max_tokens: int,
     teacher_layer: int,
-) -> torch.Tensor:
+    require_anchor: bool,
+    require_under_max_length: bool,
+) -> HiddenBatch:
     encoded = tokenizer(
         list(texts),
         padding=True,
@@ -549,13 +729,28 @@ def text_teacher_hidden(
     )
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
+    metrics = tokenizer_anchor_metrics(
+        tokenizer=tokenizer,
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        max_tokens=int(max_tokens),
+        anchor_text="Representation:" if require_anchor else "",
+        require_anchor=bool(require_anchor),
+        require_under_max_length=bool(require_under_max_length),
+        context="teacher text",
+    )
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    metrics["token_embedding_norm"] = masked_token_norm(text_embeds, attention_mask)
     outputs = llm(
         input_ids=input_ids,
         attention_mask=attention_mask,
         output_hidden_states=True,
         use_cache=False,
     )
-    return hidden_at_last_non_padding(outputs.hidden_states, attention_mask, teacher_layer).detach()
+    hidden = hidden_at_last_non_padding(outputs.hidden_states, attention_mask, teacher_layer).detach()
+    metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
+    metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
+    return HiddenBatch(hidden=hidden, metrics=metrics)
 
 
 def tensor_student_hidden(
@@ -566,9 +761,11 @@ def tensor_student_hidden(
     device: torch.device,
     max_tokens: int,
     teacher_layer: int,
-) -> torch.Tensor:
+    patch_size: int | None,
+    require_under_max_length: bool,
+) -> HiddenBatch:
     encoded = tokenizer(
-        build_student_anchor_texts(records),
+        build_student_anchor_texts(records, patch_size_override=patch_size),
         padding=True,
         truncation=True,
         max_length=int(max_tokens),
@@ -578,6 +775,18 @@ def tensor_student_hidden(
     text_attention_mask = encoded["attention_mask"].to(device)
     text_embeds = llm.get_input_embeddings()(input_ids)
     soft_prompts = soft_prompts.to(device=device, dtype=text_embeds.dtype)
+    metrics = tokenizer_anchor_metrics(
+        tokenizer=tokenizer,
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        max_tokens=int(max_tokens),
+        anchor_text="Representation:",
+        require_anchor=True,
+        require_under_max_length=bool(require_under_max_length),
+        context="student anchor text",
+    )
+    metrics["text_token_embedding_norm"] = masked_token_norm(text_embeds, text_attention_mask)
+    metrics["soft_prompt_token_norm"] = mean_token_norm(soft_prompts)
     inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_prompts.shape[1]),
@@ -591,12 +800,15 @@ def tensor_student_hidden(
         output_hidden_states=True,
         use_cache=False,
     )
-    return hidden_at_last_non_padding(
+    hidden = hidden_at_last_non_padding(
         outputs.hidden_states,
         text_attention_mask,
         teacher_layer,
         prefix_tokens=int(soft_prompts.shape[1]),
     )
+    metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
+    metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
+    return HiddenBatch(hidden=hidden, metrics=metrics)
 
 
 def normalize_patch_batch(
@@ -613,6 +825,24 @@ def normalize_patch_batch(
         normalized_patch, _state = normalize_tensor(patch.cpu(), dict(normalization_cfg or {}))
         normalized.append(normalized_patch)
     return torch.stack(normalized, dim=0)
+
+
+def build_teacher_texts_for_batch(
+    batch: Mapping[str, Any],
+    normalized_patches: torch.Tensor,
+    args: argparse.Namespace,
+) -> list[str]:
+    source = str(args.teacher_text_source).lower()
+    if source == "raw":
+        return [str(text) for text in batch["texts"]]
+    if source == "normalized":
+        return serialize_patch_batch(
+            records=batch["records"],
+            patches=normalized_patches,
+            decimal_places=int(args.text_decimal_places),
+            prompt_template=str(args.text_prompt_template),
+        )
+    raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
 
 
 def train_compressor_during_alignment(args: argparse.Namespace) -> bool:
@@ -646,23 +876,27 @@ def train_one_epoch(
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
+    metric_totals: dict[str, float] = {}
     progress = tqdm(loader, desc=f"train align epoch {epoch}", leave=False)
     for step, batch in enumerate(progress, start=1):
-        patches = normalize_patch_batch(
+        normalized_patches = normalize_patch_batch(
             batch["patch"],
             compressor_input_size,
             normalization_cfg,
             bool(args.resize_patch_to_compressor_input),
-        ).to(device)
-        texts = batch["texts"]
+        )
+        patches = normalized_patches.to(device)
+        texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
         with torch.no_grad():
-            teacher_hidden = text_teacher_hidden(
+            teacher_output = text_teacher_hidden(
                 llm,
                 tokenizer,
                 texts,
                 device,
                 int(args.max_text_tokens),
                 int(args.teacher_layer),
+                bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+                bool(args.fail_on_text_max_length_hit) and str(args.text_prompt_template) != "plain",
             )
         if train_compressor:
             latent = compressor.encode(patches)["latent_map"]
@@ -670,7 +904,7 @@ def train_one_epoch(
             with torch.no_grad():
                 latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
-        student_hidden = tensor_student_hidden(
+        student_output = tensor_student_hidden(
             llm,
             tokenizer,
             soft_prompts,
@@ -678,9 +912,16 @@ def train_one_epoch(
             device,
             int(args.max_text_tokens),
             int(args.teacher_layer),
+            int(normalized_patches.shape[-1]),
+            bool(args.fail_on_text_max_length_hit),
         )
-        tensor_embedding = F.normalize(student_hidden.float(), dim=-1)
-        text_embedding = F.normalize(teacher_hidden.to(dtype=tensor_embedding.dtype), dim=-1)
+        student_hidden = student_output.hidden
+        teacher_hidden = teacher_output.hidden
+        tensor_embedding, text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            bool(args.center_embeddings),
+        )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
@@ -711,6 +952,18 @@ def train_one_epoch(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
+        add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(
+            metric_totals,
+            {
+                "positive_cosine": float((1.0 - cosine.detach()).cpu().item()),
+                "student_embedding_pairwise_cosine": off_diagonal_cosine_mean(tensor_embedding),
+                "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
+            },
+            batch_size,
+            "alignment_",
+        )
         total_records += batch_size
         if int(args.log_interval) > 0 and step % int(args.log_interval) == 0:
             progress.set_postfix(
@@ -718,7 +971,7 @@ def train_one_epoch(
                 i2t=f"{total_i2t / max(1, total_records):.3f}",
                 t2i=f"{total_t2i / max(1, total_records):.3f}",
             )
-    return {
+    metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
         "cosine_loss": total_cosine / max(1, total_records),
@@ -726,6 +979,8 @@ def train_one_epoch(
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
+    metrics.update(averaged_metrics(metric_totals, total_records))
+    return metrics
 
 
 def pretrain_patch_encoder_one_epoch(
@@ -832,25 +1087,29 @@ def evaluate(
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
+    metric_totals: dict[str, float] = {}
     train_compressor = train_compressor_during_alignment(args)
     for batch in tqdm(loader, desc="eval align", leave=False):
-        patches = normalize_patch_batch(
+        normalized_patches = normalize_patch_batch(
             batch["patch"],
             compressor_input_size,
             normalization_cfg,
             bool(args.resize_patch_to_compressor_input),
-        ).to(device)
-        teacher_hidden = text_teacher_hidden(
+        )
+        patches = normalized_patches.to(device)
+        teacher_output = text_teacher_hidden(
             llm,
             tokenizer,
-            batch["texts"],
+            build_teacher_texts_for_batch(batch, normalized_patches, args),
             device,
             int(args.max_text_tokens),
             int(args.teacher_layer),
+            bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+            bool(args.fail_on_text_max_length_hit) and str(args.text_prompt_template) != "plain",
         )
         latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
-        student_hidden = tensor_student_hidden(
+        student_output = tensor_student_hidden(
             llm,
             tokenizer,
             soft_prompts,
@@ -858,9 +1117,16 @@ def evaluate(
             device,
             int(args.max_text_tokens),
             int(args.teacher_layer),
+            int(normalized_patches.shape[-1]),
+            bool(args.fail_on_text_max_length_hit),
         )
-        tensor_embedding = F.normalize(student_hidden.float(), dim=-1)
-        text_embedding = F.normalize(teacher_hidden.to(dtype=tensor_embedding.dtype), dim=-1)
+        student_hidden = student_output.hidden
+        teacher_hidden = teacher_output.hidden
+        tensor_embedding, text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            bool(args.center_embeddings),
+        )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
@@ -881,8 +1147,20 @@ def evaluate(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
+        add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(
+            metric_totals,
+            {
+                "positive_cosine": float((1.0 - cosine.detach()).cpu().item()),
+                "student_embedding_pairwise_cosine": off_diagonal_cosine_mean(tensor_embedding),
+                "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
+            },
+            batch_size,
+            "alignment_",
+        )
         total_records += batch_size
-    return {
+    metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
         "cosine_loss": total_cosine / max(1, total_records),
@@ -890,6 +1168,8 @@ def evaluate(
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
+    metrics.update(averaged_metrics(metric_totals, total_records))
+    return metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -938,10 +1218,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--projection-dim", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--cosine-loss-weight", type=float, default=None)
     parser.add_argument("--reconstruction-loss-weight", type=float, default=None)
+    parser.add_argument(
+        "--teacher-text-source",
+        type=str,
+        choices=("normalized", "raw"),
+        default=None,
+        help="Use normalized AE-input patches or raw patches when serializing the teacher text branch.",
+    )
+    parser.add_argument("--center-embeddings", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--fail-on-text-anchor-missing", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--fail-on-text-max-length-hit", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--text-prompt-template",
         type=str,
@@ -950,6 +1241,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--text-decimal-places", type=int, default=None)
     parser.add_argument("--max-text-tokens", type=int, default=None)
+    parser.add_argument("--text-preflight-records", type=int, default=None)
     parser.add_argument("--teacher-layer", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
@@ -1035,13 +1327,29 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "adapter_heads", first_nested(config, ["patch_alignment.adapter_heads"]), 8)
     set_default(args, "projection_dim", first_nested(config, ["patch_alignment.projection_dim"]), None)
     set_default(args, "dropout", first_nested(config, ["patch_alignment.dropout"]), 0.0)
+    set_default(args, "soft_prompt_scale", first_nested(config, ["patch_alignment.soft_prompt_scale"]), 0.05)
     set_default(args, "temperature", first_nested(config, ["patch_alignment.temperature"]), 0.07)
     set_default(args, "contrastive_loss_weight", first_nested(config, ["patch_alignment.contrastive_loss_weight"]), 1.0)
-    set_default(args, "cosine_loss_weight", first_nested(config, ["patch_alignment.cosine_loss_weight"]), 0.2)
+    set_default(args, "cosine_loss_weight", first_nested(config, ["patch_alignment.cosine_loss_weight"]), 0.0)
     set_default(args, "reconstruction_loss_weight", first_nested(config, ["patch_alignment.reconstruction_loss_weight"]), 1.0)
+    set_default(args, "teacher_text_source", first_nested(config, ["patch_alignment.teacher_text_source"]), "normalized")
+    set_default(args, "center_embeddings", first_nested(config, ["patch_alignment.center_embeddings"]), True)
+    set_default(
+        args,
+        "fail_on_text_anchor_missing",
+        first_nested(config, ["patch_alignment.fail_on_text_anchor_missing"]),
+        True,
+    )
+    set_default(
+        args,
+        "fail_on_text_max_length_hit",
+        first_nested(config, ["patch_alignment.fail_on_text_max_length_hit"]),
+        True,
+    )
     set_default(args, "text_prompt_template", first_nested(config, ["patch_alignment.text_prompt_template"]), "compact")
     set_default(args, "text_decimal_places", first_nested(config, ["patch_alignment.text_decimal_places"]), 3)
     set_default(args, "max_text_tokens", first_nested(config, ["patch_alignment.max_text_tokens"]), 1024)
+    set_default(args, "text_preflight_records", first_nested(config, ["patch_alignment.text_preflight_records"]), 32)
     set_default(args, "teacher_layer", first_nested(config, ["patch_alignment.teacher_layer"]), 14)
     set_default(args, "log_interval", first_nested(config, ["patch_alignment.log_interval"]), 20)
     set_default(args, "wandb_enabled", first_nested(config, ["wandb.enabled"]), False)
@@ -1057,6 +1365,17 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     require_args(args, ["hdf5_path", "model_name_or_path", "output_root"])
     if str(args.encoder_source) == "checkpoint" and not args.compressor_checkpoint:
         raise ValueError("encoder_source=checkpoint requires --compressor-checkpoint or patch_alignment.compressor_checkpoint.")
+    if int(args.max_text_tokens) <= 0:
+        raise ValueError("patch_alignment.max_text_tokens must be positive.")
+    if int(args.text_preflight_records) < 0:
+        raise ValueError("patch_alignment.text_preflight_records must be non-negative.")
+    if float(args.soft_prompt_scale) < 0.0:
+        raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
+    if float(args.temperature) <= 0.0:
+        raise ValueError("patch_alignment.temperature must be positive.")
+    for name in ("contrastive_loss_weight", "cosine_loss_weight", "reconstruction_loss_weight"):
+        if float(getattr(args, name)) < 0.0:
+            raise ValueError(f"patch_alignment.{name} must be non-negative.")
     return args
 
 
@@ -1068,6 +1387,46 @@ def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: i
         num_workers=int(num_workers),
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_patch_text,
+    )
+
+
+def preflight_teacher_text_tokenization(
+    *,
+    dataset: Dataset,
+    tokenizer: Any,
+    args: argparse.Namespace,
+    compressor_input_size: Sequence[int],
+    normalization_cfg: Mapping[str, Any],
+) -> dict[str, float]:
+    record_count = min(int(args.text_preflight_records), len(dataset))
+    if record_count <= 0:
+        return {}
+    items = [dataset[index] for index in range(record_count)]
+    batch = collate_patch_text(items)
+    normalized_patches = normalize_patch_batch(
+        batch["patch"],
+        compressor_input_size,
+        normalization_cfg,
+        bool(args.resize_patch_to_compressor_input),
+    )
+    texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+    encoded = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=int(args.max_text_tokens),
+        return_tensors="pt",
+    )
+    return tokenizer_anchor_metrics(
+        tokenizer=tokenizer,
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        max_tokens=int(args.max_text_tokens),
+        anchor_text="Representation:" if str(args.text_prompt_template) != "plain" else "",
+        require_anchor=bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+        require_under_max_length=bool(args.fail_on_text_max_length_hit)
+        and str(args.text_prompt_template) != "plain",
+        context="teacher text preflight",
     )
 
 
@@ -1135,13 +1494,19 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "adapter_heads": int(args.adapter_heads),
             "projection_dim": args.projection_dim,
             "dropout": float(args.dropout),
+            "soft_prompt_scale": float(args.soft_prompt_scale),
             "temperature": float(args.temperature),
             "contrastive_loss_weight": float(args.contrastive_loss_weight),
             "cosine_loss_weight": float(args.cosine_loss_weight),
             "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
+            "teacher_text_source": str(args.teacher_text_source),
+            "center_embeddings": bool(args.center_embeddings),
+            "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
+            "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
             "text_prompt_template": str(args.text_prompt_template),
             "text_decimal_places": int(args.text_decimal_places),
             "max_text_tokens": int(args.max_text_tokens),
+            "text_preflight_records": int(args.text_preflight_records),
             "teacher_layer": int(args.teacher_layer),
             "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
@@ -1283,6 +1648,7 @@ def main() -> None:
         "patch_size": int(args.patch_size),
         "decimal_places": int(args.text_decimal_places),
         "prompt_template": str(args.text_prompt_template),
+        "include_raw_text": str(args.teacher_text_source).lower() == "raw",
     }
     train_dataset = PDEBenchPatchTextDataset(records=train_records, **dataset_kwargs)
     val_dataset = PDEBenchPatchTextDataset(records=val_records, **dataset_kwargs)
@@ -1290,6 +1656,13 @@ def main() -> None:
     train_loader = make_loader(train_dataset, int(args.batch_size), True, int(args.num_workers))
     val_loader = make_loader(val_dataset, int(args.eval_batch_size), False, int(args.num_workers))
     test_loader = make_loader(test_dataset, int(args.eval_batch_size), False, int(args.num_workers))
+    text_preflight_metrics = preflight_teacher_text_tokenization(
+        dataset=train_dataset,
+        tokenizer=tokenizer,
+        args=args,
+        compressor_input_size=compressor_input_size,
+        normalization_cfg=normalization_cfg,
+    )
 
     with torch.no_grad():
         probe_patch = normalize_patch_batch(
@@ -1311,6 +1684,7 @@ def main() -> None:
         query_tokens=int(args.query_tokens),
         adapter_layers=int(args.adapter_layers),
         adapter_heads=int(args.adapter_heads),
+        soft_prompt_scale=float(args.soft_prompt_scale),
     ).to(device)
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
@@ -1340,10 +1714,17 @@ def main() -> None:
         "llm_num_hidden_layers": int(getattr(llm.config, "num_hidden_layers", -1)),
         "projection_dim": int(projection_dim),
         "teacher_layer": int(args.teacher_layer),
+        "teacher_text_source": str(args.teacher_text_source),
+        "center_embeddings": bool(args.center_embeddings),
+        "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
+        "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
+        "text_preflight_records": int(args.text_preflight_records),
+        "text_preflight": dict(text_preflight_metrics),
         "adapter_type": str(args.adapter_type),
         "query_tokens": int(args.query_tokens),
         "adapter_layers": int(args.adapter_layers),
         "adapter_heads": int(args.adapter_heads),
+        "soft_prompt_scale": float(args.soft_prompt_scale),
         "alignment_mode": "input_soft_prompt_hidden",
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
         "pretrain_trainable_compressor_parameters": sum(
@@ -1354,6 +1735,14 @@ def main() -> None:
         ),
     }
     dump_json(run_dir / "run_summary.json", run_summary)
+    if text_preflight_metrics:
+        print(
+            "teacher_text_preflight "
+            f"token_mean={text_preflight_metrics.get('token_count_mean', 0.0):.1f} "
+            f"token_max={text_preflight_metrics.get('token_count_max', 0.0):.0f} "
+            f"anchor_missing={text_preflight_metrics.get('anchor_missing_fraction', 0.0):.3f} "
+            f"max_len_hit={text_preflight_metrics.get('max_length_hit_fraction', 0.0):.3f}"
+        )
     wandb_logger = WandbLogger(config=build_wandb_config(args, run_summary), run_dir=run_dir)
     global_step = 0
 

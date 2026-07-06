@@ -1016,16 +1016,16 @@ tensor path:
         -> frozen LLM -> middle-layer student hidden state
 
 text path:
-  patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
+  同一份 normalized/resized patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
 ```
 
-当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，因此配置默认 `teacher_layer: 14`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `8/14/20/-1`。
+当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，当前配置使用 `teacher_layer: 8`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `4/8/14/20/-1`。
 
-注意：Q-Former 不再直接预测 layer-14 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
+注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
 
 Prompt 设置：
 
-Teacher branch 的默认 `compact` prompt 包含任务说明、字段名、patch 尺寸、完整数值矩阵和 anchor：
+Teacher branch 的默认 `compact` prompt 包含任务说明、字段名、patch 尺寸、完整数值矩阵和 anchor。默认 `teacher_text_source: normalized`，因此这里的数值矩阵来自 **AE 实际输入的 normalized/resized patch**，不是 HDF5 原始值；这样 teacher branch 和 tensor path 才表示同一个对象。
 
 ```text
 Represent this PDE tensor patch for numeric reasoning.
@@ -1034,7 +1034,7 @@ Vx=[[...]; [...]; ...]
 Representation:
 ```
 
-它不再包含 `sample_index`、`time_index`、`top_left`，因为 tensor path 只能看到 patch 数值，看不到这些采样元数据。旧格式可通过 `text_prompt_template: compact_with_metadata` 复现，但只建议做消融。
+它不再包含 `sample_index`、`time_index`、`top_left`，因为 tensor path 只能看到 patch 数值，看不到这些采样元数据。旧格式可通过 `text_prompt_template: compact_with_metadata` 复现，但只建议做消融。若设置 `teacher_text_source: raw`，teacher branch 会读取原始 HDF5 数值；这会和默认 zscore AE 输入产生信息不一致，只建议作为 ablation。
 
 Student branch 的短 anchor prompt 不包含数值矩阵：
 
@@ -1090,7 +1090,9 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
      + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
-这里的 `tensor_embedding` 实际是 student branch 经过 frozen LLM 后取出的 anchor hidden state。`text_teacher_embedding` 是 teacher branch 读完整数值矩阵文本后的同层 anchor hidden state。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge。
+这里的 `tensor_embedding` 实际是 student branch 经过 frozen LLM 后取出的 anchor hidden state。`text_teacher_embedding` 是 teacher branch 读完整数值矩阵文本后的同层 anchor hidden state。默认会先对两个 batch hidden 分别减去 batch mean，再 L2 normalize 后进入 InfoNCE，以减弱 LLM hidden space 的公共方向。当前默认 `cosine_loss_weight: 0.0`，因为 raw cosine 可能只鼓励公共方向接近，却不提高 batch retrieval。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge。
+
+脚本会检查 teacher/student tokenization 后的最后 token 附近是否仍包含 `Representation:`。默认 `fail_on_text_anchor_missing: true`，一旦文本过长导致 anchor 被截断，会直接报错，而不是继续训练一个语义位置已经错位的目标。默认 `fail_on_text_max_length_hit: true`，只要序列打满 `max_text_tokens` 也会报错；这比静默截断更严格，若触发应优先增大 `max_text_tokens`、减小 `patch_size` 或降低 `text_decimal_places`。
 
 输出文件：
 
@@ -1115,6 +1117,12 @@ W&B 曲线：
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
+| `train/teacher_anchor_missing_fraction`、`val/teacher_anchor_missing_fraction` | teacher text tokenization 后 anchor 缺失比例；默认应为 0，否则代码会报错。 |
+| `train/teacher_max_length_hit_fraction`、`val/teacher_max_length_hit_fraction` | teacher text 达到 `max_text_tokens` 的比例；非 0 时应考虑增大上下文或减小 patch/text 精度。 |
+| `train/student_soft_prompt_token_norm`、`val/student_soft_prompt_token_norm` | soft prompt token 的平均范数。 |
+| `train/student_text_token_embedding_norm`、`val/student_text_token_embedding_norm` | 普通文本 token embedding 的平均范数，可和 soft prompt norm 对比。 |
+| `train/alignment_student_embedding_pairwise_cosine`、`val/alignment_student_embedding_pairwise_cosine` | student embedding 的 batch 内非对角 cosine 均值，用于检查塌缩。 |
+| `train/alignment_teacher_embedding_pairwise_cosine`、`val/alignment_teacher_embedding_pairwise_cosine` | teacher embedding 的 batch 内非对角 cosine 均值。 |
 
 要启用 W&B：
 
@@ -1155,12 +1163,20 @@ patch_alignment:
 | `--query-tokens` | Q-Former learnable query 数。 | 正整数 | query 越多，tensor path 容量越大，显存也更高。 |
 | `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 默认 2。 |
 | `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
+| `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`；`0`：关闭限制。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
+| `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `normalized`、`raw` | `normalized`：使用 AE 实际输入，默认；`raw`：使用 HDF5 原始值，只建议消融。 |
+| `--center-embeddings` / `--no-center-embeddings` | InfoNCE 前是否分别对 student/teacher batch hidden 减均值。 | 布尔开关 | 默认开启，用于减弱 LLM hidden 公共方向。 |
+| `--fail-on-text-anchor-missing` / `--no-fail-on-text-anchor-missing` | tokenization 后 anchor 缺失时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录缺失比例。 |
+| `--fail-on-text-max-length-hit` / `--no-fail-on-text-max-length-hit` | tokenized 文本打满 `max_text_tokens` 时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录 `*_max_length_hit_fraction`。 |
 | `--text-prompt-template` | teacher branch 的数值矩阵 prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | `compact`：不含不可见元数据；`compact_with_metadata`：旧格式，含 sample/time/top_left；`plain`：仅矩阵文本。 |
 | `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 默认 3；位数越多 token 越多。 |
 | `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 默认 1024。 |
-| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 默认 14；`-1` 表示最后一层。 |
+| `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
+| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 当前配置为 8；`-1` 表示最后一层。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
+| `--contrastive-loss-weight` | symmetric InfoNCE 权重。 | 非负数 | 当前主要优化项，默认 1.0。 |
+| `--cosine-loss-weight` | 正样本 cosine loss 权重。 | 非负数 | 当前默认 0.0；非 0 时注意它可能提高公共方向相似度但不提高 retrieval。 |
 | `--projection-dim` | tensor embedding 维度。 | `null` 或 LLM hidden size | 当前 text teacher 不训练 projection，因此必须等于 LLM hidden size；默认 `null` 自动匹配。 |
 | `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | 默认读取 `wandb.enabled`。 |
 | `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
