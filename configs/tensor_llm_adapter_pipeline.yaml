@@ -168,7 +168,10 @@ patch_alignment:
   # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.
   soft_prompt_scale: 0.05
   temperature: 0.07
+  # Main objective. With center_embeddings: false this optimizes globally comparable embeddings.
   contrastive_loss_weight: 1.0
+  # Optional auxiliary batch-centered InfoNCE. Keep small; it is a stabilizer, not the success metric.
+  centered_contrastive_loss_weight: 0.1
   # Keep this at 0 for now: raw cosine can reward shared hidden-space directions without improving retrieval.
   cosine_loss_weight: 0.0
   # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
@@ -176,8 +179,9 @@ patch_alignment:
   # normalized: serialize exactly the normalized/resized patch that enters the AE.
   # raw: serialize the original HDF5 values; useful only as an ablation.
   teacher_text_source: normalized
-  # Subtract batch means before L2 normalization and InfoNCE to reduce common hidden-space directions.
-  center_embeddings: true
+  # false: main loss uses raw L2-normalized embeddings, so retrieval is globally comparable.
+  # true recreates the earlier batch-centered objective and should be used only as an ablation.
+  center_embeddings: false
   # true: fail immediately if tokenization/truncation drops the Representation anchor.
   fail_on_text_anchor_missing: true
   # true: fail when a serialized text sequence reaches max_text_tokens, because truncation is then ambiguous.

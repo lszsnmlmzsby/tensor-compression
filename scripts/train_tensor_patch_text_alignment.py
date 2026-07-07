@@ -1125,6 +1125,11 @@ def train_one_epoch(
             teacher_hidden.to(dtype=student_hidden.dtype),
             bool(args.center_embeddings),
         )
+        centered_tensor_embedding, centered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            True,
+        )
         uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
             student_hidden,
             teacher_hidden.to(dtype=student_hidden.dtype),
@@ -1135,11 +1140,17 @@ def train_one_epoch(
             text_embedding,
             float(args.temperature),
         )
+        centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
+            centered_tensor_embedding,
+            centered_text_embedding,
+            float(args.temperature),
+        )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
+            + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.cosine_loss_weight) * cosine
             + reconstruction_weight * reconstruction
         )
@@ -1162,6 +1173,16 @@ def train_one_epoch(
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(
             metric_totals,
+            {
+                "contrastive_loss": float(centered_contrastive.detach().cpu().item()),
+                "i2t_accuracy": float(centered_contrastive_metrics["i2t_accuracy"]),
+                "t2i_accuracy": float(centered_contrastive_metrics["t2i_accuracy"]),
+            },
+            batch_size,
+            "centered_",
+        )
+        add_weighted_metrics(
+            metric_totals,
             retrieval_accuracy(
                 uncentered_tensor_embedding,
                 uncentered_text_embedding,
@@ -1178,6 +1199,10 @@ def train_one_epoch(
                 "positive_cosine": float((1.0 - cosine.detach()).cpu().item()),
                 "student_embedding_pairwise_cosine": off_diagonal_cosine_mean(tensor_embedding),
                 "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
+                "centered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_tensor_embedding),
+                "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
+                "uncentered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_tensor_embedding),
+                "uncentered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_text_embedding),
             },
             batch_size,
             "alignment_",
@@ -1347,6 +1372,11 @@ def evaluate(
             teacher_hidden.to(dtype=student_hidden.dtype),
             bool(args.center_embeddings),
         )
+        centered_tensor_embedding, centered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            True,
+        )
         uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
             student_hidden,
             teacher_hidden.to(dtype=student_hidden.dtype),
@@ -1357,11 +1387,17 @@ def evaluate(
             text_embedding,
             float(args.temperature),
         )
+        centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
+            centered_tensor_embedding,
+            centered_text_embedding,
+            float(args.temperature),
+        )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
+            + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.cosine_loss_weight) * cosine
             + reconstruction_weight * reconstruction
         )
@@ -1372,6 +1408,16 @@ def evaluate(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(
+            metric_totals,
+            {
+                "contrastive_loss": float(centered_contrastive.detach().cpu().item()),
+                "i2t_accuracy": float(centered_contrastive_metrics["i2t_accuracy"]),
+                "t2i_accuracy": float(centered_contrastive_metrics["t2i_accuracy"]),
+            },
+            batch_size,
+            "centered_",
+        )
         add_weighted_metrics(
             metric_totals,
             retrieval_accuracy(
@@ -1390,6 +1436,10 @@ def evaluate(
                 "positive_cosine": float((1.0 - cosine.detach()).cpu().item()),
                 "student_embedding_pairwise_cosine": off_diagonal_cosine_mean(tensor_embedding),
                 "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
+                "centered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_tensor_embedding),
+                "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
+                "uncentered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_tensor_embedding),
+                "uncentered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_text_embedding),
             },
             batch_size,
             "alignment_",
@@ -1415,6 +1465,7 @@ def evaluate(
         student_all = torch.cat(collected_student_hidden, dim=0)
         teacher_all = torch.cat(collected_teacher_hidden, dim=0)
         global_tensor, global_text = prepare_alignment_embeddings(student_all, teacher_all, bool(args.center_embeddings))
+        global_centered_tensor, global_centered_text = prepare_alignment_embeddings(student_all, teacher_all, True)
         global_uncentered_tensor, global_uncentered_text = prepare_alignment_embeddings(student_all, teacher_all, False)
         metrics.update(
             {
@@ -1422,6 +1473,17 @@ def evaluate(
                 for key, value in full_retrieval_accuracy(
                     global_tensor,
                     global_text,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
+        metrics.update(
+            {
+                f"global_centered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_centered_tensor,
+                    global_centered_text,
                     float(args.temperature),
                     int(args.global_retrieval_chunk_size),
                 ).items()
@@ -1503,6 +1565,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--contrastive-loss-weight", type=float, default=None)
+    parser.add_argument("--centered-contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--cosine-loss-weight", type=float, default=None)
     parser.add_argument("--reconstruction-loss-weight", type=float, default=None)
     parser.add_argument(
@@ -1621,10 +1684,16 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "soft_prompt_scale", first_nested(config, ["patch_alignment.soft_prompt_scale"]), 0.05)
     set_default(args, "temperature", first_nested(config, ["patch_alignment.temperature"]), 0.07)
     set_default(args, "contrastive_loss_weight", first_nested(config, ["patch_alignment.contrastive_loss_weight"]), 1.0)
+    set_default(
+        args,
+        "centered_contrastive_loss_weight",
+        first_nested(config, ["patch_alignment.centered_contrastive_loss_weight"]),
+        0.0,
+    )
     set_default(args, "cosine_loss_weight", first_nested(config, ["patch_alignment.cosine_loss_weight"]), 0.0)
     set_default(args, "reconstruction_loss_weight", first_nested(config, ["patch_alignment.reconstruction_loss_weight"]), 1.0)
     set_default(args, "teacher_text_source", first_nested(config, ["patch_alignment.teacher_text_source"]), "normalized")
-    set_default(args, "center_embeddings", first_nested(config, ["patch_alignment.center_embeddings"]), True)
+    set_default(args, "center_embeddings", first_nested(config, ["patch_alignment.center_embeddings"]), False)
     set_default(
         args,
         "fail_on_text_anchor_missing",
@@ -1684,7 +1753,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
     if float(args.temperature) <= 0.0:
         raise ValueError("patch_alignment.temperature must be positive.")
-    for name in ("contrastive_loss_weight", "cosine_loss_weight", "reconstruction_loss_weight"):
+    for name in (
+        "contrastive_loss_weight",
+        "centered_contrastive_loss_weight",
+        "cosine_loss_weight",
+        "reconstruction_loss_weight",
+    ):
         if float(getattr(args, name)) < 0.0:
             raise ValueError(f"patch_alignment.{name} must be non-negative.")
     return args
@@ -1772,6 +1846,30 @@ def numeric_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]
     return payload
 
 
+def fmt_metric(metrics: Mapping[str, Any], key: str) -> str:
+    value = metrics.get(key)
+    if isinstance(value, (int, float)):
+        return f"{float(value):.4f}"
+    return "n/a"
+
+
+def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
+    return (
+        f"main_i2t={fmt_metric(metrics, 'i2t_accuracy')} "
+        f"main_t2i={fmt_metric(metrics, 't2i_accuracy')} "
+        f"centered_i2t={fmt_metric(metrics, 'centered_i2t_accuracy')} "
+        f"centered_t2i={fmt_metric(metrics, 'centered_t2i_accuracy')} "
+        f"uncentered_i2t={fmt_metric(metrics, 'uncentered_i2t_accuracy')} "
+        f"uncentered_t2i={fmt_metric(metrics, 'uncentered_t2i_accuracy')} "
+        f"global_i2t={fmt_metric(metrics, 'global_i2t_accuracy')} "
+        f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')} "
+        f"global_centered_i2t={fmt_metric(metrics, 'global_centered_i2t_accuracy')} "
+        f"global_centered_t2i={fmt_metric(metrics, 'global_centered_t2i_accuracy')} "
+        f"global_uncentered_i2t={fmt_metric(metrics, 'global_uncentered_i2t_accuracy')} "
+        f"global_uncentered_t2i={fmt_metric(metrics, 'global_uncentered_t2i_accuracy')}"
+    )
+
+
 def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "experiment": {"name": str(args.run_name)},
@@ -1814,6 +1912,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "soft_prompt_scale": float(args.soft_prompt_scale),
             "temperature": float(args.temperature),
             "contrastive_loss_weight": float(args.contrastive_loss_weight),
+            "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
             "cosine_loss_weight": float(args.cosine_loss_weight),
             "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
             "teacher_text_source": str(args.teacher_text_source),
@@ -2082,6 +2181,9 @@ def main() -> None:
         "teacher_layer": int(args.teacher_layer),
         "teacher_text_source": str(args.teacher_text_source),
         "center_embeddings": bool(args.center_embeddings),
+        "contrastive_loss_weight": float(args.contrastive_loss_weight),
+        "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
+        "cosine_loss_weight": float(args.cosine_loss_weight),
         "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
         "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
         "global_retrieval_eval": bool(args.global_retrieval_eval),
@@ -2111,6 +2213,14 @@ def main() -> None:
         f"val_samples={run_summary['split_plan']['val_sample_count']} "
         f"test_samples={run_summary['split_plan']['test_sample_count']} "
         f"overlap={run_summary['record_summary']['overlap']}"
+    )
+    print(
+        "alignment_objective "
+        f"center_embeddings={bool(args.center_embeddings)} "
+        f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
+        f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
+        f"cosine_weight={float(args.cosine_loss_weight):.4g} "
+        f"global_eval={bool(args.global_retrieval_eval)}"
     )
     if text_preflight_metrics:
         print(
@@ -2258,11 +2368,9 @@ def main() -> None:
         wandb_logger.log(wandb_payload, step=global_step)
         print(
             f"epoch={epoch:04d} train_loss={train_metrics['loss']:.4f} "
-            f"train_i2t={train_metrics['i2t_accuracy']:.4f} "
-            f"train_t2i={train_metrics['t2i_accuracy']:.4f} "
+            f"train[{alignment_metric_summary(train_metrics)}] "
             f"val_loss={val_metrics['loss']:.4f} "
-            f"val_i2t={val_metrics['i2t_accuracy']:.4f} "
-            f"val_t2i={val_metrics['t2i_accuracy']:.4f}"
+            f"val[{alignment_metric_summary(val_metrics)}]"
         )
 
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
