@@ -90,12 +90,23 @@ patch_alignment:
   fields:
     - Vx
   patch_size: 16
-  # Number of random sample/time/patch records created in-memory per split.
+  # Number of random patch records created in-memory per split after applying split_mode.
   train_records: 65536
   val_records: 4096
   test_records: 4096
   sample_indices: all
   time_indices: all
+  # sample: train/val/test use disjoint sample_index values. This is the default credibility check.
+  # random_record: old behavior; all splits draw from the same sample/time pool.
+  # time: disjoint time_index values; sample_time: both sample and time are disjoint.
+  split_mode: sample
+  split_train_ratio: 0.8
+  split_val_ratio: 0.1
+  split_test_ratio: 0.1
+  # Avoid exact duplicate (sample,time,row,col) records within each split.
+  unique_records: true
+  # Fail if exact records overlap across train/val/test.
+  ensure_disjoint_records: true
   seed: 42
   device: auto
   batch_size: 16
@@ -171,11 +182,15 @@ patch_alignment:
   fail_on_text_anchor_missing: true
   # true: fail when a serialized text sequence reaches max_text_tokens, because truncation is then ambiguous.
   fail_on_text_max_length_hit: true
+  # Also report retrieval over the full validation/test split, not only within each mini-batch.
+  global_retrieval_eval: true
+  global_retrieval_max_records: 8192
+  global_retrieval_chunk_size: 1024
   # compact excludes sample/time/top_left metadata because tensor path cannot observe them.
   # compact_with_metadata keeps the previous metadata-rich prompt only for ablation.
   text_prompt_template: compact
-  text_decimal_places: 3
-  max_text_tokens: 1024
+  text_decimal_places: 2
+  max_text_tokens: 2048
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
   # Qwen2.5-1.5B has 28 decoder layers; lower-middle layers are usually easier for input-level soft prompts.

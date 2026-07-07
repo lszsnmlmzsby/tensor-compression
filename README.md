@@ -1062,6 +1062,8 @@ Representation:
 
 默认 patch size 是 `16x16`。`8x8` 信息量偏少，`32x32` 文本 token 开销明显增大；`16x16` 单字段在 Qwen2.5-1.5B 的上下文内比较适合做第一轮实验。
 
+当前默认 `split_mode: sample`，train/val/test 会使用互不重叠的 `sample_index`，每个 split 内再随机采样 time 和空间 patch。这比旧的 `random_record` 更严格，可以避免验证集来自训练集已见过的 simulation trajectory。`run_summary.json` 会记录每个 split 的 sample/time 数量、预览和 exact record overlap。
+
 命令：
 
 ```bash
@@ -1098,7 +1100,7 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
 
 | 文件 | 说明 |
 |---|---|
-| `run_summary.json` | patch 大小、字段、encoder 来源、latent grid、LLM hidden size、teacher layer、adapter 参数量。 |
+| `run_summary.json` | patch 大小、字段、split plan、record overlap、encoder 来源、latent grid、LLM hidden size、teacher layer、adapter 参数量。 |
 | `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
 | `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
 | `patch_ae_pretrain_last.pt` | 可选 patch AE reconstruction warmup 后的 checkpoint。 |
@@ -1117,6 +1119,10 @@ W&B 曲线：
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
+| `train/uncentered_i2t_accuracy`、`val/uncentered_i2t_accuracy` | 不做 batch-centering 的 batch 内 tensor-to-text retrieval accuracy。 |
+| `train/uncentered_t2i_accuracy`、`val/uncentered_t2i_accuracy` | 不做 batch-centering 的 batch 内 text-to-tensor retrieval accuracy。 |
+| `val/global_i2t_accuracy`、`val/global_t2i_accuracy` | 整个验证 split 内的 retrieval accuracy，使用 `center_embeddings` 对全 split 做一次 centering。 |
+| `val/global_uncentered_i2t_accuracy`、`val/global_uncentered_t2i_accuracy` | 整个验证 split 内的不居中 retrieval accuracy，更接近 standalone embedding 质量。 |
 | `train/teacher_anchor_missing_fraction`、`val/teacher_anchor_missing_fraction` | teacher text tokenization 后 anchor 缺失比例；默认应为 0，否则代码会报错。 |
 | `train/teacher_max_length_hit_fraction`、`val/teacher_max_length_hit_fraction` | teacher text 达到 `max_text_tokens` 的比例；非 0 时应考虑增大上下文或减小 patch/text 精度。 |
 | `train/student_soft_prompt_token_norm`、`val/student_soft_prompt_token_norm` | soft prompt token 的平均范数。 |
@@ -1153,6 +1159,10 @@ patch_alignment:
 | `--patch-size` | 从 PDEBench 原始场中裁剪的方形 patch 边长。 | 正整数 | 默认 16；建议先在 16 和 32 中比较。 |
 | `--fields` | 使用哪些 HDF5 字段。 | 逗号分隔字段 | 当前建议先用单字段 `Vx`，多字段会显著增加文本长度。 |
 | `--train-records`、`--val-records`、`--test-records` | 随机采样 patch 数。 | 正整数 | 初始 smoke test 用小值，正式训练可增大。 |
+| `--split-mode` | train/val/test 如何隔离采样轴。 | `sample`、`time`、`sample_time`、`random_record` | `sample`：默认，按 `sample_index` 隔离；`time`：按 `time_index` 隔离；`sample_time`：两者都隔离；`random_record`：旧随机记录方式，只适合 smoke test。 |
+| `--split-train-ratio`、`--split-val-ratio`、`--split-test-ratio` | sample/time 轴隔离时的 split 比例。 | 正数 | 默认 `0.8/0.1/0.1`。 |
+| `--unique-records` / `--no-unique-records` | 是否避免 split 内完全重复的 `(sample,time,row,col)`。 | 布尔开关 | 默认开启。 |
+| `--ensure-disjoint-records` / `--no-ensure-disjoint-records` | 是否禁止 train/val/test 出现完全相同 record。 | 布尔开关 | 默认开启；触发说明 split 采样有泄漏。 |
 | `--encoder-source` | encoder 从哪里来。 | `patch_ae_config`、`checkpoint` | `patch_ae_config`：按 YAML 构建 patch AE；`checkpoint`：加载 `compressor_checkpoint`。 |
 | `--train-patch-ae` / `--no-train-patch-ae` | 是否更新 AE 参数。 | 布尔开关 | 新建 patch AE 建议 `true`；加载已训练 patch AE 做纯 adapter 对齐时可设 `false`。 |
 | `--freeze-patch-ae-after-pretrain` / `--no-freeze-patch-ae-after-pretrain` | AE warmup 后 alignment 阶段是否冻结 AE。 | 布尔开关 | 默认 `true`：减少 encoder 记忆训练集 teacher hidden 的风险。 |
@@ -1169,9 +1179,12 @@ patch_alignment:
 | `--center-embeddings` / `--no-center-embeddings` | InfoNCE 前是否分别对 student/teacher batch hidden 减均值。 | 布尔开关 | 默认开启，用于减弱 LLM hidden 公共方向。 |
 | `--fail-on-text-anchor-missing` / `--no-fail-on-text-anchor-missing` | tokenization 后 anchor 缺失时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录缺失比例。 |
 | `--fail-on-text-max-length-hit` / `--no-fail-on-text-max-length-hit` | tokenized 文本打满 `max_text_tokens` 时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录 `*_max_length_hit_fraction`。 |
+| `--global-retrieval-eval` / `--no-global-retrieval-eval` | eval 时是否额外计算整个 split 的 retrieval。 | 布尔开关 | 默认开启；比 batch 内 retrieval 更严格。 |
+| `--global-retrieval-max-records` | 允许全局 retrieval 的最大 split 条数。 | 正整数 | 默认 8192；超过则跳过，避免相似度矩阵过大。 |
+| `--global-retrieval-chunk-size` | 全局 retrieval 矩阵分块大小。 | 正整数 | 默认 1024；显存/内存紧张时调小。 |
 | `--text-prompt-template` | teacher branch 的数值矩阵 prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | `compact`：不含不可见元数据；`compact_with_metadata`：旧格式，含 sample/time/top_left；`plain`：仅矩阵文本。 |
-| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 默认 3；位数越多 token 越多。 |
-| `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 默认 1024。 |
+| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 当前配置为 2；位数越多 token 越多。 |
+| `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 2048。 |
 | `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
 | `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 当前配置为 8；`-1` 表示最后一层。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |

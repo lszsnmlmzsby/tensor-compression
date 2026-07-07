@@ -225,6 +225,142 @@ def hdf5_axis_sizes(hdf5_path: str | Path, field: str) -> tuple[int, int, int, i
     return shape
 
 
+def split_axis_indices(
+    indices: Sequence[int],
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    axis_name: str,
+) -> dict[str, list[int]]:
+    values = sorted({int(index) for index in indices})
+    if len(values) < 3:
+        raise ValueError(
+            f"split_mode requires at least 3 distinct {axis_name} indices, got {len(values)}. "
+            "Use split_mode=random_record only for non-isolated smoke tests."
+        )
+    ratio_sum = float(train_ratio) + float(val_ratio) + float(test_ratio)
+    if ratio_sum <= 0.0:
+        raise ValueError("split_train_ratio + split_val_ratio + split_test_ratio must be positive.")
+    train_fraction = float(train_ratio) / ratio_sum
+    val_fraction = float(val_ratio) / ratio_sum
+    rng = random.Random(int(seed))
+    shuffled = list(values)
+    rng.shuffle(shuffled)
+    train_count = max(1, int(len(shuffled) * train_fraction))
+    val_count = max(1, int(len(shuffled) * val_fraction))
+    if train_count + val_count >= len(shuffled):
+        train_count = max(1, len(shuffled) - 2)
+        val_count = 1
+    test_count = len(shuffled) - train_count - val_count
+    if test_count <= 0:
+        raise ValueError(f"Could not create non-empty train/val/test split for {axis_name}.")
+    return {
+        "train": sorted(shuffled[:train_count]),
+        "val": sorted(shuffled[train_count : train_count + val_count]),
+        "test": sorted(shuffled[train_count + val_count :]),
+    }
+
+
+def build_axis_split_plan(
+    *,
+    hdf5_path: str | Path,
+    field: str,
+    sample_indices: str | Sequence[int],
+    time_indices: str | Sequence[int],
+    split_mode: str,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> dict[str, Any]:
+    sample_count, time_count, _height, _width = hdf5_axis_sizes(hdf5_path, field)
+    samples = parse_index_spec(sample_indices, sample_count)
+    times = parse_index_spec(time_indices, time_count)
+    if not samples or not times:
+        raise ValueError("sample_indices and time_indices must not be empty.")
+    mode = str(split_mode).lower()
+    sample_splits = {"train": list(samples), "val": list(samples), "test": list(samples)}
+    time_splits = {"train": list(times), "val": list(times), "test": list(times)}
+    if mode == "sample":
+        sample_splits = split_axis_indices(
+            samples,
+            train_ratio=float(train_ratio),
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+            seed=int(seed),
+            axis_name="sample",
+        )
+    elif mode == "time":
+        time_splits = split_axis_indices(
+            times,
+            train_ratio=float(train_ratio),
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+            seed=int(seed),
+            axis_name="time",
+        )
+    elif mode == "sample_time":
+        sample_splits = split_axis_indices(
+            samples,
+            train_ratio=float(train_ratio),
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+            seed=int(seed),
+            axis_name="sample",
+        )
+        time_splits = split_axis_indices(
+            times,
+            train_ratio=float(train_ratio),
+            val_ratio=float(val_ratio),
+            test_ratio=float(test_ratio),
+            seed=int(seed) + 9973,
+            axis_name="time",
+        )
+    elif mode != "random_record":
+        raise ValueError(f"Unsupported patch_alignment.split_mode: {split_mode}")
+    return {
+        "mode": mode,
+        "samples": sample_splits,
+        "times": time_splits,
+        "available_sample_count": len(set(samples)),
+        "available_time_count": len(set(times)),
+    }
+
+
+def record_key(record: PatchRecord) -> tuple[int, int, int, int]:
+    return (int(record.sample_index), int(record.time_index), int(record.row), int(record.col))
+
+
+def summarize_records(records: Sequence[PatchRecord]) -> dict[str, Any]:
+    sample_values = sorted({int(record.sample_index) for record in records})
+    time_values = sorted({int(record.time_index) for record in records})
+    return {
+        "record_count": len(records),
+        "unique_record_count": len({record_key(record) for record in records}),
+        "sample_count": len(sample_values),
+        "time_count": len(time_values),
+        "sample_preview": sample_values[:16],
+        "time_preview": time_values[:16],
+    }
+
+
+def split_overlap_summary(
+    train_records: Sequence[PatchRecord],
+    val_records: Sequence[PatchRecord],
+    test_records: Sequence[PatchRecord],
+) -> dict[str, int]:
+    train_keys = {record_key(record) for record in train_records}
+    val_keys = {record_key(record) for record in val_records}
+    test_keys = {record_key(record) for record in test_records}
+    return {
+        "train_val_exact_record_overlap": len(train_keys & val_keys),
+        "train_test_exact_record_overlap": len(train_keys & test_keys),
+        "val_test_exact_record_overlap": len(val_keys & test_keys),
+    }
+
+
 def build_patch_records(
     *,
     hdf5_path: str | Path,
@@ -234,6 +370,7 @@ def build_patch_records(
     patch_size: int,
     count: int,
     seed: int,
+    unique_records: bool,
 ) -> list[PatchRecord]:
     sample_count, time_count, height, width = hdf5_axis_sizes(hdf5_path, field)
     samples = parse_index_spec(sample_indices, sample_count)
@@ -244,17 +381,29 @@ def build_patch_records(
         raise ValueError(f"Invalid patch_size={patch_size} for spatial shape {(height, width)}.")
     rng = random.Random(int(seed))
     records: list[PatchRecord] = []
+    seen: set[tuple[int, int, int, int]] = set()
     max_row = height - int(patch_size)
     max_col = width - int(patch_size)
-    for _ in range(int(count)):
-        records.append(
-            PatchRecord(
-                sample_index=int(rng.choice(samples)),
-                time_index=int(rng.choice(times)),
-                row=int(rng.randint(0, max_row)),
-                col=int(rng.randint(0, max_col)),
+    max_attempts = max(int(count) * 50, 1000)
+    attempts = 0
+    while len(records) < int(count):
+        attempts += 1
+        if attempts > max_attempts:
+            raise ValueError(
+                f"Could not draw {count} unique patch records after {max_attempts} attempts. "
+                "Reduce record count, relax split constraints, or set unique_records=false for a smoke test."
             )
+        record = PatchRecord(
+            sample_index=int(rng.choice(samples)),
+            time_index=int(rng.choice(times)),
+            row=int(rng.randint(0, max_row)),
+            col=int(rng.randint(0, max_col)),
         )
+        key = record_key(record)
+        if bool(unique_records) and key in seen:
+            continue
+        seen.add(key)
+        records.append(record)
     return records
 
 
@@ -554,6 +703,60 @@ def symmetric_contrastive_loss(
     return loss, {
         "i2t_accuracy": float(i2t_accuracy.detach().cpu().item()),
         "t2i_accuracy": float(t2i_accuracy.detach().cpu().item()),
+    }
+
+
+@torch.no_grad()
+def retrieval_accuracy(
+    tensor_embedding: torch.Tensor,
+    text_embedding: torch.Tensor,
+    temperature: float,
+) -> dict[str, float]:
+    logits = tensor_embedding.detach().float() @ text_embedding.detach().float().T / max(float(temperature), 1.0e-6)
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return {
+        "contrastive_loss": float(
+            (0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))).cpu().item()
+        ),
+        "i2t_accuracy": float((logits.argmax(dim=1) == labels).float().mean().cpu().item()),
+        "t2i_accuracy": float((logits.argmax(dim=0) == labels).float().mean().cpu().item()),
+    }
+
+
+@torch.no_grad()
+def full_retrieval_accuracy(
+    tensor_embedding: torch.Tensor,
+    text_embedding: torch.Tensor,
+    temperature: float,
+    chunk_size: int,
+) -> dict[str, float]:
+    tensor_cpu = tensor_embedding.detach().float().cpu()
+    text_cpu = text_embedding.detach().float().cpu()
+    total = int(tensor_cpu.shape[0])
+    if total == 0:
+        return {"contrastive_loss": 0.0, "i2t_accuracy": 0.0, "t2i_accuracy": 0.0}
+    labels = torch.arange(total)
+    chunk = max(1, int(chunk_size))
+    i2t_correct = 0
+    t2i_correct = 0
+    i2t_loss_sum = 0.0
+    t2i_loss_sum = 0.0
+    for start in range(0, total, chunk):
+        end = min(total, start + chunk)
+        logits = tensor_cpu[start:end] @ text_cpu.T / max(float(temperature), 1.0e-6)
+        local_labels = labels[start:end]
+        i2t_correct += int((logits.argmax(dim=1) == local_labels).sum().item())
+        i2t_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
+    for start in range(0, total, chunk):
+        end = min(total, start + chunk)
+        logits = text_cpu[start:end] @ tensor_cpu.T / max(float(temperature), 1.0e-6)
+        local_labels = labels[start:end]
+        t2i_correct += int((logits.argmax(dim=1) == local_labels).sum().item())
+        t2i_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
+    return {
+        "contrastive_loss": 0.5 * (i2t_loss_sum + t2i_loss_sum) / max(1, total),
+        "i2t_accuracy": i2t_correct / max(1, total),
+        "t2i_accuracy": t2i_correct / max(1, total),
     }
 
 
@@ -922,6 +1125,11 @@ def train_one_epoch(
             teacher_hidden.to(dtype=student_hidden.dtype),
             bool(args.center_embeddings),
         )
+        uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            False,
+        )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
@@ -952,6 +1160,16 @@ def train_one_epoch(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                uncentered_tensor_embedding,
+                uncentered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "uncentered_",
+        )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
@@ -1088,6 +1306,8 @@ def evaluate(
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
+    collected_student_hidden: list[torch.Tensor] = []
+    collected_teacher_hidden: list[torch.Tensor] = []
     train_compressor = train_compressor_during_alignment(args)
     for batch in tqdm(loader, desc="eval align", leave=False):
         normalized_patches = normalize_patch_batch(
@@ -1127,6 +1347,11 @@ def evaluate(
             teacher_hidden.to(dtype=student_hidden.dtype),
             bool(args.center_embeddings),
         )
+        uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden.to(dtype=student_hidden.dtype),
+            False,
+        )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
@@ -1147,6 +1372,16 @@ def evaluate(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                uncentered_tensor_embedding,
+                uncentered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "uncentered_",
+        )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
@@ -1160,6 +1395,9 @@ def evaluate(
             "alignment_",
         )
         total_records += batch_size
+        if bool(args.global_retrieval_eval) and total_records <= int(args.global_retrieval_max_records):
+            collected_student_hidden.append(student_hidden.detach().float().cpu())
+            collected_teacher_hidden.append(teacher_hidden.detach().float().cpu())
     metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
@@ -1169,6 +1407,39 @@ def evaluate(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
+    if (
+        bool(args.global_retrieval_eval)
+        and collected_student_hidden
+        and total_records <= int(args.global_retrieval_max_records)
+    ):
+        student_all = torch.cat(collected_student_hidden, dim=0)
+        teacher_all = torch.cat(collected_teacher_hidden, dim=0)
+        global_tensor, global_text = prepare_alignment_embeddings(student_all, teacher_all, bool(args.center_embeddings))
+        global_uncentered_tensor, global_uncentered_text = prepare_alignment_embeddings(student_all, teacher_all, False)
+        metrics.update(
+            {
+                f"global_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_tensor,
+                    global_text,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
+        metrics.update(
+            {
+                f"global_uncentered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_uncentered_tensor,
+                    global_uncentered_text,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
+    elif bool(args.global_retrieval_eval):
+        metrics["global_retrieval_skipped"] = 1.0
     return metrics
 
 
@@ -1190,6 +1461,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-records", type=int, default=None)
     parser.add_argument("--sample-indices", type=str, default=None)
     parser.add_argument("--time-indices", type=str, default=None)
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        choices=("random_record", "sample", "time", "sample_time"),
+        default=None,
+    )
+    parser.add_argument("--split-train-ratio", type=float, default=None)
+    parser.add_argument("--split-val-ratio", type=float, default=None)
+    parser.add_argument("--split-test-ratio", type=float, default=None)
+    parser.add_argument("--unique-records", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ensure-disjoint-records", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -1233,6 +1515,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-embeddings", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fail-on-text-anchor-missing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fail-on-text-max-length-hit", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--global-retrieval-eval", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--global-retrieval-max-records", type=int, default=None)
+    parser.add_argument("--global-retrieval-chunk-size", type=int, default=None)
     parser.add_argument(
         "--text-prompt-template",
         type=str,
@@ -1300,6 +1585,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "test_records", first_nested(config, ["patch_alignment.test_records"]), 512)
     set_default(args, "sample_indices", value_to_csv(first_nested(config, ["patch_alignment.sample_indices"])), "all")
     set_default(args, "time_indices", value_to_csv(first_nested(config, ["patch_alignment.time_indices"])), "all")
+    set_default(args, "split_mode", first_nested(config, ["patch_alignment.split_mode"]), "sample")
+    set_default(args, "split_train_ratio", first_nested(config, ["patch_alignment.split_train_ratio"]), 0.8)
+    set_default(args, "split_val_ratio", first_nested(config, ["patch_alignment.split_val_ratio"]), 0.1)
+    set_default(args, "split_test_ratio", first_nested(config, ["patch_alignment.split_test_ratio"]), 0.1)
+    set_default(args, "unique_records", first_nested(config, ["patch_alignment.unique_records"]), True)
+    set_default(args, "ensure_disjoint_records", first_nested(config, ["patch_alignment.ensure_disjoint_records"]), True)
     set_default(args, "seed", first_nested(config, ["patch_alignment.seed", "runtime.seed"]), 42)
     set_default(args, "device", first_nested(config, ["patch_alignment.device", "runtime.device"]), "auto")
     set_default(args, "batch_size", first_nested(config, ["patch_alignment.batch_size"]), 8)
@@ -1346,6 +1637,19 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         first_nested(config, ["patch_alignment.fail_on_text_max_length_hit"]),
         True,
     )
+    set_default(args, "global_retrieval_eval", first_nested(config, ["patch_alignment.global_retrieval_eval"]), True)
+    set_default(
+        args,
+        "global_retrieval_max_records",
+        first_nested(config, ["patch_alignment.global_retrieval_max_records"]),
+        8192,
+    )
+    set_default(
+        args,
+        "global_retrieval_chunk_size",
+        first_nested(config, ["patch_alignment.global_retrieval_chunk_size"]),
+        1024,
+    )
     set_default(args, "text_prompt_template", first_nested(config, ["patch_alignment.text_prompt_template"]), "compact")
     set_default(args, "text_decimal_places", first_nested(config, ["patch_alignment.text_decimal_places"]), 3)
     set_default(args, "max_text_tokens", first_nested(config, ["patch_alignment.max_text_tokens"]), 1024)
@@ -1369,6 +1673,13 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.max_text_tokens must be positive.")
     if int(args.text_preflight_records) < 0:
         raise ValueError("patch_alignment.text_preflight_records must be non-negative.")
+    if int(args.global_retrieval_max_records) <= 0:
+        raise ValueError("patch_alignment.global_retrieval_max_records must be positive.")
+    if int(args.global_retrieval_chunk_size) <= 0:
+        raise ValueError("patch_alignment.global_retrieval_chunk_size must be positive.")
+    split_ratio_sum = float(args.split_train_ratio) + float(args.split_val_ratio) + float(args.split_test_ratio)
+    if split_ratio_sum <= 0.0:
+        raise ValueError("patch_alignment split ratios must sum to a positive value.")
     if float(args.soft_prompt_scale) < 0.0:
         raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
     if float(args.temperature) <= 0.0:
@@ -1473,6 +1784,12 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "test_records": int(args.test_records),
             "sample_indices": str(args.sample_indices),
             "time_indices": str(args.time_indices),
+            "split_mode": str(args.split_mode),
+            "split_train_ratio": float(args.split_train_ratio),
+            "split_val_ratio": float(args.split_val_ratio),
+            "split_test_ratio": float(args.split_test_ratio),
+            "unique_records": bool(args.unique_records),
+            "ensure_disjoint_records": bool(args.ensure_disjoint_records),
         },
         "model": {
             "name_or_path": str(args.model_name_or_path),
@@ -1503,6 +1820,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "center_embeddings": bool(args.center_embeddings),
             "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
             "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
+            "global_retrieval_eval": bool(args.global_retrieval_eval),
+            "global_retrieval_max_records": int(args.global_retrieval_max_records),
+            "global_retrieval_chunk_size": int(args.global_retrieval_chunk_size),
             "text_prompt_template": str(args.text_prompt_template),
             "text_decimal_places": int(args.text_decimal_places),
             "max_text_tokens": int(args.max_text_tokens),
@@ -1615,33 +1935,50 @@ def main() -> None:
         )
 
     first_field = field_keys[0]
-    train_records = build_patch_records(
+    split_plan = build_axis_split_plan(
         hdf5_path=args.hdf5_path,
         field=first_field,
         sample_indices=str(args.sample_indices),
         time_indices=str(args.time_indices),
+        split_mode=str(args.split_mode),
+        train_ratio=float(args.split_train_ratio),
+        val_ratio=float(args.split_val_ratio),
+        test_ratio=float(args.split_test_ratio),
+        seed=int(args.seed),
+    )
+    train_records = build_patch_records(
+        hdf5_path=args.hdf5_path,
+        field=first_field,
+        sample_indices=split_plan["samples"]["train"],
+        time_indices=split_plan["times"]["train"],
         patch_size=int(args.patch_size),
         count=int(args.train_records),
         seed=int(args.seed),
+        unique_records=bool(args.unique_records),
     )
     val_records = build_patch_records(
         hdf5_path=args.hdf5_path,
         field=first_field,
-        sample_indices=str(args.sample_indices),
-        time_indices=str(args.time_indices),
+        sample_indices=split_plan["samples"]["val"],
+        time_indices=split_plan["times"]["val"],
         patch_size=int(args.patch_size),
         count=int(args.val_records),
         seed=int(args.seed) + 1,
+        unique_records=bool(args.unique_records),
     )
     test_records = build_patch_records(
         hdf5_path=args.hdf5_path,
         field=first_field,
-        sample_indices=str(args.sample_indices),
-        time_indices=str(args.time_indices),
+        sample_indices=split_plan["samples"]["test"],
+        time_indices=split_plan["times"]["test"],
         patch_size=int(args.patch_size),
         count=int(args.test_records),
         seed=int(args.seed) + 2,
+        unique_records=bool(args.unique_records),
     )
+    overlap_summary = split_overlap_summary(train_records, val_records, test_records)
+    if bool(args.ensure_disjoint_records) and any(value > 0 for value in overlap_summary.values()):
+        raise ValueError(f"Exact patch record overlap across splits is not allowed: {overlap_summary}")
     dataset_kwargs = {
         "hdf5_path": args.hdf5_path,
         "field_keys": field_keys,
@@ -1698,6 +2035,35 @@ def main() -> None:
         "train_records": len(train_dataset),
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
+        "split_mode": str(args.split_mode),
+        "split_train_ratio": float(args.split_train_ratio),
+        "split_val_ratio": float(args.split_val_ratio),
+        "split_test_ratio": float(args.split_test_ratio),
+        "unique_records": bool(args.unique_records),
+        "ensure_disjoint_records": bool(args.ensure_disjoint_records),
+        "split_plan": {
+            "mode": str(split_plan["mode"]),
+            "available_sample_count": int(split_plan["available_sample_count"]),
+            "available_time_count": int(split_plan["available_time_count"]),
+            "train_sample_count": len(split_plan["samples"]["train"]),
+            "val_sample_count": len(split_plan["samples"]["val"]),
+            "test_sample_count": len(split_plan["samples"]["test"]),
+            "train_time_count": len(split_plan["times"]["train"]),
+            "val_time_count": len(split_plan["times"]["val"]),
+            "test_time_count": len(split_plan["times"]["test"]),
+            "train_sample_preview": list(split_plan["samples"]["train"][:16]),
+            "val_sample_preview": list(split_plan["samples"]["val"][:16]),
+            "test_sample_preview": list(split_plan["samples"]["test"][:16]),
+            "train_time_preview": list(split_plan["times"]["train"][:16]),
+            "val_time_preview": list(split_plan["times"]["val"][:16]),
+            "test_time_preview": list(split_plan["times"]["test"][:16]),
+        },
+        "record_summary": {
+            "train": summarize_records(train_records),
+            "val": summarize_records(val_records),
+            "test": summarize_records(test_records),
+            "overlap": dict(overlap_summary),
+        },
         "encoder_source": str(args.encoder_source),
         "compressor_checkpoint": str(args.compressor_checkpoint) if args.compressor_checkpoint else None,
         "train_patch_ae": bool(args.train_patch_ae),
@@ -1718,6 +2084,9 @@ def main() -> None:
         "center_embeddings": bool(args.center_embeddings),
         "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
         "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
+        "global_retrieval_eval": bool(args.global_retrieval_eval),
+        "global_retrieval_max_records": int(args.global_retrieval_max_records),
+        "global_retrieval_chunk_size": int(args.global_retrieval_chunk_size),
         "text_preflight_records": int(args.text_preflight_records),
         "text_preflight": dict(text_preflight_metrics),
         "adapter_type": str(args.adapter_type),
@@ -1735,6 +2104,14 @@ def main() -> None:
         ),
     }
     dump_json(run_dir / "run_summary.json", run_summary)
+    print(
+        "patch_split "
+        f"mode={run_summary['split_mode']} "
+        f"train_samples={run_summary['split_plan']['train_sample_count']} "
+        f"val_samples={run_summary['split_plan']['val_sample_count']} "
+        f"test_samples={run_summary['split_plan']['test_sample_count']} "
+        f"overlap={run_summary['record_summary']['overlap']}"
+    )
     if text_preflight_metrics:
         print(
             "teacher_text_preflight "
