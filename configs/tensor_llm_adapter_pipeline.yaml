@@ -163,6 +163,19 @@ patch_alignment:
   adapter_heads: 8
   # null means directly align to the LLM hidden size. This keeps the text teacher side fixed.
   projection_dim: null
+  # Optional CLIP-style alignment space on top of frozen LLM hidden states.
+  # The LLM still receives tensor soft prompts; this only changes the contrastive loss/eval space.
+  alignment_projection:
+    enabled: true
+    # Keep this lower than the LLM hidden size to avoid a high-capacity private matching space.
+    dim: 512
+    # Used only when layers > 1.
+    hidden_dim: 1024
+    # 1 = LayerNorm + Linear. Increase only as an ablation.
+    layers: 1
+    dropout: 0.0
+    # false gives student/teacher separate linear maps; true forces the same map on both branches.
+    shared: false
   dropout: 0.0
   # Bound each soft prompt dimension with tanh before feeding it to the frozen LLM.
   # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.

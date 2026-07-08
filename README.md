@@ -1088,11 +1088,12 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
 
 ```text
 loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teacher_embedding)
+     + centered_contrastive_loss_weight * symmetric_InfoNCE(centered_tensor_embedding, centered_text_teacher_embedding)
      + cosine_loss_weight * (1 - cosine_similarity)
      + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
-这里的 `tensor_embedding` 实际是 student branch 经过 frozen LLM 后取出的 anchor hidden state。`text_teacher_embedding` 是 teacher branch 读完整数值矩阵文本后的同层 anchor hidden state。当前默认 `center_embeddings: false`，主 loss 直接优化 raw L2-normalized embedding，因此结果更接近全局可复用表示。`centered_contrastive_loss_weight` 只作为小权重辅助项，用来保留 batch residual 对齐信号；不要把 centered batch retrieval 当成最终成功指标。当前默认 `cosine_loss_weight: 0.0`，因为 raw cosine 可能只鼓励公共方向接近，却不提高 retrieval。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge。
+这里的 `tensor_embedding` 默认不是 raw LLM hidden，而是 student branch 的 anchor hidden 经过 `alignment_projection.student` 后得到的对齐向量；`text_teacher_embedding` 是 teacher branch 的同层 anchor hidden 经过 `alignment_projection.teacher` 后得到的对齐向量。当前配置开启 `alignment_projection.enabled: true`，使用轻量 `LayerNorm + Linear` 投到 512 维 CLIP-style 对齐空间。raw LLM hidden 的检索结果会额外记录为 `hidden_*` 和 `global_hidden_*` 指标，用于判断 projection 是否只是掩盖了 LLM hidden 本身的各向异性。当前默认 `center_embeddings: false`，主 loss 直接优化投影后的 raw L2-normalized embedding；`centered_contrastive_loss_weight` 只作为小权重辅助项。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge 和 projection head。
 
 脚本会检查 teacher/student tokenization 后的最后 token 附近是否仍包含 `Representation:`。默认 `fail_on_text_anchor_missing: true`，一旦文本过长导致 anchor 被截断，会直接报错，而不是继续训练一个语义位置已经错位的目标。默认 `fail_on_text_max_length_hit: true`，只要序列打满 `max_text_tokens` 也会报错；这比静默截断更严格，若触发应优先增大 `max_text_tokens`、减小 `patch_size` 或降低 `text_decimal_places`。
 
@@ -1125,6 +1126,8 @@ W&B 曲线：
 | `val/global_i2t_accuracy`、`val/global_t2i_accuracy` | 整个验证 split 内的 retrieval accuracy，使用 `center_embeddings` 对全 split 做一次 centering。 |
 | `val/global_centered_i2t_accuracy`、`val/global_centered_t2i_accuracy` | 整个验证 split 内的 centered retrieval，仅用于诊断 residual alignment。 |
 | `val/global_uncentered_i2t_accuracy`、`val/global_uncentered_t2i_accuracy` | 整个验证 split 内的不居中 retrieval accuracy，更接近 standalone embedding 质量。 |
+| `train/hidden_uncentered_i2t_accuracy`、`val/hidden_uncentered_i2t_accuracy` | 不经过 projection 的 raw LLM hidden batch retrieval；用于和 projection 后主指标对比。 |
+| `val/global_hidden_uncentered_i2t_accuracy`、`val/global_hidden_uncentered_t2i_accuracy` | 不经过 projection 的 raw LLM hidden 全局 retrieval；若 projection 指标高而该项低，说明 projection 解决的是对齐空间问题，不等于 raw hidden 本身可用。 |
 | `train/teacher_anchor_missing_fraction`、`val/teacher_anchor_missing_fraction` | teacher text tokenization 后 anchor 缺失比例；默认应为 0，否则代码会报错。 |
 | `train/teacher_max_length_hit_fraction`、`val/teacher_max_length_hit_fraction` | teacher text 达到 `max_text_tokens` 的比例；非 0 时应考虑增大上下文或减小 patch/text 精度。 |
 | `train/student_soft_prompt_token_norm`、`val/student_soft_prompt_token_norm` | soft prompt token 的平均范数。 |
@@ -1176,6 +1179,12 @@ patch_alignment:
 | `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 默认 2。 |
 | `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`；`0`：关闭限制。 |
+| `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 是否在 LLM hidden 后接 projection head，再进行对比学习。 | 布尔开关 | 当前默认配置开启；关闭后退回 raw hidden alignment。 |
+| `--alignment-projection-dim` | projection 后的对齐空间维度。 | 正整数 | 当前配置为 512；低于 LLM hidden size，降低私有匹配空间风险。 |
+| `--alignment-projection-layers` | projection head 层数。 | 正整数 | `1`：`LayerNorm + Linear`，默认；大于 1 会变成 MLP，只建议消融。 |
+| `--alignment-projection-hidden-dim` | MLP projection 的隐藏维度。 | 正整数 | 仅 `--alignment-projection-layers > 1` 时使用。 |
+| `--alignment-projection-dropout` | projection head dropout。 | 非负数 | 默认 0。 |
+| `--alignment-projection-shared` / `--no-alignment-projection-shared` | student/teacher 是否共享同一个 projection head。 | 布尔开关 | 默认 false：两条路径分布不同，先允许不同线性映射；true 是更强约束的消融。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
 | `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `normalized`、`raw` | `normalized`：使用 AE 实际输入，默认；`raw`：使用 HDF5 原始值，只建议消融。 |
 | `--center-embeddings` / `--no-center-embeddings` | 主 InfoNCE 前是否分别对 student/teacher batch hidden 减均值。 | 布尔开关 | 当前默认关闭；开启只建议做 batch-centered ablation。 |
@@ -1193,7 +1202,7 @@ patch_alignment:
 | `--contrastive-loss-weight` | symmetric InfoNCE 权重。 | 非负数 | 当前主要优化项，默认 1.0。 |
 | `--centered-contrastive-loss-weight` | batch-centered InfoNCE 辅助权重。 | 非负数 | 当前配置为 0.1；设 0 可完全关闭。 |
 | `--cosine-loss-weight` | 正样本 cosine loss 权重。 | 非负数 | 当前默认 0.0；非 0 时注意它可能提高公共方向相似度但不提高 retrieval。 |
-| `--projection-dim` | tensor embedding 维度。 | `null` 或 LLM hidden size | 当前 text teacher 不训练 projection，因此必须等于 LLM hidden size；默认 `null` 自动匹配。 |
+| `--projection-dim` | adapter 输出到 LLM 的 soft prompt 维度。 | `null` 或 LLM hidden size | 默认 `null` 自动匹配 LLM hidden size；不要和 `alignment_projection.dim` 混淆。 |
 | `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | 默认读取 `wandb.enabled`。 |
 | `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 patch AE/alignment checkpoint artifact。 | 布尔开关 | 默认读取 `wandb.log_model`。 |

@@ -687,6 +687,69 @@ class TensorPatchAlignmentAdapter(nn.Module):
         return F.normalize(soft_prompts.mean(dim=1), dim=-1)
 
 
+def build_projection_head(
+    input_dim: int,
+    output_dim: int,
+    hidden_dim: int,
+    layers: int,
+    dropout: float,
+) -> nn.Module:
+    input_dim = int(input_dim)
+    output_dim = int(output_dim)
+    hidden_dim = int(hidden_dim)
+    layers = int(layers)
+    if layers <= 0:
+        raise ValueError("alignment_projection_layers must be positive.")
+    if layers == 1:
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, output_dim),
+        )
+    modules: list[nn.Module] = [nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dim), nn.GELU()]
+    if float(dropout) > 0.0:
+        modules.append(nn.Dropout(float(dropout)))
+    for _ in range(layers - 2):
+        modules.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
+        if float(dropout) > 0.0:
+            modules.append(nn.Dropout(float(dropout)))
+    modules.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*modules)
+
+
+class AlignmentProjectionPair(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        shared: bool,
+    ) -> None:
+        super().__init__()
+        self.shared = bool(shared)
+        self.student = build_projection_head(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            dropout=dropout,
+        )
+        if self.shared:
+            self.teacher = self.student
+        else:
+            self.teacher = build_projection_head(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_dim=hidden_dim,
+                layers=layers,
+                dropout=dropout,
+            )
+
+    def forward(self, student_hidden: torch.Tensor, teacher_hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.student(student_hidden.float()), self.teacher(teacher_hidden.float())
+
+
 def symmetric_contrastive_loss(
     tensor_embedding: torch.Tensor,
     text_embedding: torch.Tensor,
@@ -1056,6 +1119,7 @@ def train_one_epoch(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -1067,6 +1131,8 @@ def train_one_epoch(
     epoch: int,
 ) -> dict[str, float]:
     adapter.train()
+    if projector is not None:
+        projector.train()
     train_compressor = train_compressor_during_alignment(args)
     if train_compressor:
         compressor.train()
@@ -1119,21 +1185,36 @@ def train_one_epoch(
             bool(args.fail_on_text_max_length_hit),
         )
         student_hidden = student_output.hidden
-        teacher_hidden = teacher_output.hidden
+        teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
+        if projector is None:
+            student_features = student_hidden
+            teacher_features = teacher_hidden
+        else:
+            student_features, teacher_features = projector(student_hidden, teacher_hidden)
         tensor_embedding, text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             bool(args.center_embeddings),
         )
         centered_tensor_embedding, centered_text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             True,
         )
         uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             False,
+        )
+        hidden_uncentered_tensor_embedding, hidden_uncentered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+            False,
+        )
+        hidden_centered_tensor_embedding, hidden_centered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+            True,
         )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
@@ -1191,6 +1272,26 @@ def train_one_epoch(
             batch_size,
             "uncentered_",
         )
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                hidden_uncentered_tensor_embedding,
+                hidden_uncentered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "hidden_uncentered_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                hidden_centered_tensor_embedding,
+                hidden_centered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "hidden_centered_",
+        )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
@@ -1203,6 +1304,19 @@ def train_one_epoch(
                 "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
                 "uncentered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_tensor_embedding),
                 "uncentered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_text_embedding),
+                "hidden_positive_cosine": float(
+                    F.cosine_similarity(
+                        hidden_uncentered_tensor_embedding,
+                        hidden_uncentered_text_embedding,
+                        dim=-1,
+                    )
+                    .mean()
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_tensor_embedding),
+                "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_text_embedding),
             },
             batch_size,
             "alignment_",
@@ -1313,6 +1427,7 @@ def evaluate(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -1323,6 +1438,8 @@ def evaluate(
 ) -> dict[str, float]:
     compressor.eval()
     adapter.eval()
+    if projector is not None:
+        projector.eval()
     total_loss = 0.0
     total_contrastive = 0.0
     total_cosine = 0.0
@@ -1331,6 +1448,8 @@ def evaluate(
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
+    collected_student_features: list[torch.Tensor] = []
+    collected_teacher_features: list[torch.Tensor] = []
     collected_student_hidden: list[torch.Tensor] = []
     collected_teacher_hidden: list[torch.Tensor] = []
     train_compressor = train_compressor_during_alignment(args)
@@ -1366,21 +1485,36 @@ def evaluate(
             bool(args.fail_on_text_max_length_hit),
         )
         student_hidden = student_output.hidden
-        teacher_hidden = teacher_output.hidden
+        teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
+        if projector is None:
+            student_features = student_hidden
+            teacher_features = teacher_hidden
+        else:
+            student_features, teacher_features = projector(student_hidden, teacher_hidden)
         tensor_embedding, text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             bool(args.center_embeddings),
         )
         centered_tensor_embedding, centered_text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             True,
         )
         uncentered_tensor_embedding, uncentered_text_embedding = prepare_alignment_embeddings(
-            student_hidden,
-            teacher_hidden.to(dtype=student_hidden.dtype),
+            student_features,
+            teacher_features,
             False,
+        )
+        hidden_uncentered_tensor_embedding, hidden_uncentered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+            False,
+        )
+        hidden_centered_tensor_embedding, hidden_centered_text_embedding = prepare_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+            True,
         )
         contrastive, contrastive_metrics = symmetric_contrastive_loss(
             tensor_embedding,
@@ -1428,6 +1562,26 @@ def evaluate(
             batch_size,
             "uncentered_",
         )
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                hidden_uncentered_tensor_embedding,
+                hidden_uncentered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "hidden_uncentered_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            retrieval_accuracy(
+                hidden_centered_tensor_embedding,
+                hidden_centered_text_embedding,
+                float(args.temperature),
+            ),
+            batch_size,
+            "hidden_centered_",
+        )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
@@ -1440,12 +1594,27 @@ def evaluate(
                 "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
                 "uncentered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_tensor_embedding),
                 "uncentered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(uncentered_text_embedding),
+                "hidden_positive_cosine": float(
+                    F.cosine_similarity(
+                        hidden_uncentered_tensor_embedding,
+                        hidden_uncentered_text_embedding,
+                        dim=-1,
+                    )
+                    .mean()
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_tensor_embedding),
+                "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_text_embedding),
             },
             batch_size,
             "alignment_",
         )
         total_records += batch_size
         if bool(args.global_retrieval_eval) and total_records <= int(args.global_retrieval_max_records):
+            collected_student_features.append(student_features.detach().float().cpu())
+            collected_teacher_features.append(teacher_features.detach().float().cpu())
             collected_student_hidden.append(student_hidden.detach().float().cpu())
             collected_teacher_hidden.append(teacher_hidden.detach().float().cpu())
     metrics = {
@@ -1459,14 +1628,26 @@ def evaluate(
     metrics.update(averaged_metrics(metric_totals, total_records))
     if (
         bool(args.global_retrieval_eval)
-        and collected_student_hidden
+        and collected_student_features
         and total_records <= int(args.global_retrieval_max_records)
     ):
-        student_all = torch.cat(collected_student_hidden, dim=0)
-        teacher_all = torch.cat(collected_teacher_hidden, dim=0)
+        student_all = torch.cat(collected_student_features, dim=0)
+        teacher_all = torch.cat(collected_teacher_features, dim=0)
+        student_hidden_all = torch.cat(collected_student_hidden, dim=0)
+        teacher_hidden_all = torch.cat(collected_teacher_hidden, dim=0)
         global_tensor, global_text = prepare_alignment_embeddings(student_all, teacher_all, bool(args.center_embeddings))
         global_centered_tensor, global_centered_text = prepare_alignment_embeddings(student_all, teacher_all, True)
         global_uncentered_tensor, global_uncentered_text = prepare_alignment_embeddings(student_all, teacher_all, False)
+        global_hidden_centered_tensor, global_hidden_centered_text = prepare_alignment_embeddings(
+            student_hidden_all,
+            teacher_hidden_all,
+            True,
+        )
+        global_hidden_uncentered_tensor, global_hidden_uncentered_text = prepare_alignment_embeddings(
+            student_hidden_all,
+            teacher_hidden_all,
+            False,
+        )
         metrics.update(
             {
                 f"global_{key}": value
@@ -1495,6 +1676,28 @@ def evaluate(
                 for key, value in full_retrieval_accuracy(
                     global_uncentered_tensor,
                     global_uncentered_text,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
+        metrics.update(
+            {
+                f"global_hidden_centered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_hidden_centered_tensor,
+                    global_hidden_centered_text,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
+        metrics.update(
+            {
+                f"global_hidden_uncentered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_hidden_uncentered_tensor,
+                    global_hidden_uncentered_text,
                     float(args.temperature),
                     int(args.global_retrieval_chunk_size),
                 ).items()
@@ -1561,6 +1764,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--projection-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--alignment-projection-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-hidden-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-layers", type=int, default=None)
+    parser.add_argument("--alignment-projection-dropout", type=float, default=None)
+    parser.add_argument("--alignment-projection-shared", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
@@ -1680,6 +1889,37 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "adapter_layers", first_nested(config, ["patch_alignment.adapter_layers"]), 2)
     set_default(args, "adapter_heads", first_nested(config, ["patch_alignment.adapter_heads"]), 8)
     set_default(args, "projection_dim", first_nested(config, ["patch_alignment.projection_dim"]), None)
+    set_default(
+        args,
+        "alignment_projection_enabled",
+        first_nested(config, ["patch_alignment.alignment_projection.enabled"]),
+        False,
+    )
+    set_default(args, "alignment_projection_dim", first_nested(config, ["patch_alignment.alignment_projection.dim"]), 512)
+    set_default(
+        args,
+        "alignment_projection_hidden_dim",
+        first_nested(config, ["patch_alignment.alignment_projection.hidden_dim"]),
+        1024,
+    )
+    set_default(
+        args,
+        "alignment_projection_layers",
+        first_nested(config, ["patch_alignment.alignment_projection.layers"]),
+        1,
+    )
+    set_default(
+        args,
+        "alignment_projection_dropout",
+        first_nested(config, ["patch_alignment.alignment_projection.dropout"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "alignment_projection_shared",
+        first_nested(config, ["patch_alignment.alignment_projection.shared"]),
+        False,
+    )
     set_default(args, "dropout", first_nested(config, ["patch_alignment.dropout"]), 0.0)
     set_default(args, "soft_prompt_scale", first_nested(config, ["patch_alignment.soft_prompt_scale"]), 0.05)
     set_default(args, "temperature", first_nested(config, ["patch_alignment.temperature"]), 0.07)
@@ -1749,6 +1989,15 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     split_ratio_sum = float(args.split_train_ratio) + float(args.split_val_ratio) + float(args.split_test_ratio)
     if split_ratio_sum <= 0.0:
         raise ValueError("patch_alignment split ratios must sum to a positive value.")
+    if bool(args.alignment_projection_enabled):
+        if int(args.alignment_projection_dim) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.dim must be positive.")
+        if int(args.alignment_projection_hidden_dim) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.hidden_dim must be positive.")
+        if int(args.alignment_projection_layers) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.layers must be positive.")
+        if float(args.alignment_projection_dropout) < 0.0:
+            raise ValueError("patch_alignment.alignment_projection.dropout must be non-negative.")
     if float(args.soft_prompt_scale) < 0.0:
         raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
     if float(args.temperature) <= 0.0:
@@ -1820,6 +2069,7 @@ def save_checkpoint(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     args: argparse.Namespace,
     metrics: Mapping[str, Any],
     compressor_config: Mapping[str, Any],
@@ -1831,6 +2081,8 @@ def save_checkpoint(
         "args": redacted_args(args),
         "metrics": metrics,
     }
+    if projector is not None:
+        payload["alignment_projector_state_dict"] = projector.state_dict()
     if save_compressor:
         payload["compressor_state_dict"] = compressor.state_dict()
     torch.save(payload, path)
@@ -1866,7 +2118,9 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"global_centered_i2t={fmt_metric(metrics, 'global_centered_i2t_accuracy')} "
         f"global_centered_t2i={fmt_metric(metrics, 'global_centered_t2i_accuracy')} "
         f"global_uncentered_i2t={fmt_metric(metrics, 'global_uncentered_i2t_accuracy')} "
-        f"global_uncentered_t2i={fmt_metric(metrics, 'global_uncentered_t2i_accuracy')}"
+        f"global_uncentered_t2i={fmt_metric(metrics, 'global_uncentered_t2i_accuracy')} "
+        f"global_hidden_uncentered_i2t={fmt_metric(metrics, 'global_hidden_uncentered_i2t_accuracy')} "
+        f"global_hidden_uncentered_t2i={fmt_metric(metrics, 'global_hidden_uncentered_t2i_accuracy')}"
     )
 
 
@@ -1908,6 +2162,14 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "adapter_layers": int(args.adapter_layers),
             "adapter_heads": int(args.adapter_heads),
             "projection_dim": args.projection_dim,
+            "alignment_projection": {
+                "enabled": bool(args.alignment_projection_enabled),
+                "dim": int(args.alignment_projection_dim),
+                "hidden_dim": int(args.alignment_projection_hidden_dim),
+                "layers": int(args.alignment_projection_layers),
+                "dropout": float(args.alignment_projection_dropout),
+                "shared": bool(args.alignment_projection_shared),
+            },
             "dropout": float(args.dropout),
             "soft_prompt_scale": float(args.soft_prompt_scale),
             "temperature": float(args.temperature),
@@ -2122,6 +2384,16 @@ def main() -> None:
         adapter_heads=int(args.adapter_heads),
         soft_prompt_scale=float(args.soft_prompt_scale),
     ).to(device)
+    alignment_projector: AlignmentProjectionPair | None = None
+    if bool(args.alignment_projection_enabled):
+        alignment_projector = AlignmentProjectionPair(
+            input_dim=llm_hidden_size,
+            output_dim=int(args.alignment_projection_dim),
+            hidden_dim=int(args.alignment_projection_hidden_dim),
+            layers=int(args.alignment_projection_layers),
+            dropout=float(args.alignment_projection_dropout),
+            shared=bool(args.alignment_projection_shared),
+        ).to(device)
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
         bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
@@ -2178,6 +2450,19 @@ def main() -> None:
         "llm_hidden_size": int(llm_hidden_size),
         "llm_num_hidden_layers": int(getattr(llm.config, "num_hidden_layers", -1)),
         "projection_dim": int(projection_dim),
+        "alignment_projection": {
+            "enabled": bool(args.alignment_projection_enabled),
+            "dim": int(args.alignment_projection_dim),
+            "hidden_dim": int(args.alignment_projection_hidden_dim),
+            "layers": int(args.alignment_projection_layers),
+            "dropout": float(args.alignment_projection_dropout),
+            "shared": bool(args.alignment_projection_shared),
+            "parameters": (
+                sum(parameter.numel() for parameter in alignment_projector.parameters())
+                if alignment_projector is not None
+                else 0
+            ),
+        },
         "teacher_layer": int(args.teacher_layer),
         "teacher_text_source": str(args.teacher_text_source),
         "center_embeddings": bool(args.center_embeddings),
@@ -2198,6 +2483,11 @@ def main() -> None:
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "alignment_mode": "input_soft_prompt_hidden",
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
+        "alignment_projector_parameters": (
+            sum(parameter.numel() for parameter in alignment_projector.parameters() if parameter.requires_grad)
+            if alignment_projector is not None
+            else 0
+        ),
         "pretrain_trainable_compressor_parameters": sum(
             parameter.numel() for parameter in compressor.parameters() if parameter.requires_grad
         ),
@@ -2220,6 +2510,9 @@ def main() -> None:
         f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
         f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
         f"cosine_weight={float(args.cosine_loss_weight):.4g} "
+        f"projection_enabled={bool(args.alignment_projection_enabled)} "
+        f"projection_dim={int(args.alignment_projection_dim)} "
+        f"projection_layers={int(args.alignment_projection_layers)} "
         f"global_eval={bool(args.global_retrieval_eval)}"
     )
     if text_preflight_metrics:
@@ -2282,6 +2575,7 @@ def main() -> None:
                 run_dir / "patch_ae_pretrain_last.pt",
                 compressor=compressor,
                 adapter=adapter,
+                projector=alignment_projector,
                 args=args,
                 metrics=pretrain_epoch_metrics,
                 compressor_config=compressor_config,
@@ -2301,6 +2595,8 @@ def main() -> None:
             parameter.requires_grad_(False)
         compressor.eval()
     optimizer_params = list(adapter.parameters())
+    if alignment_projector is not None:
+        optimizer_params += list(alignment_projector.parameters())
     if bool(args.alignment_train_patch_ae):
         optimizer_params += [parameter for parameter in compressor.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(optimizer_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -2311,6 +2607,7 @@ def main() -> None:
         train_metrics = train_one_epoch(
             compressor=compressor,
             adapter=adapter,
+            projector=alignment_projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=train_loader,
@@ -2324,6 +2621,7 @@ def main() -> None:
         val_metrics = evaluate(
             compressor=compressor,
             adapter=adapter,
+            projector=alignment_projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=val_loader,
@@ -2340,6 +2638,7 @@ def main() -> None:
             run_dir / "alignment_last.pt",
             compressor=compressor,
             adapter=adapter,
+            projector=alignment_projector,
             args=args,
             metrics=epoch_metrics,
             compressor_config=compressor_config,
@@ -2352,6 +2651,7 @@ def main() -> None:
                 run_dir / "alignment_best.pt",
                 compressor=compressor,
                 adapter=adapter,
+                projector=alignment_projector,
                 args=args,
                 metrics=epoch_metrics,
                 compressor_config=compressor_config,
@@ -2375,11 +2675,14 @@ def main() -> None:
 
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
     adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
+    if alignment_projector is not None and "alignment_projector_state_dict" in best_checkpoint:
+        alignment_projector.load_state_dict(best_checkpoint["alignment_projector_state_dict"])
     if bool(args.train_patch_ae) and "compressor_state_dict" in best_checkpoint:
         compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
     test_metrics = evaluate(
         compressor=compressor,
         adapter=adapter,
+        projector=alignment_projector,
         llm=llm,
         tokenizer=tokenizer,
         loader=test_loader,
