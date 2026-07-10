@@ -1019,7 +1019,7 @@ text path:
   同一份 normalized/resized patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
 ```
 
-当前默认对齐位置是：**冻结 LLM 中层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，当前配置使用 `teacher_layer: 8`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `4/8/14/20/-1`。
+当前默认对齐位置是：**冻结 LLM 浅层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，当前配置使用 `teacher_layer: 2`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `1/2/4/8/-1`；`0` 通常是 token embedding 输出，更多是 tokenizer/格式基线，不是已经读入上下文后的表示。
 
 注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
 
@@ -1093,7 +1093,7 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
      + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
-这里的 `tensor_embedding` 默认不是 raw LLM hidden，而是 student branch 的 anchor hidden 经过 `alignment_projection.student` 后得到的对齐向量；`text_teacher_embedding` 是 teacher branch 的同层 anchor hidden 经过 `alignment_projection.teacher` 后得到的对齐向量。当前配置开启 `alignment_projection.enabled: true`，使用轻量 `LayerNorm + Linear` 投到 512 维 CLIP-style 对齐空间。raw LLM hidden 的检索结果会额外记录为 `hidden_*` 和 `global_hidden_*` 指标，用于判断 projection 是否只是掩盖了 LLM hidden 本身的各向异性。当前默认 `center_embeddings: false`，主 loss 直接优化投影后的 raw L2-normalized embedding；`centered_contrastive_loss_weight` 只作为小权重辅助项。`freeze_patch_ae_after_pretrain: true` 时，reconstruction 项只在 AE warmup 阶段训练 encoder；alignment 阶段默认冻结 patch AE，只训练 Q-Former/soft prompt bridge 和 projection head。
+这里的 `tensor_embedding` 默认不是 raw LLM hidden，而是 student branch 的 anchor hidden 经过 `alignment_projection.student` 后得到的对齐向量；`text_teacher_embedding` 是 teacher branch 的同层 anchor hidden 经过 `alignment_projection.teacher` 后得到的对齐向量。当前配置开启 `alignment_projection.enabled: true`，使用轻量 `LayerNorm + Linear` 投到 512 维 CLIP-style 对齐空间。raw LLM hidden 的检索结果会额外记录为 `hidden_*` 和 `global_hidden_*` 指标，用于判断 projection 是否只是掩盖了 LLM hidden 本身的各向异性。当前默认 `center_embeddings: false`，主 loss 直接优化投影后的 raw L2-normalized embedding；`centered_contrastive_loss_weight` 只作为小权重辅助项。`freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；若设为 `true`，alignment 阶段只训练 Q-Former/soft prompt bridge 和 projection head。
 
 脚本会检查 teacher/student tokenization 后的最后 token 附近是否仍包含 `Representation:`。默认 `fail_on_text_anchor_missing: true`，一旦文本过长导致 anchor 被截断，会直接报错，而不是继续训练一个语义位置已经错位的目标。默认 `fail_on_text_max_length_hit: true`，只要序列打满 `max_text_tokens` 也会报错；这比静默截断更严格，若触发应优先增大 `max_text_tokens`、减小 `patch_size` 或降低 `text_decimal_places`。
 
@@ -1162,7 +1162,8 @@ patch_alignment:
 | 参数 | 说明 | 可选值 | 可选值说明 |
 |---|---|---|---|
 | `--patch-size` | 从 PDEBench 原始场中裁剪的方形 patch 边长。 | 正整数 | 默认 16；建议先在 16 和 32 中比较。 |
-| `--fields` | 使用哪些 HDF5 字段。 | 逗号分隔字段 | 当前建议先用单字段 `Vx`，多字段会显著增加文本长度。 |
+| `--fields` | 使用哪些 HDF5 字段。 | 逗号分隔字段 | 配合 `--field-sampling-mode single` 时，多个字段不会堆成通道，而是作为单通道 patch 的采样池。 |
+| `--field-sampling-mode` | 多个 HDF5 字段如何进入 patch。 | `channels`、`single` | `channels`：旧行为，所有字段堆成 `[C,H,W]`；`single`：每条 record 随机选一个字段，patch 保持 `[1,H,W]`。 |
 | `--train-records`、`--val-records`、`--test-records` | 随机采样 patch 数。 | 正整数 | 初始 smoke test 用小值，正式训练可增大。 |
 | `--split-mode` | train/val/test 如何隔离采样轴。 | `sample`、`time`、`sample_time`、`random_record` | `sample`：默认，按 `sample_index` 隔离；`time`：按 `time_index` 隔离；`sample_time`：两者都隔离；`random_record`：旧随机记录方式，只适合 smoke test。 |
 | `--split-train-ratio`、`--split-val-ratio`、`--split-test-ratio` | sample/time 轴隔离时的 split 比例。 | 正数 | 默认 `0.8/0.1/0.1`。 |
@@ -1197,7 +1198,7 @@ patch_alignment:
 | `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 当前配置为 2；位数越多 token 越多。 |
 | `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 2048。 |
 | `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
-| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 当前配置为 8；`-1` 表示最后一层。 |
+| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 当前配置为 2；`0` 通常是 embedding 层输出，`-1` 表示最后一层。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
 | `--contrastive-loss-weight` | symmetric InfoNCE 权重。 | 非负数 | 当前主要优化项，默认 1.0。 |
 | `--centered-contrastive-loss-weight` | batch-centered InfoNCE 辅助权重。 | 非负数 | 当前配置为 0.1；设 0 可完全关闭。 |
@@ -1207,7 +1208,7 @@ patch_alignment:
 | `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 patch AE/alignment checkpoint artifact。 | 布尔开关 | 默认读取 `wandb.log_model`。 |
 
-`patch_alignment.patch_encoder` 是新建 patch AE 的模型配置，只有 `encoder_source: patch_ae_config` 时使用。默认单字段 `Vx` 的结构是：
+`patch_alignment.patch_encoder` 是新建 patch AE 的模型配置，只有 `encoder_source: patch_ae_config` 时使用。当前 `field_sampling_mode: single` 下仍是单通道 patch AE，即使 `fields` 写了多个 HDF5 key：
 
 ```yaml
 patch_encoder:

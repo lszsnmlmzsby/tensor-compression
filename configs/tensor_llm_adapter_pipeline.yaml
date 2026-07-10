@@ -88,12 +88,18 @@ patch_alignment:
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
+    - density
+    - pressure
     - Vx
+    - Vy
+  # channels: stack all fields into one [C,H,W] patch.
+  # single: sample one field per record, so multiple fields enlarge the single-channel patch pool.
+  field_sampling_mode: single
   patch_size: 16
   # Number of random patch records created in-memory per split after applying split_mode.
-  train_records: 65536
-  val_records: 4096
-  test_records: 4096
+  train_records: 262144
+  val_records: 8192
+  test_records: 8192
   sample_indices: all
   time_indices: all
   # sample: train/val/test use disjoint sample_index values. This is the default credibility check.
@@ -109,9 +115,9 @@ patch_alignment:
   ensure_disjoint_records: true
   seed: 42
   device: auto
-  batch_size: 16
-  eval_batch_size: 16
-  epochs: 40
+  batch_size: 32
+  eval_batch_size: 32
+  epochs: 4
   lr: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
@@ -128,7 +134,7 @@ patch_alignment:
   #   patch_ae_pretrain_epochs: 0
   train_patch_ae: true
   # true: after reconstruction pretraining, freeze patch AE and train only the Q-Former/soft prompt bridge.
-  freeze_patch_ae_after_pretrain: true
+  freeze_patch_ae_after_pretrain: false
   # Reconstruction-only warmup for a fresh patch AE before contrastive alignment starts.
   patch_ae_pretrain_epochs: 5
   # Used only when encoder_source: checkpoint.
@@ -158,8 +164,8 @@ patch_alignment:
       output_activation: identity
   adapter_type: qformer
   adapter_dim: 512
-  query_tokens: 8
-  adapter_layers: 2
+  query_tokens: 16
+  adapter_layers: 4
   adapter_heads: 8
   # null means directly align to the LLM hidden size. This keeps the text teacher side fixed.
   projection_dim: null
@@ -211,7 +217,7 @@ patch_alignment:
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
   # Qwen2.5-1.5B has 28 decoder layers; lower-middle layers are usually easier for input-level soft prompts.
-  teacher_layer: 8
+  teacher_layer: 2
   log_interval: 20
 
 adapter:

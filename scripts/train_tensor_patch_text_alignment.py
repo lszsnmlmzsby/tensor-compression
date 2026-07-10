@@ -57,6 +57,7 @@ class PatchRecord:
     time_index: int
     row: int
     col: int
+    field_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,24 @@ def build_patch_encoder_config(
     }
 
 
+def checkpoint_channel_count(config: Mapping[str, Any]) -> int | None:
+    model_cfg = config.get("model", {})
+    if not isinstance(model_cfg, Mapping):
+        return None
+    for key in ("in_channels", "out_channels"):
+        value = model_cfg.get(key)
+        if value is not None:
+            return int(value)
+    dataset_cfg = config.get("data", {}).get("dataset", {}) if isinstance(config.get("data"), Mapping) else {}
+    if isinstance(dataset_cfg, Mapping):
+        keys = dataset_cfg.get("hdf5_dataset_keys")
+        if isinstance(keys, Sequence) and not isinstance(keys, str) and keys:
+            return len(keys)
+        if dataset_cfg.get("hdf5_dataset_key"):
+            return 1
+    return None
+
+
 def hdf5_axis_sizes(hdf5_path: str | Path, field: str) -> tuple[int, int, int, int]:
     with h5py.File(Path(hdf5_path).expanduser(), "r") as handle:
         if field not in handle or not isinstance(handle[field], h5py.Dataset):
@@ -223,6 +242,21 @@ def hdf5_axis_sizes(hdf5_path: str | Path, field: str) -> tuple[int, int, int, i
     if len(shape) != 4:
         raise ValueError(f"Expected PDEBench 2D field [sample,time,height,width], got {shape}.")
     return shape
+
+
+def validate_field_shapes(hdf5_path: str | Path, field_keys: Sequence[str]) -> tuple[int, int, int, int]:
+    if not field_keys:
+        raise ValueError("At least one field key is required.")
+    reference_field = str(field_keys[0])
+    reference_shape = hdf5_axis_sizes(hdf5_path, reference_field)
+    for field in field_keys[1:]:
+        shape = hdf5_axis_sizes(hdf5_path, str(field))
+        if shape != reference_shape:
+            raise ValueError(
+                "All fields must have the same [sample,time,height,width] shape for patch alignment. "
+                f"{reference_field} has {reference_shape}, but {field} has {shape}."
+            )
+    return reference_shape
 
 
 def split_axis_indices(
@@ -329,16 +363,25 @@ def build_axis_split_plan(
     }
 
 
-def record_key(record: PatchRecord) -> tuple[int, int, int, int]:
-    return (int(record.sample_index), int(record.time_index), int(record.row), int(record.col))
+def record_key(record: PatchRecord) -> tuple[str, int, int, int, int]:
+    return (
+        "" if record.field_key is None else str(record.field_key),
+        int(record.sample_index),
+        int(record.time_index),
+        int(record.row),
+        int(record.col),
+    )
 
 
 def summarize_records(records: Sequence[PatchRecord]) -> dict[str, Any]:
     sample_values = sorted({int(record.sample_index) for record in records})
     time_values = sorted({int(record.time_index) for record in records})
+    field_values = sorted({str(record.field_key) for record in records if record.field_key is not None})
     return {
         "record_count": len(records),
         "unique_record_count": len({record_key(record) for record in records}),
+        "field_count": len(field_values),
+        "field_preview": field_values[:16],
         "sample_count": len(sample_values),
         "time_count": len(time_values),
         "sample_preview": sample_values[:16],
@@ -365,6 +408,7 @@ def build_patch_records(
     *,
     hdf5_path: str | Path,
     field: str,
+    record_fields: Sequence[str] | None = None,
     sample_indices: str | Sequence[int],
     time_indices: str | Sequence[int],
     patch_size: int,
@@ -380,8 +424,9 @@ def build_patch_records(
     if int(patch_size) <= 0 or int(patch_size) > min(height, width):
         raise ValueError(f"Invalid patch_size={patch_size} for spatial shape {(height, width)}.")
     rng = random.Random(int(seed))
+    sampled_fields = [str(item) for item in (record_fields or []) if str(item)]
     records: list[PatchRecord] = []
-    seen: set[tuple[int, int, int, int]] = set()
+    seen: set[tuple[str, int, int, int, int]] = set()
     max_row = height - int(patch_size)
     max_col = width - int(patch_size)
     max_attempts = max(int(count) * 50, 1000)
@@ -398,6 +443,7 @@ def build_patch_records(
             time_index=int(rng.choice(times)),
             row=int(rng.randint(0, max_row)),
             col=int(rng.randint(0, max_col)),
+            field_key=str(rng.choice(sampled_fields)) if sampled_fields else None,
         )
         key = record_key(record)
         if bool(unique_records) and key in seen:
@@ -506,6 +552,7 @@ class PDEBenchPatchTextDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[int(index)]
+        selected_fields = self._record_field_keys(record)
         patch = self._read_patch(record)
         text = self._serialize_patch(record, patch) if self.include_raw_text else ""
         return {
@@ -515,18 +562,23 @@ class PDEBenchPatchTextDataset(Dataset):
                 "row": int(record.row),
                 "col": int(record.col),
                 "patch_size": int(self.patch_size),
-                "fields": list(self.field_keys),
+                "fields": list(selected_fields),
             },
             "patch": patch,
             "text": text,
         }
+
+    def _record_field_keys(self, record: PatchRecord) -> list[str]:
+        if record.field_key is not None:
+            return [str(record.field_key)]
+        return list(self.field_keys)
 
     def _read_patch(self, record: PatchRecord) -> torch.Tensor:
         arrays: list[np.ndarray] = []
         row_slice = slice(int(record.row), int(record.row) + self.patch_size)
         col_slice = slice(int(record.col), int(record.col) + self.patch_size)
         with h5py.File(self.hdf5_path, "r") as handle:
-            for field in self.field_keys:
+            for field in self._record_field_keys(record):
                 dataset = handle[field]
                 arrays.append(
                     np.asarray(
@@ -541,7 +593,7 @@ class PDEBenchPatchTextDataset(Dataset):
         return serialize_patch_text(
             record=record,
             patch=patch,
-            field_keys=self.field_keys,
+            field_keys=self._record_field_keys(record),
             decimal_places=int(self.decimal_places),
             prompt_template=str(self.prompt_template),
         )
@@ -1718,6 +1770,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--hdf5-path", type=str, default=None)
     parser.add_argument("--fields", type=str, default=None)
+    parser.add_argument(
+        "--field-sampling-mode",
+        type=str,
+        choices=("channels", "single"),
+        default=None,
+        help=(
+            "channels stacks all --fields as patch channels; single samples one field per record "
+            "so multiple fields form a larger pool of single-channel patches."
+        ),
+    )
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--patch-size", type=int, default=None)
@@ -1850,6 +1912,7 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             args.model_name_or_path = str(model_path)
 
     set_default(args, "fields", value_to_csv(first_nested(config, ["patch_alignment.fields", "data.fields"])), None)
+    set_default(args, "field_sampling_mode", first_nested(config, ["patch_alignment.field_sampling_mode"]), "channels")
     set_default(args, "run_name", first_nested(config, ["patch_alignment.run_name"]), "tensor_patch_text_alignment")
     set_default(args, "patch_size", first_nested(config, ["patch_alignment.patch_size"]), 16)
     set_default(args, "train_records", first_nested(config, ["patch_alignment.train_records"]), 4096)
@@ -1986,6 +2049,8 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.global_retrieval_max_records must be positive.")
     if int(args.global_retrieval_chunk_size) <= 0:
         raise ValueError("patch_alignment.global_retrieval_chunk_size must be positive.")
+    if str(args.field_sampling_mode).lower() not in {"channels", "single"}:
+        raise ValueError("patch_alignment.field_sampling_mode must be 'channels' or 'single'.")
     split_ratio_sum = float(args.split_train_ratio) + float(args.split_val_ratio) + float(args.split_test_ratio)
     if split_ratio_sum <= 0.0:
         raise ValueError("patch_alignment split ratios must sum to a positive value.")
@@ -2130,6 +2195,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
         "data": {
             "hdf5_path": str(args.hdf5_path),
             "fields": parse_csv(args.fields),
+            "field_sampling_mode": str(args.field_sampling_mode),
             "patch_size": int(args.patch_size),
             "train_records": int(args.train_records),
             "val_records": int(args.val_records),
@@ -2235,20 +2301,34 @@ def main() -> None:
     dump_json(run_dir / "args.json", redacted_args(args))
 
     checkpoint: dict[str, Any] | None = None
+    field_sampling_mode = str(args.field_sampling_mode).lower()
     if str(args.encoder_source) == "checkpoint":
         checkpoint, compressor_config = load_checkpoint_and_config(args.compressor_checkpoint, args.compressor_config)
         state_dict = resolve_checkpoint_state_dict(checkpoint, args.compressor_checkpoint)
-        field_keys = resolve_field_keys(args.fields, compressor_config)
+        if field_sampling_mode == "single":
+            field_keys = parse_csv(args.fields) or resolve_checkpoint_field_keys(compressor_config)
+            if not field_keys:
+                raise ValueError("field_sampling_mode=single requires at least one field.")
+            channel_count = checkpoint_channel_count(compressor_config)
+            if channel_count is not None and int(channel_count) != 1:
+                raise ValueError(
+                    "field_sampling_mode=single requires a single-channel patch encoder checkpoint. "
+                    f"Got checkpoint channel count {channel_count}."
+                )
+        else:
+            field_keys = resolve_field_keys(args.fields, compressor_config)
         compressor = build_model(compressor_config)
         compressor.load_state_dict(state_dict)
     else:
         field_keys = resolve_field_keys(args.fields, None)
+        encoder_field_keys = [field_keys[0]] if field_sampling_mode == "single" else field_keys
         compressor_config = build_patch_encoder_config(
             patch_encoder_cfg=args.patch_encoder_config,
-            field_keys=field_keys,
+            field_keys=encoder_field_keys,
             patch_size=int(args.patch_size),
         )
         compressor = build_model(compressor_config)
+    validate_field_shapes(args.hdf5_path, field_keys)
     compressor_input_size = tuple(int(dim) for dim in compressor_config["model"]["input_size"])
     normalization_cfg = dict(compressor_config.get("data", {}).get("dataset", {}).get("normalization", {}))
     if not bool(args.resize_patch_to_compressor_input) and tuple(compressor_input_size) != (
@@ -2296,6 +2376,7 @@ def main() -> None:
         )
 
     first_field = field_keys[0]
+    record_fields = field_keys if field_sampling_mode == "single" else None
     split_plan = build_axis_split_plan(
         hdf5_path=args.hdf5_path,
         field=first_field,
@@ -2310,6 +2391,7 @@ def main() -> None:
     train_records = build_patch_records(
         hdf5_path=args.hdf5_path,
         field=first_field,
+        record_fields=record_fields,
         sample_indices=split_plan["samples"]["train"],
         time_indices=split_plan["times"]["train"],
         patch_size=int(args.patch_size),
@@ -2320,6 +2402,7 @@ def main() -> None:
     val_records = build_patch_records(
         hdf5_path=args.hdf5_path,
         field=first_field,
+        record_fields=record_fields,
         sample_indices=split_plan["samples"]["val"],
         time_indices=split_plan["times"]["val"],
         patch_size=int(args.patch_size),
@@ -2330,6 +2413,7 @@ def main() -> None:
     test_records = build_patch_records(
         hdf5_path=args.hdf5_path,
         field=first_field,
+        record_fields=record_fields,
         sample_indices=split_plan["samples"]["test"],
         time_indices=split_plan["times"]["test"],
         patch_size=int(args.patch_size),
@@ -2402,6 +2486,8 @@ def main() -> None:
     run_summary = {
         "hdf5_path": str(args.hdf5_path),
         "field_keys": field_keys,
+        "field_sampling_mode": field_sampling_mode,
+        "encoder_field_keys": [field_keys[0]] if field_sampling_mode == "single" else field_keys,
         "patch_size": int(args.patch_size),
         "train_records": len(train_dataset),
         "val_records": len(val_dataset),
