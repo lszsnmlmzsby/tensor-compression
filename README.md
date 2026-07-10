@@ -1071,6 +1071,16 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
+多卡扩大对比学习负样本：
+
+```bash
+CUDA_VISIBLE_DEVICES=1,3,4,5 torchrun --nproc_per_node=4 \
+  scripts/train_tensor_patch_text_alignment.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+多卡模式会自动读取 `WORLD_SIZE/RANK/LOCAL_RANK`，每个进程处理一个 GPU。训练阶段会 all-gather 每张卡上的 projected embeddings，使 InfoNCE 候选数从 `batch_size` 扩大为 `batch_size * GPU数`；例如当前 `batch_size: 32`、4 张 GPU 时，每个样本看到 128 个候选。只有 rank 0 会写 JSON、保存 checkpoint、运行 val/test 和记录 W&B。
+
 小规模 smoke test：
 
 ```bash
@@ -1120,6 +1130,7 @@ W&B 曲线：
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
+| `train/candidate_count` | 训练 InfoNCE 的候选数；单卡等于 batch size，多卡等于每卡 batch size 乘 GPU 数。 |
 | `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | batch-centered 辅助/诊断 retrieval；不作为最终成功标准。 |
 | `train/uncentered_i2t_accuracy`、`val/uncentered_i2t_accuracy` | 不做 batch-centering 的 batch 内 tensor-to-text retrieval accuracy。 |
 | `train/uncentered_t2i_accuracy`、`val/uncentered_t2i_accuracy` | 不做 batch-centering 的 batch 内 text-to-tensor retrieval accuracy。 |

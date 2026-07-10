@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -13,9 +14,11 @@ from typing import Any
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +90,109 @@ def dump_json(path: str | Path, payload: Mapping[str, Any]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def distributed_world_size() -> int:
+    return int(dist.get_world_size()) if distributed_is_initialized() else 1
+
+
+def distributed_rank() -> int:
+    return int(dist.get_rank()) if distributed_is_initialized() else 0
+
+
+def is_main_process() -> bool:
+    return distributed_rank() == 0
+
+
+def setup_distributed_from_env(args: argparse.Namespace) -> None:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        args.distributed = False
+        args.rank = 0
+        args.local_rank = 0
+        args.world_size = 1
+        return
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available, but WORLD_SIZE > 1.")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        args.device = f"cuda:{local_rank}"
+    dist.init_process_group(backend=backend)
+    args.distributed = True
+    args.rank = distributed_rank()
+    args.local_rank = local_rank
+    args.world_size = distributed_world_size()
+
+
+def cleanup_distributed() -> None:
+    if distributed_is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def distributed_barrier() -> None:
+    if distributed_is_initialized():
+        dist.barrier()
+
+
+def broadcast_object_from_main(value: Any) -> Any:
+    if not distributed_is_initialized():
+        return value
+    payload = [value if is_main_process() else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def broadcast_module_state(module: nn.Module | None) -> None:
+    if module is None or not distributed_is_initialized():
+        return
+    with torch.no_grad():
+        for parameter in module.parameters():
+            dist.broadcast(parameter.data, src=0)
+        for buffer in module.buffers():
+            dist.broadcast(buffer.data, src=0)
+
+
+def synchronize_gradients(modules: Sequence[nn.Module | None]) -> None:
+    if not distributed_is_initialized():
+        return
+    world_size = float(distributed_world_size())
+    for module in modules:
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            if parameter.grad is None:
+                continue
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(world_size)
+
+
+def average_metrics_across_processes(metrics: Mapping[str, float]) -> dict[str, float]:
+    if not distributed_is_initialized():
+        return dict(metrics)
+    averaged: dict[str, float] = {}
+    for key, value in metrics.items():
+        if not isinstance(value, (int, float)):
+            continue
+        tensor = torch.tensor(float(value), device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"))
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        averaged[key] = float((tensor / distributed_world_size()).detach().cpu().item())
+    return averaged
+
+
+def gather_with_local_grad(tensor: torch.Tensor) -> torch.Tensor:
+    if not distributed_is_initialized():
+        return tensor
+    gathered = [torch.zeros_like(tensor) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered, tensor.contiguous())
+    gathered[distributed_rank()] = tensor
+    return torch.cat(gathered, dim=0)
 
 
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -818,6 +924,34 @@ def symmetric_contrastive_loss(
     return loss, {
         "i2t_accuracy": float(i2t_accuracy.detach().cpu().item()),
         "t2i_accuracy": float(t2i_accuracy.detach().cpu().item()),
+        "candidate_count": float(logits.shape[1]),
+    }
+
+
+def distributed_symmetric_contrastive_loss(
+    tensor_embedding: torch.Tensor,
+    text_embedding: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if not distributed_is_initialized():
+        return symmetric_contrastive_loss(tensor_embedding, text_embedding, temperature)
+    local_batch = int(tensor_embedding.shape[0])
+    tensor_all = gather_with_local_grad(tensor_embedding)
+    text_all = gather_with_local_grad(text_embedding)
+    label_offset = distributed_rank() * local_batch
+    labels = torch.arange(local_batch, device=tensor_embedding.device) + int(label_offset)
+    logits_i2t = tensor_embedding @ text_all.T / max(float(temperature), 1.0e-6)
+    logits_t2i = text_embedding @ tensor_all.T / max(float(temperature), 1.0e-6)
+    loss_i2t = F.cross_entropy(logits_i2t, labels)
+    loss_t2i = F.cross_entropy(logits_t2i, labels)
+    loss = 0.5 * (loss_i2t + loss_t2i)
+    with torch.no_grad():
+        i2t_accuracy = (logits_i2t.argmax(dim=1) == labels).float().mean()
+        t2i_accuracy = (logits_t2i.argmax(dim=1) == labels).float().mean()
+    return loss, {
+        "i2t_accuracy": float(i2t_accuracy.detach().cpu().item()),
+        "t2i_accuracy": float(t2i_accuracy.detach().cpu().item()),
+        "candidate_count": float(text_all.shape[0]),
     }
 
 
@@ -835,6 +969,31 @@ def retrieval_accuracy(
         ),
         "i2t_accuracy": float((logits.argmax(dim=1) == labels).float().mean().cpu().item()),
         "t2i_accuracy": float((logits.argmax(dim=0) == labels).float().mean().cpu().item()),
+        "candidate_count": float(logits.shape[1]),
+    }
+
+
+@torch.no_grad()
+def distributed_retrieval_accuracy(
+    tensor_embedding: torch.Tensor,
+    text_embedding: torch.Tensor,
+    temperature: float,
+) -> dict[str, float]:
+    if not distributed_is_initialized():
+        return retrieval_accuracy(tensor_embedding, text_embedding, temperature)
+    local_batch = int(tensor_embedding.shape[0])
+    tensor_all = gather_with_local_grad(tensor_embedding.detach())
+    text_all = gather_with_local_grad(text_embedding.detach())
+    labels = torch.arange(local_batch, device=tensor_embedding.device) + distributed_rank() * local_batch
+    logits_i2t = tensor_embedding.detach().float() @ text_all.float().T / max(float(temperature), 1.0e-6)
+    logits_t2i = text_embedding.detach().float() @ tensor_all.float().T / max(float(temperature), 1.0e-6)
+    return {
+        "contrastive_loss": float(
+            (0.5 * (F.cross_entropy(logits_i2t, labels) + F.cross_entropy(logits_t2i, labels))).cpu().item()
+        ),
+        "i2t_accuracy": float((logits_i2t.argmax(dim=1) == labels).float().mean().cpu().item()),
+        "t2i_accuracy": float((logits_t2i.argmax(dim=1) == labels).float().mean().cpu().item()),
+        "candidate_count": float(text_all.shape[0]),
     }
 
 
@@ -1182,6 +1341,9 @@ def train_one_epoch(
     normalization_cfg: Mapping[str, Any],
     epoch: int,
 ) -> dict[str, float]:
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(int(epoch))
     adapter.train()
     if projector is not None:
         projector.train()
@@ -1198,7 +1360,7 @@ def train_one_epoch(
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
-    progress = tqdm(loader, desc=f"train align epoch {epoch}", leave=False)
+    progress = tqdm(loader, desc=f"train align epoch {epoch}", leave=False, disable=not is_main_process())
     for step, batch in enumerate(progress, start=1):
         normalized_patches = normalize_patch_batch(
             batch["patch"],
@@ -1268,12 +1430,12 @@ def train_one_epoch(
             teacher_hidden,
             True,
         )
-        contrastive, contrastive_metrics = symmetric_contrastive_loss(
+        contrastive, contrastive_metrics = distributed_symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
             float(args.temperature),
         )
-        centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
+        centered_contrastive, centered_contrastive_metrics = distributed_symmetric_contrastive_loss(
             centered_tensor_embedding,
             centered_text_embedding,
             float(args.temperature),
@@ -1290,6 +1452,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        synchronize_gradients([compressor if train_compressor else None, adapter, projector])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
                 [parameter for group in optimizer.param_groups for parameter in group["params"]],
@@ -1316,7 +1479,7 @@ def train_one_epoch(
         )
         add_weighted_metrics(
             metric_totals,
-            retrieval_accuracy(
+            distributed_retrieval_accuracy(
                 uncentered_tensor_embedding,
                 uncentered_text_embedding,
                 float(args.temperature),
@@ -1326,7 +1489,7 @@ def train_one_epoch(
         )
         add_weighted_metrics(
             metric_totals,
-            retrieval_accuracy(
+            distributed_retrieval_accuracy(
                 hidden_uncentered_tensor_embedding,
                 hidden_uncentered_text_embedding,
                 float(args.temperature),
@@ -1336,7 +1499,7 @@ def train_one_epoch(
         )
         add_weighted_metrics(
             metric_totals,
-            retrieval_accuracy(
+            distributed_retrieval_accuracy(
                 hidden_centered_tensor_embedding,
                 hidden_centered_text_embedding,
                 float(args.temperature),
@@ -1389,7 +1552,7 @@ def train_one_epoch(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
-    return metrics
+    return average_metrics_across_processes(metrics)
 
 
 def pretrain_patch_encoder_one_epoch(
@@ -1405,10 +1568,13 @@ def pretrain_patch_encoder_one_epoch(
     wandb_logger: WandbLogger | None = None,
     global_step: int = 0,
 ) -> tuple[dict[str, float], int]:
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(int(epoch))
     compressor.train()
     total_loss = 0.0
     total_records = 0
-    progress = tqdm(loader, desc=f"pretrain patch AE epoch {epoch}", leave=False)
+    progress = tqdm(loader, desc=f"pretrain patch AE epoch {epoch}", leave=False, disable=not is_main_process())
     for step, batch in enumerate(progress, start=1):
         patches = normalize_patch_batch(
             batch["patch"],
@@ -1420,6 +1586,7 @@ def pretrain_patch_encoder_one_epoch(
         loss = reconstruction_mse(compressor, latent, patches)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        synchronize_gradients([compressor])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
                 [parameter for group in optimizer.param_groups for parameter in group["params"]],
@@ -1443,7 +1610,8 @@ def pretrain_patch_encoder_one_epoch(
                 },
                 step=global_step,
             )
-    return {"reconstruction_loss": total_loss / max(1, total_records)}, global_step
+    metrics = {"reconstruction_loss": total_loss / max(1, total_records)}
+    return average_metrics_across_processes(metrics), global_step
 
 
 @torch.no_grad()
@@ -1459,7 +1627,7 @@ def evaluate_patch_encoder_reconstruction(
     compressor.eval()
     total_loss = 0.0
     total_records = 0
-    for batch in tqdm(loader, desc="eval patch AE reconstruction", leave=False):
+    for batch in tqdm(loader, desc="eval patch AE reconstruction", leave=False, disable=not is_main_process()):
         patches = normalize_patch_batch(
             batch["patch"],
             compressor_input_size,
@@ -1505,7 +1673,7 @@ def evaluate(
     collected_student_hidden: list[torch.Tensor] = []
     collected_teacher_hidden: list[torch.Tensor] = []
     train_compressor = train_compressor_during_alignment(args)
-    for batch in tqdm(loader, desc="eval align", leave=False):
+    for batch in tqdm(loader, desc="eval align", leave=False, disable=not is_main_process()):
         normalized_patches = normalize_patch_batch(
             batch["patch"],
             compressor_input_size,
@@ -2078,13 +2246,22 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     return args
 
 
-def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    sampler: torch.utils.data.Sampler | None = None,
+    drop_last: bool = False,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=int(batch_size),
-        shuffle=bool(shuffle),
+        shuffle=bool(shuffle) if sampler is None else False,
+        sampler=sampler,
         num_workers=int(num_workers),
         pin_memory=torch.cuda.is_available(),
+        drop_last=bool(drop_last),
         collate_fn=collate_patch_text,
     )
 
@@ -2290,15 +2467,20 @@ def main() -> None:
     args = parse_args()
     config = load_yaml_mapping(args.config)
     args = apply_config_defaults(args, config)
+    setup_distributed_from_env(args)
     random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
     if args.hf_home:
         __import__("os").environ["HF_HOME"] = str(args.hf_home)
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.output_root) / f"{timestamp}_{args.run_name}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    dump_json(run_dir / "args.json", redacted_args(args))
+    if is_main_process():
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.output_root) / f"{timestamp}_{args.run_name}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        dump_json(run_dir / "args.json", redacted_args(args))
+    else:
+        run_dir = None
+    run_dir = Path(broadcast_object_from_main(str(run_dir)))
 
     checkpoint: dict[str, Any] | None = None
     field_sampling_mode = str(args.field_sampling_mode).lower()
@@ -2435,7 +2617,25 @@ def main() -> None:
     train_dataset = PDEBenchPatchTextDataset(records=train_records, **dataset_kwargs)
     val_dataset = PDEBenchPatchTextDataset(records=val_records, **dataset_kwargs)
     test_dataset = PDEBenchPatchTextDataset(records=test_records, **dataset_kwargs)
-    train_loader = make_loader(train_dataset, int(args.batch_size), True, int(args.num_workers))
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=distributed_world_size(),
+            rank=distributed_rank(),
+            shuffle=True,
+            drop_last=True,
+        )
+        if distributed_is_initialized()
+        else None
+    )
+    train_loader = make_loader(
+        train_dataset,
+        int(args.batch_size),
+        True,
+        int(args.num_workers),
+        sampler=train_sampler,
+        drop_last=distributed_is_initialized(),
+    )
     val_loader = make_loader(val_dataset, int(args.eval_batch_size), False, int(args.num_workers))
     test_loader = make_loader(test_dataset, int(args.eval_batch_size), False, int(args.num_workers))
     text_preflight_metrics = preflight_teacher_text_tokenization(
@@ -2478,6 +2678,9 @@ def main() -> None:
             dropout=float(args.alignment_projection_dropout),
             shared=bool(args.alignment_projection_shared),
         ).to(device)
+    broadcast_module_state(compressor)
+    broadcast_module_state(adapter)
+    broadcast_module_state(alignment_projector)
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
         bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
@@ -2568,6 +2771,17 @@ def main() -> None:
         "adapter_heads": int(args.adapter_heads),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "alignment_mode": "input_soft_prompt_hidden",
+        "distributed": {
+            "enabled": bool(distributed_is_initialized()),
+            "rank": int(distributed_rank()),
+            "world_size": int(distributed_world_size()),
+            "local_rank": int(getattr(args, "local_rank", 0)),
+            "per_rank_batch_size": int(args.batch_size),
+            "train_contrastive_candidates": int(args.batch_size) * int(distributed_world_size()),
+            "gradient_sync": "manual_all_reduce",
+            "negative_gather": "embedding_all_gather",
+            "train_drop_last": bool(distributed_is_initialized()),
+        },
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
         "alignment_projector_parameters": (
             sum(parameter.numel() for parameter in alignment_projector.parameters() if parameter.requires_grad)
@@ -2581,35 +2795,39 @@ def main() -> None:
             sum(parameter.numel() for parameter in compressor.parameters()) if bool(args.alignment_train_patch_ae) else 0
         ),
     }
-    dump_json(run_dir / "run_summary.json", run_summary)
-    print(
-        "patch_split "
-        f"mode={run_summary['split_mode']} "
-        f"train_samples={run_summary['split_plan']['train_sample_count']} "
-        f"val_samples={run_summary['split_plan']['val_sample_count']} "
-        f"test_samples={run_summary['split_plan']['test_sample_count']} "
-        f"overlap={run_summary['record_summary']['overlap']}"
-    )
-    print(
-        "alignment_objective "
-        f"center_embeddings={bool(args.center_embeddings)} "
-        f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
-        f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
-        f"cosine_weight={float(args.cosine_loss_weight):.4g} "
-        f"projection_enabled={bool(args.alignment_projection_enabled)} "
-        f"projection_dim={int(args.alignment_projection_dim)} "
-        f"projection_layers={int(args.alignment_projection_layers)} "
-        f"global_eval={bool(args.global_retrieval_eval)}"
-    )
-    if text_preflight_metrics:
+    if is_main_process():
+        dump_json(run_dir / "run_summary.json", run_summary)
         print(
-            "teacher_text_preflight "
-            f"token_mean={text_preflight_metrics.get('token_count_mean', 0.0):.1f} "
-            f"token_max={text_preflight_metrics.get('token_count_max', 0.0):.0f} "
-            f"anchor_missing={text_preflight_metrics.get('anchor_missing_fraction', 0.0):.3f} "
-            f"max_len_hit={text_preflight_metrics.get('max_length_hit_fraction', 0.0):.3f}"
+            "patch_split "
+            f"mode={run_summary['split_mode']} "
+            f"train_samples={run_summary['split_plan']['train_sample_count']} "
+            f"val_samples={run_summary['split_plan']['val_sample_count']} "
+            f"test_samples={run_summary['split_plan']['test_sample_count']} "
+            f"overlap={run_summary['record_summary']['overlap']}"
         )
-    wandb_logger = WandbLogger(config=build_wandb_config(args, run_summary), run_dir=run_dir)
+        print(
+            "alignment_objective "
+            f"center_embeddings={bool(args.center_embeddings)} "
+            f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
+            f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
+            f"cosine_weight={float(args.cosine_loss_weight):.4g} "
+            f"projection_enabled={bool(args.alignment_projection_enabled)} "
+            f"projection_dim={int(args.alignment_projection_dim)} "
+            f"projection_layers={int(args.alignment_projection_layers)} "
+            f"distributed={bool(distributed_is_initialized())} "
+            f"world_size={int(distributed_world_size())} "
+            f"train_candidates={int(args.batch_size) * int(distributed_world_size())} "
+            f"global_eval={bool(args.global_retrieval_eval)}"
+        )
+        if text_preflight_metrics:
+            print(
+                "teacher_text_preflight "
+                f"token_mean={text_preflight_metrics.get('token_count_mean', 0.0):.1f} "
+                f"token_max={text_preflight_metrics.get('token_count_max', 0.0):.0f} "
+                f"anchor_missing={text_preflight_metrics.get('anchor_missing_fraction', 0.0):.3f} "
+                f"max_len_hit={text_preflight_metrics.get('max_length_hit_fraction', 0.0):.3f}"
+            )
+    wandb_logger = WandbLogger(config=build_wandb_config(args, run_summary), run_dir=run_dir) if is_main_process() else None
     global_step = 0
 
     metrics_history: dict[str, Any] = {}
@@ -2639,39 +2857,42 @@ def main() -> None:
                 args=args,
                 compressor_input_size=compressor_input_size,
                 normalization_cfg=normalization_cfg,
-            )
-            pretrain_epoch_metrics = {
-                "train": pretrain_metrics,
-                "val": pretrain_val_metrics,
-            }
-            metrics_history[f"patch_ae_pretrain_{pretrain_epoch:04d}"] = pretrain_epoch_metrics
-            dump_json(run_dir / "metrics_latest.json", metrics_history)
-            wandb_logger.log(
-                {
-                    "patch_ae_pretrain/reconstruction_loss": float(pretrain_metrics["reconstruction_loss"]),
-                    "patch_ae_pretrain/val_reconstruction_loss": float(
-                        pretrain_val_metrics["reconstruction_loss"]
-                    ),
-                    "patch_ae_pretrain/epoch": float(pretrain_epoch),
-                    "patch_ae_pretrain/lr": float(compressor_optimizer.param_groups[0]["lr"]),
-                },
-                step=global_step,
-            )
-            save_checkpoint(
-                run_dir / "patch_ae_pretrain_last.pt",
-                compressor=compressor,
-                adapter=adapter,
-                projector=alignment_projector,
-                args=args,
-                metrics=pretrain_epoch_metrics,
-                compressor_config=compressor_config,
-                save_compressor=True,
-            )
-            print(
-                f"patch_ae_pretrain_epoch={pretrain_epoch:04d} "
-                f"train_recon={pretrain_metrics['reconstruction_loss']:.4f} "
-                f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f}"
-            )
+            ) if is_main_process() else {}
+            if is_main_process():
+                pretrain_epoch_metrics = {
+                    "train": pretrain_metrics,
+                    "val": pretrain_val_metrics,
+                }
+                metrics_history[f"patch_ae_pretrain_{pretrain_epoch:04d}"] = pretrain_epoch_metrics
+                dump_json(run_dir / "metrics_latest.json", metrics_history)
+                if wandb_logger is not None:
+                    wandb_logger.log(
+                        {
+                            "patch_ae_pretrain/reconstruction_loss": float(pretrain_metrics["reconstruction_loss"]),
+                            "patch_ae_pretrain/val_reconstruction_loss": float(
+                                pretrain_val_metrics["reconstruction_loss"]
+                            ),
+                            "patch_ae_pretrain/epoch": float(pretrain_epoch),
+                            "patch_ae_pretrain/lr": float(compressor_optimizer.param_groups[0]["lr"]),
+                        },
+                        step=global_step,
+                    )
+                save_checkpoint(
+                    run_dir / "patch_ae_pretrain_last.pt",
+                    compressor=compressor,
+                    adapter=adapter,
+                    projector=alignment_projector,
+                    args=args,
+                    metrics=pretrain_epoch_metrics,
+                    compressor_config=compressor_config,
+                    save_compressor=True,
+                )
+                print(
+                    f"patch_ae_pretrain_epoch={pretrain_epoch:04d} "
+                    f"train_recon={pretrain_metrics['reconstruction_loss']:.4f} "
+                    f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f}"
+                )
+            distributed_barrier()
 
     if bool(args.alignment_train_patch_ae):
         for parameter in compressor.parameters():
@@ -2704,37 +2925,25 @@ def main() -> None:
             normalization_cfg=normalization_cfg,
             epoch=epoch,
         )
-        val_metrics = evaluate(
-            compressor=compressor,
-            adapter=adapter,
-            projector=alignment_projector,
-            llm=llm,
-            tokenizer=tokenizer,
-            loader=val_loader,
-            device=device,
-            args=args,
-            compressor_input_size=compressor_input_size,
-            normalization_cfg=normalization_cfg,
-        )
-        epoch_metrics = {"epoch": int(epoch), "train": train_metrics, "val": val_metrics}
-        metrics_history[f"epoch_{epoch:04d}"] = epoch_metrics
-        dump_json(run_dir / "metrics_latest.json", metrics_history)
         global_step += len(train_loader)
-        save_checkpoint(
-            run_dir / "alignment_last.pt",
-            compressor=compressor,
-            adapter=adapter,
-            projector=alignment_projector,
-            args=args,
-            metrics=epoch_metrics,
-            compressor_config=compressor_config,
-            save_compressor=bool(args.train_patch_ae),
-        )
-        if float(val_metrics["loss"]) < best_val:
-            best_val = float(val_metrics["loss"])
-            best_epoch = int(epoch)
+        if is_main_process():
+            val_metrics = evaluate(
+                compressor=compressor,
+                adapter=adapter,
+                projector=alignment_projector,
+                llm=llm,
+                tokenizer=tokenizer,
+                loader=val_loader,
+                device=device,
+                args=args,
+                compressor_input_size=compressor_input_size,
+                normalization_cfg=normalization_cfg,
+            )
+            epoch_metrics = {"epoch": int(epoch), "train": train_metrics, "val": val_metrics}
+            metrics_history[f"epoch_{epoch:04d}"] = epoch_metrics
+            dump_json(run_dir / "metrics_latest.json", metrics_history)
             save_checkpoint(
-                run_dir / "alignment_best.pt",
+                run_dir / "alignment_last.pt",
                 compressor=compressor,
                 adapter=adapter,
                 projector=alignment_projector,
@@ -2743,67 +2952,86 @@ def main() -> None:
                 compressor_config=compressor_config,
                 save_compressor=bool(args.train_patch_ae),
             )
-        wandb_payload = {
-            "epoch": float(epoch),
-            "lr": float(optimizer.param_groups[0]["lr"]),
-            "best_val/loss": float(best_val),
-            "best_val/epoch": float(best_epoch),
-        }
-        wandb_payload.update(numeric_payload("train", train_metrics))
-        wandb_payload.update(numeric_payload("val", val_metrics))
-        wandb_logger.log(wandb_payload, step=global_step)
-        print(
-            f"epoch={epoch:04d} train_loss={train_metrics['loss']:.4f} "
-            f"train[{alignment_metric_summary(train_metrics)}] "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val[{alignment_metric_summary(val_metrics)}]"
-        )
+            if float(val_metrics["loss"]) < best_val:
+                best_val = float(val_metrics["loss"])
+                best_epoch = int(epoch)
+                save_checkpoint(
+                    run_dir / "alignment_best.pt",
+                    compressor=compressor,
+                    adapter=adapter,
+                    projector=alignment_projector,
+                    args=args,
+                    metrics=epoch_metrics,
+                    compressor_config=compressor_config,
+                    save_compressor=bool(args.train_patch_ae),
+                )
+            wandb_payload = {
+                "epoch": float(epoch),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "best_val/loss": float(best_val),
+                "best_val/epoch": float(best_epoch),
+            }
+            wandb_payload.update(numeric_payload("train", train_metrics))
+            wandb_payload.update(numeric_payload("val", val_metrics))
+            if wandb_logger is not None:
+                wandb_logger.log(wandb_payload, step=global_step)
+            print(
+                f"epoch={epoch:04d} train_loss={train_metrics['loss']:.4f} "
+                f"train[{alignment_metric_summary(train_metrics)}] "
+                f"val_loss={val_metrics['loss']:.4f} "
+                f"val[{alignment_metric_summary(val_metrics)}]"
+            )
+        distributed_barrier()
 
-    best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
-    adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
-    if alignment_projector is not None and "alignment_projector_state_dict" in best_checkpoint:
-        alignment_projector.load_state_dict(best_checkpoint["alignment_projector_state_dict"])
-    if bool(args.train_patch_ae) and "compressor_state_dict" in best_checkpoint:
-        compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
-    test_metrics = evaluate(
-        compressor=compressor,
-        adapter=adapter,
-        projector=alignment_projector,
-        llm=llm,
-        tokenizer=tokenizer,
-        loader=test_loader,
-        device=device,
-        args=args,
-        compressor_input_size=compressor_input_size,
-        normalization_cfg=normalization_cfg,
-    )
-    metrics_history["best"] = {"epoch": int(best_epoch), "val_loss": float(best_val)}
-    metrics_history["test"] = test_metrics
-    dump_json(run_dir / "metrics_latest.json", metrics_history)
-    dump_json(run_dir / "test_metrics.json", test_metrics)
-    wandb_logger.log(numeric_payload("test", test_metrics), step=global_step)
-    if bool(args.wandb_log_model):
-        log_checkpoint_artifact(
-            wandb_logger,
-            run_dir / "patch_ae_pretrain_last.pt",
-            f"{args.run_name}-patch-ae-pretrain-last",
-            "patch-ae-checkpoint",
+    if is_main_process():
+        best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
+        adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
+        if alignment_projector is not None and "alignment_projector_state_dict" in best_checkpoint:
+            alignment_projector.load_state_dict(best_checkpoint["alignment_projector_state_dict"])
+        if bool(args.train_patch_ae) and "compressor_state_dict" in best_checkpoint:
+            compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
+        test_metrics = evaluate(
+            compressor=compressor,
+            adapter=adapter,
+            projector=alignment_projector,
+            llm=llm,
+            tokenizer=tokenizer,
+            loader=test_loader,
+            device=device,
+            args=args,
+            compressor_input_size=compressor_input_size,
+            normalization_cfg=normalization_cfg,
         )
-        log_checkpoint_artifact(
-            wandb_logger,
-            run_dir / "alignment_best.pt",
-            f"{args.run_name}-alignment-best",
-            "patch-alignment-checkpoint",
-        )
-        log_checkpoint_artifact(
-            wandb_logger,
-            run_dir / "alignment_last.pt",
-            f"{args.run_name}-alignment-last",
-            "patch-alignment-checkpoint",
-        )
-    wandb_logger.finish()
-    print(f"Run directory: {run_dir}")
-    print(json.dumps({"best_epoch": best_epoch, "test": test_metrics}, ensure_ascii=False, indent=2))
+        metrics_history["best"] = {"epoch": int(best_epoch), "val_loss": float(best_val)}
+        metrics_history["test"] = test_metrics
+        dump_json(run_dir / "metrics_latest.json", metrics_history)
+        dump_json(run_dir / "test_metrics.json", test_metrics)
+        if wandb_logger is not None:
+            wandb_logger.log(numeric_payload("test", test_metrics), step=global_step)
+            if bool(args.wandb_log_model):
+                log_checkpoint_artifact(
+                    wandb_logger,
+                    run_dir / "patch_ae_pretrain_last.pt",
+                    f"{args.run_name}-patch-ae-pretrain-last",
+                    "patch-ae-checkpoint",
+                )
+                log_checkpoint_artifact(
+                    wandb_logger,
+                    run_dir / "alignment_best.pt",
+                    f"{args.run_name}-alignment-best",
+                    "patch-alignment-checkpoint",
+                )
+                log_checkpoint_artifact(
+                    wandb_logger,
+                    run_dir / "alignment_last.pt",
+                    f"{args.run_name}-alignment-last",
+                    "patch-alignment-checkpoint",
+                )
+            wandb_logger.finish()
+        print(f"Run directory: {run_dir}")
+        print(json.dumps({"best_epoch": best_epoch, "test": test_metrics}, ensure_ascii=False, indent=2))
+    distributed_barrier()
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
