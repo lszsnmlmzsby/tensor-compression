@@ -1295,6 +1295,8 @@ adapter:
   local_adapter_layers: 2
   local_gate_init: 0.1
   freeze_global_adapter: true
+  global_unfreeze_epoch: 3
+  global_lr: 1.0e-5
 
 llm_training:
   ranking_loss_weight: 0.1
@@ -1302,6 +1304,8 @@ llm_training:
 ```
 
 最终前缀为 `[8 local tokens][16 frozen global tokens][question text]`。`macro_latent_gain` 是各任务 `correct_accuracy - shuffled_accuracy` 的宏平均，用它选择 `adapter_best.pt` 可避免容易的 `extreme_quadrant` 掩盖单点和区域任务。结构化条件只包含问题本身公开的 task、field、坐标、区域和 mean/std，不读取 `oracle` 或正确答案。
+
+`freeze_global_adapter: true` 表示训练开始时冻结 global branch；当 epoch 到达 `global_unfreeze_epoch` 时自动解冻。上例中 epoch 1-2 只训练 local branch，epoch 3 起联合微调，其中 local 使用 `llm_training.lr: 1e-4`，global 使用较小的 `global_lr: 1e-5`。设置 `global_unfreeze_epoch: 0` 可保持全程冻结；设置 `freeze_global_adapter: false` 则从第一个 epoch 开始微调 global。
 
 随机初始化对照使用同一个类和完全相同的训练参数，只关闭初始化 checkpoint：
 

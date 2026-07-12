@@ -471,10 +471,16 @@ class HybridGlobalLocalAdapter(nn.Module):
         self.soft_prompt_tokens = int(global_adapter.soft_prompt_tokens + local_adapter.soft_prompt_tokens)
         self.structured_query_conditioning = True
 
+        self.set_global_trainable(not self.freeze_global)
+
+    def set_global_trainable(self, trainable: bool) -> None:
+        self.freeze_global = not bool(trainable)
+        for parameter in self.global_adapter.parameters():
+            parameter.requires_grad_(bool(trainable))
         if self.freeze_global:
-            for parameter in self.global_adapter.parameters():
-                parameter.requires_grad_(False)
             self.global_adapter.eval()
+        else:
+            self.global_adapter.train(self.training)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -714,6 +720,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-adapter-layers", type=int, default=None)
     parser.add_argument("--local-gate-init", type=float, default=None)
     parser.add_argument("--freeze-global-adapter", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--global-unfreeze-epoch", type=int, default=None)
+    parser.add_argument("--global-lr", type=float, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument(
         "--prompt-template",
@@ -851,6 +859,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "local_adapter_layers", first_nested(config, ["adapter.local_adapter_layers"]), 2)
     set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 0.1)
     set_default(args, "freeze_global_adapter", first_nested(config, ["adapter.freeze_global_adapter"]), True)
+    set_default(args, "global_unfreeze_epoch", first_nested(config, ["adapter.global_unfreeze_epoch"]), 0)
+    set_default(args, "global_lr", first_nested(config, ["adapter.global_lr"]), 1.0e-5)
     set_default(args, "soft_prompt_scale", first_nested(config, ["adapter.soft_prompt_scale"]), 0.05)
     set_default(
         args,
@@ -1981,6 +1991,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "local_adapter_layers": int(args.local_adapter_layers),
             "local_gate_init": float(args.local_gate_init),
             "freeze_global_adapter": bool(args.freeze_global_adapter),
+            "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
+            "global_lr": float(args.global_lr),
             "soft_prompt_scale": float(args.soft_prompt_scale),
         },
         "llm_training": {
@@ -2185,11 +2197,24 @@ def main() -> None:
         num_workers=0,
         collate_fn=collate_tensor_readout,
     )
-    optimizer = torch.optim.AdamW(
-        adapter.parameters(),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-    )
+    if isinstance(adapter, HybridGlobalLocalAdapter):
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": list(adapter.local_adapter.parameters()), "lr": float(args.lr), "name": "local"},
+                {
+                    "params": list(adapter.global_adapter.parameters()),
+                    "lr": float(args.global_lr),
+                    "name": "global",
+                },
+            ],
+            weight_decay=float(args.weight_decay),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            adapter.parameters(),
+            lr=float(args.lr),
+            weight_decay=float(args.weight_decay),
+        )
     baseline_modes = parse_csv(args.eval_baselines)
     if not baseline_modes:
         baseline_modes = ["correct"]
@@ -2222,6 +2247,8 @@ def main() -> None:
         "local_adapter_layers": int(args.local_adapter_layers),
         "local_gate_init": float(args.local_gate_init),
         "freeze_global_adapter": bool(args.freeze_global_adapter),
+        "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
+        "global_lr": float(args.global_lr),
         "checkpoint_metric": str(args.checkpoint_metric),
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
@@ -2264,6 +2291,17 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         for epoch in range(1, int(args.epochs) + 1):
+            if (
+                isinstance(adapter, HybridGlobalLocalAdapter)
+                and adapter.freeze_global
+                and int(args.global_unfreeze_epoch) > 0
+                and epoch >= int(args.global_unfreeze_epoch)
+            ):
+                adapter.set_global_trainable(True)
+                print(
+                    f"unfroze global adapter at epoch {epoch}: "
+                    f"global_lr={float(args.global_lr):.3g}, local_lr={float(args.lr):.3g}"
+                )
             adapter.train()
             running_loss = 0.0
             running_ce_loss = 0.0
@@ -2369,6 +2407,13 @@ def main() -> None:
                             "train_step/epoch": float(epoch),
                             "train_step/epoch_step": float(step),
                             "train_step/lr": float(optimizer.param_groups[0]["lr"]),
+                            "train_step/local_lr": float(optimizer.param_groups[0]["lr"]),
+                            "train_step/global_lr": float(
+                                optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0
+                            ),
+                            "train_step/global_trainable": float(
+                                isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
+                            ),
                         },
                         step=global_step,
                     )
@@ -2432,6 +2477,11 @@ def main() -> None:
                 "train/weighted_ranking_loss": float(train_weighted_ranking_loss),
                 "train/ranking_margin": float(train_ranking_margin),
                 "lr": float(optimizer.param_groups[0]["lr"]),
+                "local_lr": float(optimizer.param_groups[0]["lr"]),
+                "global_lr": float(optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0),
+                "global_trainable": float(
+                    isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
+                ),
                 "val/macro_latent_gain": float(val_macro_latent_gain),
                 "best_val/checkpoint_score": float(max(best_val_score, val_score)),
             }

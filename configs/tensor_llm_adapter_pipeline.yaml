@@ -273,7 +273,11 @@ adapter:
   local_adapter_layers: 2
   # A small nonzero gate gives the local branch gradients immediately without overwhelming global tokens.
   local_gate_init: 0.1
+  # Freeze the pretrained global branch for epochs 1-2, then fine-tune it from epoch 3.
   freeze_global_adapter: true
+  global_unfreeze_epoch: 3
+  # Use one tenth of the local branch LR after unfreezing.
+  global_lr: 1.0e-5
   soft_prompt_scale: 0.05
 
 llm_training:
