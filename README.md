@@ -1234,7 +1234,69 @@ patch_encoder:
 
 这个脚本不是 QA 训练。它的目标是验证：tensor path 能否学到和“LLM 直接阅读文本形式 patch”一致的中间表示。若这里的 retrieval accuracy 训练不上去，说明 text teacher 表示或 tensor adapter 结构仍有问题；若训练有效，再把这个 adapter 初始化迁移到后续 readout QA。
 
-### 3.10 Adapter 诊断输出
+### 3.10 16x16 Patch QA 迁移
+
+第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE，因此归一化和 latent 与第一阶段完全一致。
+
+当前任务使用固定、清晰的自然语言问题：
+
+| `task_type` | 目标 |
+|---|---|
+| `normalized_point_value` | 从 soft tokens 读取某点的标准化值，选择最接近的数值。 |
+| `raw_point_value_with_stats` | 文本给出 patch mean/std，结合 latent 中的标准化值和 `x=z*std+mean` 选择原始值。 |
+| `point_compare` | 比较 patch 内两个点的标准化值。 |
+| `region_mean_compare` | 比较两个局部区域的标准化均值。 |
+| `extreme_quadrant` | 定位最大值或最小值所在象限。 |
+
+先在配置中填写最新 checkpoint：
+
+```yaml
+patch_qa:
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+
+adapter:
+  architecture: alignment_qformer
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+```
+
+生成 QA 和 latent：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+输出：
+
+```text
+patch_qa.qa_dir/train.jsonl
+patch_qa.qa_dir/val.jsonl
+patch_qa.qa_dir/test.jsonl
+patch_qa.qa_dir/metadata.json
+patch_qa.latent_dir/<patch_id>.pt
+```
+
+使用 alignment adapter 初始化下游 QA：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+`adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段的 `alignment_projector_state_dict` 不进入下游；冻结 LLM，仅更新 Q-Former adapter。
+
+随机初始化对照使用同一个类和完全相同的训练参数，只关闭初始化 checkpoint：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --adapter-init-checkpoint none \
+  --run-name tensor_patch_qa_random_qformer
+```
+
+训练器默认先在 512 条验证记录上运行训练前评估，再开始微调。评估同时报告 `correct`、`zero_latent`、`no_latent`、`shuffled` 和 `shuffled_stats`，并按 task、field、task/field 组合统计 accuracy。patch QA 的 shuffled baseline 优先换成同字段、同任务的其他 patch，避免字段差异成为简单线索；`shuffled_stats` 保留正确 latent，但替换 raw-value 问题中的 mean/std，用来检查模型是否真正组合了 tensor 与文本统计量。
+
+### 3.11 Adapter 诊断输出
 
 `scripts/diagnose_tensor_llm_adapter.py` 用于检查三个问题：QA 记录和 latent 是否对齐、不同 state 的 latent/soft prompt 是否真的不同、正确 latent 是否系统性降低正确答案的 NLL。输出是 JSONL，不会改训练结果。
 
@@ -1281,7 +1343,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/diagnose_tensor_llm_adapter.py \
 | soft prompt 差异大，但 NLL margin 接近 0 | LLM 没有有效使用 soft prompt。 |
 | `answer_margin_shuffled_minus_correct` 多数为正 | 正确 latent 正在降低正确答案 NLL，是有效信号。 |
 
-### 3.11 配置模型对话 Smoke Test
+### 3.12 配置模型对话 Smoke Test
 
 `tests/chat_with_config_model.py` 会读取 `configs/tensor_llm_adapter_pipeline.yaml` 中的 `model.local_dir` 或 `model.name_or_path`，并使用同一份配置里的 `storage.hf_home`、`model.torch_dtype`、`model.trust_remote_code` 加载模型。这个脚本是手动检查下载模型是否能正常加载和生成文本，不属于自动单元测试。
 
@@ -1313,7 +1375,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 | `--top-p` | nucleus sampling 阈值。 | 0 到 1 | - |
 | `--do-sample` / `--no-do-sample` | 是否采样生成。 | 布尔开关 | `--no-do-sample`：贪心/确定性生成。 |
 
-### 3.12 模型选择建议
+### 3.13 模型选择建议
 
 | 阶段 | 模型 | 说明 |
 |---|---|---|
@@ -1323,7 +1385,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 当前 QA 是英文 DSL，第一阶段不强依赖中文能力；后续如果要中文提问，优先选 Qwen 系列。
 
-### 3.13 评估逻辑
+### 3.14 评估逻辑
 
 训练脚本默认做 choice likelihood 评估，而不是只看 loss。
 
@@ -1337,7 +1399,7 @@ CUDA_VISIBLE_DEVICES=1 python tests/chat_with_config_model.py \
 
 只有当 `correct` 明显优于 `zero_latent/shuffled` 时，才说明 adapter 可能学到了读取 tensor latent 的能力。开启 `structured_query_conditioning` 后，`no_latent` 会同时移除 soft prompt 和 query-conditioned adapter 输出，因此不再是唯一关键对照。
 
-### 3.14 LLM Readout Inspection
+### 3.15 LLM Readout Inspection
 
 这个脚本用于回答一个更具体的问题：在答案位置，冻结 LLM 到底更偏向哪些候选项。它不会解释 LLM 的内部语义，只输出可观测的候选答案 NLL、归一化概率、rank，以及 correct latent 相比 `zero_latent/shuffled/no_latent` 对正确答案概率的改变。
 

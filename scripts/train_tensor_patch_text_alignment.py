@@ -776,6 +776,8 @@ class TensorPatchAlignmentAdapter(nn.Module):
         self.adapter_type = str(adapter_type).lower()
         self.latent_grid = tuple(int(dim) for dim in latent_grid)
         self.latent_token_count = int(self.latent_grid[0] * self.latent_grid[1])
+        self.soft_prompt_tokens = int(query_tokens) if self.adapter_type == "qformer" else 1
+        self.structured_query_conditioning = False
         self.soft_prompt_scale = float(soft_prompt_scale)
         adapter_dim = int(adapter_dim)
         projection_dim = int(projection_dim)
@@ -843,6 +845,16 @@ class TensorPatchAlignmentAdapter(nn.Module):
     def forward_tensor(self, latent_map: torch.Tensor) -> torch.Tensor:
         soft_prompts = self.forward_soft_prompts(latent_map)
         return F.normalize(soft_prompts.mean(dim=1), dim=-1)
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor | None = None,
+        question_mask: torch.Tensor | None = None,
+        structured_query: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del question_embeds, question_mask, structured_query
+        return self.forward_soft_prompts(latent_map)
 
 
 def build_projection_head(

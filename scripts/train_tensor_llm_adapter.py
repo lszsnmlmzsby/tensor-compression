@@ -21,8 +21,12 @@ from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+
+from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
 
 from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
 from tensor_compression.integrations import WandbLogger  # noqa: E402
@@ -354,18 +358,42 @@ class TensorReadoutQADataset(Dataset):
                 "Cannot build shuffled latent baseline: every record belongs to the same state_ref."
             )
         rng = random.Random(seed)
+        indices_by_field_task: dict[tuple[str, str], list[int]] = defaultdict(list)
+        indices_by_field: dict[str, list[int]] = defaultdict(list)
+        for candidate_index, candidate_record in enumerate(self.records):
+            field = str(
+                candidate_record.get("field")
+                or candidate_record.get("metadata", {}).get("field")
+                or ""
+            )
+            task = str(candidate_record.get("task_type", ""))
+            indices_by_field_task[(field, task)].append(candidate_index)
+            indices_by_field[field].append(candidate_index)
         indices: list[int] = []
         for index, record in enumerate(self.records):
             state_ref = str(record.get("state_ref", ""))
-            candidate = rng.randrange(total)
-            attempts = 0
-            while str(self.records[candidate].get("state_ref", "")) == state_ref:
-                candidate = rng.randrange(total)
-                attempts += 1
-                if attempts > total * 4:
-                    raise RuntimeError(
-                        "Failed to sample a different-state shuffled latent; check QA state distribution."
-                    )
+            field = str(record.get("field") or record.get("metadata", {}).get("field") or "")
+            task = str(record.get("task_type", ""))
+            candidates = [
+                candidate
+                for candidate in indices_by_field_task.get((field, task), [])
+                if str(self.records[candidate].get("state_ref", "")) != state_ref
+            ]
+            if not candidates:
+                candidates = [
+                    candidate
+                    for candidate in indices_by_field.get(field, [])
+                    if str(self.records[candidate].get("state_ref", "")) != state_ref
+                ]
+            if not candidates:
+                candidates = [
+                    candidate
+                    for candidate in range(total)
+                    if str(self.records[candidate].get("state_ref", "")) != state_ref
+                ]
+            if not candidates:
+                raise RuntimeError("Failed to sample a different-state shuffled latent.")
+            candidate = int(rng.choice(candidates))
             indices.append(int(candidate))
         return indices
 
@@ -445,6 +473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-records", type=int, default=None)
     parser.add_argument("--max-val-records", type=int, default=None)
     parser.add_argument("--max-test-records", type=int, default=None)
+    parser.add_argument("--initial-eval-records", type=int, default=None)
     parser.add_argument("--prefer-record-latent-ref", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
@@ -476,6 +505,13 @@ def parse_args() -> argparse.Namespace:
         choices=("shuffled", "random", "no_latent", "zero_latent"),
     )
     parser.add_argument("--soft-prompt-tokens", type=int, default=None)
+    parser.add_argument(
+        "--adapter-architecture",
+        type=str,
+        choices=("legacy", "alignment_qformer"),
+        default=None,
+    )
+    parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
@@ -505,7 +541,7 @@ def parse_args() -> argparse.Namespace:
         "--eval-baselines",
         type=str,
         default=None,
-        help="Comma-separated: correct,no_latent,zero_latent,shuffled,random.",
+        help="Comma-separated: correct,no_latent,zero_latent,shuffled,random,shuffled_stats.",
     )
     parser.add_argument(
         "--choice-score",
@@ -549,8 +585,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         )
 
     path_defaults = {
-        "qa_dir": first_nested(config, ["data.qa_dir"]),
-        "latent_dir": first_nested(config, ["data.latent_dir", "latent_export.output_dir"]),
+        "qa_dir": first_nested(config, ["patch_qa.qa_dir", "data.qa_dir"]),
+        "latent_dir": first_nested(config, ["patch_qa.latent_dir", "data.latent_dir", "latent_export.output_dir"]),
+        "adapter_init_checkpoint": first_nested(config, ["adapter.init_checkpoint", "patch_qa.alignment_checkpoint"]),
         "output_root": first_nested(config, ["llm_training.output_root", "storage.output_root"]),
         "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
         "hf_home": first_nested(config, ["storage.hf_home"]),
@@ -566,6 +603,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "max_train_records", first_nested(config, ["llm_training.max_train_records"]), None)
     set_default(args, "max_val_records", first_nested(config, ["llm_training.max_val_records"]), None)
     set_default(args, "max_test_records", first_nested(config, ["llm_training.max_test_records"]), None)
+    set_default(args, "initial_eval_records", first_nested(config, ["llm_training.initial_eval_records"]), 512)
     set_default(
         args,
         "prefer_record_latent_ref",
@@ -595,6 +633,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "ranking_loss_weight", first_nested(config, ["llm_training.ranking_loss_weight"]), 0.2)
     set_default(args, "ranking_loss_margin", first_nested(config, ["llm_training.ranking_loss_margin"]), 0.1)
     set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
+    set_default(args, "adapter_architecture", first_nested(config, ["adapter.architecture"]), "legacy")
     set_default(args, "soft_prompt_tokens", first_nested(config, ["adapter.soft_prompt_tokens"]), 32)
     set_default(args, "adapter_dim", first_nested(config, ["adapter.adapter_dim"]), 512)
     set_default(args, "adapter_layers", first_nested(config, ["adapter.adapter_layers"]), 2)
@@ -729,6 +768,17 @@ def qa_path(qa_dir: str | Path, split: str) -> Path:
 
 def task_specific_instruction(record: Mapping[str, Any]) -> str:
     task_type = str(record.get("task_type", "")).strip()
+    if task_type == "normalized_point_value":
+        return (
+            "Rule: read the standardized value at the requested patch-local row and column from the tensor soft tokens. "
+            "Choose the closest numeric option and return only its label."
+        )
+    if task_type == "raw_point_value_with_stats":
+        return (
+            "Rule: read the standardized value z at the requested patch-local position from the tensor soft tokens, "
+            "then use x = z * standard deviation + mean with the statistics stated in the question. "
+            "Choose the closest original-value option and return only its label."
+        )
     if task_type == "point_bin":
         return (
             "Rule: read the requested field value at the given row and col from the tensor soft tokens. "
@@ -749,6 +799,16 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
             "Choice A means patch A has greater or tied mean. "
             "Choice B means patch B has strictly greater mean. "
             "Return exactly A or B and no extra text."
+        )
+    if task_type == "region_mean_compare":
+        return (
+            "Rule: compare the mean standardized values in the two stated patch-local regions using the tensor soft tokens. "
+            "Return A if region A has the greater or tied mean; otherwise return B."
+        )
+    if task_type == "extreme_quadrant":
+        return (
+            "Rule: locate the requested maximum or minimum in the standardized patch using the tensor soft tokens. "
+            "Return A for top-left, B for top-right, C for bottom-left, or D for bottom-right."
         )
     if task_type == "max_speed_quadrant":
         return (
@@ -784,6 +844,10 @@ def choice_semantics(record: Mapping[str, Any]) -> str:
         return "Choice meanings: A=point A is greater than or tied with point B; B=point B is strictly greater than point A."
     if task_type == "patch_compare":
         return "Choice meanings: A=patch A mean is greater than or tied with patch B mean; B=patch B mean is strictly greater than patch A mean."
+    if task_type == "region_mean_compare":
+        return "Choice meanings: A=region A has greater or tied mean; B=region B has strictly greater mean."
+    if task_type == "extreme_quadrant":
+        return "Choice meanings: A=top-left; B=top-right; C=bottom-left; D=bottom-right."
     if task_type == "max_speed_quadrant":
         return "Choice meanings: quadrant labels refer to the location of the maximum-speed grid cell."
     if labels:
@@ -1365,7 +1429,7 @@ def baseline_latents(
     dataset: TensorReadoutQADataset,
 ) -> torch.Tensor:
     latents = batch["latent_map"]
-    if mode in {"correct", "no_latent"}:
+    if mode in {"correct", "no_latent", "shuffled_stats"}:
         return latents
     if mode == "zero_latent":
         return torch.zeros_like(latents)
@@ -1379,10 +1443,47 @@ def baseline_latents(
     raise ValueError(f"Unsupported baseline mode: {mode}")
 
 
+def records_for_baseline(
+    mode: str,
+    batch: Mapping[str, Any],
+    dataset: TensorReadoutQADataset,
+) -> list[Mapping[str, Any]]:
+    records = list(batch["records"])
+    if mode != "shuffled_stats":
+        return records
+    updated: list[Mapping[str, Any]] = []
+    for index, record in zip(batch["indices"], records):
+        if str(record.get("task_type")) != "raw_point_value_with_stats":
+            updated.append(record)
+            continue
+        prompt_data = record.get("prompt_data")
+        shuffled = dataset.shuffled_record_for_index(index)
+        shuffled_data = shuffled.get("prompt_data") if isinstance(shuffled, Mapping) else None
+        if not isinstance(prompt_data, Mapping) or not isinstance(shuffled_data, Mapping):
+            updated.append(record)
+            continue
+        digits = int(prompt_data.get("significant_digits", 6))
+        mean = float(shuffled_data.get("mean", prompt_data["mean"]))
+        std = float(shuffled_data.get("std", prompt_data["std"]))
+        question = (
+            f"A 16 by 16 patch of {prompt_data['field']} was standardized using "
+            "z = (x - mean) / standard deviation. "
+            f"Its mean is {mean:.{digits}g} and its standard deviation is {std:.{digits}g}. "
+            "The standardized patch is encoded in the tensor soft tokens. Which option is closest to the "
+            f"original value x at row {int(prompt_data['row'])}, column {int(prompt_data['col'])}? "
+            f"Options: {prompt_data['option_text']}."
+        )
+        changed = dict(record)
+        changed["question"] = question
+        changed["query"] = question
+        updated.append(changed)
+    return updated
+
+
 @torch.no_grad()
 def evaluate_choice_accuracy(
     llm,
-    adapter: TensorSoftPromptAdapter,
+    adapter: nn.Module,
     tokenizer,
     dataset: TensorReadoutQADataset,
     device: torch.device,
@@ -1403,8 +1504,12 @@ def evaluate_choice_accuracy(
         correct = 0
         task_total: dict[str, int] = defaultdict(int)
         task_correct: dict[str, int] = defaultdict(int)
+        field_total: dict[str, int] = defaultdict(int)
+        field_correct: dict[str, int] = defaultdict(int)
+        task_field_total: dict[str, int] = defaultdict(int)
+        task_field_correct: dict[str, int] = defaultdict(int)
         for batch in tqdm(loader, desc=f"Eval [{mode}]", leave=False):
-            records = batch["records"]
+            records = records_for_baseline(mode, batch, dataset)
             latents = baseline_latents(mode, batch, dataset)
             predictions = collect_candidate_scores(
                 llm=llm,
@@ -1414,16 +1519,22 @@ def evaluate_choice_accuracy(
                 latent_map=latents,
                 device=device,
                 args=args,
-                mode=mode,
+                mode="correct" if mode == "shuffled_stats" else mode,
             )
             for record, prediction in zip(records, predictions):
                 answer = str(record["answer"])
                 task_type = str(record.get("task_type", "unknown"))
+                field = str(record.get("field") or record.get("metadata", {}).get("field") or "unknown")
+                task_field = f"{task_type}/{field}"
                 hit = int(prediction == answer)
                 total += 1
                 correct += hit
                 task_total[task_type] += 1
                 task_correct[task_type] += hit
+                field_total[field] += 1
+                field_correct[field] += hit
+                task_field_total[task_field] += 1
+                task_field_correct[task_field] += hit
         metrics[mode] = {
             "accuracy": correct / max(1, total),
             "correct": correct,
@@ -1436,6 +1547,22 @@ def evaluate_choice_accuracy(
                 }
                 for task, count in sorted(task_total.items())
             },
+            "by_field": {
+                field: {
+                    "accuracy": field_correct[field] / max(1, count),
+                    "correct": field_correct[field],
+                    "total": count,
+                }
+                for field, count in sorted(field_total.items())
+            },
+            "by_task_field": {
+                key: {
+                    "accuracy": task_field_correct[key] / max(1, count),
+                    "correct": task_field_correct[key],
+                    "total": count,
+                }
+                for key, count in sorted(task_field_total.items())
+            },
         }
     adapter.train()
     return metrics
@@ -1443,7 +1570,7 @@ def evaluate_choice_accuracy(
 
 def save_adapter_checkpoint(
     path: str | Path,
-    adapter: TensorSoftPromptAdapter,
+    adapter: nn.Module,
     args: argparse.Namespace,
     latent_shape: Sequence[int],
     llm_hidden_size: int,
@@ -1484,7 +1611,7 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
     if not isinstance(correct, Mapping) or not isinstance(correct.get("accuracy"), (int, float)):
         return
     correct_accuracy = float(correct["accuracy"])
-    for baseline in ("no_latent", "zero_latent", "shuffled", "random"):
+    for baseline in ("no_latent", "zero_latent", "shuffled", "shuffled_stats", "random"):
         baseline_metrics = metrics.get(baseline)
         if isinstance(baseline_metrics, Mapping) and isinstance(baseline_metrics.get("accuracy"), (int, float)):
             payload[f"{prefix}/correct_minus_{baseline}_accuracy"] = correct_accuracy - float(
@@ -1504,6 +1631,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "max_train_records": args.max_train_records,
             "max_val_records": args.max_val_records,
             "max_test_records": args.max_test_records,
+            "initial_eval_records": int(args.initial_eval_records),
             "shuffle_seed": int(args.shuffle_seed),
         },
         "model": {
@@ -1512,6 +1640,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "trust_remote_code": bool(args.trust_remote_code),
         },
         "adapter": {
+            "architecture": str(args.adapter_architecture),
+            "init_checkpoint": args.adapter_init_checkpoint,
             "soft_prompt_tokens": int(args.soft_prompt_tokens),
             "adapter_dim": int(args.adapter_dim),
             "adapter_layers": int(args.adapter_layers),
@@ -1603,20 +1733,72 @@ def main() -> None:
     latent_shape = tuple(int(dim) for dim in first_latent.shape)
     latent_channels = int(latent_shape[0])
 
-    adapter = TensorSoftPromptAdapter(
-        latent_channels=latent_channels,
-        llm_hidden_size=llm_hidden_size,
-        soft_prompt_tokens=int(args.soft_prompt_tokens),
-        adapter_dim=int(args.adapter_dim),
-        adapter_layers=int(args.adapter_layers),
-        adapter_heads=int(args.adapter_heads),
-        dropout=float(args.dropout),
-        latent_pos_encoding=str(args.latent_pos_encoding),
-        question_conditioning=bool(args.question_conditioning),
-        question_condition_gate_init=float(args.question_condition_gate_init),
-        structured_query_conditioning=bool(args.structured_query_conditioning),
-        soft_prompt_scale=float(args.soft_prompt_scale),
-    ).to(device)
+    initialization = "random"
+    if str(args.adapter_architecture) == "alignment_qformer":
+        checkpoint: Mapping[str, Any] | None = None
+        checkpoint_args: Mapping[str, Any] = {}
+        init_checkpoint = str(args.adapter_init_checkpoint or "").strip()
+        if init_checkpoint.lower() in {"", "none", "null", "random"}:
+            init_checkpoint = ""
+        if init_checkpoint:
+            loaded = torch.load(Path(init_checkpoint).expanduser(), map_location="cpu")
+            if not isinstance(loaded, Mapping):
+                raise ValueError(f"Unsupported alignment checkpoint: {args.adapter_init_checkpoint}")
+            checkpoint = loaded
+            checkpoint_args = loaded.get("args", {}) if isinstance(loaded.get("args"), Mapping) else {}
+        query_tokens = int(checkpoint_args.get("query_tokens", args.soft_prompt_tokens))
+        adapter_layers = int(checkpoint_args.get("adapter_layers", args.adapter_layers))
+        adapter_heads = int(checkpoint_args.get("adapter_heads", args.adapter_heads))
+        adapter_dim = int(checkpoint_args.get("adapter_dim", args.adapter_dim))
+        checkpoint_projection_dim = int(checkpoint_args.get("projection_dim") or llm_hidden_size)
+        if checkpoint_projection_dim != llm_hidden_size:
+            raise ValueError(
+                "Alignment adapter soft-prompt dimension must equal the downstream LLM hidden size. "
+                f"Got checkpoint projection_dim={checkpoint_projection_dim}, llm_hidden_size={llm_hidden_size}."
+            )
+        latent_grid = tuple(int(dim) for dim in latent_shape[-2:])
+        adapter = TensorPatchAlignmentAdapter(
+            latent_channels=latent_channels,
+            latent_grid=latent_grid,
+            adapter_dim=adapter_dim,
+            projection_dim=checkpoint_projection_dim,
+            dropout=float(checkpoint_args.get("dropout", args.dropout)),
+            adapter_type=str(checkpoint_args.get("adapter_type", "qformer")),
+            query_tokens=query_tokens,
+            adapter_layers=adapter_layers,
+            adapter_heads=adapter_heads,
+            soft_prompt_scale=float(checkpoint_args.get("soft_prompt_scale", args.soft_prompt_scale)),
+        ).to(device)
+        if checkpoint is not None:
+            state_dict = checkpoint.get("adapter_state_dict")
+            if not isinstance(state_dict, Mapping):
+                raise ValueError("Alignment checkpoint does not contain adapter_state_dict.")
+            adapter.load_state_dict(state_dict, strict=True)
+            initialization = "alignment_checkpoint"
+            args.adapter_init_checkpoint = init_checkpoint
+        else:
+            args.adapter_init_checkpoint = None
+        args.soft_prompt_tokens = query_tokens
+        args.adapter_layers = adapter_layers
+        args.adapter_heads = adapter_heads
+        args.adapter_dim = adapter_dim
+        args.question_conditioning = False
+        args.structured_query_conditioning = False
+    else:
+        adapter = TensorSoftPromptAdapter(
+            latent_channels=latent_channels,
+            llm_hidden_size=llm_hidden_size,
+            soft_prompt_tokens=int(args.soft_prompt_tokens),
+            adapter_dim=int(args.adapter_dim),
+            adapter_layers=int(args.adapter_layers),
+            adapter_heads=int(args.adapter_heads),
+            dropout=float(args.dropout),
+            latent_pos_encoding=str(args.latent_pos_encoding),
+            question_conditioning=bool(args.question_conditioning),
+            question_condition_gate_init=float(args.question_condition_gate_init),
+            structured_query_conditioning=bool(args.structured_query_conditioning),
+            soft_prompt_scale=float(args.soft_prompt_scale),
+        ).to(device)
 
     train_loader = DataLoader(
         train_dataset,
@@ -1655,6 +1837,9 @@ def main() -> None:
         "question_condition_gate_init": float(args.question_condition_gate_init),
         "structured_query_conditioning": bool(args.structured_query_conditioning),
         "soft_prompt_scale": float(args.soft_prompt_scale),
+        "adapter_architecture": str(args.adapter_architecture),
+        "adapter_initialization": initialization,
+        "adapter_init_checkpoint": str(args.adapter_init_checkpoint) if args.adapter_init_checkpoint else None,
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }
@@ -1667,6 +1852,30 @@ def main() -> None:
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     global_step = 0
     try:
+        initial_count = min(max(0, int(args.initial_eval_records)), len(val_dataset))
+        if initial_count > 0:
+            initial_dataset = TensorReadoutQADataset(
+                qa_path(args.qa_dir, args.val_split),
+                latent_dir=args.latent_dir,
+                max_records=initial_count,
+                prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
+                shuffle_seed=int(args.shuffle_seed),
+            )
+            initial_metrics = evaluate_choice_accuracy(
+                llm=llm,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                dataset=initial_dataset,
+                device=device,
+                args=args,
+                baseline_modes=baseline_modes,
+            )
+            history["initial_eval"] = initial_metrics
+            dump_json(run_dir / "metrics_latest.json", history)
+            initial_payload = flatten_numeric_metrics("initial_eval", initial_metrics)
+            add_accuracy_deltas("initial_eval", initial_metrics, initial_payload)
+            wandb_logger.log(initial_payload, step=0)
+            print(json.dumps({"initial_eval": initial_metrics}, ensure_ascii=False, indent=2))
         for epoch in range(1, int(args.epochs) + 1):
             adapter.train()
             running_loss = 0.0

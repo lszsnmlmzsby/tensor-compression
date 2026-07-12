@@ -24,6 +24,41 @@ data:
   qa_dir: /data/wyx/tensor_llm_assets/tensor_readout_qa_vx
   latent_dir: /data/wyx/tensor_llm_assets/tensor_readout_latents_vx_2x
 
+# Downstream QA over the normalized 16x16 patches used by patch alignment.
+# Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
+patch_qa:
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+  hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
+  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16
+  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16
+  fields:
+    - density
+    - pressure
+    - Vx
+    - Vy
+  patch_size: 16
+  train_patches: 8192
+  val_patches: 1024
+  test_patches: 1024
+  sample_indices: all
+  time_indices: all
+  split_mode: sample
+  tasks:
+    - normalized_point_value
+    - raw_point_value_with_stats
+    - point_compare
+    - region_mean_compare
+    - extreme_quadrant
+  region_size: 4
+  # Numeric distractors differ by this amount in z space; raw-value spacing is this value times patch std.
+  numeric_choice_spacing: 0.5
+  decimal_places: 6
+  batch_size: 256
+  device: auto
+  storage_dtype: float16
+  include_oracle: true
+  overwrite: false
+
 compressor:
   config: null
   checkpoint: /home/lpr/wyx/tensor-compression/outputs/runs/20260620_153406_compressor_2d_baseline/checkpoints/best.pt
@@ -221,19 +256,23 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  soft_prompt_tokens: 32
+  # alignment_qformer exactly matches and can strictly load patch_alignment adapter_state_dict.
+  # Set init_checkpoint to null for the random-initialized control run.
+  architecture: alignment_qformer
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+  soft_prompt_tokens: 16
   adapter_dim: 512
-  adapter_layers: 2
+  adapter_layers: 4
   adapter_heads: 8
-  dropout: 0.1
+  dropout: 0.0
   latent_pos_encoding: grid
-  question_conditioning: true
-  question_condition_gate_init: 1.0
-  structured_query_conditioning: true
+  question_conditioning: false
+  question_condition_gate_init: 0.0
+  structured_query_conditioning: false
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_llm_adapter_vx_2x_qwen25_1p5b
+  run_name: tensor_patch_qa_aligned_qformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -241,6 +280,8 @@ llm_training:
   max_train_records: null
   max_val_records: null
   max_test_records: null
+  # Evaluate transfer before QA fine-tuning on this many validation questions.
+  initial_eval_records: 512
   prefer_record_latent_ref: false
   device: auto
   torch_dtype: bfloat16
@@ -253,9 +294,10 @@ llm_training:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   grad_clip_norm: 1.0
-  ce_loss_weight: 0.1
+  ce_loss_weight: 0.05
   choice_ce_loss_weight: 1.0
-  ranking_loss_weight: 0.5
+  # Start without ranking loss; add 0.1 only if correct and shuffled latents remain indistinguishable.
+  ranking_loss_weight: 0.0
   ranking_loss_margin: 0.1
   ranking_loss_negative: shuffled
   prompt_template: task_specific
@@ -267,6 +309,7 @@ llm_training:
     - no_latent
     - zero_latent
     - shuffled
+    - shuffled_stats
   choice_score: mean
   log_interval: 20
 
