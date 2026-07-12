@@ -1285,6 +1285,24 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 
 `adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段的 `alignment_projector_state_dict` 不进入下游；冻结 LLM，仅更新 Q-Former adapter。
 
+局部读取增强模式不需要重跑第一阶段，也不使用 AE decoder。它从上一轮下游 `adapter_best.pt` 加载并冻结 16-token global Q-Former，再增加 8 个由问题文本、任务类型和坐标条件驱动的 local queries，直接 cross-attend `[128,4,4]` latent：
+
+```yaml
+adapter:
+  architecture: hybrid_local_qformer
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/adapter_best.pt
+  local_soft_prompt_tokens: 8
+  local_adapter_layers: 2
+  local_gate_init: 0.1
+  freeze_global_adapter: true
+
+llm_training:
+  ranking_loss_weight: 0.1
+  checkpoint_metric: macro_latent_gain
+```
+
+最终前缀为 `[8 local tokens][16 frozen global tokens][question text]`。`macro_latent_gain` 是各任务 `correct_accuracy - shuffled_accuracy` 的宏平均，用它选择 `adapter_best.pt` 可避免容易的 `extreme_quadrant` 掩盖单点和区域任务。结构化条件只包含问题本身公开的 task、field、坐标、区域和 mean/std，不读取 `oracle` 或正确答案。
+
 随机初始化对照使用同一个类和完全相同的训练参数，只关闭初始化 checkpoint：
 
 ```bash

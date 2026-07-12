@@ -79,37 +79,68 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
     choice_count = len(choices) if isinstance(choices, Sequence) and not isinstance(choices, str) else 0
 
     features = [0.0] * STRUCTURED_QUERY_FEATURE_DIM
-    task_order = ["point_bin", "point_compare", "patch_compare", "max_speed_quadrant", "global_stat_bin"]
+    task_order = [
+        "normalized_point_value",
+        "raw_point_value_with_stats",
+        "point_compare",
+        "region_mean_compare",
+        "extreme_quadrant",
+        "point_bin",
+        "patch_compare",
+        "max_speed_quadrant",
+        "global_stat_bin",
+    ]
     if task_type in task_order:
         features[task_order.index(task_type)] = 1.0
-    features[5] = _normalize_length(choice_count, 16)
-    features[6] = 1.0 if "Vx" in query else 0.0
-    features[7] = 1.0 if "Vy" in query else 0.0
+    field = str(record.get("field") or metadata.get("field") or "").lower()
+    for offset, field_name in enumerate(("density", "pressure", "vx", "vy"), start=9):
+        features[offset] = float(field == field_name)
+    features[13] = _normalize_length(choice_count, 16)
+    features[14] = 1.0 if "maximum" in query.lower() else 0.0
+    features[15] = 1.0 if "minimum" in query.lower() else 0.0
 
-    point = re.search(r"row=(\d+)\s+col=(\d+)", query)
+    point = re.search(r"row(?:=|\s+)(\d+)[,\s]+col(?:umn)?(?:=|\s+)(\d+)", query, re.IGNORECASE)
     if point:
         row = int(point.group(1))
         col = int(point.group(2))
-        features[8] = _normalize_coordinate(row, height)
-        features[9] = _normalize_coordinate(col, width)
-        features[10] = _normalize_length(row // max(1, height // 16), 16)
-        features[11] = _normalize_length(col // max(1, width // 16), 16)
+        features[16] = _normalize_coordinate(row, height)
+        features[17] = _normalize_coordinate(col, width)
 
-    point_pair = re.search(r"A=\((\d+),(\d+)\)\s+B=\((\d+),(\d+)\)", query)
+    point_pair = re.search(
+        r"A at row (\d+), column (\d+).*?B at row (\d+), column (\d+)",
+        query,
+        re.IGNORECASE,
+    ) or re.search(r"A=\((\d+),(\d+)\)\s+B=\((\d+),(\d+)\)", query)
     if point_pair:
         row_a, col_a, row_b, col_b = [int(group) for group in point_pair.groups()]
-        features[12] = _normalize_coordinate(row_a, height)
-        features[13] = _normalize_coordinate(col_a, width)
-        features[14] = _normalize_coordinate(row_b, height)
-        features[15] = _normalize_coordinate(col_b, width)
-        features[16] = _normalize_coordinate(row_b - row_a + (height - 1) / 2.0, height)
-        features[17] = _normalize_coordinate(col_b - col_a + (width - 1) / 2.0, width)
+        features[16] = _normalize_coordinate(row_a, height)
+        features[17] = _normalize_coordinate(col_a, width)
+        features[18] = _normalize_coordinate(row_b, height)
+        features[19] = _normalize_coordinate(col_b, width)
+        features[20] = (float(row_b) - float(row_a)) / max(1.0, float(height - 1))
+        features[21] = (float(col_b) - float(col_a)) / max(1.0, float(width - 1))
 
+    region_pair = re.search(
+        r"Region A starts at row (\d+), column (\d+); region B starts at row (\d+), column (\d+)",
+        query,
+        re.IGNORECASE,
+    )
     patch_pair = re.search(
         r"A=\[(\d+):(\d+),(\d+):(\d+)\]\s+B=\[(\d+):(\d+),(\d+):(\d+)\]",
         query,
     )
-    if patch_pair:
+    if region_pair:
+        row_a, col_a, row_b, col_b = [int(group) for group in region_pair.groups()]
+        size_match = re.search(r"two (\d+) by (\d+) regions", query, re.IGNORECASE)
+        region_h = int(size_match.group(1)) if size_match else 1
+        region_w = int(size_match.group(2)) if size_match else region_h
+        features[22] = _normalize_coordinate(row_a, height)
+        features[23] = _normalize_coordinate(col_a, width)
+        features[24] = _normalize_coordinate(row_b, height)
+        features[25] = _normalize_coordinate(col_b, width)
+        features[26] = _normalize_length(region_h, height)
+        features[27] = _normalize_length(region_w, width)
+    elif patch_pair:
         row0_a, row1_a, col0_a, col1_a, row0_b, row1_b, col0_b, col1_b = [
             int(group) for group in patch_pair.groups()
         ]
@@ -117,14 +148,16 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
         center_col_a = (col0_a + col1_a - 1) / 2.0
         center_row_b = (row0_b + row1_b - 1) / 2.0
         center_col_b = (col0_b + col1_b - 1) / 2.0
-        features[18] = _normalize_coordinate(center_row_a, height)
-        features[19] = _normalize_coordinate(center_col_a, width)
-        features[20] = _normalize_coordinate(center_row_b, height)
-        features[21] = _normalize_coordinate(center_col_b, width)
-        features[22] = _normalize_length(row1_a - row0_a, height)
-        features[23] = _normalize_length(col1_a - col0_a, width)
-        features[24] = _normalize_length(row1_b - row0_b, height)
-        features[25] = _normalize_length(col1_b - col0_b, width)
+        features[22] = _normalize_coordinate(center_row_a, height)
+        features[23] = _normalize_coordinate(center_col_a, width)
+        features[24] = _normalize_coordinate(center_row_b, height)
+        features[25] = _normalize_coordinate(center_col_b, width)
+        features[26] = _normalize_length(row1_a - row0_a, height)
+        features[27] = _normalize_length(col1_a - col0_a, width)
+    prompt_data = record.get("prompt_data")
+    if isinstance(prompt_data, Mapping):
+        features[28] = math.tanh(float(prompt_data.get("mean", 0.0)))
+        features[29] = math.tanh(math.log1p(abs(float(prompt_data.get("std", 0.0)))))
     return features
 
 
@@ -158,11 +191,17 @@ class CrossAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, queries: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        queries: torch.Tensor,
+        latents: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         attended, _weights = self.attention(
             query=self.query_norm(queries),
             key=self.latent_norm(latents),
             value=self.latent_norm(latents),
+            key_padding_mask=key_padding_mask,
             need_weights=False,
         )
         queries = queries + attended
@@ -315,6 +354,151 @@ class TensorSoftPromptAdapter(nn.Module):
         if self.soft_prompt_scale > 0.0:
             soft_prompt = torch.tanh(soft_prompt) * self.soft_prompt_scale
         return soft_prompt
+
+
+class QuestionConditionedLocalAdapter(nn.Module):
+    """Extract local latent evidence using the question and explicit non-answer query metadata."""
+
+    def __init__(
+        self,
+        latent_channels: int,
+        latent_grid: Sequence[int],
+        llm_hidden_size: int,
+        adapter_dim: int,
+        local_tokens: int,
+        local_layers: int,
+        adapter_heads: int,
+        dropout: float,
+        soft_prompt_scale: float,
+        gate_init: float,
+        max_text_tokens: int,
+    ) -> None:
+        super().__init__()
+        if int(adapter_dim) % int(adapter_heads) != 0:
+            raise ValueError("adapter_dim must be divisible by adapter_heads for the local adapter.")
+        self.soft_prompt_tokens = int(local_tokens)
+        self.latent_grid = tuple(int(dim) for dim in latent_grid)
+        self.soft_prompt_scale = float(soft_prompt_scale)
+        self.latent_projection = nn.Linear(int(latent_channels), int(adapter_dim))
+        self.position_projection = nn.Linear(2, int(adapter_dim))
+        self.text_projection = nn.Sequential(
+            nn.LayerNorm(int(llm_hidden_size)),
+            nn.Linear(int(llm_hidden_size), int(adapter_dim)),
+        )
+        self.text_pos_embed = nn.Parameter(torch.zeros(1, int(max_text_tokens), int(adapter_dim)))
+        self.structured_projection = nn.Sequential(
+            nn.LayerNorm(STRUCTURED_QUERY_FEATURE_DIM),
+            nn.Linear(STRUCTURED_QUERY_FEATURE_DIM, int(adapter_dim)),
+            nn.GELU(),
+            nn.Linear(int(adapter_dim), int(adapter_dim)),
+        )
+        self.query_tokens = nn.Parameter(torch.empty(1, int(local_tokens), int(adapter_dim)))
+        self.text_blocks = nn.ModuleList(
+            [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
+        )
+        self.latent_blocks = nn.ModuleList(
+            [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
+        )
+        self.output = nn.Sequential(
+            nn.LayerNorm(int(adapter_dim)),
+            nn.Linear(int(adapter_dim), int(llm_hidden_size)),
+        )
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        nn.init.normal_(self.text_pos_embed, mean=0.0, std=0.02)
+
+    def _position_tokens(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        height, width = self.latent_grid
+        rows = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        cols = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(rows, cols, indexing="ij")
+        coords = torch.stack([yy, xx], dim=-1).reshape(1, height * width, 2)
+        return self.position_projection(coords.expand(int(batch_size), -1, -1))
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor,
+        question_mask: torch.Tensor | None,
+        structured_query: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_tokens = latent_map.flatten(2).transpose(1, 2).to(dtype=self.latent_projection.weight.dtype)
+        if int(latent_tokens.shape[1]) != int(self.latent_grid[0] * self.latent_grid[1]):
+            raise ValueError(f"Expected local latent grid {self.latent_grid}, got {tuple(latent_map.shape[-2:])}.")
+        latents = self.latent_projection(latent_tokens)
+        latents = latents + self._position_tokens(latents.shape[0], latents.device, latents.dtype)
+
+        text_context = self.text_projection(question_embeds.detach().to(dtype=self.text_projection[1].weight.dtype))
+        if int(text_context.shape[1]) > int(self.text_pos_embed.shape[1]):
+            raise ValueError(
+                f"Question length {int(text_context.shape[1])} exceeds local adapter limit "
+                f"{int(self.text_pos_embed.shape[1])}."
+            )
+        text_context = text_context + self.text_pos_embed[:, : text_context.shape[1]]
+        key_padding_mask = None
+        if question_mask is not None:
+            key_padding_mask = ~question_mask.to(device=text_context.device, dtype=torch.bool)
+        queries = self.query_tokens.expand(latents.shape[0], -1, -1)
+        query_condition = self.structured_projection(
+            structured_query.to(device=queries.device, dtype=self.structured_projection[1].weight.dtype)
+        )
+        queries = queries + query_condition.unsqueeze(1)
+        for text_block, latent_block in zip(self.text_blocks, self.latent_blocks):
+            queries = text_block(queries, text_context, key_padding_mask=key_padding_mask)
+            queries = latent_block(queries, latents)
+        local_prompts = self.output(queries)
+        if self.soft_prompt_scale > 0.0:
+            local_prompts = torch.tanh(local_prompts) * self.soft_prompt_scale
+        return self.gate.to(dtype=local_prompts.dtype) * local_prompts
+
+
+class HybridGlobalLocalAdapter(nn.Module):
+    def __init__(
+        self,
+        global_adapter: TensorPatchAlignmentAdapter,
+        local_adapter: QuestionConditionedLocalAdapter,
+        freeze_global: bool,
+    ) -> None:
+        super().__init__()
+        self.global_adapter = global_adapter
+        self.local_adapter = local_adapter
+        self.freeze_global = bool(freeze_global)
+        self.soft_prompt_tokens = int(global_adapter.soft_prompt_tokens + local_adapter.soft_prompt_tokens)
+        self.structured_query_conditioning = True
+
+        if self.freeze_global:
+            for parameter in self.global_adapter.parameters():
+                parameter.requires_grad_(False)
+            self.global_adapter.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_global:
+            self.global_adapter.eval()
+        return self
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor | None = None,
+        question_mask: torch.Tensor | None = None,
+        structured_query: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if question_embeds is None or structured_query is None:
+            raise ValueError("hybrid_local_qformer requires question embeddings and structured query features.")
+        if self.freeze_global:
+            with torch.no_grad():
+                global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
+        else:
+            global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
+        local_prompts = self.local_adapter(latent_map, question_embeds, question_mask, structured_query)
+        # Keeping local tokens first preserves the relative positions between global tokens and text.
+        return torch.cat([local_prompts, global_prompts], dim=1)
 
 
 class TensorReadoutQADataset(Dataset):
@@ -508,7 +692,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-architecture",
         type=str,
-        choices=("legacy", "alignment_qformer"),
+        choices=("legacy", "alignment_qformer", "hybrid_local_qformer"),
         default=None,
     )
     parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
@@ -526,6 +710,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-conditioning", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--question-condition-gate-init", type=float, default=None)
     parser.add_argument("--structured-query-conditioning", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--local-soft-prompt-tokens", type=int, default=None)
+    parser.add_argument("--local-adapter-layers", type=int, default=None)
+    parser.add_argument("--local-gate-init", type=float, default=None)
+    parser.add_argument("--freeze-global-adapter", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument(
         "--prompt-template",
@@ -551,6 +739,12 @@ def parse_args() -> argparse.Namespace:
         help="Normalize candidate NLL by target-token count or not.",
     )
     parser.add_argument("--log-interval", type=int, default=None)
+    parser.add_argument(
+        "--checkpoint-metric",
+        type=str,
+        default=None,
+        choices=("correct_accuracy", "macro_latent_gain"),
+    )
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--wandb-api-key", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -653,6 +847,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         first_nested(config, ["adapter.structured_query_conditioning"]),
         True,
     )
+    set_default(args, "local_soft_prompt_tokens", first_nested(config, ["adapter.local_soft_prompt_tokens"]), 8)
+    set_default(args, "local_adapter_layers", first_nested(config, ["adapter.local_adapter_layers"]), 2)
+    set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 0.1)
+    set_default(args, "freeze_global_adapter", first_nested(config, ["adapter.freeze_global_adapter"]), True)
     set_default(args, "soft_prompt_scale", first_nested(config, ["adapter.soft_prompt_scale"]), 0.05)
     set_default(
         args,
@@ -671,6 +869,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(args, "choice_score", first_nested(config, ["llm_training.choice_score"]), "mean")
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
+    set_default(
+        args,
+        "checkpoint_metric",
+        first_nested(config, ["llm_training.checkpoint_metric"]),
+        "correct_accuracy",
+    )
     set_default(args, "wandb_enabled", first_nested(config, ["wandb.enabled"]), False)
     set_default(args, "wandb_api_key", first_nested(config, ["wandb.api_key"]), None)
     set_default(args, "wandb_project", first_nested(config, ["wandb.project"]), "tensor-compression")
@@ -1169,7 +1373,7 @@ def choice_ce_loss(
     device: torch.device,
     args: argparse.Namespace,
     soft_prompt_mode: str = "correct",
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -1215,6 +1419,7 @@ def choice_ce_loss(
     losses: list[torch.Tensor] = []
     correct_nll_sums: list[torch.Tensor] = []
     correct_target_counts: list[torch.Tensor] = []
+    correct_choice_nlls: list[torch.Tensor] = []
     hard_correct = 0
     start = 0
     for count, target_index in zip(candidate_counts, target_indices):
@@ -1224,6 +1429,7 @@ def choice_ce_loss(
         correct_flat_index = start + int(target_index)
         correct_nll_sums.append(flat_nll_sum[correct_flat_index])
         correct_target_counts.append(flat_target_counts[correct_flat_index])
+        correct_choice_nlls.append(flat_nll[correct_flat_index])
         prediction = int(torch.argmax(scores.detach()).item())
         hard_correct += int(prediction == int(target_index))
         start += count
@@ -1235,7 +1441,7 @@ def choice_ce_loss(
         / torch.stack(correct_target_counts).sum().clamp_min(1)
     )
     accuracy = hard_correct / max(1, len(losses))
-    return loss, correct_answer_ce, {
+    return loss, correct_answer_ce, torch.stack(correct_choice_nlls), {
         "choice_accuracy": float(accuracy),
         "choice_01_loss": float(1.0 - accuracy),
     }
@@ -1260,7 +1466,7 @@ def training_loss(
         "choice_01_loss": 0.0,
     }
     if choice_ce_weight > 0.0:
-        choice_loss_value, ce_loss, choice_metrics = choice_ce_loss(
+        choice_loss_value, ce_loss, positive_nll, choice_metrics = choice_ce_loss(
             llm=llm,
             adapter=adapter,
             tokenizer=tokenizer,
@@ -1285,6 +1491,7 @@ def training_loss(
             prompt_template=str(args.prompt_template),
         )
         choice_loss_value = ce_loss.new_zeros(())
+        positive_nll = None
     if ranking_weight <= 0.0:
         weighted_ce_loss = ce_weight * ce_loss
         weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
@@ -1302,21 +1509,22 @@ def training_loss(
             "ranking_margin_mean": 0.0,
         }
 
-    positive_nll = forward_answer_nll(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        records=records,
-        answers=answers,
-        latent_map=batch["latent_map"],
-        device=device,
-        max_prompt_tokens=int(args.max_prompt_tokens),
-        max_target_tokens=int(args.max_target_tokens),
-        append_eos=bool(args.append_eos),
-        prompt_template=str(args.prompt_template),
-        soft_prompt_mode="correct",
-        reduction=str(args.choice_score),
-    )
+    if positive_nll is None:
+        positive_nll = forward_answer_nll(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            answers=answers,
+            latent_map=batch["latent_map"],
+            device=device,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            max_target_tokens=int(args.max_target_tokens),
+            append_eos=bool(args.append_eos),
+            prompt_template=str(args.prompt_template),
+            soft_prompt_mode="correct",
+            reduction=str(args.choice_score),
+        )
     negative_mode = str(args.ranking_loss_negative)
     if negative_mode == "shuffled":
         negative_latents = baseline_latents("shuffled", batch, dataset)
@@ -1707,6 +1915,36 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
             )
 
 
+def macro_latent_gain(metrics: Mapping[str, Any], baseline: str = "shuffled") -> float:
+    correct = metrics.get("correct")
+    baseline_metrics = metrics.get(baseline)
+    if not isinstance(correct, Mapping) or not isinstance(baseline_metrics, Mapping):
+        return -math.inf
+    correct_by_task = correct.get("by_task")
+    baseline_by_task = baseline_metrics.get("by_task")
+    if not isinstance(correct_by_task, Mapping) or not isinstance(baseline_by_task, Mapping):
+        return -math.inf
+    gains: list[float] = []
+    for task, task_metrics in correct_by_task.items():
+        baseline_task_metrics = baseline_by_task.get(task)
+        if not isinstance(task_metrics, Mapping) or not isinstance(baseline_task_metrics, Mapping):
+            continue
+        correct_accuracy = task_metrics.get("accuracy")
+        baseline_accuracy = baseline_task_metrics.get("accuracy")
+        if isinstance(correct_accuracy, (int, float)) and isinstance(baseline_accuracy, (int, float)):
+            gains.append(float(correct_accuracy) - float(baseline_accuracy))
+    return sum(gains) / len(gains) if gains else -math.inf
+
+
+def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
+    if metric_name == "macro_latent_gain":
+        return macro_latent_gain(metrics)
+    if metric_name == "correct_accuracy":
+        correct = metrics.get("correct")
+        return float(correct.get("accuracy", -math.inf)) if isinstance(correct, Mapping) else -math.inf
+    raise ValueError(f"Unsupported checkpoint metric: {metric_name}")
+
+
 def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
     return {
         "experiment": {"name": str(args.run_name)},
@@ -1739,6 +1977,10 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "question_conditioning": bool(args.question_conditioning),
             "question_condition_gate_init": float(args.question_condition_gate_init),
             "structured_query_conditioning": bool(args.structured_query_conditioning),
+            "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),
+            "local_adapter_layers": int(args.local_adapter_layers),
+            "local_gate_init": float(args.local_gate_init),
+            "freeze_global_adapter": bool(args.freeze_global_adapter),
             "soft_prompt_scale": float(args.soft_prompt_scale),
         },
         "llm_training": {
@@ -1759,6 +2001,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "max_prompt_tokens": int(args.max_prompt_tokens),
             "max_target_tokens": int(args.max_target_tokens),
             "append_eos": bool(args.append_eos),
+            "checkpoint_metric": str(args.checkpoint_metric),
             "eval_baselines": parse_csv(args.eval_baselines),
             "choice_score": str(args.choice_score),
             "log_interval": int(args.log_interval),
@@ -1822,9 +2065,10 @@ def main() -> None:
     latent_channels = int(latent_shape[0])
 
     initialization = "random"
-    if str(args.adapter_architecture) == "alignment_qformer":
+    if str(args.adapter_architecture) in {"alignment_qformer", "hybrid_local_qformer"}:
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_args: Mapping[str, Any] = {}
+        hybrid_state_dict: Mapping[str, Any] | None = None
         init_checkpoint = str(args.adapter_init_checkpoint or "").strip()
         if init_checkpoint.lower() in {"", "none", "null", "random"}:
             init_checkpoint = ""
@@ -1861,6 +2105,15 @@ def main() -> None:
             state_dict = checkpoint.get("adapter_state_dict")
             if not isinstance(state_dict, Mapping):
                 raise ValueError("Alignment checkpoint does not contain adapter_state_dict.")
+            if str(args.adapter_architecture) == "hybrid_local_qformer" and any(
+                str(key).startswith("global_adapter.") for key in state_dict
+            ):
+                hybrid_state_dict = state_dict
+                state_dict = {
+                    str(key).removeprefix("global_adapter."): value
+                    for key, value in state_dict.items()
+                    if str(key).startswith("global_adapter.")
+                }
             adapter.load_state_dict(state_dict, strict=True)
             initialization = "alignment_checkpoint"
             args.adapter_init_checkpoint = init_checkpoint
@@ -1872,6 +2125,43 @@ def main() -> None:
         args.adapter_dim = adapter_dim
         args.question_conditioning = False
         args.structured_query_conditioning = False
+        if str(args.adapter_architecture) == "hybrid_local_qformer":
+            local_soft_prompt_tokens = int(
+                checkpoint_args.get("local_soft_prompt_tokens", args.local_soft_prompt_tokens)
+            )
+            local_adapter_layers = int(checkpoint_args.get("local_adapter_layers", args.local_adapter_layers))
+            local_gate_init = float(checkpoint_args.get("local_gate_init", args.local_gate_init))
+            freeze_global_adapter = bool(
+                checkpoint_args.get("freeze_global_adapter", args.freeze_global_adapter)
+            )
+            global_adapter = adapter
+            local_adapter = QuestionConditionedLocalAdapter(
+                latent_channels=latent_channels,
+                latent_grid=latent_grid,
+                llm_hidden_size=llm_hidden_size,
+                adapter_dim=adapter_dim,
+                local_tokens=local_soft_prompt_tokens,
+                local_layers=local_adapter_layers,
+                adapter_heads=adapter_heads,
+                dropout=float(args.dropout),
+                soft_prompt_scale=float(args.soft_prompt_scale),
+                gate_init=local_gate_init,
+                max_text_tokens=int(args.max_prompt_tokens) + int(args.max_target_tokens),
+            )
+            adapter = HybridGlobalLocalAdapter(
+                global_adapter=global_adapter,
+                local_adapter=local_adapter,
+                freeze_global=freeze_global_adapter,
+            ).to(device)
+            if hybrid_state_dict is not None:
+                adapter.load_state_dict(hybrid_state_dict, strict=True)
+            args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
+            args.local_soft_prompt_tokens = local_soft_prompt_tokens
+            args.local_adapter_layers = local_adapter_layers
+            args.local_gate_init = local_gate_init
+            args.freeze_global_adapter = freeze_global_adapter
+            args.question_conditioning = True
+            args.structured_query_conditioning = True
     else:
         adapter = TensorSoftPromptAdapter(
             latent_channels=latent_channels,
@@ -1928,6 +2218,11 @@ def main() -> None:
         "adapter_architecture": str(args.adapter_architecture),
         "adapter_initialization": initialization,
         "adapter_init_checkpoint": str(args.adapter_init_checkpoint) if args.adapter_init_checkpoint else None,
+        "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),
+        "local_adapter_layers": int(args.local_adapter_layers),
+        "local_gate_init": float(args.local_gate_init),
+        "freeze_global_adapter": bool(args.freeze_global_adapter),
+        "checkpoint_metric": str(args.checkpoint_metric),
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }
@@ -1935,7 +2230,8 @@ def main() -> None:
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     wandb_logger = WandbLogger(config=build_wandb_config(args, summary), run_dir=run_dir)
 
-    best_val_accuracy = -math.inf
+    best_val_score = -math.inf
+    best_epoch = 0
     history: dict[str, Any] = {}
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     global_step = 0
@@ -2121,6 +2417,8 @@ def main() -> None:
                 metrics=epoch_payload,
             )
             val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
+            val_macro_latent_gain = macro_latent_gain(val_metrics)
+            val_score = checkpoint_score(val_metrics, str(args.checkpoint_metric))
             wandb_payload = {
                 "epoch": float(epoch),
                 "train/loss": float(train_loss),
@@ -2134,13 +2432,15 @@ def main() -> None:
                 "train/weighted_ranking_loss": float(train_weighted_ranking_loss),
                 "train/ranking_margin": float(train_ranking_margin),
                 "lr": float(optimizer.param_groups[0]["lr"]),
-                "best_val/correct_accuracy": float(max(best_val_accuracy, val_accuracy)),
+                "val/macro_latent_gain": float(val_macro_latent_gain),
+                "best_val/checkpoint_score": float(max(best_val_score, val_score)),
             }
             wandb_payload.update(flatten_numeric_metrics("val", val_metrics))
             add_accuracy_deltas("val", val_metrics, wandb_payload)
             wandb_logger.log(wandb_payload, step=global_step)
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
+            if val_score > best_val_score:
+                best_val_score = val_score
+                best_epoch = epoch
                 save_adapter_checkpoint(
                     run_dir / "adapter_best.pt",
                     adapter=adapter,
@@ -2150,6 +2450,19 @@ def main() -> None:
                     metrics=epoch_payload,
                 )
 
+        best_checkpoint_path = run_dir / "adapter_best.pt"
+        if not best_checkpoint_path.exists():
+            raise FileNotFoundError("Training completed without producing adapter_best.pt.")
+        best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu")
+        best_state_dict = best_checkpoint.get("adapter_state_dict")
+        if not isinstance(best_state_dict, Mapping):
+            raise ValueError("adapter_best.pt does not contain adapter_state_dict.")
+        adapter.load_state_dict(best_state_dict, strict=True)
+        adapter.to(device)
+        print(
+            f"testing best checkpoint: epoch={best_epoch} "
+            f"{args.checkpoint_metric}={best_val_score:.6f}"
+        )
         test_metrics = evaluate_choice_accuracy(
             llm=llm,
             adapter=adapter,
