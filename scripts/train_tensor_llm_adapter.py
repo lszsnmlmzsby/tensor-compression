@@ -1035,8 +1035,58 @@ def forward_loss(
         device=device,
     )
     labels = torch.cat([soft_labels, text_labels], dim=1)
-    outputs = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
-    return outputs.loss
+    sequence_nll, target_counts = selective_answer_nll(
+        llm=llm,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
+    return sequence_nll.sum() / target_counts.sum().clamp_min(1)
+
+
+def selective_answer_nll(
+    llm,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    decoder = None
+    get_decoder = getattr(llm, "get_decoder", None)
+    if callable(get_decoder):
+        decoder = get_decoder()
+    if decoder is None or decoder is llm:
+        base_model_prefix = str(getattr(llm, "base_model_prefix", ""))
+        decoder = getattr(llm, base_model_prefix, None) if base_model_prefix else None
+    if decoder is None or decoder is llm:
+        raise ValueError("The causal LLM does not expose a decoder for memory-efficient answer scoring.")
+    output_embeddings = llm.get_output_embeddings()
+    if output_embeddings is None:
+        raise ValueError("The causal LLM does not expose output embeddings for answer scoring.")
+
+    decoder_outputs = decoder(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    shift_hidden = decoder_outputs.last_hidden_state[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    target_mask = shift_labels.ne(IGNORE_INDEX)
+    if not bool(target_mask.any()):
+        raise ValueError("Answer scoring received a batch without target tokens.")
+
+    target_hidden = shift_hidden[target_mask]
+    target_labels = shift_labels[target_mask]
+    target_logits = output_embeddings(target_hidden).float()
+    token_nll = F.cross_entropy(target_logits, target_labels, reduction="none")
+    sequence_indices = (
+        torch.arange(labels.shape[0], device=labels.device)
+        .unsqueeze(1)
+        .expand_as(target_mask)[target_mask]
+    )
+    sequence_nll = token_nll.new_zeros(labels.shape[0]).scatter_add(0, sequence_indices, token_nll)
+    target_counts = target_mask.sum(dim=1)
+    return sequence_nll, target_counts
 
 
 def forward_answer_nll(
@@ -1053,7 +1103,8 @@ def forward_answer_nll(
     prompt_template: str,
     soft_prompt_mode: str = "correct",
     reduction: str = "mean",
-) -> torch.Tensor:
+    return_target_counts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
         answers=answers,
@@ -1094,18 +1145,18 @@ def forward_answer_nll(
     )
     labels = torch.cat([soft_labels, text_labels], dim=1)
 
-    logits = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
-    shift_logits = logits[:, :-1, :].float()
-    shift_labels = labels[:, 1:]
-    target_mask = shift_labels.ne(IGNORE_INDEX)
-    safe_labels = shift_labels.masked_fill(~target_mask, 0)
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    nll = -(token_log_probs * target_mask).sum(dim=1)
+    nll, target_counts = selective_answer_nll(
+        llm=llm,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
     if reduction == "mean":
-        nll = nll / target_mask.sum(dim=1).clamp_min(1)
+        nll = nll / target_counts.clamp_min(1)
     elif reduction != "sum":
         raise ValueError(f"Unsupported NLL reduction: {reduction}")
+    if return_target_counts:
+        return nll, target_counts
     return nll
 
 
@@ -1118,7 +1169,7 @@ def choice_ce_loss(
     device: torch.device,
     args: argparse.Namespace,
     soft_prompt_mode: str = "correct",
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -1139,7 +1190,7 @@ def choice_ce_loss(
             candidate_answers.append(choice)
             candidate_latents.append(latent_map[record_index])
 
-    flat_nll = forward_answer_nll(
+    flat_nll_sum, flat_target_counts = forward_answer_nll(
         llm=llm,
         adapter=adapter,
         tokenizer=tokenizer,
@@ -1152,23 +1203,39 @@ def choice_ce_loss(
         append_eos=bool(args.append_eos),
         prompt_template=str(args.prompt_template),
         soft_prompt_mode=soft_prompt_mode,
-        reduction=str(args.choice_score),
+        reduction="sum",
+        return_target_counts=True,
     )
+    if str(args.choice_score) == "mean":
+        flat_nll = flat_nll_sum / flat_target_counts.clamp_min(1)
+    elif str(args.choice_score) == "sum":
+        flat_nll = flat_nll_sum
+    else:
+        raise ValueError(f"Unsupported choice_score: {args.choice_score}")
     losses: list[torch.Tensor] = []
+    correct_nll_sums: list[torch.Tensor] = []
+    correct_target_counts: list[torch.Tensor] = []
     hard_correct = 0
     start = 0
     for count, target_index in zip(candidate_counts, target_indices):
         scores = -flat_nll[start : start + count]
         target = torch.tensor([int(target_index)], dtype=torch.long, device=device)
         losses.append(F.cross_entropy(scores.unsqueeze(0), target))
+        correct_flat_index = start + int(target_index)
+        correct_nll_sums.append(flat_nll_sum[correct_flat_index])
+        correct_target_counts.append(flat_target_counts[correct_flat_index])
         prediction = int(torch.argmax(scores.detach()).item())
         hard_correct += int(prediction == int(target_index))
         start += count
     if not losses:
         raise ValueError("choice_ce_loss received an empty record batch.")
     loss = torch.stack(losses).mean()
+    correct_answer_ce = (
+        torch.stack(correct_nll_sums).sum()
+        / torch.stack(correct_target_counts).sum().clamp_min(1)
+    )
     accuracy = hard_correct / max(1, len(losses))
-    return loss, {
+    return loss, correct_answer_ce, {
         "choice_accuracy": float(accuracy),
         "choice_01_loss": float(1.0 - accuracy),
     }
@@ -1185,29 +1252,15 @@ def training_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     records = batch["records"]
     answers = [str(record["answer"]) for record in records]
-    ce_loss = forward_loss(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        records=records,
-        answers=answers,
-        latent_map=batch["latent_map"],
-        device=device,
-        max_prompt_tokens=int(args.max_prompt_tokens),
-        max_target_tokens=int(args.max_target_tokens),
-        append_eos=bool(args.append_eos),
-        prompt_template=str(args.prompt_template),
-    )
     ce_weight = float(args.ce_loss_weight)
     choice_ce_weight = float(args.choice_ce_loss_weight)
     ranking_weight = float(args.ranking_loss_weight)
-    choice_loss_value = ce_loss.new_zeros(())
     choice_metrics = {
         "choice_accuracy": 0.0,
         "choice_01_loss": 0.0,
     }
     if choice_ce_weight > 0.0:
-        choice_loss_value, choice_metrics = choice_ce_loss(
+        choice_loss_value, ce_loss, choice_metrics = choice_ce_loss(
             llm=llm,
             adapter=adapter,
             tokenizer=tokenizer,
@@ -1217,6 +1270,21 @@ def training_loss(
             args=args,
             soft_prompt_mode="correct",
         )
+    else:
+        ce_loss = forward_loss(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            answers=answers,
+            latent_map=batch["latent_map"],
+            device=device,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            max_target_tokens=int(args.max_target_tokens),
+            append_eos=bool(args.append_eos),
+            prompt_template=str(args.prompt_template),
+        )
+        choice_loss_value = ce_loss.new_zeros(())
     if ranking_weight <= 0.0:
         weighted_ce_loss = ce_weight * ce_loss
         weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
@@ -1354,16 +1422,14 @@ def score_candidate_batch(
     )
     labels = torch.cat([soft_labels, text_labels], dim=1)
 
-    logits = llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
-    shift_logits = logits[:, :-1, :].float()
-    shift_labels = labels[:, 1:]
-    target_mask = shift_labels.ne(IGNORE_INDEX)
-    safe_labels = shift_labels.masked_fill(~target_mask, 0)
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    token_log_probs = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    nll = -(token_log_probs * target_mask).sum(dim=1)
+    nll, target_counts = selective_answer_nll(
+        llm=llm,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
     if choice_score == "mean":
-        nll = nll / target_mask.sum(dim=1).clamp_min(1)
+        nll = nll / target_counts.clamp_min(1)
     return [float(value) for value in nll.detach().cpu()]
 
 
@@ -1566,6 +1632,28 @@ def evaluate_choice_accuracy(
         }
     adapter.train()
     return metrics
+
+
+def print_evaluation_summary(
+    stage: str,
+    metrics: Mapping[str, Any],
+    detail_path: str | Path,
+) -> None:
+    print(f"{stage}: detailed metrics saved to {detail_path}")
+    for mode, raw_mode_metrics in metrics.items():
+        if not isinstance(raw_mode_metrics, Mapping):
+            continue
+        accuracy = float(raw_mode_metrics.get("accuracy", 0.0))
+        correct = int(raw_mode_metrics.get("correct", 0))
+        total = int(raw_mode_metrics.get("total", 0))
+        by_task = raw_mode_metrics.get("by_task")
+        task_parts: list[str] = []
+        if isinstance(by_task, Mapping):
+            for task, raw_task_metrics in sorted(by_task.items()):
+                if isinstance(raw_task_metrics, Mapping):
+                    task_parts.append(f"{task}={float(raw_task_metrics.get('accuracy', 0.0)):.3f}")
+        task_suffix = f" tasks[{', '.join(task_parts)}]" if task_parts else ""
+        print(f"  {mode}: accuracy={accuracy:.4f} ({correct}/{total}){task_suffix}")
 
 
 def save_adapter_checkpoint(
@@ -1871,11 +1959,14 @@ def main() -> None:
                 baseline_modes=baseline_modes,
             )
             history["initial_eval"] = initial_metrics
-            dump_json(run_dir / "metrics_latest.json", history)
+            metrics_path = run_dir / "metrics_latest.json"
+            dump_json(metrics_path, history)
             initial_payload = flatten_numeric_metrics("initial_eval", initial_metrics)
             add_accuracy_deltas("initial_eval", initial_metrics, initial_payload)
             wandb_logger.log(initial_payload, step=0)
-            print(json.dumps({"initial_eval": initial_metrics}, ensure_ascii=False, indent=2))
+            print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         for epoch in range(1, int(args.epochs) + 1):
             adapter.train()
             running_loss = 0.0
@@ -2075,7 +2166,8 @@ def main() -> None:
         if bool(args.wandb_log_model):
             log_adapter_artifact(wandb_logger, run_dir / "adapter_best.pt", f"{args.run_name}-best")
             log_adapter_artifact(wandb_logger, run_dir / "adapter_last.pt", f"{args.run_name}-last")
-        print(json.dumps({"run_dir": str(run_dir), "test": test_metrics}, indent=2, ensure_ascii=False))
+        print(f"run_dir: {run_dir}")
+        print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
     finally:
         wandb_logger.finish()
 
