@@ -33,6 +33,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     apply_config_defaults,
     apply_runtime_environment,
     build_text_tensors,
+    contextual_adapter_soft_embeds,
     load_tokenizer_and_llm,
     qa_path,
     score_candidate_batch,
@@ -168,6 +169,7 @@ def choice_scores_for_mode(
         prompt_template=str(args.prompt_template),
         soft_prompt_mode=mode,
         choice_score=str(args.choice_score),
+        local_context_layer=int(args.local_context_layer),
     )
     min_nll = min(scores)
     weights = [math.exp(-(score - min_nll)) for score in scores]
@@ -221,9 +223,23 @@ def soft_prompt_for_mode(
     text_labels = text_labels.to(device)
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(-100) & text_attention_mask.bool()
+    batched_latent = latent_map.unsqueeze(0).to(device)
+    soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=[record],
+        latent_map=batched_latent,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        mode=mode,
+    )
+    if soft_embeds is not None:
+        return soft_embeds
     return adapter_soft_embeds(
         adapter,
-        latent_map.unsqueeze(0).to(device),
+        batched_latent,
         text_embeds,
         question_embeds=text_embeds,
         question_mask=prompt_mask,

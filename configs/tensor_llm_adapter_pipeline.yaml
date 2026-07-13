@@ -257,11 +257,9 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Keep the trained global Q-Former and add natural-language-conditioned local queries over the same 4x4 latent.
-  # Start from stage-1 tensor/text alignment; the natural-language local branch is trained from scratch.
-  # A previous hybrid checkpoint is also loadable, but its legacy parsed-feature weights are not reused.
+  # Reuse the trained global Q-Former while rebuilding the local branch around contextual Qwen question tokens.
   architecture: hybrid_local_qformer
-  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260713_194829_tensor_patch_qa_natural_language_local_qformer/adapter_best.pt
   soft_prompt_tokens: 16
   adapter_dim: 512
   adapter_layers: 4
@@ -274,10 +272,12 @@ adapter:
   structured_query_conditioning: false
   local_soft_prompt_tokens: 8
   local_adapter_layers: 2
-  # Generic self-attention over frozen Qwen token embeddings before text-to-latent cross-attention.
-  local_text_encoder_layers: 2
-  # A small nonzero gate gives the local branch gradients immediately without overwhelming global tokens.
-  local_gate_init: 0.1
+  # Use frozen Qwen contextual token states; keep every question token until after it attends to the latent grid.
+  local_question_input_mode: contextual_tokens
+  local_context_layer: 2
+  local_text_encoder_layers: 0
+  # The previous 0.1 gate left the local branch much weaker than the global branch.
+  local_gate_init: 0.5
   # Freeze the pretrained global branch for epochs 1-2, then fine-tune it from epoch 3.
   freeze_global_adapter: true
   global_unfreeze_epoch: 3
@@ -286,7 +286,7 @@ adapter:
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_natural_language_local_qformer
+  run_name: tensor_patch_qa_contextual_local_qformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -304,14 +304,14 @@ llm_training:
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # Full 40,960-record set. Actual wall-clock time is written to run_timing.json.
-  epochs: 4
-  batch_size: 12
+  # Full 40,960-record set; 12 epochs targets one overnight run and still saves the best validation checkpoint.
+  epochs: 12
+  batch_size: 16
   eval_batch_size: 2
   eval_choice_batch_size: 16
   gradient_accumulation_steps: 1
   lr: 1.0e-4
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   ce_loss_weight: 0.05
   choice_ce_loss_weight: 1.0

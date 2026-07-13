@@ -31,6 +31,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     apply_config_defaults,
     apply_runtime_environment,
     build_text_tensors,
+    contextual_adapter_soft_embeds,
     load_tokenizer_and_llm,
     qa_path,
     score_candidate_batch,
@@ -206,15 +207,27 @@ def soft_prompt_for_record(
     latent_map = latent_map.unsqueeze(0).to(device)
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
-    soft_embeds = adapter_soft_embeds(
-        adapter,
-        latent_map,
-        text_embeds,
-        question_embeds=text_embeds,
-        question_mask=prompt_mask,
+    soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
         records=[record],
+        latent_map=latent_map,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
         mode=mode,
     )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter,
+            latent_map,
+            text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=[record],
+            mode=mode,
+        )
     return soft_embeds, text_embeds, text_attention_mask, text_labels
 
 
@@ -281,6 +294,7 @@ def nll_by_choice(
         prompt_template=str(args.prompt_template),
         soft_prompt_mode=mode,
         choice_score=str(args.choice_score),
+        local_context_layer=int(args.local_context_layer),
     )
     best_index = min(range(len(scores)), key=lambda index: scores[index])
     return {

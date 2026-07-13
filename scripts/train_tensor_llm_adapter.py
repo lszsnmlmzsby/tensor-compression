@@ -264,6 +264,39 @@ class CrossAttentionBlock(nn.Module):
         return queries + self.ffn(self.ffn_norm(queries))
 
 
+class BidirectionalCrossAttentionBlock(nn.Module):
+    """Update text tokens from latent tokens without collapsing the text sequence first."""
+
+    def __init__(self, dim: int, heads: int, dropout: float) -> None:
+        super().__init__()
+        self.text_norm = nn.LayerNorm(dim)
+        self.latent_norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, text: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+        attended, _weights = self.attention(
+            query=self.text_norm(text),
+            key=self.latent_norm(latents),
+            value=self.latent_norm(latents),
+            need_weights=False,
+        )
+        text = text + attended
+        return text + self.ffn(self.ffn_norm(text))
+
+
 class TensorSoftPromptAdapter(nn.Module):
     """A small Perceiver/Q-Former style adapter from tensor latents to LLM soft prompts."""
 
@@ -430,6 +463,7 @@ class QuestionConditionedLocalAdapter(nn.Module):
         gate_init: float,
         max_text_tokens: int,
         structured_query_conditioning: bool,
+        question_input_mode: str = "input_embeddings",
     ) -> None:
         super().__init__()
         if int(adapter_dim) % int(adapter_heads) != 0:
@@ -438,6 +472,9 @@ class QuestionConditionedLocalAdapter(nn.Module):
         self.latent_grid = tuple(int(dim) for dim in latent_grid)
         self.soft_prompt_scale = float(soft_prompt_scale)
         self.structured_query_conditioning = bool(structured_query_conditioning)
+        self.question_input_mode = str(question_input_mode)
+        if self.question_input_mode not in {"input_embeddings", "contextual_tokens"}:
+            raise ValueError(f"Unsupported local question_input_mode: {question_input_mode}")
         self.latent_projection = nn.Linear(int(latent_channels), int(adapter_dim))
         self.position_projection = nn.Linear(2, int(adapter_dim))
         self.text_projection = nn.Sequential(
@@ -472,9 +509,26 @@ class QuestionConditionedLocalAdapter(nn.Module):
         self.query_tokens = nn.Parameter(torch.empty(1, int(local_tokens), int(adapter_dim)))
         self.text_blocks = nn.ModuleList(
             [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
+            if self.question_input_mode == "input_embeddings"
+            else []
         )
         self.latent_blocks = nn.ModuleList(
             [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
+            if self.question_input_mode == "input_embeddings"
+            else []
+        )
+        self.text_latent_blocks = nn.ModuleList(
+            [
+                BidirectionalCrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout))
+                for _ in range(int(local_layers))
+            ]
+            if self.question_input_mode == "contextual_tokens"
+            else []
+        )
+        self.pool_blocks = nn.ModuleList(
+            [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout))]
+            if self.question_input_mode == "contextual_tokens"
+            else []
         )
         self.output = nn.Sequential(
             nn.LayerNorm(int(adapter_dim)),
@@ -516,7 +570,8 @@ class QuestionConditionedLocalAdapter(nn.Module):
                 f"Question length {int(text_context.shape[1])} exceeds local adapter limit "
                 f"{int(self.text_pos_embed.shape[1])}."
             )
-        text_context = text_context + self.text_pos_embed[:, : text_context.shape[1]]
+        if self.question_input_mode == "input_embeddings":
+            text_context = text_context + self.text_pos_embed[:, : text_context.shape[1]]
         key_padding_mask = None
         if question_mask is not None:
             key_padding_mask = ~question_mask.to(device=text_context.device, dtype=torch.bool)
@@ -529,9 +584,16 @@ class QuestionConditionedLocalAdapter(nn.Module):
                 structured_query.to(device=queries.device, dtype=self.structured_projection[1].weight.dtype)
             )
             queries = queries + query_condition.unsqueeze(1)
-        for text_block, latent_block in zip(self.text_blocks, self.latent_blocks):
-            queries = text_block(queries, text_context, key_padding_mask=key_padding_mask)
-            queries = latent_block(queries, latents)
+        if self.question_input_mode == "contextual_tokens":
+            fused_text = text_context
+            for text_latent_block in self.text_latent_blocks:
+                fused_text = text_latent_block(fused_text, latents)
+            for pool_block in self.pool_blocks:
+                queries = pool_block(queries, fused_text, key_padding_mask=key_padding_mask)
+        else:
+            for text_block, latent_block in zip(self.text_blocks, self.latent_blocks):
+                queries = text_block(queries, text_context, key_padding_mask=key_padding_mask)
+                queries = latent_block(queries, latents)
         local_prompts = self.output(queries)
         if self.soft_prompt_scale > 0.0:
             local_prompts = torch.tanh(local_prompts) * self.soft_prompt_scale
@@ -952,6 +1014,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-soft-prompt-tokens", type=int, default=None)
     parser.add_argument("--local-adapter-layers", type=int, default=None)
     parser.add_argument("--local-text-encoder-layers", type=int, default=None)
+    parser.add_argument(
+        "--local-question-input-mode",
+        type=str,
+        choices=("input_embeddings", "contextual_tokens"),
+        default=None,
+    )
+    parser.add_argument("--local-context-layer", type=int, default=None)
     parser.add_argument("--local-gate-init", type=float, default=None)
     parser.add_argument("--freeze-global-adapter", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--global-unfreeze-epoch", type=int, default=None)
@@ -1117,6 +1186,13 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "local_soft_prompt_tokens", first_nested(config, ["adapter.local_soft_prompt_tokens"]), 8)
     set_default(args, "local_adapter_layers", first_nested(config, ["adapter.local_adapter_layers"]), 2)
     set_default(args, "local_text_encoder_layers", first_nested(config, ["adapter.local_text_encoder_layers"]), 2)
+    set_default(
+        args,
+        "local_question_input_mode",
+        first_nested(config, ["adapter.local_question_input_mode"]),
+        "input_embeddings",
+    )
+    set_default(args, "local_context_layer", first_nested(config, ["adapter.local_context_layer"]), 2)
     set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 0.1)
     set_default(args, "freeze_global_adapter", first_nested(config, ["adapter.freeze_global_adapter"]), True)
     set_default(args, "global_unfreeze_epoch", first_nested(config, ["adapter.global_unfreeze_epoch"]), 0)
@@ -1208,6 +1284,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("adapter.dropout must be in [0, 1).")
     if int(args.local_text_encoder_layers) < 0:
         raise ValueError("adapter.local_text_encoder_layers must be non-negative.")
+    if int(args.local_context_layer) < 0:
+        raise ValueError("adapter.local_context_layer must be non-negative.")
     if int(args.diagnostics_every_epochs) < 0 or int(args.diagnostics_records_per_task) <= 0:
         raise ValueError("Diagnostic cadence must be non-negative and records_per_task must be positive.")
     if bool(args.diagnostics_enabled) and not parse_csv(args.diagnostics_layers):
@@ -1256,11 +1334,73 @@ def validate_diagnostic_layers(llm, raw_layers: str | Sequence[str] | None) -> d
     }
 
 
+def validate_local_context_layer(llm, layer_index: int) -> dict[str, Any]:
+    decoder = _decoder_for_diagnostics(llm)
+    layers = getattr(decoder, "layers", None)
+    if not isinstance(layers, nn.ModuleList):
+        raise ValueError("contextual_tokens requires a causal decoder with an exposed ModuleList named layers.")
+    if not 0 <= int(layer_index) <= len(layers):
+        raise ValueError(
+            f"adapter.local_context_layer={layer_index} is invalid for a decoder with {len(layers)} layers."
+        )
+    return {
+        "validated_before_training": True,
+        "layer": int(layer_index),
+        "decoder_layers": len(layers),
+        "execution": "input_embeddings" if int(layer_index) == 0 else "early_exit_forward_hook",
+    }
+
+
 def gradient_l2_norm(parameters) -> float:
     norms = [parameter.grad.detach().norm(2).float() for parameter in parameters if parameter.grad is not None]
     if not norms:
         return 0.0
     return float(torch.linalg.vector_norm(torch.stack(norms)).cpu().item())
+
+
+def adamw_parameter_groups(
+    module: nn.Module,
+    learning_rate: float,
+    weight_decay: float,
+    name: str,
+    include_frozen: bool = False,
+) -> list[dict[str, Any]]:
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for parameter_name, parameter in module.named_parameters():
+        if not parameter.requires_grad and not bool(include_frozen):
+            continue
+        if parameter.ndim < 2 or parameter_name.endswith("bias"):
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    groups: list[dict[str, Any]] = []
+    if decay:
+        groups.append(
+            {
+                "params": decay,
+                "lr": float(learning_rate),
+                "weight_decay": float(weight_decay),
+                "name": f"{name}_decay",
+            }
+        )
+    if no_decay:
+        groups.append(
+            {
+                "params": no_decay,
+                "lr": float(learning_rate),
+                "weight_decay": 0.0,
+                "name": f"{name}_no_decay",
+            }
+        )
+    return groups
+
+
+def optimizer_group_lr(optimizer: torch.optim.Optimizer, prefix: str, default: float = 0.0) -> float:
+    for group in optimizer.param_groups:
+        if str(group.get("name", "")).startswith(str(prefix)):
+            return float(group["lr"])
+    return float(default)
 
 
 def seed_everything(seed: int) -> None:
@@ -1657,6 +1797,120 @@ def build_text_tensors(
     return input_ids, attention_mask, labels
 
 
+@torch.no_grad()
+def contextual_question_tokens(
+    llm,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    layer_index: int,
+) -> torch.Tensor:
+    decoder = _decoder_for_diagnostics(llm)
+    if int(layer_index) == 0:
+        contextual = llm.get_input_embeddings()(input_ids).detach()
+    else:
+        layers = getattr(decoder, "layers", None)
+        if not isinstance(layers, nn.ModuleList) or int(layer_index) > len(layers):
+            count = len(layers) + 1 if isinstance(layers, nn.ModuleList) else 0
+            raise ValueError(f"local_context_layer={layer_index} is invalid for {count} hidden-state tensors.")
+
+        captured: dict[str, torch.Tensor] = {}
+
+        class _ContextReady(RuntimeError):
+            pass
+
+        def stop_after_layer(_module, _inputs, output) -> None:
+            value = output[0] if isinstance(output, tuple) else output
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("The selected Qwen decoder layer did not return a hidden-state tensor.")
+            captured["hidden"] = value.detach()
+            raise _ContextReady
+
+        handle = layers[int(layer_index) - 1].register_forward_hook(stop_after_layer)
+        try:
+            try:
+                decoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            except _ContextReady:
+                pass
+        finally:
+            handle.remove()
+        if "hidden" not in captured:
+            raise RuntimeError("The shallow Qwen context hook did not capture a hidden state.")
+        contextual = captured["hidden"]
+    return contextual * prompt_mask.to(device=contextual.device, dtype=contextual.dtype).unsqueeze(-1)
+
+
+def build_local_question_tensors(
+    records: Sequence[Mapping[str, Any]],
+    tokenizer,
+    device: torch.device,
+    max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    questions = [
+        re.split(
+            r"\s+(?:options|choices)\s*:",
+            str(record.get("query") or record.get("question") or ""),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        for record in records
+    ]
+    if any(not question for question in questions):
+        raise ValueError("The contextual local adapter received an empty natural-language question.")
+    encoded = tokenizer(questions, padding=True, truncation=False, return_tensors="pt")
+    if int(encoded["input_ids"].shape[1]) > int(max_tokens):
+        raise ValueError(
+            f"A local question uses {int(encoded['input_ids'].shape[1])} tokens, exceeding "
+            f"max_prompt_tokens={max_tokens}."
+        )
+    return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
+
+
+def contextual_adapter_soft_embeds(
+    llm,
+    adapter: nn.Module,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    max_prompt_tokens: int,
+    layer_index: int,
+    mode: str,
+) -> torch.Tensor | None:
+    if not (
+        isinstance(adapter, HybridGlobalLocalAdapter)
+        and adapter.local_adapter.question_input_mode == "contextual_tokens"
+    ):
+        return None
+    question_ids, question_mask = build_local_question_tensors(
+        records=records,
+        tokenizer=tokenizer,
+        device=device,
+        max_tokens=int(max_prompt_tokens),
+    )
+    question_embeds = contextual_question_tokens(
+        llm=llm,
+        input_ids=question_ids,
+        attention_mask=question_mask,
+        prompt_mask=question_mask.bool(),
+        layer_index=int(layer_index),
+    )
+    return adapter_soft_embeds(
+        adapter=adapter,
+        latent_map=latent_map.to(device),
+        text_embeds=question_embeds,
+        question_embeds=question_embeds,
+        question_mask=question_mask.bool(),
+        records=records,
+        mode=mode,
+    )
+
+
 def adapter_soft_embeds(
     adapter: TensorSoftPromptAdapter,
     latent_map: torch.Tensor,
@@ -1704,6 +1958,7 @@ def forward_loss(
     append_eos: bool,
     prompt_template: str,
     soft_prompt_mode: str = "correct",
+    local_context_layer: int = 2,
 ) -> torch.Tensor:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -1721,15 +1976,27 @@ def forward_loss(
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
-    soft_embeds = adapter_soft_embeds(
-        adapter,
-        latent_map,
-        text_embeds,
-        question_embeds=text_embeds,
-        question_mask=prompt_mask,
+    soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
         records=records,
+        latent_map=latent_map,
+        device=device,
+        max_prompt_tokens=max_prompt_tokens,
+        layer_index=int(local_context_layer),
         mode=soft_prompt_mode,
     )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter,
+            latent_map,
+            text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=records,
+            mode=soft_prompt_mode,
+        )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_embeds.shape[1]),
@@ -1813,6 +2080,8 @@ def forward_answer_nll(
     soft_prompt_mode: str = "correct",
     reduction: str = "mean",
     return_target_counts: bool = False,
+    local_context_layer: int = 2,
+    precomputed_soft_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -1830,15 +2099,30 @@ def forward_answer_nll(
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
-    soft_embeds = adapter_soft_embeds(
-        adapter,
-        latent_map,
-        text_embeds,
-        question_embeds=text_embeds,
-        question_mask=prompt_mask,
-        records=records,
-        mode=soft_prompt_mode,
-    )
+    soft_embeds = precomputed_soft_embeds
+    if soft_embeds is None:
+        soft_embeds = contextual_adapter_soft_embeds(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=latent_map,
+            device=device,
+            max_prompt_tokens=max_prompt_tokens,
+            layer_index=int(local_context_layer),
+            mode=soft_prompt_mode,
+        )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter,
+            latent_map,
+            text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=records,
+            mode=soft_prompt_mode,
+        )
+    soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_embeds.shape[1]),
@@ -1884,6 +2168,7 @@ def choice_ce_loss(
     candidate_latents: list[torch.Tensor] = []
     candidate_counts: list[int] = []
     target_indices: list[int] = []
+    candidate_owners: list[int] = []
     for record_index, record in enumerate(records):
         choices = record.get("choices")
         if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
@@ -1898,6 +2183,24 @@ def choice_ce_loss(
             candidate_records.append(record)
             candidate_answers.append(choice)
             candidate_latents.append(latent_map[record_index])
+            candidate_owners.append(record_index)
+
+    base_soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        mode=soft_prompt_mode,
+    )
+    candidate_soft_embeds = (
+        torch.stack([base_soft_embeds[index] for index in candidate_owners], dim=0)
+        if base_soft_embeds is not None
+        else None
+    )
 
     flat_nll_sum, flat_target_counts = forward_answer_nll(
         llm=llm,
@@ -1914,6 +2217,8 @@ def choice_ce_loss(
         soft_prompt_mode=soft_prompt_mode,
         reduction="sum",
         return_target_counts=True,
+        local_context_layer=int(args.local_context_layer),
+        precomputed_soft_embeds=candidate_soft_embeds,
     )
     if str(args.choice_score) == "mean":
         flat_nll = flat_nll_sum / flat_target_counts.clamp_min(1)
@@ -1994,6 +2299,7 @@ def training_loss(
             max_target_tokens=int(args.max_target_tokens),
             append_eos=bool(args.append_eos),
             prompt_template=str(args.prompt_template),
+            local_context_layer=int(args.local_context_layer),
         )
         choice_loss_value = ce_loss.new_zeros(())
         positive_nll = None
@@ -2029,6 +2335,7 @@ def training_loss(
             prompt_template=str(args.prompt_template),
             soft_prompt_mode="correct",
             reduction=str(args.choice_score),
+            local_context_layer=int(args.local_context_layer),
         )
     negative_mode = str(args.ranking_loss_negative)
     if negative_mode == "shuffled":
@@ -2055,6 +2362,7 @@ def training_loss(
         prompt_template=str(args.prompt_template),
         soft_prompt_mode=negative_mode,
         reduction=str(args.choice_score),
+        local_context_layer=int(args.local_context_layer),
     )
     margin = float(args.ranking_loss_margin)
     ranking_terms = F.relu(margin + positive_nll - negative_nll)
@@ -2094,6 +2402,8 @@ def score_candidate_batch(
     prompt_template: str,
     soft_prompt_mode: str,
     choice_score: str,
+    local_context_layer: int = 2,
+    precomputed_soft_embeds: torch.Tensor | None = None,
 ) -> list[float]:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -2111,15 +2421,30 @@ def score_candidate_batch(
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
-    soft_embeds = adapter_soft_embeds(
-        adapter,
-        latent_map,
-        text_embeds,
-        question_embeds=text_embeds,
-        question_mask=prompt_mask,
-        records=records,
-        mode=soft_prompt_mode,
-    )
+    soft_embeds = precomputed_soft_embeds
+    if soft_embeds is None:
+        soft_embeds = contextual_adapter_soft_embeds(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=latent_map,
+            device=device,
+            max_prompt_tokens=max_prompt_tokens,
+            layer_index=int(local_context_layer),
+            mode=soft_prompt_mode,
+        )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter,
+            latent_map,
+            text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=records,
+            mode=soft_prompt_mode,
+        )
+    soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = torch.ones(
         (input_ids.shape[0], soft_embeds.shape[1]),
@@ -2173,6 +2498,21 @@ def collect_candidate_scores(
             candidate_latents.append(latent_map[record_index].detach().cpu())
             candidate_owner.append(record_index)
 
+    base_soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        mode=mode,
+    )
+    candidate_soft_embeds = (
+        [base_soft_embeds[index] for index in candidate_owner] if base_soft_embeds is not None else None
+    )
+
     scores_by_record: list[list[float]] = [[] for _ in records]
     batch_size = max(1, int(args.eval_choice_batch_size))
     for start in range(0, len(candidate_records), batch_size):
@@ -2191,6 +2531,12 @@ def collect_candidate_scores(
             prompt_template=str(args.prompt_template),
             soft_prompt_mode=mode,
             choice_score=str(args.choice_score),
+            local_context_layer=int(args.local_context_layer),
+            precomputed_soft_embeds=(
+                torch.stack(candidate_soft_embeds[start:end], dim=0)
+                if candidate_soft_embeds is not None
+                else None
+            ),
         )
         for owner, score in zip(candidate_owner[start:end], scores):
             scores_by_record[owner].append(score)
@@ -2388,6 +2734,10 @@ def _cosine_and_relative_l2(left: torch.Tensor, right: torch.Tensor) -> dict[str
     }
 
 
+def _rms(value: torch.Tensor) -> float:
+    return float(value.float().square().mean().sqrt().cpu().item())
+
+
 def _diagnostic_records(dataset: TensorReadoutQADataset, records_per_task: int) -> list[int]:
     selected: list[int] = []
     counts: dict[str, int] = defaultdict(int)
@@ -2416,6 +2766,24 @@ def _alternate_question_record(dataset: TensorReadoutQADataset, index: int) -> M
     task = str(source.get("task_type", ""))
     for record in dataset.records:
         if str(record.get("state_ref", "")) == state_ref and str(record.get("task_type", "")) != task:
+            return record
+    return None
+
+
+def _same_task_alternate_question_record(
+    dataset: TensorReadoutQADataset,
+    index: int,
+) -> Mapping[str, Any] | None:
+    source = dataset.records[index]
+    task = str(source.get("task_type", ""))
+    field = str(source.get("field", ""))
+    source_query = str(source.get("query") or source.get("question") or "")
+    for record in dataset.records:
+        if (
+            str(record.get("task_type", "")) == task
+            and str(record.get("field", "")) == field
+            and str(record.get("query") or record.get("question") or "") != source_query
+        ):
             return record
     return None
 
@@ -2475,6 +2843,10 @@ def _adapter_forward_with_trace(
             handles.append(module.register_forward_hook(capture(f"local_after_text_{index}")))
         for index, module in enumerate(adapter.local_adapter.latent_blocks):
             handles.append(module.register_forward_hook(capture(f"local_after_latent_{index}")))
+        for index, module in enumerate(adapter.local_adapter.text_latent_blocks):
+            handles.append(module.register_forward_hook(capture(f"local_text_after_latent_{index}", pool_text=True)))
+        for index, module in enumerate(adapter.local_adapter.pool_blocks):
+            handles.append(module.register_forward_hook(capture(f"local_after_pool_{index}")))
         handles.append(adapter.local_adapter.output.register_forward_hook(capture("local_output_pre_gate")))
         handles.append(
             adapter.global_adapter.latent_projection.register_forward_hook(capture("global_latent_projected"))
@@ -2533,6 +2905,26 @@ def run_embedded_diagnostics(
         text_labels = text_labels.to(device)
         text_embeds = llm.get_input_embeddings()(input_ids)
         prompt_mask = text_labels.eq(IGNORE_INDEX) & text_mask.bool()
+        local_text_embeds = text_embeds
+        local_text_mask = prompt_mask
+        if (
+            isinstance(adapter, HybridGlobalLocalAdapter)
+            and adapter.local_adapter.question_input_mode == "contextual_tokens"
+        ):
+            local_ids, local_mask = build_local_question_tensors(
+                records=records,
+                tokenizer=tokenizer,
+                device=device,
+                max_tokens=int(args.max_prompt_tokens),
+            )
+            local_text_embeds = contextual_question_tokens(
+                llm=llm,
+                input_ids=local_ids,
+                attention_mask=local_mask,
+                prompt_mask=local_mask.bool(),
+                layer_index=int(args.local_context_layer),
+            )
+            local_text_mask = local_mask.bool()
         condition = (
             structured_query_features(records, device)
             if bool(getattr(adapter, "structured_query_conditioning", False))
@@ -2545,8 +2937,8 @@ def run_embedded_diagnostics(
             soft, adapter_hidden = _adapter_forward_with_trace(
                 adapter=adapter,
                 latent=latent,
-                text_embeds=text_embeds,
-                prompt_mask=prompt_mask,
+                text_embeds=local_text_embeds,
+                prompt_mask=local_text_mask,
                 structured_query=condition,
             )
             soft = soft.to(dtype=text_embeds.dtype)
@@ -2615,6 +3007,7 @@ def run_embedded_diagnostics(
                 prompt_template=str(args.prompt_template),
                 soft_prompt_mode=mode,
                 choice_score=str(args.choice_score),
+                local_context_layer=int(args.local_context_layer),
             )
             target_index = choices.index(answer)
             wrong_scores = [value for choice_index, value in enumerate(scores) if choice_index != target_index]
@@ -2641,6 +3034,8 @@ def run_embedded_diagnostics(
                     "local_relative_l2": local_comparison["relative_l2"],
                     "global_cosine": global_comparison["cosine"],
                     "global_relative_l2": global_comparison["relative_l2"],
+                    "local_rms": _rms(correct_state["soft_prompt"][:local_count]),
+                    "global_rms": _rms(correct_state["soft_prompt"][local_count:]),
                 }
             )
         hidden_comparison: dict[str, Any] = {}
@@ -2672,6 +3067,24 @@ def run_embedded_diagnostics(
             alt_labels = alt_labels.to(device)
             alt_text_embeds = llm.get_input_embeddings()(alt_ids)
             alt_prompt_mask = alt_labels.eq(IGNORE_INDEX) & alt_mask.bool()
+            if (
+                isinstance(adapter, HybridGlobalLocalAdapter)
+                and adapter.local_adapter.question_input_mode == "contextual_tokens"
+            ):
+                alt_local_ids, alt_local_mask = build_local_question_tensors(
+                    records=[alternate_record],
+                    tokenizer=tokenizer,
+                    device=device,
+                    max_tokens=int(args.max_prompt_tokens),
+                )
+                alt_text_embeds = contextual_question_tokens(
+                    llm=llm,
+                    input_ids=alt_local_ids,
+                    attention_mask=alt_local_mask,
+                    prompt_mask=alt_local_mask.bool(),
+                    layer_index=int(args.local_context_layer),
+                )
+                alt_prompt_mask = alt_local_mask.bool()
             alt_condition = (
                 structured_query_features([alternate_record], device)
                 if bool(getattr(adapter, "structured_query_conditioning", False))
@@ -2694,6 +3107,41 @@ def run_embedded_diagnostics(
                 question_sensitivity["same_latent_local_prompt"] = _cosine_and_relative_l2(
                     correct_state["soft_prompt"][:local_count], alt_soft[:local_count]
                 )
+        same_task_record = _same_task_alternate_question_record(dataset, index)
+        same_task_sensitivity: dict[str, Any] | None = None
+        if same_task_record is not None and local_count:
+            same_ids, same_mask = build_local_question_tensors(
+                records=[same_task_record],
+                tokenizer=tokenizer,
+                device=device,
+                max_tokens=int(args.max_prompt_tokens),
+            )
+            same_text_embeds = llm.get_input_embeddings()(same_ids)
+            if (
+                isinstance(adapter, HybridGlobalLocalAdapter)
+                and adapter.local_adapter.question_input_mode == "contextual_tokens"
+            ):
+                same_text_embeds = contextual_question_tokens(
+                    llm=llm,
+                    input_ids=same_ids,
+                    attention_mask=same_mask,
+                    prompt_mask=same_mask.bool(),
+                    layer_index=int(args.local_context_layer),
+                )
+            same_soft, _same_trace = _adapter_forward_with_trace(
+                adapter=adapter,
+                latent=correct_latent.to(device),
+                text_embeds=same_text_embeds,
+                prompt_mask=same_mask.bool(),
+                structured_query=None,
+            )
+            same_soft = same_soft[0].detach().float().cpu()
+            same_task_sensitivity = {
+                "alternate_qa_id": str(same_task_record.get("qa_id", "")),
+                "same_latent_local_prompt": _cosine_and_relative_l2(
+                    correct_state["soft_prompt"][:local_count], same_soft[:local_count]
+                ),
+            }
         qa_id = str(record.get("qa_id", f"index_{index}"))
         tensor_payload["records"][qa_id] = {
             "input_ids": input_ids[0].detach().cpu(),
@@ -2715,6 +3163,7 @@ def run_embedded_diagnostics(
                 "soft_prompt_correct_vs_shuffled": soft_comparison,
                 "adapter_hidden_correct_vs_shuffled": adapter_hidden_comparison,
                 "question_sensitivity": question_sensitivity,
+                "same_task_question_sensitivity": same_task_sensitivity,
                 "hidden_correct_vs_shuffled": hidden_comparison,
             }
         )
@@ -2727,6 +3176,15 @@ def run_embedded_diagnostics(
         key=int,
     )
     question_sensitive_records = [item for item in summaries if item["question_sensitivity"] is not None]
+    same_task_sensitive_records = [
+        item for item in summaries if item["same_task_question_sensitivity"] is not None
+    ]
+    local_rms_values = [
+        float(item["soft_prompt_correct_vs_shuffled"].get("local_rms", 0.0)) for item in summaries
+    ]
+    global_rms_values = [
+        float(item["soft_prompt_correct_vs_shuffled"].get("global_rms", 0.0)) for item in summaries
+    ]
     aggregate = {
         "records": len(summaries),
         "soft_prompt_relative_l2_mean": sum(
@@ -2764,6 +3222,17 @@ def run_embedded_diagnostics(
             if "same_latent_local_prompt" in item["question_sensitivity"]
         )
         / max(1, len(question_sensitive_records)),
+        "same_task_different_question_local_relative_l2_mean": sum(
+            item["same_task_question_sensitivity"]["same_latent_local_prompt"]["relative_l2"]
+            for item in same_task_sensitive_records
+        )
+        / max(1, len(same_task_sensitive_records)),
+        "local_prompt_rms_mean": sum(local_rms_values) / max(1, len(local_rms_values)),
+        "global_prompt_rms_mean": sum(global_rms_values) / max(1, len(global_rms_values)),
+        "local_to_global_prompt_rms_ratio": (
+            (sum(local_rms_values) / max(1, len(local_rms_values)))
+            / max(sum(global_rms_values) / max(1, len(global_rms_values)), 1.0e-8)
+        ),
         "question_last_relative_l2_by_layer": {
             layer: sum(
                 item["hidden_correct_vs_shuffled"][layer]["question_last"]["relative_l2"] for item in summaries
@@ -2829,6 +3298,9 @@ def load_compatible_hybrid_state(
         key = str(raw_key)
         if key.startswith("global_adapter."):
             continue
+        if adapter.local_adapter.question_input_mode == "contextual_tokens":
+            skipped.append(key)
+            continue
         if key.startswith("local_adapter.structured_projection."):
             skipped.append(key)
             continue
@@ -2837,8 +3309,9 @@ def load_compatible_hybrid_state(
         else:
             skipped.append(key)
     result = adapter.load_state_dict(compatible, strict=False)
+    contextual_reinit = adapter.local_adapter.question_input_mode == "contextual_tokens"
     return {
-        "mode": "compatible_local_warm_start",
+        "mode": "global_only_contextual_local_reinit" if contextual_reinit else "compatible_local_warm_start",
         "loaded_parameter_tensors": len(compatible),
         "skipped_keys": sorted(skipped),
         "new_or_missing_keys": sorted(key for key in result.missing_keys if key.startswith("local_adapter.")),
@@ -2933,6 +3406,7 @@ def adapter_from_checkpoint(
         gate_init=float(ckpt_args.get("local_gate_init", 0.1)),
         max_text_tokens=int(text_pos.shape[1]),
         structured_query_conditioning=bool(ckpt_args.get("structured_query_conditioning", False)),
+        question_input_mode=str(ckpt_args.get("local_question_input_mode", "input_embeddings")),
     )
     adapter = HybridGlobalLocalAdapter(global_adapter, local_adapter, freeze_global=False)
     adapter.load_state_dict(state_dict, strict=True)
@@ -3032,6 +3506,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),
             "local_adapter_layers": int(args.local_adapter_layers),
             "local_text_encoder_layers": int(args.local_text_encoder_layers),
+            "local_question_input_mode": str(args.local_question_input_mode),
+            "local_context_layer": int(args.local_context_layer),
             "local_gate_init": float(args.local_gate_init),
             "freeze_global_adapter": bool(args.freeze_global_adapter),
             "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
@@ -3168,6 +3644,36 @@ def main() -> None:
         if bool(args.diagnostics_enabled)
         else {"validated_before_training": False, "reason": "diagnostics disabled"}
     )
+    local_context_audit = (
+        validate_local_context_layer(llm, int(args.local_context_layer))
+        if str(args.local_question_input_mode) == "contextual_tokens"
+        else {"validated_before_training": False, "reason": "input_embeddings mode"}
+    )
+    if str(args.local_question_input_mode) == "contextual_tokens":
+        preflight_ids, preflight_mask = build_local_question_tensors(
+            records=[train_dataset.records[0]],
+            tokenizer=tokenizer,
+            device=device,
+            max_tokens=int(args.max_prompt_tokens),
+        )
+        preflight_context = contextual_question_tokens(
+            llm=llm,
+            input_ids=preflight_ids,
+            attention_mask=preflight_mask,
+            prompt_mask=preflight_mask.bool(),
+            layer_index=int(args.local_context_layer),
+        )
+        if not bool(torch.isfinite(preflight_context).all()):
+            raise ValueError("The local contextual Qwen preflight produced non-finite hidden states.")
+        local_context_audit.update(
+            {
+                "forward_preflight_passed": True,
+                "question_tokens": int(preflight_mask.sum().item()),
+                "hidden_shape": [int(value) for value in preflight_context.shape],
+                "hidden_rms": _rms(preflight_context),
+            }
+        )
+        del preflight_context
 
     initialization = "random"
     checkpoint_load_report: dict[str, Any] = {"mode": "random"}
@@ -3256,11 +3762,22 @@ def main() -> None:
             args.question_conditioning = False
             args.structured_query_conditioning = False
         if str(args.adapter_architecture) == "hybrid_local_qformer":
+            new_local_architecture = str(args.local_question_input_mode) == "contextual_tokens"
             local_soft_prompt_tokens = int(
-                checkpoint_args.get("local_soft_prompt_tokens", args.local_soft_prompt_tokens)
+                args.local_soft_prompt_tokens
+                if new_local_architecture
+                else checkpoint_args.get("local_soft_prompt_tokens", args.local_soft_prompt_tokens)
             )
-            local_adapter_layers = int(checkpoint_args.get("local_adapter_layers", args.local_adapter_layers))
-            local_gate_init = float(checkpoint_args.get("local_gate_init", args.local_gate_init))
+            local_adapter_layers = int(
+                args.local_adapter_layers
+                if new_local_architecture
+                else checkpoint_args.get("local_adapter_layers", args.local_adapter_layers)
+            )
+            local_gate_init = float(
+                args.local_gate_init
+                if new_local_architecture
+                else checkpoint_args.get("local_gate_init", args.local_gate_init)
+            )
             freeze_global_adapter = bool(args.freeze_global_adapter)
             global_adapter = adapter
             local_adapter = QuestionConditionedLocalAdapter(
@@ -3277,6 +3794,7 @@ def main() -> None:
                 gate_init=local_gate_init,
                 max_text_tokens=int(args.max_prompt_tokens) + int(args.max_target_tokens),
                 structured_query_conditioning=bool(args.structured_query_conditioning),
+                question_input_mode=str(args.local_question_input_mode),
             )
             adapter = HybridGlobalLocalAdapter(
                 global_adapter=global_adapter,
@@ -3291,6 +3809,7 @@ def main() -> None:
             args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
             args.local_soft_prompt_tokens = local_soft_prompt_tokens
             args.local_adapter_layers = local_adapter_layers
+            args.local_question_input_mode = str(local_adapter.question_input_mode)
             args.local_gate_init = local_gate_init
             args.freeze_global_adapter = freeze_global_adapter
             args.question_conditioning = True
@@ -3319,22 +3838,30 @@ def main() -> None:
         collate_fn=collate_tensor_readout,
     )
     if isinstance(adapter, HybridGlobalLocalAdapter):
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": list(adapter.local_adapter.parameters()), "lr": float(args.lr), "name": "local"},
-                {
-                    "params": list(adapter.global_adapter.parameters()),
-                    "lr": float(args.global_lr),
-                    "name": "global",
-                },
-            ],
+        local_groups = adamw_parameter_groups(
+            adapter.local_adapter,
+            learning_rate=float(args.lr),
             weight_decay=float(args.weight_decay),
+            name="local",
+        )
+        global_groups = adamw_parameter_groups(
+            adapter.global_adapter,
+            learning_rate=float(args.global_lr),
+            weight_decay=float(args.weight_decay),
+            name="global",
+            include_frozen=True,
+        )
+        optimizer = torch.optim.AdamW(
+            local_groups + global_groups,
         )
     else:
         optimizer = torch.optim.AdamW(
-            adapter.parameters(),
-            lr=float(args.lr),
-            weight_decay=float(args.weight_decay),
+            adamw_parameter_groups(
+                adapter,
+                learning_rate=float(args.lr),
+                weight_decay=float(args.weight_decay),
+                name="adapter",
+            ),
         )
     baseline_modes = parse_csv(args.eval_baselines)
     if not baseline_modes:
@@ -3370,9 +3897,10 @@ def main() -> None:
             else (
                 "legacy_parsed_features"
                 if bool(args.structured_query_conditioning)
-                else "natural_language_token_embeddings"
+                else str(args.local_question_input_mode)
             )
         ),
+        "local_context_layer": int(args.local_context_layer),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "adapter_architecture": str(args.adapter_architecture),
         "adapter_initialization": initialization,
@@ -3394,6 +3922,7 @@ def main() -> None:
         "data_audit": data_audit,
         "prompt_audit": prompt_audit,
         "diagnostic_layer_audit": diagnostic_layer_audit,
+        "local_context_audit": local_context_audit,
         "adapter_parameters_total": sum(p.numel() for p in adapter.parameters()),
         "trainable_adapter_parameters": sum(p.numel() for p in adapter.parameters() if p.requires_grad),
         "local_adapter_parameters": (
@@ -3604,11 +4133,9 @@ def main() -> None:
                             "train_step/current_ranking_margin": float(loss_parts["ranking_margin_mean"]),
                             "train_step/epoch": float(epoch),
                             "train_step/epoch_step": float(step),
-                            "train_step/lr": float(optimizer.param_groups[0]["lr"]),
-                            "train_step/local_lr": float(optimizer.param_groups[0]["lr"]),
-                            "train_step/global_lr": float(
-                                optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0
-                            ),
+                            "train_step/lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
+                            "train_step/local_lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
+                            "train_step/global_lr": optimizer_group_lr(optimizer, "global", 0.0),
                             "train_step/global_trainable": float(
                                 isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                             ),
@@ -3688,9 +4215,9 @@ def main() -> None:
                     if isinstance(adapter, HybridGlobalLocalAdapter)
                     else 0.0
                 ),
-                "lr": float(optimizer.param_groups[0]["lr"]),
-                "local_lr": float(optimizer.param_groups[0]["lr"]),
-                "global_lr": float(optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else 0.0),
+                "lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
+                "local_lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
+                "global_lr": optimizer_group_lr(optimizer, "global", 0.0),
                 "global_trainable": float(
                     isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                 ),
