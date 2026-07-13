@@ -1096,6 +1096,17 @@ def parse_args() -> argparse.Namespace:
 
 def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     config = load_yaml_mapping(args.config)
+    configured_loss_fields = {
+        "ce_loss_weight": first_nested(config, ["llm_training.ce_loss_weight"]),
+        "choice_ce_loss_weight": first_nested(config, ["llm_training.choice_ce_loss_weight"]),
+        "ranking_loss_weight": first_nested(config, ["llm_training.ranking_loss_weight"]),
+        "ranking_loss_margin": first_nested(config, ["llm_training.ranking_loss_margin"]),
+    }
+    defaulted_loss_fields = [
+        field
+        for field, configured_value in configured_loss_fields.items()
+        if args.config and getattr(args, field, None) is None and configured_value is None
+    ]
 
     model_local_dir = first_nested(config, ["model.local_dir"])
     model_name = first_nested(config, ["model.name_or_path", "model.model_name_or_path"])
@@ -1158,10 +1169,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "lr", first_nested(config, ["llm_training.lr"]), 1.0e-4)
     set_default(args, "weight_decay", first_nested(config, ["llm_training.weight_decay"]), 1.0e-2)
     set_default(args, "grad_clip_norm", first_nested(config, ["llm_training.grad_clip_norm"]), 1.0)
-    set_default(args, "ce_loss_weight", first_nested(config, ["llm_training.ce_loss_weight"]), 0.5)
-    set_default(args, "choice_ce_loss_weight", first_nested(config, ["llm_training.choice_ce_loss_weight"]), 0.0)
-    set_default(args, "ranking_loss_weight", first_nested(config, ["llm_training.ranking_loss_weight"]), 0.2)
-    set_default(args, "ranking_loss_margin", first_nested(config, ["llm_training.ranking_loss_margin"]), 0.1)
+    set_default(args, "ce_loss_weight", configured_loss_fields["ce_loss_weight"], 0.05)
+    set_default(args, "choice_ce_loss_weight", configured_loss_fields["choice_ce_loss_weight"], 1.0)
+    set_default(args, "ranking_loss_weight", configured_loss_fields["ranking_loss_weight"], 0.1)
+    set_default(args, "ranking_loss_margin", configured_loss_fields["ranking_loss_margin"], 0.1)
     set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
     set_default(args, "adapter_architecture", first_nested(config, ["adapter.architecture"]), "legacy")
     set_default(args, "soft_prompt_tokens", first_nested(config, ["adapter.soft_prompt_tokens"]), 32)
@@ -1299,6 +1310,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"llm_training.{setting} must include correct.")
     if str(args.checkpoint_metric) == "macro_latent_gain" and "shuffled" not in parse_csv(args.eval_baselines):
         raise ValueError("checkpoint_metric=macro_latent_gain requires shuffled in llm_training.eval_baselines.")
+    if defaulted_loss_fields:
+        print(
+            "warning: config omits "
+            f"{','.join(f'llm_training.{field}' for field in defaulted_loss_fields)}; "
+            "using built-in training defaults."
+        )
     return args
 
 
@@ -3312,7 +3329,7 @@ def load_compatible_hybrid_state(
     contextual_reinit = adapter.local_adapter.question_input_mode == "contextual_tokens"
     return {
         "mode": "global_only_contextual_local_reinit" if contextual_reinit else "compatible_local_warm_start",
-        "loaded_parameter_tensors": len(compatible),
+        "local_loaded_parameter_tensors": len(compatible),
         "skipped_keys": sorted(skipped),
         "new_or_missing_keys": sorted(key for key in result.missing_keys if key.startswith("local_adapter.")),
         "unexpected_keys": sorted(result.unexpected_keys),
@@ -3677,6 +3694,7 @@ def main() -> None:
 
     initialization = "random"
     checkpoint_load_report: dict[str, Any] = {"mode": "random"}
+    global_checkpoint_load_report: dict[str, Any] | None = None
     if str(args.adapter_architecture) in {"alignment_qformer", "hybrid_local_qformer"}:
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_args: Mapping[str, Any] = {}
@@ -3748,6 +3766,25 @@ def main() -> None:
                     if str(key).startswith("global_adapter.")
                 }
             adapter.load_state_dict(state_dict, strict=True)
+            global_loaded_parameter_tensors = sum(
+                1 for value in state_dict.values() if isinstance(value, torch.Tensor)
+            )
+            global_loaded_parameters = sum(
+                int(value.numel()) for value in state_dict.values() if isinstance(value, torch.Tensor)
+            )
+            if global_loaded_parameter_tensors <= 0:
+                raise ValueError("The adapter checkpoint did not provide any global adapter tensors.")
+            global_checkpoint_load_report = {
+                "global_loaded_parameter_tensors": global_loaded_parameter_tensors,
+                "global_loaded_parameters": global_loaded_parameters,
+                "global_strict_load": True,
+            }
+            checkpoint_load_report = {
+                "mode": "strict_global_checkpoint",
+                "loaded_parameter_tensors": global_loaded_parameter_tensors,
+                "local_loaded_parameter_tensors": 0,
+                **global_checkpoint_load_report,
+            }
             initialization = "alignment_checkpoint"
             args.adapter_init_checkpoint = init_checkpoint
         else:
@@ -3802,10 +3839,23 @@ def main() -> None:
                 freeze_global=freeze_global_adapter,
             ).to(device)
             if hybrid_state_dict is not None:
-                checkpoint_load_report = load_compatible_hybrid_state(adapter, hybrid_state_dict)
+                local_load_report = load_compatible_hybrid_state(adapter, hybrid_state_dict)
+                if global_checkpoint_load_report is None:
+                    raise RuntimeError("Hybrid warm start did not record a strict global checkpoint load.")
+                local_loaded_parameter_tensors = int(
+                    local_load_report.get("local_loaded_parameter_tensors", 0)
+                )
+                checkpoint_load_report = {
+                    **local_load_report,
+                    **global_checkpoint_load_report,
+                    "loaded_parameter_tensors": (
+                        int(global_checkpoint_load_report["global_loaded_parameter_tensors"])
+                        + local_loaded_parameter_tensors
+                    ),
+                }
                 initialization = "hybrid_compatible_warm_start"
             elif checkpoint is not None:
-                checkpoint_load_report = {"mode": "strict_global_alignment_checkpoint"}
+                checkpoint_load_report["mode"] = "strict_global_alignment_checkpoint"
             args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
             args.local_soft_prompt_tokens = local_soft_prompt_tokens
             args.local_adapter_layers = local_adapter_layers
@@ -3944,7 +3994,12 @@ def main() -> None:
         f"run={run_dir.name} started_at={lifecycle.started_at} device={device} train/val/test="
         f"{len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} "
         f"question_input={summary['question_input_mode']} params={summary['trainable_adapter_parameters']:,} "
-        f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())}"
+        f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
+        f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
+        f"ranking:{float(args.ranking_loss_weight):g} "
+        f"checkpoint_load={checkpoint_load_report.get('mode')} "
+        f"global/local_tensors={int(checkpoint_load_report.get('global_loaded_parameter_tensors', 0))}/"
+        f"{int(checkpoint_load_report.get('local_loaded_parameter_tensors', 0))}"
     )
     wandb_logger = WandbLogger(config=build_wandb_config(args, summary), run_dir=run_dir)
 

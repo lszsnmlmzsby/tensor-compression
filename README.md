@@ -1305,6 +1305,8 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
+长时间训练前先检查启动摘要中包含 `loss_weights=ce:0.05,choice:1,ranking:0.1`。使用 hybrid checkpoint 时还应看到 `checkpoint_load=global_only_contextual_local_reinit`，且 `global/local_tensors` 左侧的 global 张量数大于 0；contextual local 分支按设计重新初始化，因此右侧可以为 0。若配置文件缺少任一 loss 字段，脚本会打印一行 warning 并采用上述内置默认值，同时把最终生效值写入 `args.json`。
+
 `adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段的 `alignment_projector_state_dict` 不进入下游；冻结 LLM，仅更新 Q-Former adapter。
 
 局部读取增强模式不需要重跑第一阶段、重建 QA/latent 或使用 AE decoder。当前正式配置从最近一次下游 `adapter_best.pt` 严格继承已经有效的 16-token global Q-Former，并重新初始化 local branch。local branch 只读取 `query` 中的自然语言问题，不读取 task id、正则表达式坐标、oracle 或答案选项；它使用 frozen Qwen 第 2 层的逐 token contextual hidden state，让每个问题 token 先 cross-attend `[128,4,4]` latent，最后再由 8 个 learned queries 汇聚成 local soft prompts：
