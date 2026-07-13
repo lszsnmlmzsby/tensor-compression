@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -106,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     set_default(args, "device", first_nested(config, ["patch_qa.device", "runtime.device"]), "auto")
     set_default(args, "storage_dtype", first_nested(config, ["patch_qa.storage_dtype"]), "float16")
     set_default(args, "seed", first_nested(config, ["patch_qa.seed", "runtime.seed"]), 42)
-    set_default(args, "include_oracle", first_nested(config, ["patch_qa.include_oracle"]), True)
+    set_default(args, "include_oracle", first_nested(config, ["patch_qa.include_oracle"]), False)
     set_default(args, "overwrite", first_nested(config, ["patch_qa.overwrite"]), False)
     for name in ("alignment_checkpoint", "hdf5_path", "qa_dir", "latent_dir", "fields"):
         if not getattr(args, name):
@@ -128,6 +129,45 @@ def write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def validate_reusable_latent_metadata(
+    metadata_path: Path,
+    latent_root: Path,
+    alignment_checkpoint: str | Path,
+    hdf5_path: str | Path,
+    fields: Sequence[str],
+    patch_size: int,
+    overwrite: bool,
+) -> None:
+    if bool(overwrite) or next(latent_root.glob("*.pt"), None) is None:
+        return
+    if not metadata_path.exists():
+        raise ValueError(
+            f"Existing latent files in {latent_root} cannot be verified because {metadata_path} is missing. "
+            "Use a new latent_dir or rerun with --overwrite."
+        )
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"Expected a JSON object in {metadata_path}.")
+    expected = {
+        "alignment_checkpoint": str(Path(alignment_checkpoint).expanduser().resolve()),
+        "hdf5_path": str(Path(hdf5_path).expanduser().resolve()),
+        "fields": [str(field) for field in fields],
+        "patch_size": int(patch_size),
+    }
+    observed = {
+        "alignment_checkpoint": str(Path(str(metadata.get("alignment_checkpoint", ""))).expanduser().resolve()),
+        "hdf5_path": str(Path(str(metadata.get("hdf5_path", ""))).expanduser().resolve()),
+        "fields": [str(field) for field in metadata.get("fields", [])],
+        "patch_size": int(metadata.get("patch_size", -1)),
+    }
+    if observed != expected:
+        raise ValueError(
+            "Existing patch latent metadata does not match the requested AE/data settings. "
+            f"observed={observed}, expected={expected}. Use a new latent_dir or rerun with --overwrite."
+        )
+
+
 def patch_id(record: Mapping[str, Any]) -> str:
     field = str(record["fields"][0])
     return (
@@ -136,19 +176,32 @@ def patch_id(record: Mapping[str, Any]) -> str:
     )
 
 
+def question_seed(base_seed: int, record: Mapping[str, Any]) -> int:
+    payload = f"{int(base_seed)}|{patch_id(record)}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=False)
+
+
 def labeled_numeric_choices(
     value: float,
     spacing: float,
     decimals: int,
     rng: random.Random,
-) -> tuple[str, list[str], str, list[float]]:
+) -> tuple[str, list[str], str, list[float], int]:
     spacing = max(abs(float(spacing)), 1.0e-8)
     correct_index = rng.randrange(4)
     offsets = [index - correct_index for index in range(4)]
     values = [float(value) + float(offset) * spacing for offset in offsets]
-    formatted = [f"{item:.{int(decimals)}g}" for item in values]
+    if len(set(values)) != len(values):
+        raise ValueError(f"Numeric choice spacing produced duplicate floating-point values around {value}.")
+    used_decimals = max(1, int(decimals))
+    formatted = [f"{item:.{used_decimals}g}" for item in values]
+    while len(set(formatted)) != len(formatted) and used_decimals < 17:
+        used_decimals += 1
+        formatted = [f"{item:.{used_decimals}g}" for item in values]
+    if len(set(formatted)) != len(formatted):
+        raise ValueError(f"Numeric options remain ambiguous after 17 significant digits around {value}.")
     option_text = "; ".join(f"{label}: {text}" for label, text in zip(LABELS_4, formatted))
-    return option_text, list(LABELS_4), LABELS_4[correct_index], values
+    return option_text, list(LABELS_4), LABELS_4[correct_index], values, used_decimals
 
 
 def quadrant(row: int, col: int, size: int) -> str:
@@ -223,9 +276,11 @@ def build_questions(
 
     if "normalized_point_value" in tasks:
         z_value = float(normalized_patch[0, row_a, col_a].item())
-        option_text, choices, answer, numeric_choices = labeled_numeric_choices(z_value, spacing, decimals, rng)
+        option_text, choices, answer, numeric_choices, _used_decimals = labeled_numeric_choices(
+            z_value, spacing, decimals, rng
+        )
         question = (
-            f"A standardized 16 by 16 patch of {field} is encoded in the tensor soft tokens. "
+            f"A standardized {size} by {size} patch of {field} is encoded in the tensor soft tokens. "
             f"Which option is closest to the standardized value at row {row_a}, column {col_a}? "
             f"Options: {option_text}."
         )
@@ -235,10 +290,12 @@ def build_questions(
     if "raw_point_value_with_stats" in tasks:
         raw_value = float(raw_patch[0, row_a, col_a].item())
         raw_spacing = max(abs(std) * spacing, 1.0e-8)
-        option_text, choices, answer, numeric_choices = labeled_numeric_choices(raw_value, raw_spacing, decimals, rng)
+        option_text, choices, answer, numeric_choices, used_decimals = labeled_numeric_choices(
+            raw_value, raw_spacing, decimals, rng
+        )
         question = (
-            f"A 16 by 16 patch of {field} was standardized using z = (x - mean) / standard deviation. "
-            f"Its mean is {mean:.{decimals}g} and its standard deviation is {std:.{decimals}g}. "
+            f"A {size} by {size} patch of {field} was standardized using z = (x - mean) / standard deviation. "
+            f"Its mean is {mean:.{used_decimals}g} and its standard deviation is {std:.{used_decimals}g}. "
             f"The standardized patch is encoded in the tensor soft tokens. Which option is closest to the "
             f"original value x at row {row_a}, column {col_a}? Options: {option_text}."
         )
@@ -267,7 +324,9 @@ def build_questions(
             "row": row_a,
             "col": col_a,
             "option_text": option_text,
-            "significant_digits": int(decimals),
+            "significant_digits": int(used_decimals),
+            "option_significant_digits": int(used_decimals),
+            "patch_size": size,
         }
         result.append(raw_record)
 
@@ -283,7 +342,7 @@ def build_questions(
             value_b = float(normalized_patch[0, row_b, col_b].item())
         answer = "A" if value_a >= value_b else "B"
         question = (
-            f"In the standardized 16 by 16 {field} patch, which location has the larger value: "
+            f"In the standardized {size} by {size} {field} patch, which location has the larger value: "
             f"A at row {row_a}, column {col_a}, or B at row {row_b}, column {col_b}?"
         )
         oracle = {"point_a": [row_a, col_a], "point_b": [row_b, col_b], "value_a": value_a, "value_b": value_b}
@@ -304,7 +363,7 @@ def build_questions(
             mean_b = float(normalized_patch[0, row0_b : row0_b + region, col0_b : col0_b + region].mean().item())
         answer = "A" if mean_a >= mean_b else "B"
         question = (
-            f"In the standardized 16 by 16 {field} patch, compare the mean values of two {region} by {region} regions. "
+            f"In the standardized {size} by {size} {field} patch, compare the mean values of two {region} by {region} regions. "
             f"Region A starts at row {row0_a}, column {col0_a}; region B starts at row {row0_b}, column {col0_b}. "
             "Which region has the larger mean?"
         )
@@ -319,7 +378,7 @@ def build_questions(
         answer = quadrant(row, col, size)
         extreme = "maximum" if find_maximum else "minimum"
         question = (
-            f"In the standardized 16 by 16 {field} patch, which quadrant contains the {extreme} value? "
+            f"In the standardized {size} by {size} {field} patch, which quadrant contains the {extreme} value? "
             "The quadrants are top-left, top-right, bottom-left, and bottom-right."
         )
         choices = list(LABELS_4)
@@ -394,6 +453,16 @@ def main() -> None:
     latent_root = Path(args.latent_dir).expanduser()
     qa_dir.mkdir(parents=True, exist_ok=True)
     latent_root.mkdir(parents=True, exist_ok=True)
+    metadata_path = qa_dir / "metadata.json"
+    validate_reusable_latent_metadata(
+        metadata_path=metadata_path,
+        latent_root=latent_root,
+        alignment_checkpoint=args.alignment_checkpoint,
+        hdf5_path=args.hdf5_path,
+        fields=fields,
+        patch_size=int(args.patch_size),
+        overwrite=bool(args.overwrite),
+    )
     storage_dtype = torch.float16 if args.storage_dtype == "float16" else torch.float32
     summary: dict[str, Any] = {"splits": {}, "tasks": list(args.tasks)}
 
@@ -411,7 +480,6 @@ def main() -> None:
         qa_records: list[dict[str, Any]] = []
         task_counts: Counter[str] = Counter()
         field_counts: Counter[str] = Counter()
-        patch_index = 0
         for batch in tqdm(loader, desc=f"build patch QA {split}"):
             raw_batch = batch["patch"].float()
             normalized_items: list[torch.Tensor] = []
@@ -424,23 +492,35 @@ def main() -> None:
                 std = float(scale.reshape(-1)[0].item()) if isinstance(scale, torch.Tensor) else 1.0
                 normalized_items.append(normalized)
                 stats.append((mean, std))
-            normalized_batch = torch.stack(normalized_items).to(device)
-            with torch.no_grad():
-                latent_batch = compressor.encode(normalized_batch)["latent_map"].detach().cpu()
+            refs = [patch_id(record) for record in batch["records"]]
+            latent_paths = [latent_root / f"{ref}.pt" for ref in refs]
+            encode_indices = [
+                index
+                for index, latent_path in enumerate(latent_paths)
+                if bool(args.overwrite) or not latent_path.exists()
+            ]
+            encoded_latents: dict[int, torch.Tensor] = {}
+            if encode_indices:
+                normalized_batch = torch.stack([normalized_items[index] for index in encode_indices]).to(device)
+                with torch.no_grad():
+                    missing_latents = compressor.encode(normalized_batch)["latent_map"].detach().cpu()
+                encoded_latents = {
+                    item_index: missing_latents[batch_index]
+                    for batch_index, item_index in enumerate(encode_indices)
+                }
             for local_index, record in enumerate(batch["records"]):
-                ref = patch_id(record)
-                latent_path = latent_root / f"{ref}.pt"
-                if latent_path.exists() and not bool(args.overwrite):
-                    pass
-                else:
+                ref = refs[local_index]
+                latent_path = latent_paths[local_index]
+                if local_index in encoded_latents:
                     torch.save(
                         {
-                            "latent_map": latent_batch[local_index].to(dtype=storage_dtype),
+                            "latent_map": encoded_latents[local_index].to(dtype=storage_dtype),
                             "patch_id": ref,
                             "field": str(record["fields"][0]),
                             "sample_index": int(record["sample_index"]),
                             "time_index": int(record["time_index"]),
                             "top_left": [int(record["row"]), int(record["col"])],
+                            "alignment_checkpoint": str(Path(args.alignment_checkpoint).expanduser().resolve()),
                             "normalization": {"mode": "zscore", "mean": stats[local_index][0], "std": stats[local_index][1]},
                         },
                         latent_path,
@@ -456,12 +536,11 @@ def main() -> None:
                     spacing=float(args.numeric_choice_spacing),
                     decimals=int(args.decimal_places),
                     include_oracle=bool(args.include_oracle),
-                    seed=int(args.seed) * 1_000_003 + patch_index,
+                    seed=question_seed(int(args.seed), record),
                 )
                 qa_records.extend(questions)
                 task_counts.update(question["task_type"] for question in questions)
                 field_counts.update([str(record["fields"][0])])
-                patch_index += 1
         write_jsonl(qa_dir / f"{split}.jsonl", qa_records)
         summary["splits"][split] = {
             "patches": len(records),
@@ -480,6 +559,8 @@ def main() -> None:
         "patch_size": int(args.patch_size),
         "normalization": normalization_cfg,
         "split_mode": str(args.split_mode),
+        "question_seed_mode": "sha256(seed|patch_id)",
+        "include_oracle": bool(args.include_oracle),
         "split_overlap": overlap,
         "summary": summary,
     }

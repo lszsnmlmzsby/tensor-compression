@@ -26,6 +26,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     IGNORE_INDEX,
     TensorReadoutQADataset,
     TensorSoftPromptAdapter,
+    adapter_from_checkpoint,
     adapter_soft_embeds,
     apply_config_defaults,
     apply_runtime_environment,
@@ -156,26 +157,12 @@ def l2_distance(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.linalg.vector_norm(a.detach().float() - b.detach().float()).item())
 
 
-def make_adapter_from_checkpoint(checkpoint: Mapping[str, Any], latent_channels: int, llm_hidden_size: int) -> TensorSoftPromptAdapter:
-    ckpt_args = checkpoint.get("args")
-    if not isinstance(ckpt_args, Mapping):
-        raise ValueError("Adapter checkpoint does not contain an args mapping.")
-    adapter = TensorSoftPromptAdapter(
-        latent_channels=latent_channels,
-        llm_hidden_size=llm_hidden_size,
-        soft_prompt_tokens=int(ckpt_args.get("soft_prompt_tokens", 32)),
-        adapter_dim=int(ckpt_args.get("adapter_dim", 512)),
-        adapter_layers=int(ckpt_args.get("adapter_layers", 2)),
-        adapter_heads=int(ckpt_args.get("adapter_heads", 8)),
-        dropout=float(ckpt_args.get("dropout", 0.1)),
-        latent_pos_encoding=str(ckpt_args.get("latent_pos_encoding", "grid")),
-        question_conditioning=bool(ckpt_args.get("question_conditioning", True)),
-        question_condition_gate_init=float(ckpt_args.get("question_condition_gate_init", 1.0)),
-        structured_query_conditioning=bool(ckpt_args.get("structured_query_conditioning", False)),
-        soft_prompt_scale=float(ckpt_args.get("soft_prompt_scale", 0.0)),
-    )
-    adapter.load_state_dict(checkpoint["adapter_state_dict"])
-    return adapter
+def make_adapter_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    latent_shape: Sequence[int],
+    llm_hidden_size: int,
+):
+    return adapter_from_checkpoint(checkpoint, latent_shape=latent_shape, llm_hidden_size=llm_hidden_size)
 
 
 def state_fields(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -334,7 +321,7 @@ def main() -> None:
     first_latent = dataset[0]["latent_map"]
     adapter = make_adapter_from_checkpoint(
         checkpoint=checkpoint,
-        latent_channels=int(first_latent.shape[0]),
+        latent_shape=tuple(int(value) for value in first_latent.shape),
         llm_hidden_size=int(llm.get_input_embeddings().embedding_dim),
     ).to(device)
     adapter.eval()

@@ -66,8 +66,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--diagnose",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run diagnose_tensor_llm_adapter.py on adapter_best.pt after a successful overfit run.",
+        default=False,
+        help="Run the legacy full diagnostic after training; compact diagnostics are already embedded per epoch.",
     )
     parser.add_argument(
         "--diagnose-records",
@@ -188,6 +188,7 @@ def build_command(args: argparse.Namespace, passthrough: list[str]) -> list[str]
         str(args.epochs),
         "--eval-baselines",
         str(args.eval_baselines),
+        "--no-require-disjoint-splits",
     ]
     command.extend(passthrough)
     return command

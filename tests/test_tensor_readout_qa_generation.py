@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from build_tensor_readout_qa import (  # noqa: E402
     generate_split_records,
     split_sample_indices,
 )
+from build_tensor_patch_qa import labeled_numeric_choices, question_seed  # noqa: E402
 
 
 def _write_synthetic_pdebench_file(path: Path) -> None:
@@ -37,6 +39,33 @@ def _write_synthetic_pdebench_file(path: Path) -> None:
 
 
 class TestTensorReadoutQAGeneration(unittest.TestCase):
+    def test_patch_question_seed_depends_on_record_identity(self) -> None:
+        first = {
+            "fields": ["Vx"],
+            "sample_index": 1,
+            "time_index": 2,
+            "row": 3,
+            "col": 4,
+        }
+        second = dict(first, sample_index=2)
+
+        self.assertEqual(question_seed(42, first), question_seed(42, first))
+        self.assertNotEqual(question_seed(42, first), question_seed(42, second))
+
+    def test_numeric_choices_increase_display_precision_until_distinct(self) -> None:
+        option_text, choices, answer, values, used_digits = labeled_numeric_choices(
+            value=100_000_000.0,
+            spacing=0.5,
+            decimals=6,
+            rng=random.Random(7),
+        )
+
+        displayed = [part.split(": ", 1)[1] for part in option_text.split("; ")]
+        self.assertEqual(len(set(displayed)), 4)
+        self.assertEqual(len(set(values)), 4)
+        self.assertIn(answer, choices)
+        self.assertGreater(used_digits, 6)
+
     def test_splits_samples_without_overlap(self) -> None:
         splits = split_sample_indices(
             sample_indices=list(range(10)),

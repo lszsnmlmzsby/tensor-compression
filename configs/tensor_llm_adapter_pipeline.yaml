@@ -27,7 +27,7 @@ data:
 # Downstream QA over the normalized 16x16 patches used by patch alignment.
 # Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
 patch_qa:
-  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16
   latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16
@@ -56,7 +56,8 @@ patch_qa:
   batch_size: 256
   device: auto
   storage_dtype: float16
-  include_oracle: true
+  # Training labels are enough; do not persist oracle numeric values in formal QA files.
+  include_oracle: false
   overwrite: false
 
 compressor:
@@ -256,10 +257,11 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Keep the trained global Q-Former and add question-conditioned local queries over the same 4x4 latent.
-  # Point this to the completed downstream adapter_best.pt; no AE decoder or alignment rerun is required.
+  # Keep the trained global Q-Former and add natural-language-conditioned local queries over the same 4x4 latent.
+  # Start from stage-1 tensor/text alignment; the natural-language local branch is trained from scratch.
+  # A previous hybrid checkpoint is also loadable, but its legacy parsed-feature weights are not reused.
   architecture: hybrid_local_qformer
-  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260712_203024_tensor_patch_qa_aligned_qformer/adapter_best.pt
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
   soft_prompt_tokens: 16
   adapter_dim: 512
   adapter_layers: 4
@@ -268,9 +270,12 @@ adapter:
   latent_pos_encoding: grid
   question_conditioning: true
   question_condition_gate_init: 0.0
-  structured_query_conditioning: true
+  # Formal runs must let the model read coordinates/tasks/statistics from text instead of regex-parsed features.
+  structured_query_conditioning: false
   local_soft_prompt_tokens: 8
   local_adapter_layers: 2
+  # Generic self-attention over frozen Qwen token embeddings before text-to-latent cross-attention.
+  local_text_encoder_layers: 2
   # A small nonzero gate gives the local branch gradients immediately without overwhelming global tokens.
   local_gate_init: 0.1
   # Freeze the pretrained global branch for epochs 1-2, then fine-tune it from epoch 3.
@@ -281,7 +286,7 @@ adapter:
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_hybrid_local_qformer_12h
+  run_name: tensor_patch_qa_natural_language_local_qformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -291,11 +296,15 @@ llm_training:
   max_test_records: null
   # Evaluate transfer before QA fine-tuning on this many validation questions.
   initial_eval_records: 512
+  # Formal train/val/test splits must not share PDEBench sample_index values.
+  require_disjoint_splits: true
+  # Fail instead of silently truncating any natural-language instruction or query.
+  require_untruncated_prompts: true
   prefer_record_latent_ref: false
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # Full 40,960-record set. Based on the previous run, 4 epochs with ranking should take about 9-12 hours.
+  # Full 40,960-record set. Actual wall-clock time is written to run_timing.json.
   epochs: 4
   batch_size: 12
   eval_batch_size: 2
@@ -313,7 +322,11 @@ llm_training:
   max_prompt_tokens: 512
   max_target_tokens: 8
   append_eos: true
+  # Keep per-epoch evaluation cheap; run the full baseline set once on the final best checkpoint.
   eval_baselines:
+    - correct
+    - shuffled
+  final_eval_baselines:
     - correct
     - no_latent
     - zero_latent
@@ -323,6 +336,14 @@ llm_training:
   # Prevent the easy quadrant task from dominating checkpoint selection.
   checkpoint_metric: macro_latent_gain
   log_interval: 20
+  # W&B retains step curves; the terminal and metrics JSON stay compact by default.
+  console_progress: false
+  save_step_metrics: false
+  diagnostics:
+    enabled: true
+    every_epochs: 1
+    records_per_task: 1
+    layers: [0, 2, 8, 14, -1]
 
 wandb:
   enabled: true

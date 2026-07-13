@@ -289,7 +289,7 @@ def main() -> None:
     first_latent = dataset[0]["latent_map"]
     adapter = make_adapter_from_checkpoint(
         checkpoint=checkpoint,
-        latent_channels=int(first_latent.shape[0]),
+        latent_shape=tuple(int(value) for value in first_latent.shape),
         llm_hidden_size=int(llm.get_input_embeddings().embedding_dim),
     ).to(device)
     adapter.eval()
