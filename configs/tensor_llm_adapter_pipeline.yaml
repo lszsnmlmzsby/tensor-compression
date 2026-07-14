@@ -37,9 +37,13 @@ patch_qa:
     - Vx
     - Vy
   patch_size: 16
-  train_patches: 8192
+  train_patches: 16384
   val_patches: 1024
   test_patches: 1024
+  # Multiple natural-language queries over the same tensor teach question-conditioned readout.
+  train_question_variants: 2
+  val_question_variants: 2
+  test_question_variants: 1
   sample_indices: all
   time_indices: all
   split_mode: sample
@@ -257,9 +261,9 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Reuse the trained global Q-Former while rebuilding the local branch around contextual Qwen question tokens.
+  # Start from stage-1 tensor/text alignment; do not reuse downstream QA-fitted parameters.
   architecture: hybrid_local_qformer
-  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260713_194829_tensor_patch_qa_natural_language_local_qformer/adapter_best.pt
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
   soft_prompt_tokens: 16
   adapter_dim: 512
   adapter_layers: 4
@@ -272,21 +276,25 @@ adapter:
   structured_query_conditioning: false
   local_soft_prompt_tokens: 8
   local_adapter_layers: 2
-  # Use frozen Qwen contextual token states; keep every question token until after it attends to the latent grid.
+  # Frozen Qwen contextual tokens remain the only question input; no parsed coordinates or task IDs are used.
   local_question_input_mode: contextual_tokens
-  local_context_layer: 2
+  local_context_layer: 6
+  # Condition learned queries with a causal last-token anchor, then attend text and latent in each block.
+  local_fusion_mode: anchor_queries
   local_text_encoder_layers: 0
   # The previous 0.1 gate left the local branch much weaker than the global branch.
   local_gate_init: 0.5
-  # Freeze the pretrained global branch for epochs 1-2, then fine-tune it from epoch 3.
+  # Freeze the stage-1 global branch for epoch 1, then fine-tune it from epoch 2.
   freeze_global_adapter: true
-  global_unfreeze_epoch: 3
+  global_unfreeze_epoch: 2
   # Use one tenth of the local branch LR after unfreezing.
   global_lr: 1.0e-5
+  # On a fraction of training batches, remove global prompts so local prompts cannot be bypassed.
+  global_prompt_dropout: 0.25
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_contextual_local_qformer
+  run_name: tensor_patch_qa_anchor_conditioned_qformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -304,13 +312,16 @@ llm_training:
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # Full 40,960-record set; 12 epochs targets one overnight run and still saves the best validation checkpoint.
-  epochs: 12
+  # 163,840 training QA records x 5 epochs matches the previous 40,960 x 20 exposure budget.
+  epochs: 5
   batch_size: 16
   eval_batch_size: 2
   eval_choice_batch_size: 16
   gradient_accumulation_steps: 1
   lr: 1.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.1
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   ce_loss_weight: 0.05
@@ -328,11 +339,16 @@ llm_training:
     - shuffled
   final_eval_baselines:
     - correct
+    - global_only
+    - local_only
     - no_latent
     - zero_latent
     - shuffled
     - shuffled_stats
   choice_score: mean
+  # Pair different natural-language questions for the same tensor and operation inside each batch.
+  group_questions_by_state: true
+  questions_per_state_group: 2
   # Prevent the easy quadrant task from dominating checkpoint selection.
   checkpoint_metric: macro_latent_gain
   log_interval: 20
@@ -342,7 +358,7 @@ llm_training:
   diagnostics:
     enabled: true
     every_epochs: 1
-    records_per_task: 1
+    records_per_task: 4
     layers: [0, 2, 8, 14, -1]
 
 wandb:

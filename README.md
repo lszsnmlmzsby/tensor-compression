@@ -684,11 +684,12 @@ python scripts/prepare_tensor_llm_assets.py \
 | `question_condition_gate_init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭，但训练中仍可学习。 |
 | `structured_query_conditioning` | 旧版结构化 query 旁路。正式实验必须关闭，使 adapter 自己读取自然语言。 | `true`、`false` | `false`：推荐，使用自然语言 token；`true`：regex 解析坐标/任务，仅允许 sanity 调试。 |
 | `local_question_input_mode` | local branch 的自然语言输入。 | `contextual_tokens`、`input_embeddings` | `contextual_tokens`：使用 frozen Qwen 浅层逐 token hidden state；`input_embeddings`：旧版静态 embedding 路径。 |
-| `local_context_layer` | contextual local 使用的 Qwen hidden-state 层。 | 非负整数 | `2`：运行前两个 decoder block 后提前停止。 |
+| `local_context_layer` | contextual local 使用的 Qwen hidden-state 层。 | 非负整数 | 当前 `6`：运行前六个 decoder block 后提前停止。 |
+| `local_fusion_mode` | 问题 token 与 latent 的融合方式。 | `anchor_queries`、`text_latent_pool` | `anchor_queries`：当前正式路径，用最后一个非 padding anchor state 条件化 learned queries，再依次 cross-attend 完整问题和 latent；后者仅为旧 checkpoint 兼容。 |
 | `local_text_encoder_layers` | 旧 `input_embeddings` 路径的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置设为 `0`。 |
 | `soft_prompt_scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`，使 soft prompt token 范数接近普通 token embedding；`0`：关闭尺度限制，保留线性输出。 |
 
-当前正式 adapter 的信息流是单向的：自然语言问题先经过 frozen Qwen 前两个 decoder block，逐 token contextual hidden state 在 detach 后进入 local branch；文本 token 先 cross-attend latent，最后由 learned queries 汇聚。梯度不会更新 LLM。`structured_query_conditioning: false` 时，代码不会通过 regex 提前提取任务、坐标、区域或 mean/std，模型必须从自然语言中读取这些信息。
+当前正式 adapter 的信息流是单向的：自然语言问题追加通用 anchor 后先经过 frozen Qwen 前六个 decoder block，逐 token contextual hidden state 在 detach 后进入 local branch。anchor 的最后一个非 padding state 条件化 learned queries，每层 query 再依次 cross-attend 完整问题 token 和 latent token。梯度不会更新 LLM。`structured_query_conditioning: false` 时，代码不会通过 regex 提前提取任务、坐标、区域或 mean/std，模型必须从自然语言中读取这些信息。
 
 #### `llm_training`
 
@@ -723,7 +724,7 @@ python scripts/prepare_tensor_llm_assets.py \
 | `max_prompt_tokens` | 文本 prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `max_target_tokens` | 答案最大 token 数。 | 正整数 | - |
 | `append_eos` | target 后是否追加 EOS。 | `true`、`false` | - |
-| `eval_baselines` | 评估 baseline 列表。 | `correct`、`no_latent`、`zero_latent`、`shuffled`、`random` | `correct`：正确 latent；`no_latent`：零 soft prompt；`zero_latent`：latent 置零但保留 adapter 和 query 条件；`shuffled`：固定 seed 的全局随机错配 latent；`random`：随机噪声 latent。 |
+| `eval_baselines` | 评估 baseline 列表。 | `correct`、`global_only`、`local_only`、`no_latent`、`zero_latent`、`shuffled`、`random`、`shuffled_stats` | `global_only/local_only`：将另一个分支的前缀置零；其余分别测试无前缀、零 latent、错配 latent、随机 latent 和错配 mean/std。 |
 | `choice_score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 数平均；`sum`：总 NLL。 |
 | `log_interval` | 训练日志间隔。 | 正整数 | - |
 
@@ -881,13 +882,16 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--question-conditioning` / `--no-question-conditioning` | 是否用文本问题条件化 adapter query。 | 布尔开关 | 开启后同一 tensor 的 soft prompt 会随问题变化。 |
 | `--question-condition-gate-init` | 文本问题条件分支的初始门控强度。 | 浮点数 | `1.0`：默认开启；`0.0`：初始近似关闭。 |
 | `--structured-query-conditioning` / `--no-structured-query-conditioning` | 是否使用结构化 query 条件。 | 布尔开关 | 开启后从 query 字符串解析坐标和任务类型，不读取 oracle 数值。 |
-| `--local-text-encoder-layers` | natural-language local branch 的文本 Transformer 层数。 | 非负整数 | 默认 `2`；正式配置直接读取问题 token，不使用 regex 特征。 |
+| `--local-question-input-mode` | local branch 的问题表示来源。 | `contextual_tokens`、`input_embeddings` | 正式配置使用 frozen Qwen contextual states。 |
+| `--local-context-layer` | contextual question 提前停止的 Qwen decoder 层数。 | 非负整数 | 当前配置为 `6`。 |
+| `--local-fusion-mode` | local query 的文本/latent 融合路径。 | `anchor_queries`、`text_latent_pool` | 正式配置使用通用的 `anchor_queries`；后者保留旧 checkpoint 兼容。 |
+| `--local-text-encoder-layers` | 旧 input-embedding local branch 的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置为 `0`。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：推荐默认值；`0`：关闭限制。 |
 | `--prompt-template` | 文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按任务写规则；`generic`：旧版通用提示。 |
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 默认正式配置禁止截断；调试时关闭严格检查才会左截断。 |
 | `--max-target-tokens` | target 最大 token 数。 | 正整数 | - |
 | `--append-eos` / `--no-append-eos` | target 后是否追加 EOS。 | 布尔开关 | - |
-| `--eval-baselines` | 评估 baseline 列表。 | 逗号分隔字符串 | 可包含 `correct,no_latent,zero_latent,shuffled,random`；`zero_latent` 是新结构下的重要对照。 |
+| `--eval-baselines` | 评估 baseline 列表。 | 逗号分隔字符串 | 可包含 `correct,global_only,local_only,no_latent,zero_latent,shuffled,random,shuffled_stats`。 |
 | `--final-eval-baselines` | 最终 best checkpoint 使用的完整 baseline 列表。 | 逗号分隔字符串 | 每轮通常只跑 `correct,shuffled`，最终再跑全部对照。 |
 | `--choice-score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 平均；`sum`：累加。 |
 | `--log-interval` | 训练日志间隔。 | 正整数 | - |
@@ -1268,7 +1272,7 @@ patch_qa:
   alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
 
 adapter:
-  architecture: alignment_qformer
+  architecture: hybrid_local_qformer
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
 ```
 
@@ -1279,7 +1283,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-每条题目的坐标、区域和数值选项现在由 `seed + patch_id` 独立确定，train/val/test 不会按相同记录序号复用同一随机题目序列。旧 metadata 没有该标记时，正式训练会要求先重建 QA。已有 latent 且 `overwrite: false` 时，只要 AE checkpoint、HDF5、fields 和 patch size 一致，重建会跳过 patch encoder，只重新生成自然语言问题和标签。
+每条题目的坐标、区域和数值选项由 `seed + patch_id + variant` 独立确定。默认使用 16,384 个 train patches，并为同一个 train/val tensor 的每类操作生成两个独立自然语言问题；test 保持一个固定问题。已有 latent 且 `overwrite: false` 时，只要 AE checkpoint、HDF5、fields 和 patch size 一致，重建会跳过已有 patch 的 encoder，只编码新增 patch 并重新生成 QA。
 
 输出：
 
@@ -1296,49 +1300,60 @@ patch_qa.latent_dir/<patch_id>.pt
 ```bash
 # 先做零成本语法检查，成功时不输出任何内容。
 python -m py_compile \
+  scripts/build_tensor_patch_qa.py \
   scripts/train_tensor_llm_adapter.py \
   scripts/diagnose_tensor_llm_adapter.py \
   scripts/inspect_tensor_llm_readout.py
 
-# 正式 overnight 训练；无需重新运行 build_tensor_patch_qa.py。
+# 先生成多 query QA；不重新训练 AE/alignment，已有 latent 会复用。
+CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+
+# 正式训练。
 CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-长时间训练前先检查启动摘要中包含 `loss_weights=ce:0.05,choice:1,ranking:0.1`。使用 hybrid checkpoint 时还应看到 `checkpoint_load=global_only_contextual_local_reinit`，且 `global/local_tensors` 左侧的 global 张量数大于 0；contextual local 分支按设计重新初始化，因此右侧可以为 0。若配置文件缺少任一 loss 字段，脚本会打印一行 warning 并采用上述内置默认值，同时把最终生效值写入 `args.json`。
+长时间训练前先检查启动摘要包含 `loss_weights=ce:0.05,choice:1,ranking:0.1` 和 `checkpoint_load=strict_global_alignment_checkpoint`，且 `global/local_tensors` 左侧大于 0、右侧为 0。后者表示 global Q-Former 来自第一阶段，新的自然语言 local branch 随机初始化。若配置文件缺少任一 loss 字段，脚本会打印一行 warning 并采用内置默认值，同时把最终生效值写入 `args.json`。
 
 `adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段的 `alignment_projector_state_dict` 不进入下游；冻结 LLM，仅更新 Q-Former adapter。
 
-局部读取增强模式不需要重跑第一阶段、重建 QA/latent 或使用 AE decoder。当前正式配置从最近一次下游 `adapter_best.pt` 严格继承已经有效的 16-token global Q-Former，并重新初始化 local branch。local branch 只读取 `query` 中的自然语言问题，不读取 task id、正则表达式坐标、oracle 或答案选项；它使用 frozen Qwen 第 2 层的逐 token contextual hidden state，让每个问题 token 先 cross-attend `[128,4,4]` latent，最后再由 8 个 learned queries 汇聚成 local soft prompts：
+局部读取增强模式不重跑第一阶段，也不使用 AE decoder。正式配置从第一阶段 `alignment_best.pt` 严格载入 16-token global Q-Former，并随机初始化 local branch。local branch 只读取 `query` 中的自然语言，不读取 task id、正则表达式坐标、oracle 或答案选项。问题末尾会追加固定的通用 `Tensor evidence requested:` anchor；frozen Qwen 运行到第 6 层，最后一个非 padding anchor hidden state 条件化 8 个 learned queries，然后每层依次 cross-attend 全部问题 tokens 和 `[128,4,4]` latent：
 
 ```yaml
 adapter:
   architecture: hybrid_local_qformer
-  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/adapter_best.pt
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
   local_soft_prompt_tokens: 8
   local_adapter_layers: 2
   local_question_input_mode: contextual_tokens
-  local_context_layer: 2
+  local_context_layer: 6
+  local_fusion_mode: anchor_queries
   local_text_encoder_layers: 0
   structured_query_conditioning: false
   local_gate_init: 0.5
   freeze_global_adapter: true
-  global_unfreeze_epoch: 3
+  global_unfreeze_epoch: 2
   global_lr: 1.0e-5
+  global_prompt_dropout: 0.25
 
 llm_training:
-  epochs: 12
+  epochs: 5
   batch_size: 16
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  group_questions_by_state: true
+  questions_per_state_group: 2
   weight_decay: 1.0e-4
   ranking_loss_weight: 0.1
   checkpoint_metric: macro_latent_gain
 ```
 
-最终前缀仍为 `[8 local tokens][16 global tokens][完整QA prompt]`。Qwen 浅层问题编码只运行到配置层后提前停止，并且同一问题的所有候选答案共享一次 local soft prompt 计算；它不会为每个 choice 重复跑浅层 Qwen。`macro_latent_gain` 是各任务 `correct_accuracy - shuffled_accuracy` 的宏平均，用它选择 `adapter_best.pt` 可避免容易的 `extreme_quadrant` 掩盖单点和区域任务。QA 文件中的 `oracle` 在 dataset 载入时会被删除，既不会传入 adapter，也不会参与 loss。
+最终前缀仍为 `[8 local tokens][16 global tokens][完整QA prompt]`。同一问题的所有候选答案共享一次 local soft prompt 计算。训练 batch 按 `state_ref + task_type` 把同一 tensor 的不同问题成对放置；25% 的 batch 会把 global prompts 置零，迫使 local branch 读取问题和 latent，该状态在同一个 batch 的 correct/shuffled ranking 两侧保持一致。`macro_latent_gain` 继续作为 best checkpoint 指标。QA 文件中的 `oracle` 在 dataset 载入时会被删除。
 
-旧 hybrid checkpoint 可以作为 warm start：global branch 严格加载；当 `local_question_input_mode: contextual_tokens` 时，旧 local branch 不加载，以免继承只会粗任务路由的权重。具体 loaded/skipped/missing key 会写入 `run_summary.json`。local token 数、层数、gate 和输入模式由当前 YAML 决定，不会被 checkpoint 中的旧训练参数覆盖。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layer=2` 和 checkpoint load report。
+当前正式实验不复用旧 downstream hybrid checkpoint。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layer=6`、`local_fusion_mode=anchor_queries` 和 strict global checkpoint load report。
 
-`freeze_global_adapter: true` 表示训练开始时冻结 global branch；当 epoch 到达 `global_unfreeze_epoch` 时自动解冻。上例中 epoch 1-2 只训练 local branch，epoch 3 起联合微调，其中 local 使用 `llm_training.lr: 1e-4`，global 使用较小的 `global_lr: 1e-5`。设置 `global_unfreeze_epoch: 0` 可保持全程冻结；设置 `freeze_global_adapter: false` 则从第一个 epoch 开始微调 global。
+`freeze_global_adapter: true` 表示训练开始时冻结 global branch；当前 epoch 1 只训练 local，epoch 2 起以 `global_lr: 1e-5` 联合微调。local 使用 `1e-4`，两组学习率共享 warmup+cosine 比例调度并保持十倍差距。
 
 随机初始化对照使用同一个类和完全相同的训练参数，只关闭初始化 checkpoint：
 
@@ -1357,12 +1372,12 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 
 ### 3.11 Adapter 诊断输出
 
-正式训练已经内置轻量诊断，不需要另跑实验。每个 epoch 默认从验证集为每种 task 固定取 1 条记录，对比正确 latent 与同字段错配 latent，并保存：
+正式训练已经内置轻量诊断，不需要另跑实验。每个 epoch 默认从验证集为每种 task 固定取 4 条记录，对比正确 latent、同字段错配 latent，以及同一 tensor 上的另一个同任务问题，并保存：
 
 - `diagnostics/epoch_XXXX_summary.json`：问题文本、预测、每个选项 NLL、正确答案 margin、soft prompt 差异，以及指定 LLM 层的 hidden-state cosine/relative L2；
-- `diagnostics/epoch_XXXX_states.pt`：latent、mask、local/global soft prompt、文本/latent 投影、cross-attention 节点和各指定 LLM 层 hidden state 的原始张量快照。
+- `diagnostics/epoch_XXXX_states.pt`：latent、mask、local/global soft prompt、anchor、文本/latent 投影、cross-attention 权重和各指定 LLM 层 hidden state 的原始张量快照。
 
-默认层为 `[0,2,8,14,-1]`。如果 local soft prompt 对错配 latent 几乎不变，瓶颈在 adapter；如果 soft prompt 不同但问题末 token 的差异随层数消失，瓶颈在 frozen LLM 传播；如果 hidden state 有差异但答案 margin 不变，瓶颈更接近答案打分或数值决策。诊断同时记录跨任务 `question_sensitivity`、同任务换坐标/问题后的 `same_task_question_sensitivity`，以及 local/global soft prompt RMS 比值。前者防止只学任务类别，后两者用于确认自然语言地址真的改变 local prompts 且 local 分支没有被 gate 压得过弱。
+默认层为 `[0,2,8,14,-1]`。诊断同时记录跨任务 `question_sensitivity`、按任务拆分的 same-tensor/same-task 问题敏感度、local/global soft prompt RMS、最后一层 local query 对问题 token 和 4x4 latent cell 的 attention。它还把 local prompts 换成另一个问题的结果重新评分；只有正确问题比 swapped question 获得更高答案 margin，才说明 local 差异与任务输出相关。最终测试额外报告 `local_only` 和 `global_only`，用于检查主模型是否仍绕过 local branch。
 
 W&B 和 `metrics_latest.json` 还会记录 `train_local_grad_norm`、`train_global_grad_norm`、`train_total_grad_norm` 与 local gate。若 hidden state 已有差异但 local gradient 长期接近 0，应先排查门控、mask 或 loss 路径，而不是继续增加 epoch。
 

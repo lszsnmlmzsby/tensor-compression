@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +54,17 @@ except ImportError as exc:  # pragma: no cover - exercised only in missing-depen
 
 IGNORE_INDEX = -100
 STRUCTURED_QUERY_FEATURE_DIM = 32
-SUPPORTED_BASELINE_MODES = {"correct", "no_latent", "zero_latent", "shuffled", "random", "shuffled_stats"}
+SUPPORTED_BASELINE_MODES = {
+    "correct",
+    "global_only",
+    "local_only",
+    "no_latent",
+    "zero_latent",
+    "shuffled",
+    "random",
+    "shuffled_stats",
+}
+LOCAL_QUESTION_ANCHOR_TEXT = "Tensor evidence requested:"
 _ACTIVE_RUN_LIFECYCLE: "RunLifecycle | None" = None
 
 
@@ -246,6 +256,8 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(dim * 4, dim),
             nn.Dropout(dropout),
         )
+        self.capture_attention = False
+        self.last_attention_weights: torch.Tensor | None = None
 
     def forward(
         self,
@@ -253,15 +265,29 @@ class CrossAttentionBlock(nn.Module):
         latents: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        attended, _weights = self.attention(
+        attended, weights = self.attention(
             query=self.query_norm(queries),
             key=self.latent_norm(latents),
             value=self.latent_norm(latents),
             key_padding_mask=key_padding_mask,
-            need_weights=False,
+            need_weights=bool(self.capture_attention),
+            average_attn_weights=False,
+        )
+        self.last_attention_weights = (
+            weights.detach().float().cpu() if self.capture_attention and weights is not None else None
         )
         queries = queries + attended
         return queries + self.ffn(self.ffn_norm(queries))
+
+
+def last_nonpadding_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    if attention_mask.ndim != 2:
+        raise ValueError(f"Expected a [batch,tokens] attention mask, got {tuple(attention_mask.shape)}.")
+    valid = attention_mask.to(dtype=torch.bool)
+    if int(valid.shape[1]) == 0:
+        raise ValueError("Natural-language questions must contain at least one token.")
+    positions = torch.arange(valid.shape[1], device=valid.device).unsqueeze(0).expand_as(valid)
+    return positions.masked_fill(~valid, -1).max(dim=1).values
 
 
 class BidirectionalCrossAttentionBlock(nn.Module):
@@ -464,6 +490,7 @@ class QuestionConditionedLocalAdapter(nn.Module):
         max_text_tokens: int,
         structured_query_conditioning: bool,
         question_input_mode: str = "input_embeddings",
+        fusion_mode: str = "text_latent_pool",
     ) -> None:
         super().__init__()
         if int(adapter_dim) % int(adapter_heads) != 0:
@@ -475,6 +502,9 @@ class QuestionConditionedLocalAdapter(nn.Module):
         self.question_input_mode = str(question_input_mode)
         if self.question_input_mode not in {"input_embeddings", "contextual_tokens"}:
             raise ValueError(f"Unsupported local question_input_mode: {question_input_mode}")
+        self.fusion_mode = str(fusion_mode)
+        if self.fusion_mode not in {"text_latent_pool", "anchor_queries"}:
+            raise ValueError(f"Unsupported local fusion_mode: {fusion_mode}")
         self.latent_projection = nn.Linear(int(latent_channels), int(adapter_dim))
         self.position_projection = nn.Linear(2, int(adapter_dim))
         self.text_projection = nn.Sequential(
@@ -507,14 +537,15 @@ class QuestionConditionedLocalAdapter(nn.Module):
         else:
             self.structured_projection = None
         self.query_tokens = nn.Parameter(torch.empty(1, int(local_tokens), int(adapter_dim)))
+        use_query_blocks = self.question_input_mode == "input_embeddings" or self.fusion_mode == "anchor_queries"
         self.text_blocks = nn.ModuleList(
             [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
-            if self.question_input_mode == "input_embeddings"
+            if use_query_blocks
             else []
         )
         self.latent_blocks = nn.ModuleList(
             [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout)) for _ in range(int(local_layers))]
-            if self.question_input_mode == "input_embeddings"
+            if use_query_blocks
             else []
         )
         self.text_latent_blocks = nn.ModuleList(
@@ -522,14 +553,25 @@ class QuestionConditionedLocalAdapter(nn.Module):
                 BidirectionalCrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout))
                 for _ in range(int(local_layers))
             ]
-            if self.question_input_mode == "contextual_tokens"
+            if self.question_input_mode == "contextual_tokens" and self.fusion_mode == "text_latent_pool"
             else []
         )
         self.pool_blocks = nn.ModuleList(
             [CrossAttentionBlock(int(adapter_dim), int(adapter_heads), float(dropout))]
-            if self.question_input_mode == "contextual_tokens"
+            if self.question_input_mode == "contextual_tokens" and self.fusion_mode == "text_latent_pool"
             else []
         )
+        if self.question_input_mode == "contextual_tokens" and self.fusion_mode == "anchor_queries":
+            self.anchor_projection = nn.Sequential(
+                nn.LayerNorm(int(adapter_dim)),
+                nn.Linear(int(adapter_dim), int(adapter_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_dim), int(adapter_dim)),
+            )
+            self.anchor_gate = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.anchor_projection = None
+            self.register_parameter("anchor_gate", None)
         self.output = nn.Sequential(
             nn.LayerNorm(int(adapter_dim)),
             nn.Linear(int(adapter_dim), int(llm_hidden_size)),
@@ -579,12 +621,28 @@ class QuestionConditionedLocalAdapter(nn.Module):
             text_context = layer(text_context, src_key_padding_mask=key_padding_mask)
         text_context = self.text_encoder_norm(text_context)
         queries = self.query_tokens.expand(latents.shape[0], -1, -1)
+        if self.anchor_projection is not None:
+            if question_mask is None:
+                last_indices = torch.full(
+                    (text_context.shape[0],),
+                    int(text_context.shape[1]) - 1,
+                    dtype=torch.long,
+                    device=text_context.device,
+                )
+            else:
+                last_indices = last_nonpadding_indices(question_mask.to(device=text_context.device))
+            anchor = text_context[
+                torch.arange(text_context.shape[0], device=text_context.device),
+                last_indices,
+            ]
+            anchor_condition = self.anchor_projection(anchor)
+            queries = queries + self.anchor_gate.to(dtype=queries.dtype) * anchor_condition.unsqueeze(1)
         if self.structured_projection is not None and structured_query is not None:
             query_condition = self.structured_projection(
                 structured_query.to(device=queries.device, dtype=self.structured_projection[1].weight.dtype)
             )
             queries = queries + query_condition.unsqueeze(1)
-        if self.question_input_mode == "contextual_tokens":
+        if self.question_input_mode == "contextual_tokens" and self.fusion_mode == "text_latent_pool":
             fused_text = text_context
             for text_latent_block in self.text_latent_blocks:
                 fused_text = text_latent_block(fused_text, latents)
@@ -606,11 +664,16 @@ class HybridGlobalLocalAdapter(nn.Module):
         global_adapter: TensorPatchAlignmentAdapter,
         local_adapter: QuestionConditionedLocalAdapter,
         freeze_global: bool,
+        global_prompt_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.global_adapter = global_adapter
         self.local_adapter = local_adapter
         self.freeze_global = bool(freeze_global)
+        self.global_prompt_dropout = float(global_prompt_dropout)
+        if not 0.0 <= self.global_prompt_dropout < 1.0:
+            raise ValueError("global_prompt_dropout must be in [0, 1).")
+        self.drop_global_prompts_for_batch = False
         self.soft_prompt_tokens = int(global_adapter.soft_prompt_tokens + local_adapter.soft_prompt_tokens)
         self.structured_query_conditioning = bool(local_adapter.structured_query_conditioning)
 
@@ -631,6 +694,9 @@ class HybridGlobalLocalAdapter(nn.Module):
             self.global_adapter.eval()
         return self
 
+    def set_global_prompt_dropout_for_batch(self, enabled: bool) -> None:
+        self.drop_global_prompts_for_batch = bool(enabled)
+
     def forward(
         self,
         latent_map: torch.Tensor,
@@ -645,6 +711,8 @@ class HybridGlobalLocalAdapter(nn.Module):
                 global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
         else:
             global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
+        if self.training and self.drop_global_prompts_for_batch:
+            global_prompts = torch.zeros_like(global_prompts)
         local_prompts = self.local_adapter(latent_map, question_embeds, question_mask, structured_query)
         # Keeping local tokens first preserves the relative positions between global tokens and text.
         return torch.cat([local_prompts, global_prompts], dim=1)
@@ -799,6 +867,59 @@ class TensorReadoutQADataset(Dataset):
     def shuffled_record_for_index(self, index: int) -> Mapping[str, Any]:
         other_index = self._random_different_indices[int(index)]
         return self.records[other_index]
+
+
+class StateTaskGroupedBatchSampler(Sampler[list[int]]):
+    """Keep a few same-tensor, same-operation questions together without parsing their text."""
+
+    def __init__(
+        self,
+        dataset: TensorReadoutQADataset,
+        batch_size: int,
+        questions_per_group: int,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.questions_per_group = max(1, int(questions_per_group))
+        if self.questions_per_group > self.batch_size:
+            raise ValueError(
+                "llm_training.questions_per_state_group cannot exceed llm_training.batch_size."
+            )
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for index, record in enumerate(self.dataset.records):
+            key = (str(record.get("state_ref", "")), str(record.get("task_type", "")))
+            grouped[key].append(index)
+
+        units: list[list[int]] = []
+        for indices in grouped.values():
+            rng.shuffle(indices)
+            units.extend(
+                indices[start : start + self.questions_per_group]
+                for start in range(0, len(indices), self.questions_per_group)
+            )
+        rng.shuffle(units)
+
+        batch: list[int] = []
+        for unit in units:
+            if batch and len(batch) + len(unit) > self.batch_size:
+                yield batch
+                batch = []
+            batch.extend(unit)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
 
 def collate_tensor_readout(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -977,6 +1098,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-choice-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default=None)
+    parser.add_argument("--warmup-ratio", type=float, default=None)
+    parser.add_argument("--min-lr-ratio", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
     parser.add_argument("--ce-loss-weight", type=float, default=None)
@@ -1021,10 +1145,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--local-context-layer", type=int, default=None)
+    parser.add_argument(
+        "--local-fusion-mode",
+        type=str,
+        choices=("text_latent_pool", "anchor_queries"),
+        default=None,
+    )
     parser.add_argument("--local-gate-init", type=float, default=None)
     parser.add_argument("--freeze-global-adapter", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--global-unfreeze-epoch", type=int, default=None)
     parser.add_argument("--global-lr", type=float, default=None)
+    parser.add_argument("--global-prompt-dropout", type=float, default=None)
+    parser.add_argument("--group-questions-by-state", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--questions-per-state-group", type=int, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument(
         "--prompt-template",
@@ -1040,7 +1173,10 @@ def parse_args() -> argparse.Namespace:
         "--eval-baselines",
         type=str,
         default=None,
-        help="Comma-separated: correct,no_latent,zero_latent,shuffled,random,shuffled_stats.",
+        help=(
+            "Comma-separated: correct,global_only,local_only,no_latent,zero_latent,"
+            "shuffled,random,shuffled_stats."
+        ),
     )
     parser.add_argument(
         "--final-eval-baselines",
@@ -1167,6 +1303,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         1,
     )
     set_default(args, "lr", first_nested(config, ["llm_training.lr"]), 1.0e-4)
+    set_default(args, "lr_scheduler", first_nested(config, ["llm_training.lr_scheduler"]), "constant")
+    set_default(args, "warmup_ratio", first_nested(config, ["llm_training.warmup_ratio"]), 0.0)
+    set_default(args, "min_lr_ratio", first_nested(config, ["llm_training.min_lr_ratio"]), 0.1)
     set_default(args, "weight_decay", first_nested(config, ["llm_training.weight_decay"]), 1.0e-2)
     set_default(args, "grad_clip_norm", first_nested(config, ["llm_training.grad_clip_norm"]), 1.0)
     set_default(args, "ce_loss_weight", configured_loss_fields["ce_loss_weight"], 0.05)
@@ -1204,10 +1343,24 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "input_embeddings",
     )
     set_default(args, "local_context_layer", first_nested(config, ["adapter.local_context_layer"]), 2)
+    set_default(args, "local_fusion_mode", first_nested(config, ["adapter.local_fusion_mode"]), "text_latent_pool")
     set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 0.1)
     set_default(args, "freeze_global_adapter", first_nested(config, ["adapter.freeze_global_adapter"]), True)
     set_default(args, "global_unfreeze_epoch", first_nested(config, ["adapter.global_unfreeze_epoch"]), 0)
     set_default(args, "global_lr", first_nested(config, ["adapter.global_lr"]), 1.0e-5)
+    set_default(args, "global_prompt_dropout", first_nested(config, ["adapter.global_prompt_dropout"]), 0.0)
+    set_default(
+        args,
+        "group_questions_by_state",
+        first_nested(config, ["llm_training.group_questions_by_state"]),
+        False,
+    )
+    set_default(
+        args,
+        "questions_per_state_group",
+        first_nested(config, ["llm_training.questions_per_state_group"]),
+        2,
+    )
     set_default(args, "soft_prompt_scale", first_nested(config, ["adapter.soft_prompt_scale"]), 0.05)
     set_default(
         args,
@@ -1297,6 +1450,18 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("adapter.local_text_encoder_layers must be non-negative.")
     if int(args.local_context_layer) < 0:
         raise ValueError("adapter.local_context_layer must be non-negative.")
+    if not 0.0 <= float(args.global_prompt_dropout) < 1.0:
+        raise ValueError("adapter.global_prompt_dropout must be in [0, 1).")
+    if int(args.questions_per_state_group) <= 0:
+        raise ValueError("llm_training.questions_per_state_group must be positive.")
+    if bool(args.group_questions_by_state) and int(args.questions_per_state_group) > int(args.batch_size):
+        raise ValueError(
+            "llm_training.questions_per_state_group cannot exceed llm_training.batch_size."
+        )
+    if not 0.0 <= float(args.warmup_ratio) < 1.0:
+        raise ValueError("llm_training.warmup_ratio must be in [0, 1).")
+    if not 0.0 <= float(args.min_lr_ratio) <= 1.0:
+        raise ValueError("llm_training.min_lr_ratio must be in [0, 1].")
     if int(args.diagnostics_every_epochs) < 0 or int(args.diagnostics_records_per_task) <= 0:
         raise ValueError("Diagnostic cadence must be non-negative and records_per_task must be positive.")
     if bool(args.diagnostics_enabled) and not parse_csv(args.diagnostics_layers):
@@ -1418,6 +1583,29 @@ def optimizer_group_lr(optimizer: torch.optim.Optimizer, prefix: str, default: f
         if str(group.get("name", "")).startswith(str(prefix)):
             return float(group["lr"])
     return float(default)
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler_name: str,
+    total_updates: int,
+    warmup_ratio: float,
+    min_lr_ratio: float,
+) -> tuple[torch.optim.lr_scheduler.LambdaLR, int]:
+    total_updates = max(1, int(total_updates))
+    warmup_updates = min(total_updates - 1, int(round(total_updates * float(warmup_ratio))))
+
+    def lr_factor(step: int) -> float:
+        if warmup_updates > 0 and int(step) < warmup_updates:
+            return max(1.0 / warmup_updates, float(step + 1) / warmup_updates)
+        if str(scheduler_name) == "constant":
+            return 1.0
+        decay_updates = max(1, total_updates - warmup_updates)
+        progress = min(1.0, max(0.0, (float(step) - warmup_updates) / decay_updates))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor), warmup_updates
 
 
 def seed_everything(seed: int) -> None:
@@ -1542,11 +1730,21 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
             f"Formal patch QA training requires metadata split_mode=sample, got {split_mode!r}."
         )
     question_seed_mode = str(metadata.get("question_seed_mode", "legacy_record_order"))
-    if bool(args.require_disjoint_splits) and question_seed_mode != "sha256(seed|patch_id)":
+    supported_seed_modes = {"sha256(seed|patch_id)", "sha256(seed|patch_id|variant)"}
+    if bool(args.require_disjoint_splits) and question_seed_mode not in supported_seed_modes:
         raise ValueError(
             "Formal patch QA training requires independently seeded questions. Regenerate the QA JSONL with "
             "scripts/build_tensor_patch_qa.py; existing latent files will be reused."
         )
+    question_variants = dict(metadata.get("question_variants", {}))
+    if bool(args.group_questions_by_state):
+        train_variants = int(question_variants.get(str(args.train_split), 1))
+        if train_variants < int(args.questions_per_state_group):
+            raise ValueError(
+                "Grouped natural-language training requires at least "
+                f"{int(args.questions_per_state_group)} train question variants per tensor/task, but QA metadata "
+                f"reports {train_variants}. Run scripts/build_tensor_patch_qa.py with the current config first."
+            )
     return {
         "available": True,
         "path": str(metadata_path),
@@ -1556,6 +1754,7 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "patch_size": int(metadata.get("patch_size", -1)),
         "split_mode": split_mode,
         "question_seed_mode": question_seed_mode,
+        "question_variants": question_variants,
         "include_oracle_in_source": bool(metadata.get("include_oracle", False)),
     }
 
@@ -1868,17 +2067,17 @@ def build_local_question_tensors(
     device: torch.device,
     max_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    questions = [
-        re.split(
+    questions = []
+    for record in records:
+        question = re.split(
             r"\s+(?:options|choices)\s*:",
             str(record.get("query") or record.get("question") or ""),
             maxsplit=1,
             flags=re.IGNORECASE,
         )[0].strip()
-        for record in records
-    ]
-    if any(not question for question in questions):
-        raise ValueError("The contextual local adapter received an empty natural-language question.")
+        if not question:
+            raise ValueError("The contextual local adapter received an empty natural-language question.")
+        questions.append(f"{question}\n{LOCAL_QUESTION_ANCHOR_TEXT}")
     encoded = tokenizer(questions, padding=True, truncation=False, return_tensors="pt")
     if int(encoded["input_ids"].shape[1]) > int(max_tokens):
         raise ValueError(
@@ -1942,13 +2141,21 @@ def adapter_soft_embeds(
         if records is not None and adapter.structured_query_conditioning
         else None
     )
-    if mode == "correct":
-        return adapter(
+    if mode in {"correct", "global_only", "local_only"}:
+        soft_prompts = adapter(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
             structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
+        if isinstance(adapter, HybridGlobalLocalAdapter) and mode != "correct":
+            local_count = int(adapter.local_adapter.soft_prompt_tokens)
+            soft_prompts = soft_prompts.clone()
+            if mode == "global_only":
+                soft_prompts[:, :local_count] = 0
+            else:
+                soft_prompts[:, local_count:] = 0
+        return soft_prompts
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
         return text_embeds.new_zeros((batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1]))
@@ -2571,7 +2778,7 @@ def baseline_latents(
     dataset: TensorReadoutQADataset,
 ) -> torch.Tensor:
     latents = batch["latent_map"]
-    if mode in {"correct", "no_latent", "shuffled_stats"}:
+    if mode in {"correct", "global_only", "local_only", "no_latent", "shuffled_stats"}:
         return latents
     if mode == "zero_latent":
         return torch.zeros_like(latents)
@@ -2794,7 +3001,16 @@ def _same_task_alternate_question_record(
     source = dataset.records[index]
     task = str(source.get("task_type", ""))
     field = str(source.get("field", ""))
+    state_ref = str(source.get("state_ref", ""))
     source_query = str(source.get("query") or source.get("question") or "")
+    for record in dataset.records:
+        if (
+            str(record.get("state_ref", "")) == state_ref
+            and str(record.get("task_type", "")) == task
+            and str(record.get("field", "")) == field
+            and str(record.get("query") or record.get("question") or "") != source_query
+        ):
+            return record
     for record in dataset.records:
         if (
             str(record.get("task_type", "")) == task
@@ -2846,6 +3062,12 @@ def _adapter_forward_with_trace(
     if isinstance(adapter, HybridGlobalLocalAdapter):
         trace["local_query_tokens"] = adapter.local_adapter.query_tokens[0].detach().float().cpu()
         trace["global_query_tokens"] = adapter.global_adapter.query_tokens[0].detach().float().cpu()
+        if adapter.local_adapter.anchor_projection is not None:
+            anchor_indices = last_nonpadding_indices(prompt_mask.to(device=text_embeds.device))
+            trace["local_anchor_hidden"] = text_embeds[
+                torch.arange(text_embeds.shape[0], device=text_embeds.device),
+                anchor_indices,
+            ][0].detach().float().cpu()
         handles.append(
             adapter.local_adapter.text_projection.register_forward_hook(
                 capture("local_text_projected", pool_text=True)
@@ -2865,12 +3087,24 @@ def _adapter_forward_with_trace(
         for index, module in enumerate(adapter.local_adapter.pool_blocks):
             handles.append(module.register_forward_hook(capture(f"local_after_pool_{index}")))
         handles.append(adapter.local_adapter.output.register_forward_hook(capture("local_output_pre_gate")))
+        if adapter.local_adapter.anchor_projection is not None:
+            handles.append(
+                adapter.local_adapter.anchor_projection.register_forward_hook(capture("local_anchor_condition"))
+            )
         handles.append(
             adapter.global_adapter.latent_projection.register_forward_hook(capture("global_latent_projected"))
         )
         for index, module in enumerate(adapter.global_adapter.blocks):
             handles.append(module.register_forward_hook(capture(f"global_after_latent_{index}")))
         handles.append(adapter.global_adapter.output.register_forward_hook(capture("global_output_pre_scale")))
+    attention_blocks = []
+    if isinstance(adapter, HybridGlobalLocalAdapter):
+        attention_blocks = [
+            *adapter.local_adapter.text_blocks,
+            *adapter.local_adapter.latent_blocks,
+        ]
+        for block in attention_blocks:
+            block.capture_attention = True
     try:
         soft = adapter(
             latent,
@@ -2879,6 +3113,16 @@ def _adapter_forward_with_trace(
             structured_query=structured_query,
         )
     finally:
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            for prefix, blocks in (
+                ("local_text_attention", adapter.local_adapter.text_blocks),
+                ("local_latent_attention", adapter.local_adapter.latent_blocks),
+            ):
+                for index, block in enumerate(blocks):
+                    if block.last_attention_weights is not None:
+                        trace[f"{prefix}_{index}"] = block.last_attention_weights
+                    block.capture_attention = False
+                    block.last_attention_weights = None
         for handle in handles:
             handle.remove()
     return soft, trace
@@ -2924,6 +3168,8 @@ def run_embedded_diagnostics(
         prompt_mask = text_labels.eq(IGNORE_INDEX) & text_mask.bool()
         local_text_embeds = text_embeds
         local_text_mask = prompt_mask
+        local_ids: torch.Tensor | None = None
+        local_mask: torch.Tensor | None = None
         if (
             isinstance(adapter, HybridGlobalLocalAdapter)
             and adapter.local_adapter.question_input_mode == "contextual_tokens"
@@ -3037,6 +3283,42 @@ def run_embedded_diagnostics(
         correct_state = mode_states["correct"]
         shuffled_state = mode_states["shuffled"]
         local_count = int(adapter.local_adapter.soft_prompt_tokens) if isinstance(adapter, HybridGlobalLocalAdapter) else 0
+        local_attention_summary: dict[str, Any] | None = None
+        if isinstance(adapter, HybridGlobalLocalAdapter) and local_ids is not None:
+            local_attention_summary = {}
+            text_attention_keys = sorted(
+                key for key in correct_state["adapter_hidden"] if key.startswith("local_text_attention_")
+            )
+            latent_attention_keys = sorted(
+                key for key in correct_state["adapter_hidden"] if key.startswith("local_latent_attention_")
+            )
+            if text_attention_keys:
+                text_weights = correct_state["adapter_hidden"][text_attention_keys[-1]].mean(dim=(0, 1, 2))
+                top_count = min(8, int(text_weights.numel()))
+                values, indices = torch.topk(text_weights, k=top_count)
+                token_ids = local_ids[0].detach().cpu()
+                local_attention_summary["top_question_tokens"] = [
+                    {
+                        "index": int(index),
+                        "token": str(tokenizer.convert_ids_to_tokens(int(token_ids[index]))),
+                        "weight": float(value),
+                    }
+                    for value, index in zip(values.tolist(), indices.tolist())
+                ]
+            if latent_attention_keys:
+                latent_weights = correct_state["adapter_hidden"][latent_attention_keys[-1]].mean(dim=(0, 1, 2))
+                top_count = min(8, int(latent_weights.numel()))
+                values, indices = torch.topk(latent_weights, k=top_count)
+                latent_width = int(adapter.local_adapter.latent_grid[1])
+                local_attention_summary["top_latent_cells"] = [
+                    {
+                        "index": int(index),
+                        "row": int(index) // latent_width,
+                        "col": int(index) % latent_width,
+                        "weight": float(value),
+                    }
+                    for value, index in zip(values.tolist(), indices.tolist())
+                ]
         soft_comparison = _cosine_and_relative_l2(correct_state["soft_prompt"], shuffled_state["soft_prompt"])
         if local_count:
             local_comparison = _cosine_and_relative_l2(
@@ -3153,10 +3435,39 @@ def run_embedded_diagnostics(
                 structured_query=None,
             )
             same_soft = same_soft[0].detach().float().cpu()
+            swapped_scores = score_candidate_batch(
+                llm=llm,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                records=[record] * len(choices),
+                answers=choices,
+                latent_map=correct_latent.repeat(len(choices), 1, 1, 1),
+                device=device,
+                max_prompt_tokens=int(args.max_prompt_tokens),
+                max_target_tokens=int(args.max_target_tokens),
+                append_eos=bool(args.append_eos),
+                prompt_template=str(args.prompt_template),
+                soft_prompt_mode="correct",
+                choice_score=str(args.choice_score),
+                local_context_layer=int(args.local_context_layer),
+                precomputed_soft_embeds=same_soft.unsqueeze(0).repeat(len(choices), 1, 1),
+            )
+            target_index = choices.index(answer)
+            swapped_wrong_scores = [
+                value for choice_index, value in enumerate(swapped_scores) if choice_index != target_index
+            ]
             same_task_sensitivity = {
                 "alternate_qa_id": str(same_task_record.get("qa_id", "")),
                 "same_latent_local_prompt": _cosine_and_relative_l2(
                     correct_state["soft_prompt"][:local_count], same_soft[:local_count]
+                ),
+                "swapped_question_prediction": choices[
+                    min(range(len(swapped_scores)), key=lambda choice_index: swapped_scores[choice_index])
+                ],
+                "swapped_question_answer_margin": float(
+                    min(swapped_wrong_scores) - swapped_scores[target_index]
+                    if swapped_wrong_scores
+                    else 0.0
                 ),
             }
         qa_id = str(record.get("qa_id", f"index_{index}"))
@@ -3165,6 +3476,8 @@ def run_embedded_diagnostics(
             "text_attention_mask": text_mask[0].detach().cpu(),
             "text_labels": text_labels[0].detach().cpu(),
             "prompt_mask": prompt_mask[0].detach().cpu(),
+            "local_input_ids": local_ids[0].detach().cpu() if local_ids is not None else None,
+            "local_attention_mask": local_mask[0].detach().cpu() if local_mask is not None else None,
             "modes": mode_states,
         }
         summaries.append(
@@ -3181,6 +3494,7 @@ def run_embedded_diagnostics(
                 "adapter_hidden_correct_vs_shuffled": adapter_hidden_comparison,
                 "question_sensitivity": question_sensitivity,
                 "same_task_question_sensitivity": same_task_sensitivity,
+                "local_attention": local_attention_summary,
                 "hidden_correct_vs_shuffled": hidden_comparison,
             }
         )
@@ -3202,6 +3516,13 @@ def run_embedded_diagnostics(
     global_rms_values = [
         float(item["soft_prompt_correct_vs_shuffled"].get("global_rms", 0.0)) for item in summaries
     ]
+    same_task_sensitivity_by_task: dict[str, float] = {}
+    for task in sorted({str(item["task_type"]) for item in same_task_sensitive_records}):
+        task_items = [item for item in same_task_sensitive_records if str(item["task_type"]) == task]
+        same_task_sensitivity_by_task[task] = sum(
+            item["same_task_question_sensitivity"]["same_latent_local_prompt"]["relative_l2"]
+            for item in task_items
+        ) / max(1, len(task_items))
     aggregate = {
         "records": len(summaries),
         "soft_prompt_relative_l2_mean": sum(
@@ -3244,6 +3565,24 @@ def run_embedded_diagnostics(
             for item in same_task_sensitive_records
         )
         / max(1, len(same_task_sensitive_records)),
+        "same_task_different_question_local_relative_l2_by_task": same_task_sensitivity_by_task,
+        "same_task_swapped_question_answer_margin_mean": sum(
+            item["same_task_question_sensitivity"]["swapped_question_answer_margin"]
+            for item in same_task_sensitive_records
+        )
+        / max(1, len(same_task_sensitive_records)),
+        "same_task_correct_minus_swapped_answer_margin": sum(
+            item["scores"]["correct"]["answer_margin"]
+            - item["same_task_question_sensitivity"]["swapped_question_answer_margin"]
+            for item in same_task_sensitive_records
+        )
+        / max(1, len(same_task_sensitive_records)),
+        "local_anchor_gate": float(
+            adapter.local_adapter.anchor_gate.detach().float().cpu().item()
+            if isinstance(adapter, HybridGlobalLocalAdapter)
+            and adapter.local_adapter.anchor_gate is not None
+            else 0.0
+        ),
         "local_prompt_rms_mean": sum(local_rms_values) / max(1, len(local_rms_values)),
         "global_prompt_rms_mean": sum(global_rms_values) / max(1, len(global_rms_values)),
         "local_to_global_prompt_rms_ratio": (
@@ -3424,8 +3763,14 @@ def adapter_from_checkpoint(
         max_text_tokens=int(text_pos.shape[1]),
         structured_query_conditioning=bool(ckpt_args.get("structured_query_conditioning", False)),
         question_input_mode=str(ckpt_args.get("local_question_input_mode", "input_embeddings")),
+        fusion_mode=str(ckpt_args.get("local_fusion_mode", "text_latent_pool")),
     )
-    adapter = HybridGlobalLocalAdapter(global_adapter, local_adapter, freeze_global=False)
+    adapter = HybridGlobalLocalAdapter(
+        global_adapter,
+        local_adapter,
+        freeze_global=False,
+        global_prompt_dropout=float(ckpt_args.get("global_prompt_dropout", 0.0)),
+    )
     adapter.load_state_dict(state_dict, strict=True)
     return adapter
 
@@ -3448,7 +3793,15 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
     if not isinstance(correct, Mapping) or not isinstance(correct.get("accuracy"), (int, float)):
         return
     correct_accuracy = float(correct["accuracy"])
-    for baseline in ("no_latent", "zero_latent", "shuffled", "shuffled_stats", "random"):
+    for baseline in (
+        "global_only",
+        "local_only",
+        "no_latent",
+        "zero_latent",
+        "shuffled",
+        "shuffled_stats",
+        "random",
+    ):
         baseline_metrics = metrics.get(baseline)
         if isinstance(baseline_metrics, Mapping) and isinstance(baseline_metrics.get("accuracy"), (int, float)):
             payload[f"{prefix}/correct_minus_{baseline}_accuracy"] = correct_accuracy - float(
@@ -3525,10 +3878,12 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "local_text_encoder_layers": int(args.local_text_encoder_layers),
             "local_question_input_mode": str(args.local_question_input_mode),
             "local_context_layer": int(args.local_context_layer),
+            "local_fusion_mode": str(args.local_fusion_mode),
             "local_gate_init": float(args.local_gate_init),
             "freeze_global_adapter": bool(args.freeze_global_adapter),
             "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
             "global_lr": float(args.global_lr),
+            "global_prompt_dropout": float(args.global_prompt_dropout),
             "global_dropout": float(getattr(args, "global_dropout", args.dropout)),
             "global_soft_prompt_scale": float(
                 getattr(args, "global_soft_prompt_scale", args.soft_prompt_scale)
@@ -3543,6 +3898,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "eval_choice_batch_size": int(args.eval_choice_batch_size),
             "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
             "lr": float(args.lr),
+            "lr_scheduler": str(args.lr_scheduler),
+            "warmup_ratio": float(args.warmup_ratio),
+            "min_lr_ratio": float(args.min_lr_ratio),
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
             "ce_loss_weight": float(args.ce_loss_weight),
@@ -3560,6 +3918,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "log_interval": int(args.log_interval),
             "console_progress": bool(args.console_progress),
             "save_step_metrics": bool(args.save_step_metrics),
+            "group_questions_by_state": bool(args.group_questions_by_state),
+            "questions_per_state_group": int(args.questions_per_state_group),
             "diagnostics": {
                 "enabled": bool(args.diagnostics_enabled),
                 "every_epochs": int(args.diagnostics_every_epochs),
@@ -3832,11 +4192,13 @@ def main() -> None:
                 max_text_tokens=int(args.max_prompt_tokens) + int(args.max_target_tokens),
                 structured_query_conditioning=bool(args.structured_query_conditioning),
                 question_input_mode=str(args.local_question_input_mode),
+                fusion_mode=str(args.local_fusion_mode),
             )
             adapter = HybridGlobalLocalAdapter(
                 global_adapter=global_adapter,
                 local_adapter=local_adapter,
                 freeze_global=freeze_global_adapter,
+                global_prompt_dropout=float(args.global_prompt_dropout),
             ).to(device)
             if hybrid_state_dict is not None:
                 local_load_report = load_compatible_hybrid_state(adapter, hybrid_state_dict)
@@ -3860,6 +4222,7 @@ def main() -> None:
             args.local_soft_prompt_tokens = local_soft_prompt_tokens
             args.local_adapter_layers = local_adapter_layers
             args.local_question_input_mode = str(local_adapter.question_input_mode)
+            args.local_fusion_mode = str(local_adapter.fusion_mode)
             args.local_gate_init = local_gate_init
             args.freeze_global_adapter = freeze_global_adapter
             args.question_conditioning = True
@@ -3880,13 +4243,26 @@ def main() -> None:
             soft_prompt_scale=float(args.soft_prompt_scale),
         ).to(device)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=max(1, int(args.batch_size)),
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_tensor_readout,
-    )
+    if bool(args.group_questions_by_state):
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=StateTaskGroupedBatchSampler(
+                dataset=train_dataset,
+                batch_size=int(args.batch_size),
+                questions_per_group=int(args.questions_per_state_group),
+                seed=int(args.shuffle_seed),
+            ),
+            num_workers=0,
+            collate_fn=collate_tensor_readout,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=max(1, int(args.batch_size)),
+            shuffle=True,
+            num_workers=0,
+            collate_fn=collate_tensor_readout,
+        )
     if isinstance(adapter, HybridGlobalLocalAdapter):
         local_groups = adamw_parameter_groups(
             adapter.local_adapter,
@@ -3913,6 +4289,16 @@ def main() -> None:
                 name="adapter",
             ),
         )
+    accumulation_steps = max(1, int(args.gradient_accumulation_steps))
+    updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    total_optimizer_updates = max(1, updates_per_epoch * int(args.epochs))
+    lr_scheduler, warmup_updates = build_lr_scheduler(
+        optimizer=optimizer,
+        scheduler_name=str(args.lr_scheduler),
+        total_updates=total_optimizer_updates,
+        warmup_ratio=float(args.warmup_ratio),
+        min_lr_ratio=float(args.min_lr_ratio),
+    )
     baseline_modes = parse_csv(args.eval_baselines)
     if not baseline_modes:
         baseline_modes = ["correct"]
@@ -3951,6 +4337,7 @@ def main() -> None:
             )
         ),
         "local_context_layer": int(args.local_context_layer),
+        "local_fusion_mode": str(args.local_fusion_mode),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "adapter_architecture": str(args.adapter_architecture),
         "adapter_initialization": initialization,
@@ -3962,6 +4349,13 @@ def main() -> None:
         "freeze_global_adapter": bool(args.freeze_global_adapter),
         "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
         "global_lr": float(args.global_lr),
+        "global_prompt_dropout": float(args.global_prompt_dropout),
+        "group_questions_by_state": bool(args.group_questions_by_state),
+        "questions_per_state_group": int(args.questions_per_state_group),
+        "lr_scheduler": str(args.lr_scheduler),
+        "warmup_updates": int(warmup_updates),
+        "total_optimizer_updates": int(total_optimizer_updates),
+        "min_lr_ratio": float(args.min_lr_ratio),
         "global_dropout": float(getattr(args, "global_dropout", args.dropout)),
         "global_soft_prompt_scale": float(
             getattr(args, "global_soft_prompt_scale", args.soft_prompt_scale)
@@ -3993,7 +4387,10 @@ def main() -> None:
     print(
         f"run={run_dir.name} started_at={lifecycle.started_at} device={device} train/val/test="
         f"{len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} "
-        f"question_input={summary['question_input_mode']} params={summary['trainable_adapter_parameters']:,} "
+        f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
+        f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
+        f"global_dropout={summary['global_prompt_dropout']:.2f} "
+        f"params={summary['trainable_adapter_parameters']:,} "
         f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
         f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
         f"ranking:{float(args.ranking_loss_weight):g} "
@@ -4006,7 +4403,6 @@ def main() -> None:
     best_val_score = -math.inf
     best_epoch = 0
     history: dict[str, Any] = {}
-    accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     global_step = 0
     try:
         initial_count = min(max(0, int(args.initial_eval_records)), len(val_dataset))
@@ -4062,6 +4458,7 @@ def main() -> None:
             running_total_grad_norm = 0.0
             running_local_grad_norm = 0.0
             running_global_grad_norm = 0.0
+            running_global_dropout_batches = 0
             optimizer_update_count = 0
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(
@@ -4071,15 +4468,27 @@ def main() -> None:
             )
             final_accumulation_steps = len(train_loader) % accumulation_steps
             for step, batch in enumerate(progress, start=1):
-                loss, loss_parts = training_loss(
-                    llm=llm,
-                    adapter=adapter,
-                    tokenizer=tokenizer,
-                    dataset=train_dataset,
-                    batch=batch,
-                    device=device,
-                    args=args,
+                drop_global_for_batch = bool(
+                    isinstance(adapter, HybridGlobalLocalAdapter)
+                    and float(args.global_prompt_dropout) > 0.0
+                    and random.random() < float(args.global_prompt_dropout)
                 )
+                if isinstance(adapter, HybridGlobalLocalAdapter):
+                    adapter.set_global_prompt_dropout_for_batch(drop_global_for_batch)
+                try:
+                    loss, loss_parts = training_loss(
+                        llm=llm,
+                        adapter=adapter,
+                        tokenizer=tokenizer,
+                        dataset=train_dataset,
+                        batch=batch,
+                        device=device,
+                        args=args,
+                    )
+                finally:
+                    if isinstance(adapter, HybridGlobalLocalAdapter):
+                        adapter.set_global_prompt_dropout_for_batch(False)
+                running_global_dropout_batches += int(drop_global_for_batch)
                 accumulation_divisor = (
                     final_accumulation_steps
                     if final_accumulation_steps > 0 and step > len(train_loader) - final_accumulation_steps
@@ -4114,6 +4523,7 @@ def main() -> None:
                     running_global_grad_norm += global_grad_norm
                     optimizer_update_count += 1
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
@@ -4194,6 +4604,7 @@ def main() -> None:
                             "train_step/global_trainable": float(
                                 isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                             ),
+                            "train_step/global_prompt_dropped": float(drop_global_for_batch),
                         },
                         step=global_step,
                     )
@@ -4211,6 +4622,7 @@ def main() -> None:
             train_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
             train_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
             train_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
+            train_global_dropout_rate = running_global_dropout_batches / max(1, len(train_loader))
             val_metrics = evaluate_choice_accuracy(
                 llm=llm,
                 adapter=adapter,
@@ -4235,6 +4647,7 @@ def main() -> None:
                 "train_total_grad_norm": train_total_grad_norm,
                 "train_local_grad_norm": train_local_grad_norm,
                 "train_global_grad_norm": train_global_grad_norm,
+                "train_global_prompt_dropout_rate": train_global_dropout_rate,
                 "val": val_metrics,
             }
             history[f"epoch_{epoch:04d}"] = epoch_payload
@@ -4265,9 +4678,16 @@ def main() -> None:
                 "train/total_grad_norm": float(train_total_grad_norm),
                 "train/local_grad_norm": float(train_local_grad_norm),
                 "train/global_grad_norm": float(train_global_grad_norm),
+                "train/global_prompt_dropout_rate": float(train_global_dropout_rate),
                 "adapter/local_gate": float(
                     adapter.local_adapter.gate.detach().float().cpu().item()
                     if isinstance(adapter, HybridGlobalLocalAdapter)
+                    else 0.0
+                ),
+                "adapter/local_anchor_gate": float(
+                    adapter.local_adapter.anchor_gate.detach().float().cpu().item()
+                    if isinstance(adapter, HybridGlobalLocalAdapter)
+                    and adapter.local_adapter.anchor_gate is not None
                     else 0.0
                 ),
                 "lr": optimizer_group_lr(optimizer, "local", float(args.lr)),

@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-patches", type=int, default=None)
     parser.add_argument("--val-patches", type=int, default=None)
     parser.add_argument("--test-patches", type=int, default=None)
+    parser.add_argument("--train-question-variants", type=int, default=None)
+    parser.add_argument("--val-question-variants", type=int, default=None)
+    parser.add_argument("--test-question-variants", type=int, default=None)
     parser.add_argument("--sample-indices", type=str, default=None)
     parser.add_argument("--time-indices", type=str, default=None)
     parser.add_argument("--split-mode", choices=("sample", "time", "sample_time", "random_record"), default=None)
@@ -96,6 +99,24 @@ def parse_args() -> argparse.Namespace:
     set_default(args, "train_patches", first_nested(config, ["patch_qa.train_patches"]), 65536)
     set_default(args, "val_patches", first_nested(config, ["patch_qa.val_patches"]), 8192)
     set_default(args, "test_patches", first_nested(config, ["patch_qa.test_patches"]), 8192)
+    set_default(
+        args,
+        "train_question_variants",
+        first_nested(config, ["patch_qa.train_question_variants"]),
+        1,
+    )
+    set_default(
+        args,
+        "val_question_variants",
+        first_nested(config, ["patch_qa.val_question_variants"]),
+        1,
+    )
+    set_default(
+        args,
+        "test_question_variants",
+        first_nested(config, ["patch_qa.test_question_variants"]),
+        1,
+    )
     set_default(args, "sample_indices", value_to_csv(first_nested(config, ["patch_qa.sample_indices", "patch_alignment.sample_indices"])), "all")
     set_default(args, "time_indices", value_to_csv(first_nested(config, ["patch_qa.time_indices", "patch_alignment.time_indices"])), "all")
     set_default(args, "split_mode", first_nested(config, ["patch_qa.split_mode", "patch_alignment.split_mode"]), "sample")
@@ -118,6 +139,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(f"Unsupported patch QA tasks: {unknown}. Supported: {TASKS}")
     if not selected_tasks:
         raise ValueError("At least one patch QA task is required.")
+    for name in (
+        "train_patches",
+        "val_patches",
+        "test_patches",
+        "train_question_variants",
+        "val_question_variants",
+        "test_question_variants",
+    ):
+        if int(getattr(args, name)) <= 0:
+            raise ValueError(f"patch_qa.{name} must be positive.")
     args.tasks = selected_tasks
     return args
 
@@ -176,8 +207,8 @@ def patch_id(record: Mapping[str, Any]) -> str:
     )
 
 
-def question_seed(base_seed: int, record: Mapping[str, Any]) -> int:
-    payload = f"{int(base_seed)}|{patch_id(record)}".encode("utf-8")
+def question_seed(base_seed: int, record: Mapping[str, Any], variant_index: int = 0) -> int:
+    payload = f"{int(base_seed)}|{patch_id(record)}|variant={int(variant_index)}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=False)
 
 
@@ -224,11 +255,13 @@ def common_record(
     choices: Sequence[str],
     answer: str,
     oracle: Mapping[str, Any] | None,
+    variant_index: int,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "qa_id": f"{patch_ref}_{task}",
+        "qa_id": f"{patch_ref}_{task}_v{int(variant_index):02d}",
         "patch_id": patch_ref,
         "state_ref": patch_ref,
+        "question_variant": int(variant_index),
         "sample_index": int(patch_record["sample_index"]),
         "time_index": int(patch_record["time_index"]),
         "field": str(patch_record["fields"][0]),
@@ -263,6 +296,8 @@ def build_questions(
     decimals: int,
     include_oracle: bool,
     seed: int,
+    variant_index: int = 0,
+    variant_family_seed: int | None = None,
 ) -> list[dict[str, Any]]:
     rng = random.Random(int(seed))
     field = str(record["fields"][0])
@@ -285,7 +320,18 @@ def build_questions(
             f"Options: {option_text}."
         )
         oracle = {"row": row_a, "col": col_a, "normalized_value": z_value, "numeric_choices": numeric_choices}
-        result.append(common_record(record, patch_ref, "normalized_point_value", question, choices, answer, oracle if include_oracle else None))
+        result.append(
+            common_record(
+                record,
+                patch_ref,
+                "normalized_point_value",
+                question,
+                choices,
+                answer,
+                oracle if include_oracle else None,
+                variant_index,
+            )
+        )
 
     if "raw_point_value_with_stats" in tasks:
         raw_value = float(raw_patch[0, row_a, col_a].item())
@@ -316,6 +362,7 @@ def build_questions(
             choices,
             answer,
             oracle if include_oracle else None,
+            variant_index,
         )
         raw_record["prompt_data"] = {
             "field": field,
@@ -327,6 +374,7 @@ def build_questions(
             "significant_digits": int(used_decimals),
             "option_significant_digits": int(used_decimals),
             "patch_size": size,
+            "question_variant": int(variant_index),
         }
         result.append(raw_record)
 
@@ -346,7 +394,18 @@ def build_questions(
             f"A at row {row_a}, column {col_a}, or B at row {row_b}, column {col_b}?"
         )
         oracle = {"point_a": [row_a, col_a], "point_b": [row_b, col_b], "value_a": value_a, "value_b": value_b}
-        result.append(common_record(record, patch_ref, "point_compare", question, ["A", "B"], answer, oracle if include_oracle else None))
+        result.append(
+            common_record(
+                record,
+                patch_ref,
+                "point_compare",
+                question,
+                ["A", "B"],
+                answer,
+                oracle if include_oracle else None,
+                variant_index,
+            )
+        )
 
     if "region_mean_compare" in tasks:
         region = max(1, min(int(region_size), size))
@@ -368,10 +427,23 @@ def build_questions(
             "Which region has the larger mean?"
         )
         oracle = {"region_a": [row0_a, col0_a, region], "region_b": [row0_b, col0_b, region], "mean_a": mean_a, "mean_b": mean_b}
-        result.append(common_record(record, patch_ref, "region_mean_compare", question, ["A", "B"], answer, oracle if include_oracle else None))
+        result.append(
+            common_record(
+                record,
+                patch_ref,
+                "region_mean_compare",
+                question,
+                ["A", "B"],
+                answer,
+                oracle if include_oracle else None,
+                variant_index,
+            )
+        )
 
     if "extreme_quadrant" in tasks:
-        find_maximum = bool(rng.randrange(2))
+        # Alternate this binary operation within a patch while keeping variant 0 balanced across patches.
+        family_seed = int(seed if variant_family_seed is None else variant_family_seed)
+        find_maximum = bool((family_seed + int(variant_index)) % 2)
         values = normalized_patch[0]
         flat_index = int(torch.argmax(values).item() if find_maximum else torch.argmin(values).item())
         row, col = divmod(flat_index, size)
@@ -383,7 +455,18 @@ def build_questions(
         )
         choices = list(LABELS_4)
         oracle = {"extreme": extreme, "row": row, "col": col, "value": float(values[row, col].item())}
-        result.append(common_record(record, patch_ref, "extreme_quadrant", question, choices, answer, oracle if include_oracle else None))
+        result.append(
+            common_record(
+                record,
+                patch_ref,
+                "extreme_quadrant",
+                question,
+                choices,
+                answer,
+                oracle if include_oracle else None,
+                variant_index,
+            )
+        )
     return result
 
 
@@ -431,6 +514,11 @@ def main() -> None:
         seed=int(args.seed),
     )
     counts = {"train": int(args.train_patches), "val": int(args.val_patches), "test": int(args.test_patches)}
+    question_variants = {
+        "train": int(args.train_question_variants),
+        "val": int(args.val_question_variants),
+        "test": int(args.test_question_variants),
+    }
     split_records = {
         split: build_patch_records(
             hdf5_path=args.hdf5_path,
@@ -525,25 +613,29 @@ def main() -> None:
                         },
                         latent_path,
                     )
-                questions = build_questions(
-                    record=record,
-                    raw_patch=raw_batch[local_index],
-                    normalized_patch=normalized_items[local_index],
-                    mean=stats[local_index][0],
-                    std=stats[local_index][1],
-                    tasks=args.tasks,
-                    region_size=int(args.region_size),
-                    spacing=float(args.numeric_choice_spacing),
-                    decimals=int(args.decimal_places),
-                    include_oracle=bool(args.include_oracle),
-                    seed=question_seed(int(args.seed), record),
-                )
-                qa_records.extend(questions)
-                task_counts.update(question["task_type"] for question in questions)
+                for variant_index in range(question_variants[split]):
+                    questions = build_questions(
+                        record=record,
+                        raw_patch=raw_batch[local_index],
+                        normalized_patch=normalized_items[local_index],
+                        mean=stats[local_index][0],
+                        std=stats[local_index][1],
+                        tasks=args.tasks,
+                        region_size=int(args.region_size),
+                        spacing=float(args.numeric_choice_spacing),
+                        decimals=int(args.decimal_places),
+                        include_oracle=bool(args.include_oracle),
+                        seed=question_seed(int(args.seed), record, variant_index),
+                        variant_index=variant_index,
+                        variant_family_seed=question_seed(int(args.seed), record, -1),
+                    )
+                    qa_records.extend(questions)
+                    task_counts.update(question["task_type"] for question in questions)
                 field_counts.update([str(record["fields"][0])])
         write_jsonl(qa_dir / f"{split}.jsonl", qa_records)
         summary["splits"][split] = {
             "patches": len(records),
+            "question_variants_per_patch": question_variants[split],
             "qa_records": len(qa_records),
             "by_task": dict(sorted(task_counts.items())),
             "patches_by_field": dict(sorted(field_counts.items())),
@@ -559,7 +651,8 @@ def main() -> None:
         "patch_size": int(args.patch_size),
         "normalization": normalization_cfg,
         "split_mode": str(args.split_mode),
-        "question_seed_mode": "sha256(seed|patch_id)",
+        "question_seed_mode": "sha256(seed|patch_id|variant)",
+        "question_variants": question_variants,
         "include_oracle": bool(args.include_oracle),
         "split_overlap": overlap,
         "summary": summary,

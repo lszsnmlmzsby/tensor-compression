@@ -9,6 +9,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -23,7 +24,7 @@ from build_tensor_readout_qa import (  # noqa: E402
     generate_split_records,
     split_sample_indices,
 )
-from build_tensor_patch_qa import labeled_numeric_choices, question_seed  # noqa: E402
+from build_tensor_patch_qa import build_questions, labeled_numeric_choices, question_seed  # noqa: E402
 
 
 def _write_synthetic_pdebench_file(path: Path) -> None:
@@ -46,11 +47,47 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
             "time_index": 2,
             "row": 3,
             "col": 4,
+            "patch_size": 4,
         }
         second = dict(first, sample_index=2)
 
         self.assertEqual(question_seed(42, first), question_seed(42, first))
         self.assertNotEqual(question_seed(42, first), question_seed(42, second))
+        self.assertNotEqual(question_seed(42, first, 0), question_seed(42, first, 1))
+
+    def test_patch_question_variants_alternate_binary_extreme_operation(self) -> None:
+        record = {
+            "fields": ["Vx"],
+            "sample_index": 1,
+            "time_index": 2,
+            "row": 3,
+            "col": 4,
+            "patch_size": 4,
+        }
+        patch = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+        family_seed = question_seed(42, record, -1)
+        variants = [
+            build_questions(
+                record=record,
+                raw_patch=torch.from_numpy(patch),
+                normalized_patch=torch.from_numpy(patch),
+                mean=0.0,
+                std=1.0,
+                tasks=["extreme_quadrant"],
+                region_size=2,
+                spacing=0.5,
+                decimals=6,
+                include_oracle=True,
+                seed=question_seed(42, record, variant_index),
+                variant_index=variant_index,
+                variant_family_seed=family_seed,
+            )[0]
+            for variant_index in range(2)
+        ]
+
+        self.assertNotEqual(variants[0]["question"], variants[1]["question"])
+        self.assertEqual({variant["oracle"]["extreme"] for variant in variants}, {"minimum", "maximum"})
+        self.assertEqual([variant["question_variant"] for variant in variants], [0, 1])
 
     def test_numeric_choices_increase_display_precision_until_distinct(self) -> None:
         option_text, choices, answer, values, used_digits = labeled_numeric_choices(
