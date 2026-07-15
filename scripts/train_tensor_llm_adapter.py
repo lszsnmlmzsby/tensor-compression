@@ -73,6 +73,21 @@ def local_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def atomic_dump_json(path: str | Path, payload: dict[str, Any]) -> None:
+    target = Path(path)
+    temporary = target.with_name(f".{target.name}.tmp")
+    dump_json(temporary, payload)
+    os.replace(temporary, target)
+
+
+def atomic_torch_save(path: str | Path, payload: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, target)
+
+
 class RunLifecycle:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
@@ -1398,6 +1413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostics-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-every-epochs", type=int, default=None)
     parser.add_argument("--diagnostics-records-per-task", type=int, default=None)
+    parser.add_argument("--diagnostics-generation-max-new-tokens", type=int, default=None)
     parser.add_argument(
         "--diagnostics-layers",
         type=str,
@@ -1621,6 +1637,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "diagnostics_generation_max_new_tokens",
+        first_nested(config, ["llm_training.diagnostics.generation_max_new_tokens"]),
+        8,
+    )
+    set_default(
+        args,
         "diagnostics_layers",
         value_to_csv(first_nested(config, ["llm_training.diagnostics.layers"])),
         "0,2,8,14,-1",
@@ -1706,6 +1728,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("llm_training.min_lr_ratio must be in [0, 1].")
     if int(args.diagnostics_every_epochs) < 0 or int(args.diagnostics_records_per_task) <= 0:
         raise ValueError("Diagnostic cadence must be non-negative and records_per_task must be positive.")
+    if int(args.diagnostics_generation_max_new_tokens) <= 0:
+        raise ValueError("llm_training.diagnostics.generation_max_new_tokens must be positive.")
     if bool(args.diagnostics_enabled) and not parse_csv(args.diagnostics_layers):
         raise ValueError("llm_training.diagnostics.layers cannot be empty when diagnostics are enabled.")
     for setting in ("eval_baselines", "final_eval_baselines"):
@@ -2090,6 +2114,17 @@ def choice_semantics(record: Mapping[str, Any]) -> str:
     return ""
 
 
+def valid_choice_instruction(record: Mapping[str, Any]) -> str:
+    choices = record.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+        raise ValueError(f"Record has no valid choices: {record.get('qa_id', '<unknown>')}")
+    labels = [str(choice) for choice in choices]
+    return (
+        f"Required output: exactly one of {', '.join(labels)}. "
+        "Output only that label, with no explanation, punctuation, or other text."
+    )
+
+
 def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
     query = str(record.get("query") or record.get("question") or "")
     choices = record.get("choices")
@@ -2099,9 +2134,10 @@ def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
     if prompt_template == "generic":
         return (
             "Tensor-state soft tokens are prepended before this text.\n"
-            "Answer the tensor readout query with exactly one choice label.\n\n"
+            "Answer the tensor readout query using those tokens.\n\n"
             f"Query: {query}\n"
             f"Choices: {choice_text}\n"
+            f"{valid_choice_instruction(record)}\n"
             "Answer:"
         )
     if prompt_template != "task_specific":
@@ -2113,9 +2149,17 @@ def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
         f"Query: {query}\n"
         f"Choices: {choice_text}\n"
         f"{choice_semantics(record)}\n"
-        "Output format: one choice label only, such as A, B, B00, B01, B02, ... .\n"
+        f"{valid_choice_instruction(record)}\n"
         "Answer:"
     )
+
+
+def build_local_conditioning_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
+    prompt = build_prompt(record, prompt_template=prompt_template)
+    answer_anchor = "Answer:"
+    if not prompt.endswith(answer_anchor):
+        raise ValueError("The local conditioning prompt requires the main prompt to end with 'Answer:'.")
+    return f"{prompt[: -len(answer_anchor)]}{LOCAL_QUESTION_ANCHOR_TEXT}"
 
 
 def audit_prompt_tokenization(
@@ -2130,12 +2174,15 @@ def audit_prompt_tokenization(
         "prompt_template": str(prompt_template),
         "splits": {},
         "truncated_records": 0,
+        "local_truncated_records": 0,
         "truncated_examples": [],
     }
     for split, dataset in datasets.items():
         split_total_tokens = 0
         split_max_tokens = 0
         split_truncated = 0
+        split_local_max_tokens = 0
+        split_local_truncated = 0
         task_stats: dict[str, dict[str, int]] = defaultdict(
             lambda: {"records": 0, "max_tokens": 0, "truncated": 0}
         )
@@ -2158,14 +2205,21 @@ def audit_prompt_tokenization(
                     )
                 prompts.append(prompt)
             encoded = tokenizer(prompts, add_special_tokens=True, truncation=False)["input_ids"]
-            for record, token_ids in zip(records, encoded):
+            local_encoded = tokenizer(
+                [build_local_conditioning_prompt(record, prompt_template=prompt_template) for record in records],
+                add_special_tokens=True,
+                truncation=False,
+            )["input_ids"]
+            for record, token_ids, local_token_ids in zip(records, encoded, local_encoded):
                 token_count = len(token_ids)
+                local_token_count = len(local_token_ids)
                 task = str(record.get("task_type", "unknown"))
                 task_stat = task_stats[task]
                 task_stat["records"] += 1
                 task_stat["max_tokens"] = max(task_stat["max_tokens"], token_count)
                 split_total_tokens += token_count
                 split_max_tokens = max(split_max_tokens, token_count)
+                split_local_max_tokens = max(split_local_max_tokens, local_token_count)
                 if token_count > limit:
                     split_truncated += 1
                     task_stat["truncated"] += 1
@@ -2178,15 +2232,32 @@ def audit_prompt_tokenization(
                                 "tokens": token_count,
                             }
                         )
+                if local_token_count > limit:
+                    split_local_truncated += 1
+                    if len(summary["truncated_examples"]) < 8:
+                        summary["truncated_examples"].append(
+                            {
+                                "split": split,
+                                "qa_id": str(record.get("qa_id", "")),
+                                "task_type": task,
+                                "tokens": local_token_count,
+                                "path": "local_conditioning_prompt",
+                            }
+                        )
         summary["splits"][split] = {
             "records": len(dataset),
             "mean_tokens": split_total_tokens / max(1, len(dataset)),
             "max_tokens": split_max_tokens,
             "truncated_records": split_truncated,
+            "local_max_tokens": split_local_max_tokens,
+            "local_truncated_records": split_local_truncated,
             "by_task": dict(sorted(task_stats.items())),
         }
         summary["truncated_records"] += split_truncated
-    summary["all_prompts_fit"] = int(summary["truncated_records"]) == 0
+        summary["local_truncated_records"] += split_local_truncated
+    summary["all_prompts_fit"] = (
+        int(summary["truncated_records"]) == 0 and int(summary["local_truncated_records"]) == 0
+    )
     return summary
 
 
@@ -2370,19 +2441,15 @@ def build_local_question_tensors(
     tokenizer,
     device: torch.device,
     max_tokens: int,
+    prompt_template: str = "task_specific",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    questions = []
+    prompts = []
     for record in records:
-        question = re.split(
-            r"\s+(?:options|choices)\s*:",
-            str(record.get("query") or record.get("question") or ""),
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0].strip()
+        question = str(record.get("query") or record.get("question") or "").strip()
         if not question:
             raise ValueError("The contextual local adapter received an empty natural-language question.")
-        questions.append(f"{question}\n{LOCAL_QUESTION_ANCHOR_TEXT}")
-    encoded = tokenizer(questions, padding=True, truncation=False, return_tensors="pt")
+        prompts.append(build_local_conditioning_prompt(record, prompt_template=prompt_template))
+    encoded = tokenizer(prompts, padding=True, truncation=False, return_tensors="pt")
     if int(encoded["input_ids"].shape[1]) > int(max_tokens):
         raise ValueError(
             f"A local question uses {int(encoded['input_ids'].shape[1])} tokens, exceeding "
@@ -2401,6 +2468,7 @@ def contextual_adapter_soft_embeds(
     max_prompt_tokens: int,
     layer_index: int,
     mode: str,
+    prompt_template: str,
 ) -> torch.Tensor | None:
     if not (
         isinstance(adapter, HybridGlobalLocalAdapter)
@@ -2412,6 +2480,7 @@ def contextual_adapter_soft_embeds(
         tokenizer=tokenizer,
         device=device,
         max_tokens=int(max_prompt_tokens),
+        prompt_template=str(prompt_template),
     )
     question_embeds = contextual_question_tokens_for_adapter(
         llm=llm,
@@ -2520,6 +2589,7 @@ def forward_loss(
         max_prompt_tokens=max_prompt_tokens,
         layer_index=int(local_context_layer),
         mode=soft_prompt_mode,
+        prompt_template=str(prompt_template),
     )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -2645,6 +2715,7 @@ def forward_answer_nll(
             max_prompt_tokens=max_prompt_tokens,
             layer_index=int(local_context_layer),
             mode=soft_prompt_mode,
+            prompt_template=str(prompt_template),
         )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -2729,6 +2800,7 @@ def choice_ce_loss(
         max_prompt_tokens=int(args.max_prompt_tokens),
         layer_index=int(args.local_context_layer),
         mode=soft_prompt_mode,
+        prompt_template=str(args.prompt_template),
     )
     candidate_soft_embeds = (
         torch.stack([base_soft_embeds[index] for index in candidate_owners], dim=0)
@@ -3058,6 +3130,7 @@ def score_candidate_batch(
             max_prompt_tokens=max_prompt_tokens,
             layer_index=int(local_context_layer),
             mode=soft_prompt_mode,
+            prompt_template=str(prompt_template),
         )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -3094,6 +3167,87 @@ def score_candidate_batch(
     if choice_score == "mean":
         nll = nll / target_counts.clamp_min(1)
     return [float(value) for value in nll.detach().cpu()]
+
+
+def parse_generated_choice(text: str, choices: Sequence[str]) -> dict[str, Any]:
+    raw = str(text)
+    stripped = raw.strip()
+    labels = [str(choice) for choice in choices]
+    if not labels:
+        return {
+            "raw_output": raw,
+            "stripped_output": stripped,
+            "parsed_choice": None,
+            "format_valid": False,
+            "contains_single_valid_choice": False,
+            "matched_choices": [],
+        }
+    exact = stripped in labels
+    label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    matches = re.findall(rf"(?<![A-Za-z0-9_])(?:{label_pattern})(?![A-Za-z0-9_])", stripped)
+    unique_matches = list(dict.fromkeys(matches))
+    parsed = stripped if exact else unique_matches[0] if len(unique_matches) == 1 else None
+    return {
+        "raw_output": raw,
+        "stripped_output": stripped,
+        "parsed_choice": parsed,
+        "format_valid": bool(exact),
+        "contains_single_valid_choice": len(unique_matches) == 1,
+        "matched_choices": unique_matches,
+    }
+
+
+@torch.no_grad()
+def generate_diagnostic_answer(
+    llm,
+    tokenizer,
+    record: Mapping[str, Any],
+    soft_embeds: torch.Tensor,
+    device: torch.device,
+    prompt_template: str,
+    max_prompt_tokens: int,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    prompt = build_prompt(record, prompt_template=prompt_template)
+    prompt_ids = tokenizer(prompt, add_special_tokens=True, truncation=False)["input_ids"]
+    if len(prompt_ids) > int(max_prompt_tokens):
+        prompt_ids = prompt_ids[-int(max_prompt_tokens) :]
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
+    inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
+    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+    outputs = llm(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=True,
+        return_dict=True,
+    )
+    generated_ids: list[int] = []
+    past_key_values = outputs.past_key_values
+    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
+    for _ in range(max(1, int(max_new_tokens))):
+        token_id = int(next_token.item())
+        generated_ids.append(token_id)
+        if eos_id is not None and token_id == eos_id:
+            break
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype, device=device)], dim=1
+        )
+        outputs = llm(
+            input_ids=next_token,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    parsed = parse_generated_choice(text, [str(value) for value in record.get("choices", [])])
+    parsed["generated_token_ids"] = generated_ids
+    return parsed
 
 
 def collect_candidate_scores(
@@ -3133,6 +3287,7 @@ def collect_candidate_scores(
         max_prompt_tokens=int(args.max_prompt_tokens),
         layer_index=int(args.local_context_layer),
         mode=mode,
+        prompt_template=str(args.prompt_template),
     )
     candidate_soft_embeds = (
         [base_soft_embeds[index] for index in candidate_owner] if base_soft_embeds is not None else None
@@ -3628,6 +3783,7 @@ def run_embedded_diagnostics(
                 tokenizer=tokenizer,
                 device=device,
                 max_tokens=int(args.max_prompt_tokens),
+                prompt_template=str(args.prompt_template),
             )
             local_text_embeds = contextual_question_tokens_for_adapter(
                 llm=llm,
@@ -3738,6 +3894,20 @@ def run_embedded_diagnostics(
                 "answer_margin": float(min(wrong_scores) - scores[target_index]) if wrong_scores else 0.0,
             }
 
+        generated_modes = {
+            mode: generate_diagnostic_answer(
+                llm=llm,
+                tokenizer=tokenizer,
+                record=record,
+                soft_embeds=mode_states[mode]["soft_prompt"].unsqueeze(0),
+                device=device,
+                prompt_template=str(args.prompt_template),
+                max_prompt_tokens=int(args.max_prompt_tokens),
+                max_new_tokens=int(args.diagnostics_generation_max_new_tokens),
+            )
+            for mode in ("correct", "shuffled")
+        }
+
         correct_state = mode_states["correct"]
         shuffled_state = mode_states["shuffled"]
         local_count = (
@@ -3757,32 +3927,37 @@ def run_embedded_diagnostics(
                 key for key in correct_state["adapter_hidden"] if key.startswith("local_latent_attention_")
             )
             if text_attention_keys:
-                text_weights = correct_state["adapter_hidden"][text_attention_keys[-1]].mean(dim=(0, 1, 2))
-                top_count = min(8, int(text_weights.numel()))
-                values, indices = torch.topk(text_weights, k=top_count)
                 token_ids = local_ids[0].detach().cpu()
-                local_attention_summary["top_question_tokens"] = [
-                    {
-                        "index": int(index),
-                        "token": str(tokenizer.convert_ids_to_tokens(int(token_ids[index]))),
-                        "weight": float(value),
-                    }
-                    for value, index in zip(values.tolist(), indices.tolist())
-                ]
+                local_attention_summary["text_blocks"] = {}
+                for key in text_attention_keys:
+                    text_weights = correct_state["adapter_hidden"][key].mean(dim=(0, 1, 2))
+                    top_count = min(8, int(text_weights.numel()))
+                    values, indices = torch.topk(text_weights, k=top_count)
+                    local_attention_summary["text_blocks"][key] = [
+                        {
+                            "index": int(index),
+                            "token": str(tokenizer.convert_ids_to_tokens(int(token_ids[index]))),
+                            "text": tokenizer.decode([int(token_ids[index])]),
+                            "weight": float(value),
+                        }
+                        for value, index in zip(values.tolist(), indices.tolist())
+                    ]
             if latent_attention_keys:
-                latent_weights = correct_state["adapter_hidden"][latent_attention_keys[-1]].mean(dim=(0, 1, 2))
-                top_count = min(8, int(latent_weights.numel()))
-                values, indices = torch.topk(latent_weights, k=top_count)
                 latent_width = int(adapter.local_adapter.latent_grid[1])
-                local_attention_summary["top_latent_cells"] = [
-                    {
-                        "index": int(index),
-                        "row": int(index) // latent_width,
-                        "col": int(index) % latent_width,
-                        "weight": float(value),
-                    }
-                    for value, index in zip(values.tolist(), indices.tolist())
-                ]
+                local_attention_summary["latent_blocks"] = {}
+                for key in latent_attention_keys:
+                    latent_weights = correct_state["adapter_hidden"][key].mean(dim=(0, 1, 2))
+                    top_count = min(8, int(latent_weights.numel()))
+                    values, indices = torch.topk(latent_weights, k=top_count)
+                    local_attention_summary["latent_blocks"][key] = [
+                        {
+                            "index": int(index),
+                            "row": int(index) // latent_width,
+                            "col": int(index) % latent_width,
+                            "weight": float(value),
+                        }
+                        for value, index in zip(values.tolist(), indices.tolist())
+                    ]
         soft_comparison = _cosine_and_relative_l2(correct_state["soft_prompt"], shuffled_state["soft_prompt"])
         soft_comparison["query_off_diagonal_cosine"] = _mean_off_diagonal_cosine(
             correct_state["soft_prompt"]
@@ -3859,6 +4034,7 @@ def run_embedded_diagnostics(
                     tokenizer=tokenizer,
                     device=device,
                     max_tokens=int(args.max_prompt_tokens),
+                    prompt_template=str(args.prompt_template),
                 )
                 alt_text_embeds = contextual_question_tokens_for_adapter(
                     llm=llm,
@@ -3903,6 +4079,7 @@ def run_embedded_diagnostics(
                 tokenizer=tokenizer,
                 device=device,
                 max_tokens=int(args.max_prompt_tokens),
+                prompt_template=str(args.prompt_template),
             )
             same_text_embeds = llm.get_input_embeddings()(same_ids)
             if (
@@ -3987,9 +4164,13 @@ def run_embedded_diagnostics(
                 "field": str(record.get("field", "unknown")),
                 "question": str(record.get("query") or record.get("question") or ""),
                 "rendered_prompt": build_prompt(record, prompt_template=str(args.prompt_template)),
+                "local_conditioning_prompt": build_local_conditioning_prompt(
+                    record, prompt_template=str(args.prompt_template)
+                ),
                 "choices": choices,
                 "answer": answer,
                 "scores": score_modes,
+                "generation": generated_modes,
                 "soft_prompt_correct_vs_shuffled": soft_comparison,
                 "adapter_hidden_correct_vs_shuffled": adapter_hidden_comparison,
                 "question_sensitivity": question_sensitivity,
@@ -4001,7 +4182,6 @@ def run_embedded_diagnostics(
 
     diagnostic_dir = run_dir / "diagnostics"
     diagnostic_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(tensor_payload, diagnostic_dir / f"{stage}_states.pt")
     layer_names = sorted(
         {layer for record_summary in summaries for layer in record_summary["hidden_correct_vs_shuffled"]},
         key=int,
@@ -4017,12 +4197,64 @@ def run_embedded_diagnostics(
         float(item["soft_prompt_correct_vs_shuffled"].get("global_rms", 0.0)) for item in summaries
     ]
     same_task_sensitivity_by_task: dict[str, float] = {}
+    same_task_margin_delta_by_task: dict[str, float] = {}
     for task in sorted({str(item["task_type"]) for item in same_task_sensitive_records}):
         task_items = [item for item in same_task_sensitive_records if str(item["task_type"]) == task]
         same_task_sensitivity_by_task[task] = sum(
             item["same_task_question_sensitivity"]["same_latent_local_prompt"]["relative_l2"]
             for item in task_items
         ) / max(1, len(task_items))
+        same_task_margin_delta_by_task[task] = sum(
+            item["scores"]["correct"]["answer_margin"]
+            - item["same_task_question_sensitivity"]["swapped_question_answer_margin"]
+            for item in task_items
+        ) / max(1, len(task_items))
+    generation_by_task: dict[str, dict[str, float]] = {}
+    score_diagnostics_by_task: dict[str, dict[str, float]] = {}
+    for task in sorted({str(item["task_type"]) for item in summaries}):
+        task_items = [item for item in summaries if str(item["task_type"]) == task]
+        generation_by_task[task] = {}
+        for mode in ("correct", "shuffled"):
+            generation_by_task[task][f"{mode}_format_valid_rate"] = sum(
+                bool(item["generation"][mode]["format_valid"]) for item in task_items
+            ) / max(1, len(task_items))
+            generation_by_task[task][f"{mode}_parsed_accuracy"] = sum(
+                item["generation"][mode]["parsed_choice"] == item["answer"] for item in task_items
+            ) / max(1, len(task_items))
+        correct_margin = sum(item["scores"]["correct"]["answer_margin"] for item in task_items) / max(
+            1, len(task_items)
+        )
+        shuffled_margin = sum(item["scores"]["shuffled"]["answer_margin"] for item in task_items) / max(
+            1, len(task_items)
+        )
+        score_diagnostics_by_task[task] = {
+            "correct_accuracy": sum(
+                item["scores"]["correct"]["prediction"] == item["answer"] for item in task_items
+            ) / max(1, len(task_items)),
+            "shuffled_accuracy": sum(
+                item["scores"]["shuffled"]["prediction"] == item["answer"] for item in task_items
+            ) / max(1, len(task_items)),
+            "correct_answer_margin": correct_margin,
+            "shuffled_answer_margin": shuffled_margin,
+            "correct_minus_shuffled_answer_margin": correct_margin - shuffled_margin,
+        }
+    text_layer_weights: dict[str, float] = {}
+    text_attention_gates: dict[str, float] = {}
+    residual_gate = 0.0
+    if isinstance(adapter, HybridGlobalLocalAdapter):
+        residual_gate = float(adapter.local_adapter.gate.detach().float().cpu().item())
+        layer_logits = getattr(adapter.local_adapter, "text_layer_logits", None)
+        context_layers = getattr(adapter.local_adapter, "context_layers", ())
+        if isinstance(layer_logits, torch.Tensor):
+            layer_weights = torch.softmax(layer_logits.detach().float().cpu(), dim=0)
+            text_layer_weights = {
+                str(layer): float(weight) for layer, weight in zip(context_layers, layer_weights.tolist())
+            }
+        text_attention_gates = {
+            str(index): float(block.gate.detach().float().cpu().item())
+            for index, block in enumerate(getattr(adapter.local_adapter, "text_blocks", []))
+            if isinstance(getattr(block, "gate", None), torch.Tensor)
+        }
     aggregate = {
         "records": len(summaries),
         "soft_prompt_relative_l2_mean": sum(
@@ -4046,6 +4278,7 @@ def run_embedded_diagnostics(
             for item in summaries
         )
         / max(1, len(summaries)),
+        "score_diagnostics_by_task": score_diagnostics_by_task,
         "correct_prediction_accuracy": sum(
             item["scores"]["correct"]["prediction"] == item["answer"] for item in summaries
         )
@@ -4066,6 +4299,7 @@ def run_embedded_diagnostics(
         )
         / max(1, len(same_task_sensitive_records)),
         "same_task_different_question_local_relative_l2_by_task": same_task_sensitivity_by_task,
+        "same_task_correct_minus_swapped_answer_margin_by_task": same_task_margin_delta_by_task,
         "same_task_swapped_question_answer_margin_mean": sum(
             item["same_task_question_sensitivity"]["swapped_question_answer_margin"]
             for item in same_task_sensitive_records
@@ -4083,6 +4317,29 @@ def run_embedded_diagnostics(
             and getattr(adapter.local_adapter, "anchor_gate", None) is not None
             else 0.0
         ),
+        "local_residual_gate": residual_gate,
+        "text_context_layer_weights": text_layer_weights,
+        "text_cross_attention_gates": text_attention_gates,
+        "generation": {
+            "correct_format_valid_rate": sum(
+                bool(item["generation"]["correct"]["format_valid"]) for item in summaries
+            ) / max(1, len(summaries)),
+            "correct_parsed_accuracy": sum(
+                item["generation"]["correct"]["parsed_choice"] == item["answer"] for item in summaries
+            ) / max(1, len(summaries)),
+            "correct_semantic_but_format_invalid_rate": sum(
+                item["generation"]["correct"]["parsed_choice"] == item["answer"]
+                and not bool(item["generation"]["correct"]["format_valid"])
+                for item in summaries
+            ) / max(1, len(summaries)),
+            "shuffled_format_valid_rate": sum(
+                bool(item["generation"]["shuffled"]["format_valid"]) for item in summaries
+            ) / max(1, len(summaries)),
+            "shuffled_parsed_accuracy": sum(
+                item["generation"]["shuffled"]["parsed_choice"] == item["answer"] for item in summaries
+            ) / max(1, len(summaries)),
+            "by_task": generation_by_task,
+        },
         "local_prompt_rms_mean": sum(local_rms_values) / max(1, len(local_rms_values)),
         "global_prompt_rms_mean": sum(global_rms_values) / max(1, len(global_rms_values)),
         "local_to_global_prompt_rms_ratio": (
@@ -4109,7 +4366,8 @@ def run_embedded_diagnostics(
         "state_file": str(diagnostic_dir / f"{stage}_states.pt"),
         "structured_query_conditioning": bool(getattr(adapter, "structured_query_conditioning", False)),
     }
-    dump_json(diagnostic_dir / f"{stage}_summary.json", summary)
+    atomic_dump_json(diagnostic_dir / f"{stage}_summary.json", summary)
+    atomic_torch_save(diagnostic_dir / f"{stage}_states.pt", tensor_payload)
     if was_training:
         adapter.train()
     return summary
@@ -4130,7 +4388,7 @@ def save_adapter_checkpoint(
         "llm_hidden_size": int(llm_hidden_size),
         "metrics": dict(metrics or {}),
     }
-    torch.save(payload, path)
+    atomic_torch_save(path, payload)
 
 
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -4381,11 +4639,24 @@ def compact_diagnostic_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
         "same_task_swapped_question_answer_margin_mean",
         "local_to_global_prompt_rms_ratio",
     )
-    return {
+    payload = {
         f"diagnostics/{key}": float(metrics[key])
         for key in keys
         if isinstance(metrics.get(key), (int, float))
     }
+    for key in ("local_residual_gate",):
+        if isinstance(metrics.get(key), (int, float)):
+            payload[f"diagnostics/{key}"] = float(metrics[key])
+    generation = metrics.get("generation")
+    if isinstance(generation, Mapping):
+        for key in (
+            "correct_format_valid_rate",
+            "correct_parsed_accuracy",
+            "correct_semantic_but_format_invalid_rate",
+        ):
+            if isinstance(generation.get(key), (int, float)):
+                payload[f"diagnostics/generation/{key}"] = float(generation[key])
+    return payload
 
 
 def macro_latent_gain(metrics: Mapping[str, Any], baseline: str = "shuffled") -> float:
@@ -4524,6 +4795,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
                 "enabled": bool(args.diagnostics_enabled),
                 "every_epochs": int(args.diagnostics_every_epochs),
                 "records_per_task": int(args.diagnostics_records_per_task),
+                "generation_max_new_tokens": int(args.diagnostics_generation_max_new_tokens),
                 "layers": parse_csv(args.diagnostics_layers),
             },
         },
@@ -4611,7 +4883,7 @@ def main() -> None:
     dump_json(run_dir / "prompt_audit.json", prompt_audit)
     if bool(args.require_untruncated_prompts) and not bool(prompt_audit["all_prompts_fit"]):
         raise ValueError(
-            f"Prompt audit found {prompt_audit['truncated_records']} prompts longer than "
+            "Prompt audit found main/local prompts longer than "
             f"max_prompt_tokens={int(args.max_prompt_tokens)}. Increase the limit so formal runs do not "
             "silently remove natural-language instructions. See prompt_audit.json."
         )
@@ -4640,6 +4912,7 @@ def main() -> None:
             tokenizer=tokenizer,
             device=device,
             max_tokens=int(args.max_prompt_tokens),
+            prompt_template=str(args.prompt_template),
         )
         preflight_context = contextual_question_token_layers(
             llm=llm,
@@ -5019,6 +5292,7 @@ def main() -> None:
             getattr(args, "global_soft_prompt_scale", args.soft_prompt_scale)
         ),
         "checkpoint_metric": str(args.checkpoint_metric),
+        "diagnostics_generation_max_new_tokens": int(args.diagnostics_generation_max_new_tokens),
         "checkpoint_load_report": checkpoint_load_report,
         "qa_metadata_audit": qa_metadata_audit,
         "data_audit": data_audit,
@@ -5050,6 +5324,7 @@ def main() -> None:
         f"global_dropout={summary['global_prompt_dropout']:.2f} "
         f"params={summary['trainable_adapter_parameters']:,} "
         f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
+        f"local_prompt_max={max(item['local_max_tokens'] for item in prompt_audit['splits'].values())} "
         f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
         f"ranking:{float(args.ranking_loss_weight):g},swap:{float(args.swapped_question_loss_weight):g} "
         f"checkpoint_load={checkpoint_load_report.get('mode')} "
@@ -5091,6 +5366,22 @@ def main() -> None:
             )
             wandb_logger.log(initial_payload, step=0)
             print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
+            if bool(args.diagnostics_enabled):
+                pretrain_diagnostic = run_embedded_diagnostics(
+                    stage="pretrain",
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    dataset=val_dataset,
+                    device=device,
+                    args=args,
+                    run_dir=run_dir,
+                )
+                history["pretrain_diagnostics"] = dict(pretrain_diagnostic["aggregate"])
+                dump_json(metrics_path, history)
+                wandb_logger.log(
+                    compact_diagnostic_metrics(pretrain_diagnostic["aggregate"]), step=0
+                )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         for epoch in range(1, int(args.epochs) + 1):

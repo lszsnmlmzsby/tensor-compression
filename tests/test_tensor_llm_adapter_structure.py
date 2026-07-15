@@ -13,6 +13,8 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
 
 from train_tensor_llm_adapter import (  # noqa: E402
     ResidualQuestionConditionedAdapter,
+    build_local_conditioning_prompt,
+    parse_generated_choice,
     same_state_question_swap_indices,
 )
 from train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
@@ -29,6 +31,41 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):
+    def test_local_prompt_contains_numeric_options_and_exact_output_contract(self) -> None:
+        record = {
+            "qa_id": "numeric-1",
+            "task_type": "normalized_point_value",
+            "query": "Read row 3, column 7. Options: A: -0.5; B: 0.0; C: 0.5; D: 1.0.",
+            "question": "Read row 3, column 7. Options: A: -0.5; B: 0.0; C: 0.5; D: 1.0.",
+            "choices": ["A", "B", "C", "D"],
+        }
+
+        prompt = build_local_conditioning_prompt(record, prompt_template="task_specific")
+
+        self.assertIn("Options: A: -0.5; B: 0.0; C: 0.5; D: 1.0", prompt)
+        self.assertIn("exactly one of A, B, C, D", prompt)
+        self.assertIn("no explanation, punctuation, or other text", prompt)
+        self.assertNotIn("Answer:", prompt)
+        self.assertTrue(prompt.endswith("Tensor evidence requested:"))
+
+    def test_generated_choice_parser_separates_correct_semantics_from_format(self) -> None:
+        exact = parse_generated_choice(" B ", ["A", "B", "C", "D"])
+        verbose = parse_generated_choice("The answer is B.", ["A", "B", "C", "D"])
+        ambiguous = parse_generated_choice("A or B", ["A", "B", "C", "D"])
+
+        self.assertTrue(exact["format_valid"])
+        self.assertEqual(exact["parsed_choice"], "B")
+        self.assertFalse(verbose["format_valid"])
+        self.assertEqual(verbose["parsed_choice"], "B")
+        self.assertFalse(ambiguous["format_valid"])
+        self.assertIsNone(ambiguous["parsed_choice"])
+
+    def test_generated_choice_parser_handles_overlapping_bin_labels(self) -> None:
+        parsed = parse_generated_choice("B01", ["B00", "B01", "B02"])
+
+        self.assertTrue(parsed["format_valid"])
+        self.assertEqual(parsed["matched_choices"], ["B01"])
+
     def test_swap_indices_stay_within_state_task_and_field(self) -> None:
         records = [
             _record("s1", "point", "Vx", "question one"),

@@ -1295,7 +1295,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-每条题目的坐标、区域和数值选项由 `seed + patch_id + variant` 独立确定。数值选项生成后会确定性随机打乱显示顺序，不再固定为 `A < B < C < D`；正确 label 随数值一起移动。默认使用 16,384 个 train patches，并为同一个 train/val tensor 的每类操作生成两个独立自然语言问题；test 保持一个固定问题。已有 latent 且 `overwrite: false` 时，只要 AE checkpoint、HDF5、fields 和 patch size 一致，重建会跳过已有 patch 的 encoder，只编码新增 patch 并重新生成 QA。因此更新本节代码后需要重新执行构建命令更新 JSONL，但不需要删除或重建 latent。
+每条题目的坐标、区域和数值选项由 `seed + patch_id + variant` 独立确定。数值选项生成后会确定性随机打乱显示顺序，不再固定为 `A < B < C < D`；正确 label 随数值一起移动。默认使用 16,384 个 train patches，并为同一个 train tensor 的每类操作生成三个独立自然语言问题；val 为两个，test 保持一个固定问题。这样每个 epoch 有 `16,384 x 5 x 3 = 245,760` 条训练记录。已有 latent 且 `overwrite: false` 时，只要 AE checkpoint、HDF5、fields 和 patch size 一致，重建会跳过已有 patch 的 encoder，只编码新增 patch 并重新生成 QA。因此更新本节代码后需要重新执行构建命令更新 JSONL，但不需要删除或重建 latent。
 
 输出：
 
@@ -1330,7 +1330,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 
 `adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段的 `alignment_projector_state_dict` 不进入下游；冻结 LLM，仅更新 Q-Former adapter。
 
-局部读取增强模式不重跑第一阶段，也不使用 AE decoder。正式配置从第一阶段 `alignment_best.pt` 严格载入 16-token Q-Former，并复制为两份：reference branch 永久冻结；conditioned branch 继承相同的 query、latent projection、位置 embedding、4 层 query self-attention/latent cross-attention/FFN。每层在继承 block 前新增一个小门控 text cross-attention。它只读取 `query` 中的自然语言，不读取 task id、正则表达式坐标、oracle 或答案选项。
+局部读取增强模式不重跑第一阶段，也不使用 AE decoder。正式配置从第一阶段 `alignment_best.pt` 严格载入 16-token Q-Former，并复制为两份：reference branch 永久冻结；conditioned branch 继承相同的 query、latent projection、位置 embedding、4 层 query self-attention/latent cross-attention/FFN。每层在继承 block 前新增一个小门控 text cross-attention。它读取完整自然语言 prompt，包括任务规则、问题、文本中的坐标或统计量、标签与数值选项的对应关系、choice semantics 和输出格式约束；不读取 task id、正则表达式坐标、oracle 或答案。
 
 问题 token 由 frozen Qwen 同一次 early-exit 前向提取第 2 层和第 6 层完整序列。第 2 层偏重数字、坐标和词法细节，第 6 层提供上下文语义；两层经过各自 `LayerNorm + Linear` 后以 learned softmax 权重融合。固定末尾 anchor 不再单独压缩并广播到全部 query。最终输出保持第一阶段相同的 16 个 token 位置：
 
@@ -1360,12 +1360,12 @@ adapter:
   global_prompt_dropout: 0.0
 
 llm_training:
-  epochs: 5
-  batch_size: 16
+  epochs: 2
+  batch_size: 15
   lr_scheduler: cosine
   warmup_ratio: 0.03
   group_questions_by_state: true
-  questions_per_state_group: 2
+  questions_per_state_group: 3
   weight_decay: 1.0e-4
   ranking_loss_weight: 0.1
   swapped_question_loss_weight: 0.1
@@ -1374,7 +1374,9 @@ llm_training:
   checkpoint_metric: macro_latent_gain
 ```
 
-最终前缀为 `[16 residual-conditioned tokens][完整QA prompt]`，不会扩成 24 个 token。同一问题的所有候选答案共享一次 soft prompt 计算。训练 batch 按 `state_ref + task_type + field` 把同一 tensor 的不同问题成对放置；swapped-question loss 将这两个 conditioned prompt 互换，要求自己的问题 prompt 对正确答案的 NLL 至少比另一问题 prompt 低 `0.1`。这个约束不解析问题内容，适用于任意自然语言条件读取。`macro_latent_gain` 继续作为 best checkpoint 指标。QA 文件中的 `oracle` 在 dataset 载入时会被删除。
+最终前缀为 `[16 residual-conditioned tokens][完整QA prompt]`，不会扩成 24 个 token。同一问题的所有候选答案共享一次 soft prompt 计算。训练 batch 按 `state_ref + task_type + field` 把同一 tensor 的三个不同问题放在一起；swapped-question loss 互换 conditioned prompt，要求自己的问题 prompt 对正确答案的 NLL 至少比另一问题 prompt 低 `0.1`。这个约束不解析问题内容，适用于任意自然语言条件读取。`macro_latent_gain` 继续作为 best checkpoint 指标。QA 文件中的 `oracle` 在 dataset 载入时会被删除。
+
+每道题的主 prompt 会按该题实际 choices 明确写出输出契约，例如 `Required output: exactly one of A, B, C, D`，并要求不输出解释、标点或其他文字。训练和正式准确率仍使用每个合法标签的候选 NLL，避免自由生成的格式噪声改变优化目标；自由生成只在内置诊断中运行，用于区分“语义上选对但格式不合规”和“答案本身错误”。
 
 当前正式实验不复用旧 downstream hybrid checkpoint，新架构会主动拒绝这样的路径。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layers=[2,6]`、`local_fusion_mode=residual_qformer` 和 `stage1_cloned_residual_qformer` load report。
 
@@ -1390,12 +1392,12 @@ llm_training:
 
 ### 3.11 Adapter 诊断输出
 
-正式训练已经内置轻量诊断，不需要另跑实验。每个 epoch 默认从验证集为每种 task 固定取 4 条记录，对比正确 latent、同字段错配 latent，以及同一 tensor 上的另一个同任务问题，并保存：
+正式训练已经内置轻量诊断，不需要另跑实验。训练前和每个 epoch 后默认从验证集为每种 task 固定取 4 条记录，对比正确 latent、同字段错配 latent，以及同一 tensor 上的另一个同任务问题，并保存：
 
-- `diagnostics/epoch_XXXX_summary.json`：问题文本、预测、每个选项 NLL、正确答案 margin、soft prompt 差异，以及指定 LLM 层的 hidden-state cosine/relative L2；
+- `diagnostics/epoch_XXXX_summary.json`：主 prompt、local 完整条件 prompt、候选 NLL 预测、自由生成原文、解析标签、严格格式是否合法、正确答案 margin、soft prompt 差异，以及指定 LLM 层的 hidden-state cosine/relative L2；
 - `diagnostics/epoch_XXXX_states.pt`：latent、mask、global prompt、conditioned residual、combined prompt、文本/latent 投影、query self-attention/cross-attention 权重和各指定 LLM 层 hidden state 的原始张量快照。
 
-默认层为 `[0,2,8,14,-1]`。诊断同时记录跨任务 `question_sensitivity`、按任务拆分的 same-tensor/same-task residual 敏感度、residual/global RMS、16 个 query 输出的平均非对角余弦相似度，以及最后一层 query 对问题 token 和 4x4 latent cell 的 attention。它还把 conditioned prompt 换成另一个问题的结果重新评分；只有正确问题比 swapped question 获得更高答案 margin，才说明问题差异与任务输出相关。最终测试额外报告 `local_only`（仅 residual）和 `global_only`（固定 stage-1 prompt）。
+默认层为 `[0,2,8,14,-1]`。诊断同时记录跨任务 `question_sensitivity`、按任务拆分的 correct/shuffled accuracy 与 answer margin、same-tensor/same-task residual 敏感度与 swapped margin、residual/global RMS、实际 residual gate、四层 text cross-attention gate、layer 2/6 learned fusion 权重、16 个 query 输出的平均非对角余弦相似度，以及每一层 query 对问题 token 和 4x4 latent cell 的 top attention。它还把 conditioned prompt 换成另一个问题的结果重新评分；只有正确问题比 swapped question 获得更高答案 margin，才说明问题差异与任务输出相关。最终测试额外报告 `local_only`（仅 residual）和 `global_only`（固定 stage-1 prompt）。摘要 JSON 会先于较大的 states PT 写入；诊断与 checkpoint 都先写临时文件再原子替换正式文件名，避免下载到仍在写入的 0 字节或半截文件。
 
 W&B 和 `metrics_latest.json` 还会记录 `train_local_grad_norm`、`train_global_grad_norm`、`train_total_grad_norm` 与 local gate。若 hidden state 已有差异但 local gradient 长期接近 0，应先排查门控、mask 或 loss 路径，而不是继续增加 epoch。
 
