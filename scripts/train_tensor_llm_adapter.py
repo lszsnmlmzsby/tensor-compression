@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import copy
 import json
 import math
 import os
@@ -278,6 +279,43 @@ class CrossAttentionBlock(nn.Module):
         )
         queries = queries + attended
         return queries + self.ffn(self.ffn_norm(queries))
+
+
+class GatedTextCrossAttentionBlock(nn.Module):
+    """Condition inherited Q-Former queries without discarding their aligned initialization."""
+
+    def __init__(self, dim: int, heads: int, dropout: float, gate_init: float) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(dim)
+        self.text_norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        self.capture_attention = False
+        self.last_attention_weights: torch.Tensor | None = None
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        text: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attended, weights = self.attention(
+            query=self.query_norm(queries),
+            key=self.text_norm(text),
+            value=self.text_norm(text),
+            key_padding_mask=key_padding_mask,
+            need_weights=bool(self.capture_attention),
+            average_attn_weights=False,
+        )
+        self.last_attention_weights = (
+            weights.detach().float().cpu() if self.capture_attention and weights is not None else None
+        )
+        return queries + self.gate.to(dtype=queries.dtype) * attended
 
 
 def last_nonpadding_indices(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -658,23 +696,132 @@ class QuestionConditionedLocalAdapter(nn.Module):
         return self.gate.to(dtype=local_prompts.dtype) * local_prompts
 
 
+class ResidualQuestionConditionedAdapter(nn.Module):
+    """Question-condition a stage-1 Q-Former while preserving its token layout and initialization."""
+
+    def __init__(
+        self,
+        aligned_adapter: TensorPatchAlignmentAdapter,
+        llm_hidden_size: int,
+        context_layers: Sequence[int],
+        adapter_heads: int,
+        dropout: float,
+        text_gate_init: float,
+        residual_gate_init: float,
+    ) -> None:
+        super().__init__()
+        if str(aligned_adapter.adapter_type) != "qformer":
+            raise ValueError("residual_question_qformer requires a stage-1 qformer checkpoint.")
+        self.backbone = copy.deepcopy(aligned_adapter)
+        self.soft_prompt_tokens = int(aligned_adapter.soft_prompt_tokens)
+        self.latent_grid = tuple(int(value) for value in aligned_adapter.latent_grid)
+        self.context_layers = tuple(int(value) for value in context_layers)
+        if not self.context_layers:
+            raise ValueError("adapter.local_context_layers must contain at least one Qwen hidden-state index.")
+        adapter_dim = int(aligned_adapter.query_tokens.shape[-1])
+        self.text_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(int(llm_hidden_size)),
+                    nn.Linear(int(llm_hidden_size), adapter_dim),
+                )
+                for _ in self.context_layers
+            ]
+        )
+        self.text_layer_logits = nn.Parameter(torch.zeros(len(self.context_layers)))
+        self.text_blocks = nn.ModuleList(
+            [
+                GatedTextCrossAttentionBlock(
+                    dim=adapter_dim,
+                    heads=int(adapter_heads),
+                    dropout=float(dropout),
+                    gate_init=float(text_gate_init),
+                )
+                for _ in self.backbone.blocks
+            ]
+        )
+        self.gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
+        self.structured_query_conditioning = False
+        self.question_input_mode = "contextual_tokens"
+        self.fusion_mode = "residual_qformer"
+
+    @property
+    def query_tokens(self) -> nn.Parameter:
+        return self.backbone.query_tokens
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor,
+        question_mask: torch.Tensor | None,
+        structured_query: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if structured_query is not None:
+            raise ValueError("residual_question_qformer does not accept parsed structured query features.")
+        if question_embeds.ndim == 3:
+            question_embeds = question_embeds.unsqueeze(1)
+        if question_embeds.ndim != 4 or int(question_embeds.shape[1]) != len(self.context_layers):
+            raise ValueError(
+                "Expected contextual question states [batch,layers,tokens,hidden] for layers "
+                f"{self.context_layers}, got {tuple(question_embeds.shape)}."
+            )
+        projected_layers = [
+            projection(question_embeds[:, index].detach().to(dtype=projection[1].weight.dtype))
+            for index, projection in enumerate(self.text_projections)
+        ]
+        fusion_weights = torch.softmax(self.text_layer_logits.float(), dim=0).to(projected_layers[0].dtype)
+        text_context = sum(
+            fusion_weights[index] * projected
+            for index, projected in enumerate(projected_layers)
+        )
+        key_padding_mask = (
+            ~question_mask.to(device=text_context.device, dtype=torch.bool)
+            if question_mask is not None
+            else None
+        )
+
+        latent_tokens = latent_map.flatten(2).transpose(1, 2)
+        if int(latent_tokens.shape[1]) != int(self.backbone.latent_token_count):
+            raise ValueError(
+                f"Expected {self.backbone.latent_token_count} latent tokens, got {int(latent_tokens.shape[1])}."
+            )
+        latent_context = (
+            self.backbone.latent_projection(latent_tokens.to(dtype=self.backbone.latent_projection.weight.dtype))
+            + self.backbone.latent_pos_embed
+        )
+        queries = self.backbone.query_tokens.expand(latent_map.shape[0], -1, -1)
+        for text_block, latent_block in zip(self.text_blocks, self.backbone.blocks):
+            queries = text_block(queries, text_context, key_padding_mask=key_padding_mask)
+            # The inherited block supplies query self-attention, latent cross-attention, and the FFN.
+            queries = latent_block(queries, latent_context)
+        return self.backbone.scale_soft_prompts(self.backbone.output(queries))
+
+
 class HybridGlobalLocalAdapter(nn.Module):
     def __init__(
         self,
         global_adapter: TensorPatchAlignmentAdapter,
-        local_adapter: QuestionConditionedLocalAdapter,
+        local_adapter: nn.Module,
         freeze_global: bool,
         global_prompt_dropout: float = 0.0,
+        combine_mode: str = "concat",
     ) -> None:
         super().__init__()
         self.global_adapter = global_adapter
         self.local_adapter = local_adapter
         self.freeze_global = bool(freeze_global)
         self.global_prompt_dropout = float(global_prompt_dropout)
+        self.combine_mode = str(combine_mode)
+        if self.combine_mode not in {"concat", "residual"}:
+            raise ValueError(f"Unsupported global/local combine mode: {combine_mode}")
         if not 0.0 <= self.global_prompt_dropout < 1.0:
             raise ValueError("global_prompt_dropout must be in [0, 1).")
         self.drop_global_prompts_for_batch = False
-        self.soft_prompt_tokens = int(global_adapter.soft_prompt_tokens + local_adapter.soft_prompt_tokens)
+        self.soft_prompt_tokens = int(
+            global_adapter.soft_prompt_tokens
+            if self.combine_mode == "residual"
+            else global_adapter.soft_prompt_tokens + local_adapter.soft_prompt_tokens
+        )
         self.structured_query_conditioning = bool(local_adapter.structured_query_conditioning)
 
         self.set_global_trainable(not self.freeze_global)
@@ -697,13 +844,17 @@ class HybridGlobalLocalAdapter(nn.Module):
     def set_global_prompt_dropout_for_batch(self, enabled: bool) -> None:
         self.drop_global_prompts_for_batch = bool(enabled)
 
-    def forward(
+    @property
+    def residual_mode(self) -> bool:
+        return self.combine_mode == "residual"
+
+    def forward_components(
         self,
         latent_map: torch.Tensor,
         question_embeds: torch.Tensor | None = None,
         question_mask: torch.Tensor | None = None,
         structured_query: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if question_embeds is None:
             raise ValueError("hybrid_local_qformer requires natural-language question embeddings.")
         if self.freeze_global:
@@ -711,11 +862,36 @@ class HybridGlobalLocalAdapter(nn.Module):
                 global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
         else:
             global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
+        conditioned_prompts = self.local_adapter(latent_map, question_embeds, question_mask, structured_query)
+        if self.residual_mode:
+            if conditioned_prompts.shape != global_prompts.shape:
+                raise ValueError(
+                    "Residual conditioned/global prompts must have identical shapes, got "
+                    f"{tuple(conditioned_prompts.shape)} and {tuple(global_prompts.shape)}."
+                )
+            local_prompts = self.local_adapter.gate.to(dtype=conditioned_prompts.dtype) * (
+                conditioned_prompts - global_prompts
+            )
+            visible_global = (
+                torch.zeros_like(global_prompts)
+                if self.training and self.drop_global_prompts_for_batch
+                else global_prompts
+            )
+            return visible_global, local_prompts, visible_global + local_prompts
+        local_prompts = conditioned_prompts
         if self.training and self.drop_global_prompts_for_batch:
             global_prompts = torch.zeros_like(global_prompts)
-        local_prompts = self.local_adapter(latent_map, question_embeds, question_mask, structured_query)
         # Keeping local tokens first preserves the relative positions between global tokens and text.
-        return torch.cat([local_prompts, global_prompts], dim=1)
+        return global_prompts, local_prompts, torch.cat([local_prompts, global_prompts], dim=1)
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor | None = None,
+        question_mask: torch.Tensor | None = None,
+        structured_query: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward_components(latent_map, question_embeds, question_mask, structured_query)[2]
 
 
 class TensorReadoutQADataset(Dataset):
@@ -954,6 +1130,8 @@ def audit_qa_datasets(
         field_counts: dict[str, int] = defaultdict(int)
         answer_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         choice_labels: dict[str, set[str]] = defaultdict(set)
+        numeric_option_records = 0
+        ascending_numeric_option_records = 0
         for record in dataset.records:
             qa_id = str(record.get("qa_id", ""))
             if not qa_id or qa_id in qa_ids:
@@ -985,6 +1163,10 @@ def audit_qa_datasets(
                         f"QA audit found missing or duplicate displayed numeric options: {qa_id}. "
                         "Regenerate patch QA with sufficient decimal_places."
                     )
+                numeric_option_records += 1
+                ascending_numeric_option_records += int(
+                    all(left < right for left, right in zip(displayed_values, displayed_values[1:]))
+                )
         split_states[split] = states
         split_samples[split] = samples
         split_latent_paths[split] = latent_paths
@@ -999,6 +1181,13 @@ def audit_qa_datasets(
             raise ValueError(
                 f"QA audit found answer labels absent from formal split {split}: {missing_answer_labels}"
             )
+        ascending_fraction = ascending_numeric_option_records / max(1, numeric_option_records)
+        if require_disjoint_splits and numeric_option_records >= 16 and ascending_fraction > 0.5:
+            raise ValueError(
+                f"QA audit found {ascending_fraction:.1%} ascending numeric option lists in {split}. "
+                "This looks like stale QA generated before option-order randomization; rerun "
+                "scripts/build_tensor_patch_qa.py."
+            )
         summary[split] = {
             "records": len(dataset),
             "states": len(states),
@@ -1010,6 +1199,8 @@ def audit_qa_datasets(
                 task: dict(sorted(counts.items())) for task, counts in sorted(answer_counts.items())
             },
             "missing_answer_labels": missing_answer_labels,
+            "numeric_option_records": numeric_option_records,
+            "ascending_numeric_option_fraction": ascending_fraction,
         }
     reference_split = "train" if "train" in split_tasks else next(iter(split_tasks))
     for split in split_tasks:
@@ -1107,6 +1298,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--choice-ce-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-weight", type=float, default=None)
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
+    parser.add_argument("--swapped-question-loss-weight", type=float, default=None)
+    parser.add_argument("--swapped-question-loss-margin", type=float, default=None)
+    parser.add_argument("--swapped-question-max-records", type=int, default=None)
     parser.add_argument(
         "--ranking-loss-negative",
         type=str,
@@ -1117,7 +1311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-architecture",
         type=str,
-        choices=("legacy", "alignment_qformer", "hybrid_local_qformer"),
+        choices=("legacy", "alignment_qformer", "hybrid_local_qformer", "residual_question_qformer"),
         default=None,
     )
     parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
@@ -1146,12 +1340,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local-context-layer", type=int, default=None)
     parser.add_argument(
+        "--local-context-layers",
+        type=str,
+        default=None,
+        help="Comma-separated Qwen hidden-state indices fused for question conditioning.",
+    )
+    parser.add_argument(
         "--local-fusion-mode",
         type=str,
-        choices=("text_latent_pool", "anchor_queries"),
+        choices=("text_latent_pool", "anchor_queries", "residual_qformer"),
         default=None,
     )
     parser.add_argument("--local-gate-init", type=float, default=None)
+    parser.add_argument("--local-text-gate-init", type=float, default=None)
     parser.add_argument("--freeze-global-adapter", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--global-unfreeze-epoch", type=int, default=None)
     parser.add_argument("--global-lr", type=float, default=None)
@@ -1227,6 +1428,7 @@ def parse_args() -> argparse.Namespace:
         choices=("online", "offline", "disabled"),
     )
     parser.add_argument("--wandb-log-model", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--wandb-detailed-metrics", action=argparse.BooleanOptionalAction, default=None)
     return apply_config_defaults(parser.parse_args())
 
 
@@ -1237,6 +1439,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "choice_ce_loss_weight": first_nested(config, ["llm_training.choice_ce_loss_weight"]),
         "ranking_loss_weight": first_nested(config, ["llm_training.ranking_loss_weight"]),
         "ranking_loss_margin": first_nested(config, ["llm_training.ranking_loss_margin"]),
+        "swapped_question_loss_weight": first_nested(config, ["llm_training.swapped_question_loss_weight"]),
+        "swapped_question_loss_margin": first_nested(config, ["llm_training.swapped_question_loss_margin"]),
     }
     defaulted_loss_fields = [
         field
@@ -1312,6 +1516,14 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "choice_ce_loss_weight", configured_loss_fields["choice_ce_loss_weight"], 1.0)
     set_default(args, "ranking_loss_weight", configured_loss_fields["ranking_loss_weight"], 0.1)
     set_default(args, "ranking_loss_margin", configured_loss_fields["ranking_loss_margin"], 0.1)
+    set_default(args, "swapped_question_loss_weight", configured_loss_fields["swapped_question_loss_weight"], 0.0)
+    set_default(args, "swapped_question_loss_margin", configured_loss_fields["swapped_question_loss_margin"], 0.1)
+    set_default(
+        args,
+        "swapped_question_max_records",
+        first_nested(config, ["llm_training.swapped_question_max_records"]),
+        8,
+    )
     set_default(args, "ranking_loss_negative", first_nested(config, ["llm_training.ranking_loss_negative"]), "shuffled")
     set_default(args, "adapter_architecture", first_nested(config, ["adapter.architecture"]), "legacy")
     set_default(args, "soft_prompt_tokens", first_nested(config, ["adapter.soft_prompt_tokens"]), 32)
@@ -1343,8 +1555,15 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "input_embeddings",
     )
     set_default(args, "local_context_layer", first_nested(config, ["adapter.local_context_layer"]), 2)
+    set_default(
+        args,
+        "local_context_layers",
+        value_to_csv(first_nested(config, ["adapter.local_context_layers"])),
+        str(args.local_context_layer),
+    )
     set_default(args, "local_fusion_mode", first_nested(config, ["adapter.local_fusion_mode"]), "text_latent_pool")
     set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 0.1)
+    set_default(args, "local_text_gate_init", first_nested(config, ["adapter.local_text_gate_init"]), 0.05)
     set_default(args, "freeze_global_adapter", first_nested(config, ["adapter.freeze_global_adapter"]), True)
     set_default(args, "global_unfreeze_epoch", first_nested(config, ["adapter.global_unfreeze_epoch"]), 0)
     set_default(args, "global_lr", first_nested(config, ["adapter.global_lr"]), 1.0e-5)
@@ -1420,6 +1639,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "wandb_tags", value_to_csv(first_nested(config, ["wandb.tags"])), "adapter,tensor-llm")
     set_default(args, "wandb_mode", first_nested(config, ["wandb.mode"]), "offline")
     set_default(args, "wandb_log_model", first_nested(config, ["wandb.log_model"]), False)
+    set_default(args, "wandb_detailed_metrics", first_nested(config, ["wandb.detailed_metrics"]), False)
     require_args(args, ["qa_dir", "latent_dir", "model_name_or_path", "output_root"])
     positive_integer_settings = (
         "epochs",
@@ -1436,12 +1656,24 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"llm_training.{setting} must be positive.")
     if int(args.initial_eval_records) < 0:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
-    for setting in ("ce_loss_weight", "choice_ce_loss_weight", "ranking_loss_weight", "ranking_loss_margin"):
+    for setting in (
+        "ce_loss_weight",
+        "choice_ce_loss_weight",
+        "ranking_loss_weight",
+        "ranking_loss_margin",
+        "swapped_question_loss_weight",
+        "swapped_question_loss_margin",
+    ):
         if float(getattr(args, setting)) < 0.0:
             raise ValueError(f"llm_training.{setting} must be non-negative.")
     if not any(
         float(value) > 0.0
-        for value in (args.ce_loss_weight, args.choice_ce_loss_weight, args.ranking_loss_weight)
+        for value in (
+            args.ce_loss_weight,
+            args.choice_ce_loss_weight,
+            args.ranking_loss_weight,
+            args.swapped_question_loss_weight,
+        )
     ):
         raise ValueError("At least one training loss weight must be positive.")
     if not 0.0 <= float(args.dropout) < 1.0:
@@ -1450,6 +1682,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("adapter.local_text_encoder_layers must be non-negative.")
     if int(args.local_context_layer) < 0:
         raise ValueError("adapter.local_context_layer must be non-negative.")
+    local_context_layers = [int(value) for value in parse_csv(args.local_context_layers)]
+    if not local_context_layers or any(value < 0 for value in local_context_layers):
+        raise ValueError("adapter.local_context_layers must contain non-negative hidden-state indices.")
+    args.local_context_layers = ",".join(str(value) for value in local_context_layers)
     if not 0.0 <= float(args.global_prompt_dropout) < 1.0:
         raise ValueError("adapter.global_prompt_dropout must be in [0, 1).")
     if int(args.questions_per_state_group) <= 0:
@@ -1458,6 +1694,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError(
             "llm_training.questions_per_state_group cannot exceed llm_training.batch_size."
         )
+    if float(args.swapped_question_loss_weight) > 0.0 and not bool(args.group_questions_by_state):
+        raise ValueError("swapped_question_loss_weight requires llm_training.group_questions_by_state: true.")
+    if float(args.swapped_question_loss_weight) > 0.0 and float(args.choice_ce_loss_weight) <= 0.0:
+        raise ValueError("swapped_question_loss_weight requires a positive choice_ce_loss_weight.")
+    if int(args.swapped_question_max_records) <= 0:
+        raise ValueError("llm_training.swapped_question_max_records must be positive.")
     if not 0.0 <= float(args.warmup_ratio) < 1.0:
         raise ValueError("llm_training.warmup_ratio must be in [0, 1).")
     if not 0.0 <= float(args.min_lr_ratio) <= 1.0:
@@ -2014,35 +2256,48 @@ def build_text_tensors(
 
 
 @torch.no_grad()
-def contextual_question_tokens(
+def contextual_question_token_layers(
     llm,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     prompt_mask: torch.Tensor,
-    layer_index: int,
+    layer_indices: Sequence[int],
 ) -> torch.Tensor:
     decoder = _decoder_for_diagnostics(llm)
-    if int(layer_index) == 0:
-        contextual = llm.get_input_embeddings()(input_ids).detach()
-    else:
-        layers = getattr(decoder, "layers", None)
-        if not isinstance(layers, nn.ModuleList) or int(layer_index) > len(layers):
-            count = len(layers) + 1 if isinstance(layers, nn.ModuleList) else 0
-            raise ValueError(f"local_context_layer={layer_index} is invalid for {count} hidden-state tensors.")
+    requested = tuple(int(value) for value in layer_indices)
+    if not requested:
+        raise ValueError("At least one local context layer is required.")
+    layers = getattr(decoder, "layers", None)
+    if not isinstance(layers, nn.ModuleList) or any(value < 0 or value > len(layers) for value in requested):
+        count = len(layers) + 1 if isinstance(layers, nn.ModuleList) else 0
+        raise ValueError(f"local_context_layers={requested} are invalid for {count} hidden-state tensors.")
 
-        captured: dict[str, torch.Tensor] = {}
+    captured: dict[int, torch.Tensor] = {}
+    if 0 in requested:
+        captured[0] = llm.get_input_embeddings()(input_ids).detach()
 
+    positive_layers = sorted({value for value in requested if value > 0})
+    if positive_layers:
         class _ContextReady(RuntimeError):
             pass
 
-        def stop_after_layer(_module, _inputs, output) -> None:
-            value = output[0] if isinstance(output, tuple) else output
-            if not isinstance(value, torch.Tensor):
-                raise TypeError("The selected Qwen decoder layer did not return a hidden-state tensor.")
-            captured["hidden"] = value.detach()
-            raise _ContextReady
+        def capture_layer(layer_index: int, stop: bool):
+            def hook(_module, _inputs, output) -> None:
+                value = output[0] if isinstance(output, tuple) else output
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError("The selected Qwen decoder layer did not return a hidden-state tensor.")
+                captured[layer_index] = value.detach()
+                if stop:
+                    raise _ContextReady
 
-        handle = layers[int(layer_index) - 1].register_forward_hook(stop_after_layer)
+            return hook
+
+        handles = [
+            layers[layer_index - 1].register_forward_hook(
+                capture_layer(layer_index, layer_index == positive_layers[-1])
+            )
+            for layer_index in positive_layers
+        ]
         try:
             try:
                 decoder(
@@ -2054,11 +2309,60 @@ def contextual_question_tokens(
             except _ContextReady:
                 pass
         finally:
-            handle.remove()
-        if "hidden" not in captured:
-            raise RuntimeError("The shallow Qwen context hook did not capture a hidden state.")
-        contextual = captured["hidden"]
-    return contextual * prompt_mask.to(device=contextual.device, dtype=contextual.dtype).unsqueeze(-1)
+            for handle in handles:
+                handle.remove()
+    missing = [value for value in requested if value not in captured]
+    if missing:
+        raise RuntimeError(f"The shallow Qwen context hooks did not capture layers {missing}.")
+    mask = prompt_mask.to(device=input_ids.device).unsqueeze(-1)
+    return torch.stack(
+        [captured[value] * mask.to(dtype=captured[value].dtype) for value in requested],
+        dim=1,
+    )
+
+
+@torch.no_grad()
+def contextual_question_tokens(
+    llm,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    layer_index: int,
+) -> torch.Tensor:
+    return contextual_question_token_layers(
+        llm=llm,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_mask=prompt_mask,
+        layer_indices=[int(layer_index)],
+    )[:, 0]
+
+
+def contextual_question_tokens_for_adapter(
+    llm,
+    adapter: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    fallback_layer: int,
+) -> torch.Tensor:
+    if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
+        adapter.local_adapter, ResidualQuestionConditionedAdapter
+    ):
+        return contextual_question_token_layers(
+            llm=llm,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            layer_indices=adapter.local_adapter.context_layers,
+        )
+    return contextual_question_tokens(
+        llm=llm,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_mask=prompt_mask,
+        layer_index=int(fallback_layer),
+    )
 
 
 def build_local_question_tensors(
@@ -2109,12 +2413,13 @@ def contextual_adapter_soft_embeds(
         device=device,
         max_tokens=int(max_prompt_tokens),
     )
-    question_embeds = contextual_question_tokens(
+    question_embeds = contextual_question_tokens_for_adapter(
         llm=llm,
+        adapter=adapter,
         input_ids=question_ids,
         attention_mask=question_mask,
         prompt_mask=question_mask.bool(),
-        layer_index=int(layer_index),
+        fallback_layer=int(layer_index),
     )
     return adapter_soft_embeds(
         adapter=adapter,
@@ -2142,20 +2447,25 @@ def adapter_soft_embeds(
         else None
     )
     if mode in {"correct", "global_only", "local_only"}:
-        soft_prompts = adapter(
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            global_prompts, local_prompts, combined_prompts = adapter.forward_components(
+                latent_map,
+                question_embeds=question_embeds,
+                question_mask=question_mask,
+                structured_query=structured_query,
+            )
+            selected = {
+                "correct": combined_prompts,
+                "global_only": global_prompts,
+                "local_only": local_prompts,
+            }[mode]
+            return selected.to(dtype=text_embeds.dtype)
+        return adapter(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
             structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
-        if isinstance(adapter, HybridGlobalLocalAdapter) and mode != "correct":
-            local_count = int(adapter.local_adapter.soft_prompt_tokens)
-            soft_prompts = soft_prompts.clone()
-            if mode == "global_only":
-                soft_prompts[:, :local_count] = 0
-            else:
-                soft_prompts[:, local_count:] = 0
-        return soft_prompts
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
         return text_embeds.new_zeros((batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1]))
@@ -2386,7 +2696,7 @@ def choice_ce_loss(
     device: torch.device,
     args: argparse.Namespace,
     soft_prompt_mode: str = "correct",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -2475,9 +2785,95 @@ def choice_ce_loss(
         / torch.stack(correct_target_counts).sum().clamp_min(1)
     )
     accuracy = hard_correct / max(1, len(losses))
-    return loss, correct_answer_ce, torch.stack(correct_choice_nlls), {
+    return loss, correct_answer_ce, torch.stack(correct_choice_nlls), base_soft_embeds, {
         "choice_accuracy": float(accuracy),
         "choice_01_loss": float(1.0 - accuracy),
+    }
+
+
+def same_state_question_swap_indices(records: Sequence[Mapping[str, Any]]) -> tuple[list[int], list[int]]:
+    grouped: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        key = (
+            str(record.get("state_ref", "")),
+            str(record.get("task_type", "")),
+            str(record.get("field") or record.get("metadata", {}).get("field") or ""),
+        )
+        grouped[key].append(index)
+    owners: list[int] = []
+    swapped: list[int] = []
+    for indices in grouped.values():
+        distinct = [
+            index
+            for index in indices
+            if any(
+                str(records[index].get("query") or records[index].get("question") or "")
+                != str(records[other].get("query") or records[other].get("question") or "")
+                for other in indices
+            )
+        ]
+        if len(distinct) < 2:
+            continue
+        for position, owner in enumerate(distinct):
+            candidate = distinct[(position + 1) % len(distinct)]
+            if str(records[owner].get("query") or records[owner].get("question") or "") == str(
+                records[candidate].get("query") or records[candidate].get("question") or ""
+            ):
+                candidate = next(
+                    other
+                    for other in distinct
+                    if str(records[owner].get("query") or records[owner].get("question") or "")
+                    != str(records[other].get("query") or records[other].get("question") or "")
+                )
+            owners.append(owner)
+            swapped.append(candidate)
+    return owners, swapped
+
+
+def swapped_question_grounding_loss(
+    llm,
+    adapter: nn.Module,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    positive_nll: torch.Tensor,
+    soft_embeds: torch.Tensor | None,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    owners, swapped = same_state_question_swap_indices(records)
+    max_records = int(args.swapped_question_max_records)
+    owners = owners[:max_records]
+    swapped = swapped[:max_records]
+    if not owners or soft_embeds is None:
+        zero = positive_nll.new_zeros(())
+        return zero, {"swapped_question_pairs": 0.0, "swapped_question_margin_mean": 0.0}
+    swapped_soft = torch.stack([soft_embeds[index] for index in swapped], dim=0)
+    selected_records = [records[index] for index in owners]
+    selected_answers = [str(record["answer"]) for record in selected_records]
+    swapped_nll = forward_answer_nll(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=selected_records,
+        answers=selected_answers,
+        latent_map=torch.stack([latent_map[index] for index in owners], dim=0),
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+        soft_prompt_mode="correct",
+        reduction=str(args.choice_score),
+        local_context_layer=int(args.local_context_layer),
+        precomputed_soft_embeds=swapped_soft,
+    )
+    selected_positive = torch.stack([positive_nll[index] for index in owners])
+    margin = swapped_nll - selected_positive
+    loss = F.relu(float(args.swapped_question_loss_margin) - margin).mean()
+    return loss, {
+        "swapped_question_pairs": float(len(owners)),
+        "swapped_question_margin_mean": float(margin.detach().mean().cpu().item()),
     }
 
 
@@ -2495,12 +2891,13 @@ def training_loss(
     ce_weight = float(args.ce_loss_weight)
     choice_ce_weight = float(args.choice_ce_loss_weight)
     ranking_weight = float(args.ranking_loss_weight)
+    swapped_weight = float(args.swapped_question_loss_weight)
     choice_metrics = {
         "choice_accuracy": 0.0,
         "choice_01_loss": 0.0,
     }
     if choice_ce_weight > 0.0:
-        choice_loss_value, ce_loss, positive_nll, choice_metrics = choice_ce_loss(
+        choice_loss_value, ce_loss, positive_nll, positive_soft_embeds, choice_metrics = choice_ce_loss(
             llm=llm,
             adapter=adapter,
             tokenizer=tokenizer,
@@ -2527,22 +2924,7 @@ def training_loss(
         )
         choice_loss_value = ce_loss.new_zeros(())
         positive_nll = None
-    if ranking_weight <= 0.0:
-        weighted_ce_loss = ce_weight * ce_loss
-        weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
-        total_loss = weighted_ce_loss + weighted_choice_ce_loss
-        return total_loss, {
-            "loss": float(total_loss.detach().cpu().item()),
-            "ce_loss": float(ce_loss.detach().cpu().item()),
-            "weighted_ce_loss": float(weighted_ce_loss.detach().cpu().item()),
-            "choice_ce_loss": float(choice_loss_value.detach().cpu().item()),
-            "weighted_choice_ce_loss": float(weighted_choice_ce_loss.detach().cpu().item()),
-            "choice_accuracy": float(choice_metrics["choice_accuracy"]),
-            "choice_01_loss": float(choice_metrics["choice_01_loss"]),
-            "ranking_loss": 0.0,
-            "weighted_ranking_loss": 0.0,
-            "ranking_margin_mean": 0.0,
-        }
+        positive_soft_embeds = None
 
     if positive_nll is None:
         positive_nll = forward_answer_nll(
@@ -2561,42 +2943,58 @@ def training_loss(
             reduction=str(args.choice_score),
             local_context_layer=int(args.local_context_layer),
         )
-    negative_mode = str(args.ranking_loss_negative)
-    if negative_mode == "shuffled":
-        negative_latents = baseline_latents("shuffled", batch, dataset)
-    elif negative_mode == "random":
-        negative_latents = baseline_latents("random", batch, dataset)
-    elif negative_mode == "no_latent":
-        negative_latents = batch["latent_map"]
-    elif negative_mode == "zero_latent":
-        negative_latents = torch.zeros_like(batch["latent_map"])
-    else:
-        raise ValueError(f"Unsupported ranking_loss_negative: {negative_mode}")
-    negative_nll = forward_answer_nll(
+    ranking_loss = positive_nll.new_zeros(())
+    ranking_margin_mean = 0.0
+    if ranking_weight > 0.0:
+        negative_mode = str(args.ranking_loss_negative)
+        if negative_mode == "shuffled":
+            negative_latents = baseline_latents("shuffled", batch, dataset)
+        elif negative_mode == "random":
+            negative_latents = baseline_latents("random", batch, dataset)
+        elif negative_mode == "no_latent":
+            negative_latents = batch["latent_map"]
+        elif negative_mode == "zero_latent":
+            negative_latents = torch.zeros_like(batch["latent_map"])
+        else:
+            raise ValueError(f"Unsupported ranking_loss_negative: {negative_mode}")
+        negative_nll = forward_answer_nll(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            answers=answers,
+            latent_map=negative_latents,
+            device=device,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            max_target_tokens=int(args.max_target_tokens),
+            append_eos=bool(args.append_eos),
+            prompt_template=str(args.prompt_template),
+            soft_prompt_mode=negative_mode,
+            reduction=str(args.choice_score),
+            local_context_layer=int(args.local_context_layer),
+        )
+        ranking_terms = F.relu(float(args.ranking_loss_margin) + positive_nll - negative_nll)
+        ranking_loss = ranking_terms.mean()
+        ranking_margin_mean = float((negative_nll.detach() - positive_nll.detach()).mean().cpu().item())
+    swapped_loss, swapped_metrics = swapped_question_grounding_loss(
         llm=llm,
         adapter=adapter,
         tokenizer=tokenizer,
         records=records,
-        answers=answers,
-        latent_map=negative_latents,
+        latent_map=batch["latent_map"],
+        positive_nll=positive_nll,
+        soft_embeds=positive_soft_embeds,
         device=device,
-        max_prompt_tokens=int(args.max_prompt_tokens),
-        max_target_tokens=int(args.max_target_tokens),
-        append_eos=bool(args.append_eos),
-        prompt_template=str(args.prompt_template),
-        soft_prompt_mode=negative_mode,
-        reduction=str(args.choice_score),
-        local_context_layer=int(args.local_context_layer),
+        args=args,
+    ) if swapped_weight > 0.0 else (
+        positive_nll.new_zeros(()),
+        {"swapped_question_pairs": 0.0, "swapped_question_margin_mean": 0.0},
     )
-    margin = float(args.ranking_loss_margin)
-    ranking_terms = F.relu(margin + positive_nll - negative_nll)
-    ranking_loss = ranking_terms.mean()
     weighted_ce_loss = ce_weight * ce_loss
     weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
     weighted_ranking_loss = ranking_weight * ranking_loss
-    total_loss = weighted_ce_loss + weighted_choice_ce_loss + weighted_ranking_loss
-    detached_positive = positive_nll.detach()
-    detached_negative = negative_nll.detach()
+    weighted_swapped_loss = swapped_weight * swapped_loss
+    total_loss = weighted_ce_loss + weighted_choice_ce_loss + weighted_ranking_loss + weighted_swapped_loss
     return total_loss, {
         "loss": float(total_loss.detach().cpu().item()),
         "ce_loss": float(ce_loss.detach().cpu().item()),
@@ -2607,7 +3005,10 @@ def training_loss(
         "choice_01_loss": float(choice_metrics["choice_01_loss"]),
         "ranking_loss": float(ranking_loss.detach().cpu().item()),
         "weighted_ranking_loss": float(weighted_ranking_loss.detach().cpu().item()),
-        "ranking_margin_mean": float((detached_negative - detached_positive).mean().cpu().item()),
+        "ranking_margin_mean": ranking_margin_mean,
+        "swapped_question_loss": float(swapped_loss.detach().cpu().item()),
+        "weighted_swapped_question_loss": float(weighted_swapped_loss.detach().cpu().item()),
+        **swapped_metrics,
     }
 
 
@@ -2962,6 +3363,16 @@ def _rms(value: torch.Tensor) -> float:
     return float(value.float().square().mean().sqrt().cpu().item())
 
 
+def _mean_off_diagonal_cosine(tokens: torch.Tensor) -> float:
+    normalized = F.normalize(tokens.float(), dim=-1)
+    similarities = normalized @ normalized.transpose(-1, -2)
+    count = int(similarities.shape[-1])
+    if count <= 1:
+        return 1.0
+    mask = ~torch.eye(count, dtype=torch.bool, device=similarities.device)
+    return float(similarities[..., mask].mean().cpu().item())
+
+
 def _diagnostic_records(dataset: TensorReadoutQADataset, records_per_task: int) -> list[int]:
     selected: list[int] = []
     counts: dict[str, int] = defaultdict(int)
@@ -3042,8 +3453,9 @@ def _adapter_forward_with_trace(
     trace: dict[str, torch.Tensor] = {}
     handles: list[Any] = []
     input_mask = prompt_mask[0].to(device=text_embeds.device, dtype=text_embeds.dtype).unsqueeze(-1)
+    trace_input = text_embeds[0].mean(dim=0) if text_embeds.ndim == 4 else text_embeds[0]
     trace["llm_input_embedding_mean"] = (
-        (text_embeds[0] * input_mask).sum(dim=0) / input_mask.sum().clamp_min(1.0)
+        (trace_input * input_mask).sum(dim=0) / input_mask.sum().clamp_min(1.0)
     ).detach().float().cpu()
 
     def capture(name: str, pool_text: bool = False):
@@ -3062,34 +3474,45 @@ def _adapter_forward_with_trace(
     if isinstance(adapter, HybridGlobalLocalAdapter):
         trace["local_query_tokens"] = adapter.local_adapter.query_tokens[0].detach().float().cpu()
         trace["global_query_tokens"] = adapter.global_adapter.query_tokens[0].detach().float().cpu()
-        if adapter.local_adapter.anchor_projection is not None:
+        anchor_projection = getattr(adapter.local_adapter, "anchor_projection", None)
+        if anchor_projection is not None:
             anchor_indices = last_nonpadding_indices(prompt_mask.to(device=text_embeds.device))
             trace["local_anchor_hidden"] = text_embeds[
                 torch.arange(text_embeds.shape[0], device=text_embeds.device),
                 anchor_indices,
             ][0].detach().float().cpu()
-        handles.append(
-            adapter.local_adapter.text_projection.register_forward_hook(
-                capture("local_text_projected", pool_text=True)
-            )
-        )
-        handles.append(
-            adapter.local_adapter.latent_projection.register_forward_hook(capture("local_latent_projected"))
-        )
-        for index, module in enumerate(adapter.local_adapter.text_encoder):
-            handles.append(module.register_forward_hook(capture(f"local_text_encoder_{index}", pool_text=True)))
-        for index, module in enumerate(adapter.local_adapter.text_blocks):
-            handles.append(module.register_forward_hook(capture(f"local_after_text_{index}")))
-        for index, module in enumerate(adapter.local_adapter.latent_blocks):
-            handles.append(module.register_forward_hook(capture(f"local_after_latent_{index}")))
-        for index, module in enumerate(adapter.local_adapter.text_latent_blocks):
-            handles.append(module.register_forward_hook(capture(f"local_text_after_latent_{index}", pool_text=True)))
-        for index, module in enumerate(adapter.local_adapter.pool_blocks):
-            handles.append(module.register_forward_hook(capture(f"local_after_pool_{index}")))
-        handles.append(adapter.local_adapter.output.register_forward_hook(capture("local_output_pre_gate")))
-        if adapter.local_adapter.anchor_projection is not None:
+        text_projections = getattr(adapter.local_adapter, "text_projections", None)
+        if text_projections is not None:
+            for index, module in enumerate(text_projections):
+                handles.append(module.register_forward_hook(capture(f"local_text_projected_layer_{index}", pool_text=True)))
+        elif hasattr(adapter.local_adapter, "text_projection"):
             handles.append(
-                adapter.local_adapter.anchor_projection.register_forward_hook(capture("local_anchor_condition"))
+                adapter.local_adapter.text_projection.register_forward_hook(
+                    capture("local_text_projected", pool_text=True)
+                )
+            )
+        local_backbone = getattr(adapter.local_adapter, "backbone", adapter.local_adapter)
+        if hasattr(local_backbone, "latent_projection"):
+            handles.append(local_backbone.latent_projection.register_forward_hook(capture("local_latent_projected")))
+        for index, module in enumerate(getattr(adapter.local_adapter, "text_encoder", [])):
+            handles.append(module.register_forward_hook(capture(f"local_text_encoder_{index}", pool_text=True)))
+        for index, module in enumerate(getattr(adapter.local_adapter, "text_blocks", [])):
+            handles.append(module.register_forward_hook(capture(f"local_after_text_{index}")))
+        for index, module in enumerate(getattr(adapter.local_adapter, "latent_blocks", [])):
+            handles.append(module.register_forward_hook(capture(f"local_after_latent_{index}")))
+        if isinstance(adapter.local_adapter, ResidualQuestionConditionedAdapter):
+            for index, module in enumerate(adapter.local_adapter.backbone.blocks):
+                handles.append(module.register_forward_hook(capture(f"local_after_latent_{index}")))
+        for index, module in enumerate(getattr(adapter.local_adapter, "text_latent_blocks", [])):
+            handles.append(module.register_forward_hook(capture(f"local_text_after_latent_{index}", pool_text=True)))
+        for index, module in enumerate(getattr(adapter.local_adapter, "pool_blocks", [])):
+            handles.append(module.register_forward_hook(capture(f"local_after_pool_{index}")))
+        local_output = getattr(local_backbone, "output", None)
+        if local_output is not None:
+            handles.append(local_output.register_forward_hook(capture("local_output_pre_gate")))
+        if anchor_projection is not None:
+            handles.append(
+                anchor_projection.register_forward_hook(capture("local_anchor_condition"))
             )
         handles.append(
             adapter.global_adapter.latent_projection.register_forward_hook(capture("global_latent_projected"))
@@ -3100,29 +3523,55 @@ def _adapter_forward_with_trace(
     attention_blocks = []
     if isinstance(adapter, HybridGlobalLocalAdapter):
         attention_blocks = [
-            *adapter.local_adapter.text_blocks,
-            *adapter.local_adapter.latent_blocks,
+            *getattr(adapter.local_adapter, "text_blocks", []),
+            *getattr(adapter.local_adapter, "latent_blocks", []),
+            *(
+                list(adapter.local_adapter.backbone.blocks)
+                if isinstance(adapter.local_adapter, ResidualQuestionConditionedAdapter)
+                else []
+            ),
         ]
         for block in attention_blocks:
             block.capture_attention = True
     try:
-        soft = adapter(
-            latent,
-            question_embeds=text_embeds,
-            question_mask=prompt_mask,
-            structured_query=structured_query,
-        )
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            global_prompts, local_prompts, soft = adapter.forward_components(
+                latent,
+                question_embeds=text_embeds,
+                question_mask=prompt_mask,
+                structured_query=structured_query,
+            )
+            trace["global_prompt"] = global_prompts[0].detach().float().cpu()
+            trace["local_prompt_or_residual"] = local_prompts[0].detach().float().cpu()
+            trace["combined_prompt"] = soft[0].detach().float().cpu()
+        else:
+            soft = adapter(
+                latent,
+                question_embeds=text_embeds,
+                question_mask=prompt_mask,
+                structured_query=structured_query,
+            )
     finally:
         if isinstance(adapter, HybridGlobalLocalAdapter):
+            local_latent_blocks = (
+                adapter.local_adapter.backbone.blocks
+                if isinstance(adapter.local_adapter, ResidualQuestionConditionedAdapter)
+                else getattr(adapter.local_adapter, "latent_blocks", [])
+            )
             for prefix, blocks in (
-                ("local_text_attention", adapter.local_adapter.text_blocks),
-                ("local_latent_attention", adapter.local_adapter.latent_blocks),
+                ("local_text_attention", getattr(adapter.local_adapter, "text_blocks", [])),
+                ("local_latent_attention", local_latent_blocks),
             ):
                 for index, block in enumerate(blocks):
                     if block.last_attention_weights is not None:
                         trace[f"{prefix}_{index}"] = block.last_attention_weights
+                    self_weights = getattr(block, "last_self_attention_weights", None)
+                    if self_weights is not None:
+                        trace[f"local_query_self_attention_{index}"] = self_weights
                     block.capture_attention = False
                     block.last_attention_weights = None
+                    if hasattr(block, "last_self_attention_weights"):
+                        block.last_self_attention_weights = None
         for handle in handles:
             handle.remove()
     return soft, trace
@@ -3180,12 +3629,13 @@ def run_embedded_diagnostics(
                 device=device,
                 max_tokens=int(args.max_prompt_tokens),
             )
-            local_text_embeds = contextual_question_tokens(
+            local_text_embeds = contextual_question_tokens_for_adapter(
                 llm=llm,
+                adapter=adapter,
                 input_ids=local_ids,
                 attention_mask=local_mask,
                 prompt_mask=local_mask.bool(),
-                layer_index=int(args.local_context_layer),
+                fallback_layer=int(args.local_context_layer),
             )
             local_text_mask = local_mask.bool()
         condition = (
@@ -3233,7 +3683,13 @@ def run_embedded_diagnostics(
             )
             prompt_positions = torch.nonzero(prompt_mask[0], as_tuple=False).flatten()
             question_last = int(soft.shape[1] + prompt_positions[-1].item())
-            local_count = int(adapter.local_adapter.soft_prompt_tokens) if isinstance(adapter, HybridGlobalLocalAdapter) else 0
+            local_count = (
+                0
+                if isinstance(adapter, HybridGlobalLocalAdapter) and adapter.residual_mode
+                else int(adapter.local_adapter.soft_prompt_tokens)
+                if isinstance(adapter, HybridGlobalLocalAdapter)
+                else 0
+            )
             layer_states: dict[str, Any] = {}
             for layer_index in resolved_layers:
                 hidden = hidden_states[layer_index][0]
@@ -3249,6 +3705,8 @@ def run_embedded_diagnostics(
             mode_states[mode] = {
                 "latent": latent[0].detach().float().cpu(),
                 "soft_prompt": soft[0].detach().float().cpu(),
+                "global_prompt": adapter_hidden.get("global_prompt"),
+                "local_prompt_or_residual": adapter_hidden.get("local_prompt_or_residual"),
                 "adapter_hidden": adapter_hidden,
                 "layers": layer_states,
             }
@@ -3282,7 +3740,13 @@ def run_embedded_diagnostics(
 
         correct_state = mode_states["correct"]
         shuffled_state = mode_states["shuffled"]
-        local_count = int(adapter.local_adapter.soft_prompt_tokens) if isinstance(adapter, HybridGlobalLocalAdapter) else 0
+        local_count = (
+            0
+            if isinstance(adapter, HybridGlobalLocalAdapter) and adapter.residual_mode
+            else int(adapter.local_adapter.soft_prompt_tokens)
+            if isinstance(adapter, HybridGlobalLocalAdapter)
+            else 0
+        )
         local_attention_summary: dict[str, Any] | None = None
         if isinstance(adapter, HybridGlobalLocalAdapter) and local_ids is not None:
             local_attention_summary = {}
@@ -3320,7 +3784,27 @@ def run_embedded_diagnostics(
                     for value, index in zip(values.tolist(), indices.tolist())
                 ]
         soft_comparison = _cosine_and_relative_l2(correct_state["soft_prompt"], shuffled_state["soft_prompt"])
-        if local_count:
+        soft_comparison["query_off_diagonal_cosine"] = _mean_off_diagonal_cosine(
+            correct_state["soft_prompt"]
+        )
+        if isinstance(adapter, HybridGlobalLocalAdapter) and adapter.residual_mode:
+            local_comparison = _cosine_and_relative_l2(
+                correct_state["local_prompt_or_residual"], shuffled_state["local_prompt_or_residual"]
+            )
+            global_comparison = _cosine_and_relative_l2(
+                correct_state["global_prompt"], shuffled_state["global_prompt"]
+            )
+            soft_comparison.update(
+                {
+                    "local_cosine": local_comparison["cosine"],
+                    "local_relative_l2": local_comparison["relative_l2"],
+                    "global_cosine": global_comparison["cosine"],
+                    "global_relative_l2": global_comparison["relative_l2"],
+                    "local_rms": _rms(correct_state["local_prompt_or_residual"]),
+                    "global_rms": _rms(correct_state["global_prompt"]),
+                }
+            )
+        elif local_count:
             local_comparison = _cosine_and_relative_l2(
                 correct_state["soft_prompt"][:local_count], shuffled_state["soft_prompt"][:local_count]
             )
@@ -3376,12 +3860,13 @@ def run_embedded_diagnostics(
                     device=device,
                     max_tokens=int(args.max_prompt_tokens),
                 )
-                alt_text_embeds = contextual_question_tokens(
+                alt_text_embeds = contextual_question_tokens_for_adapter(
                     llm=llm,
+                    adapter=adapter,
                     input_ids=alt_local_ids,
                     attention_mask=alt_local_mask,
                     prompt_mask=alt_local_mask.bool(),
-                    layer_index=int(args.local_context_layer),
+                    fallback_layer=int(args.local_context_layer),
                 )
                 alt_prompt_mask = alt_local_mask.bool()
             alt_condition = (
@@ -3389,7 +3874,7 @@ def run_embedded_diagnostics(
                 if bool(getattr(adapter, "structured_query_conditioning", False))
                 else None
             )
-            alt_soft, _alt_trace = _adapter_forward_with_trace(
+            alt_soft, alt_trace = _adapter_forward_with_trace(
                 adapter=adapter,
                 latent=correct_latent.to(device),
                 text_embeds=alt_text_embeds,
@@ -3402,13 +3887,17 @@ def run_embedded_diagnostics(
                 "alternate_task_type": str(alternate_record.get("task_type", "unknown")),
                 "same_latent_soft_prompt": _cosine_and_relative_l2(correct_state["soft_prompt"], alt_soft),
             }
-            if local_count:
+            if isinstance(adapter, HybridGlobalLocalAdapter) and adapter.residual_mode:
+                question_sensitivity["same_latent_local_prompt"] = _cosine_and_relative_l2(
+                    correct_state["local_prompt_or_residual"], alt_trace["local_prompt_or_residual"]
+                )
+            elif local_count:
                 question_sensitivity["same_latent_local_prompt"] = _cosine_and_relative_l2(
                     correct_state["soft_prompt"][:local_count], alt_soft[:local_count]
                 )
         same_task_record = _same_task_alternate_question_record(dataset, index)
         same_task_sensitivity: dict[str, Any] | None = None
-        if same_task_record is not None and local_count:
+        if same_task_record is not None and isinstance(adapter, HybridGlobalLocalAdapter):
             same_ids, same_mask = build_local_question_tensors(
                 records=[same_task_record],
                 tokenizer=tokenizer,
@@ -3420,14 +3909,15 @@ def run_embedded_diagnostics(
                 isinstance(adapter, HybridGlobalLocalAdapter)
                 and adapter.local_adapter.question_input_mode == "contextual_tokens"
             ):
-                same_text_embeds = contextual_question_tokens(
+                same_text_embeds = contextual_question_tokens_for_adapter(
                     llm=llm,
+                    adapter=adapter,
                     input_ids=same_ids,
                     attention_mask=same_mask,
                     prompt_mask=same_mask.bool(),
-                    layer_index=int(args.local_context_layer),
+                    fallback_layer=int(args.local_context_layer),
                 )
-            same_soft, _same_trace = _adapter_forward_with_trace(
+            same_soft, same_trace = _adapter_forward_with_trace(
                 adapter=adapter,
                 latent=correct_latent.to(device),
                 text_embeds=same_text_embeds,
@@ -3456,10 +3946,20 @@ def run_embedded_diagnostics(
             swapped_wrong_scores = [
                 value for choice_index, value in enumerate(swapped_scores) if choice_index != target_index
             ]
+            same_local_prompt = (
+                same_trace["local_prompt_or_residual"]
+                if adapter.residual_mode
+                else same_soft[:local_count]
+            )
+            correct_local_prompt = (
+                correct_state["local_prompt_or_residual"]
+                if adapter.residual_mode
+                else correct_state["soft_prompt"][:local_count]
+            )
             same_task_sensitivity = {
                 "alternate_qa_id": str(same_task_record.get("qa_id", "")),
                 "same_latent_local_prompt": _cosine_and_relative_l2(
-                    correct_state["soft_prompt"][:local_count], same_soft[:local_count]
+                    correct_local_prompt, same_local_prompt
                 ),
                 "swapped_question_prediction": choices[
                     min(range(len(swapped_scores)), key=lambda choice_index: swapped_scores[choice_index])
@@ -3580,7 +4080,7 @@ def run_embedded_diagnostics(
         "local_anchor_gate": float(
             adapter.local_adapter.anchor_gate.detach().float().cpu().item()
             if isinstance(adapter, HybridGlobalLocalAdapter)
-            and adapter.local_adapter.anchor_gate is not None
+            and getattr(adapter.local_adapter, "anchor_gate", None) is not None
             else 0.0
         ),
         "local_prompt_rms_mean": sum(local_rms_values) / max(1, len(local_rms_values)),
@@ -3589,6 +4089,11 @@ def run_embedded_diagnostics(
             (sum(local_rms_values) / max(1, len(local_rms_values)))
             / max(sum(global_rms_values) / max(1, len(global_rms_values)), 1.0e-8)
         ),
+        "soft_prompt_query_off_diagonal_cosine_mean": sum(
+            item["soft_prompt_correct_vs_shuffled"].get("query_off_diagonal_cosine", 1.0)
+            for item in summaries
+        )
+        / max(1, len(summaries)),
         "question_last_relative_l2_by_layer": {
             layer: sum(
                 item["hidden_correct_vs_shuffled"][layer]["question_last"]["relative_l2"] for item in summaries
@@ -3712,7 +4217,11 @@ def adapter_from_checkpoint(
 
     adapter_dim = int(ckpt_args.get("adapter_dim", 512))
     adapter_heads = int(ckpt_args.get("adapter_heads", 8))
-    global_prefix = "global_adapter." if architecture == "hybrid_local_qformer" else ""
+    global_prefix = (
+        "global_adapter."
+        if architecture in {"hybrid_local_qformer", "residual_question_qformer"}
+        else ""
+    )
     query_key = f"{global_prefix}query_tokens"
     query_tensor = state_dict.get(query_key)
     if not isinstance(query_tensor, torch.Tensor):
@@ -3743,6 +4252,26 @@ def adapter_from_checkpoint(
     if architecture == "alignment_qformer":
         global_adapter.load_state_dict(state_dict, strict=True)
         return global_adapter
+
+    if architecture == "residual_question_qformer":
+        local_adapter = ResidualQuestionConditionedAdapter(
+            aligned_adapter=global_adapter,
+            llm_hidden_size=llm_hidden_size,
+            context_layers=[int(value) for value in parse_csv(ckpt_args.get("local_context_layers", "2,6"))],
+            adapter_heads=adapter_heads,
+            dropout=float(ckpt_args.get("dropout", 0.0)),
+            text_gate_init=float(ckpt_args.get("local_text_gate_init", 0.05)),
+            residual_gate_init=float(ckpt_args.get("local_gate_init", 0.1)),
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local_adapter,
+            freeze_global=True,
+            global_prompt_dropout=float(ckpt_args.get("global_prompt_dropout", 0.0)),
+            combine_mode="residual",
+        )
+        adapter.load_state_dict(state_dict, strict=True)
+        return adapter
 
     local_query = state_dict.get("local_adapter.query_tokens")
     text_pos = state_dict.get("local_adapter.text_pos_embed")
@@ -3809,6 +4338,56 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
             )
 
 
+def compact_accuracy_metrics(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
+    """Keep W&B readable while detailed field/task matrices remain in local JSON files."""
+    payload: dict[str, float] = {}
+    for mode, raw_metrics in metrics.items():
+        if not isinstance(raw_metrics, Mapping):
+            continue
+        accuracy = raw_metrics.get("accuracy")
+        if isinstance(accuracy, (int, float)):
+            payload[f"{prefix}/{mode}/accuracy"] = float(accuracy)
+        by_task = raw_metrics.get("by_task")
+        if mode == "correct" and isinstance(by_task, Mapping):
+            for task, task_metrics in by_task.items():
+                if isinstance(task_metrics, Mapping) and isinstance(task_metrics.get("accuracy"), (int, float)):
+                    payload[f"{prefix}/task/{task}/accuracy"] = float(task_metrics["accuracy"])
+    correct = metrics.get("correct")
+    shuffled = metrics.get("shuffled")
+    if isinstance(correct, Mapping) and isinstance(shuffled, Mapping):
+        correct_tasks = correct.get("by_task")
+        shuffled_tasks = shuffled.get("by_task")
+        if isinstance(correct_tasks, Mapping) and isinstance(shuffled_tasks, Mapping):
+            for task, correct_task in correct_tasks.items():
+                shuffled_task = shuffled_tasks.get(task)
+                if (
+                    isinstance(correct_task, Mapping)
+                    and isinstance(shuffled_task, Mapping)
+                    and isinstance(correct_task.get("accuracy"), (int, float))
+                    and isinstance(shuffled_task.get("accuracy"), (int, float))
+                ):
+                    payload[f"{prefix}/task/{task}/latent_gain"] = float(correct_task["accuracy"]) - float(
+                        shuffled_task["accuracy"]
+                    )
+    add_accuracy_deltas(prefix, metrics, payload)
+    return payload
+
+
+def compact_diagnostic_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
+    keys = (
+        "local_prompt_relative_l2_mean",
+        "answer_margin_correct_minus_shuffled",
+        "same_task_different_question_local_relative_l2_mean",
+        "same_task_swapped_question_answer_margin_mean",
+        "local_to_global_prompt_rms_ratio",
+    )
+    return {
+        f"diagnostics/{key}": float(metrics[key])
+        for key in keys
+        if isinstance(metrics.get(key), (int, float))
+    }
+
+
 def macro_latent_gain(metrics: Mapping[str, Any], baseline: str = "shuffled") -> float:
     correct = metrics.get("correct")
     baseline_metrics = metrics.get(baseline)
@@ -3840,6 +4419,22 @@ def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
 
 
 def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    raw_summary = dict(summary or {})
+    compact_summary = {
+        key: raw_summary[key]
+        for key in (
+            "device",
+            "model_dtype",
+            "train_records",
+            "val_records",
+            "test_records",
+            "adapter_initialization",
+            "adapter_parameters_total",
+            "trainable_adapter_parameters",
+            "frozen_llm_parameters",
+        )
+        if key in raw_summary
+    }
     return {
         "experiment": {"name": str(args.run_name)},
         "data": {
@@ -3878,8 +4473,10 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "local_text_encoder_layers": int(args.local_text_encoder_layers),
             "local_question_input_mode": str(args.local_question_input_mode),
             "local_context_layer": int(args.local_context_layer),
+            "local_context_layers": parse_csv(args.local_context_layers),
             "local_fusion_mode": str(args.local_fusion_mode),
             "local_gate_init": float(args.local_gate_init),
+            "local_text_gate_init": float(args.local_text_gate_init),
             "freeze_global_adapter": bool(args.freeze_global_adapter),
             "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
             "global_lr": float(args.global_lr),
@@ -3908,6 +4505,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "ranking_loss_weight": float(args.ranking_loss_weight),
             "ranking_loss_margin": float(args.ranking_loss_margin),
             "ranking_loss_negative": str(args.ranking_loss_negative),
+            "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
+            "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
+            "swapped_question_max_records": int(args.swapped_question_max_records),
             "max_prompt_tokens": int(args.max_prompt_tokens),
             "max_target_tokens": int(args.max_target_tokens),
             "append_eos": bool(args.append_eos),
@@ -3927,7 +4527,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
                 "layers": parse_csv(args.diagnostics_layers),
             },
         },
-        "run_summary": dict(summary or {}),
+        "run_summary": compact_summary,
         "wandb": {
             "enabled": bool(args.wandb_enabled),
             "api_key": args.wandb_api_key,
@@ -3937,6 +4537,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "tags": parse_csv(args.wandb_tags),
             "mode": str(args.wandb_mode),
             "log_model": bool(args.wandb_log_model),
+            "detailed_metrics": bool(args.wandb_detailed_metrics),
         },
     }
 
@@ -4021,8 +4622,15 @@ def main() -> None:
         if bool(args.diagnostics_enabled)
         else {"validated_before_training": False, "reason": "diagnostics disabled"}
     )
+    context_layer_values = [int(value) for value in parse_csv(args.local_context_layers)]
     local_context_audit = (
-        validate_local_context_layer(llm, int(args.local_context_layer))
+        {
+            "validated_before_training": True,
+            "layers": [
+                validate_local_context_layer(llm, layer_index)
+                for layer_index in context_layer_values
+            ],
+        }
         if str(args.local_question_input_mode) == "contextual_tokens"
         else {"validated_before_training": False, "reason": "input_embeddings mode"}
     )
@@ -4033,12 +4641,12 @@ def main() -> None:
             device=device,
             max_tokens=int(args.max_prompt_tokens),
         )
-        preflight_context = contextual_question_tokens(
+        preflight_context = contextual_question_token_layers(
             llm=llm,
             input_ids=preflight_ids,
             attention_mask=preflight_mask,
             prompt_mask=preflight_mask.bool(),
-            layer_index=int(args.local_context_layer),
+            layer_indices=context_layer_values,
         )
         if not bool(torch.isfinite(preflight_context).all()):
             raise ValueError("The local contextual Qwen preflight produced non-finite hidden states.")
@@ -4055,7 +4663,11 @@ def main() -> None:
     initialization = "random"
     checkpoint_load_report: dict[str, Any] = {"mode": "random"}
     global_checkpoint_load_report: dict[str, Any] | None = None
-    if str(args.adapter_architecture) in {"alignment_qformer", "hybrid_local_qformer"}:
+    if str(args.adapter_architecture) in {
+        "alignment_qformer",
+        "hybrid_local_qformer",
+        "residual_question_qformer",
+    }:
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_args: Mapping[str, Any] = {}
         hybrid_state_dict: Mapping[str, Any] | None = None
@@ -4072,6 +4684,11 @@ def main() -> None:
         hybrid_checkpoint = isinstance(raw_checkpoint_state, Mapping) and any(
             str(key).startswith("global_adapter.") for key in raw_checkpoint_state
         )
+        if str(args.adapter_architecture) == "residual_question_qformer" and hybrid_checkpoint:
+            raise ValueError(
+                "residual_question_qformer must start from a stage-1 alignment checkpoint, not a downstream "
+                "hybrid checkpoint. Set adapter.init_checkpoint to alignment_best.pt."
+            )
         if hybrid_checkpoint:
             global_query = raw_checkpoint_state.get("global_adapter.query_tokens")
             if not isinstance(global_query, torch.Tensor):
@@ -4227,6 +4844,42 @@ def main() -> None:
             args.freeze_global_adapter = freeze_global_adapter
             args.question_conditioning = True
             args.structured_query_conditioning = bool(adapter.structured_query_conditioning)
+        if str(args.adapter_architecture) == "residual_question_qformer":
+            if checkpoint is None:
+                raise ValueError("residual_question_qformer requires adapter.init_checkpoint from stage-1 alignment.")
+            context_layers = [int(value) for value in parse_csv(args.local_context_layers)]
+            global_adapter = adapter
+            local_adapter = ResidualQuestionConditionedAdapter(
+                aligned_adapter=global_adapter,
+                llm_hidden_size=llm_hidden_size,
+                context_layers=context_layers,
+                adapter_heads=adapter_heads,
+                dropout=float(args.dropout),
+                text_gate_init=float(args.local_text_gate_init),
+                residual_gate_init=float(args.local_gate_init),
+            )
+            adapter = HybridGlobalLocalAdapter(
+                global_adapter=global_adapter,
+                local_adapter=local_adapter,
+                freeze_global=True,
+                global_prompt_dropout=float(args.global_prompt_dropout),
+                combine_mode="residual",
+            ).to(device)
+            checkpoint_load_report["mode"] = "stage1_cloned_residual_qformer"
+            checkpoint_load_report["conditioned_backbone_initialized_parameters"] = sum(
+                int(parameter.numel()) for parameter in local_adapter.backbone.parameters()
+            )
+            initialization = "stage1_residual_question_qformer"
+            args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
+            args.local_soft_prompt_tokens = int(local_adapter.soft_prompt_tokens)
+            args.local_adapter_layers = int(len(local_adapter.backbone.blocks))
+            args.local_question_input_mode = "contextual_tokens"
+            args.local_context_layer = int(max(context_layers))
+            args.local_fusion_mode = "residual_qformer"
+            args.freeze_global_adapter = True
+            args.global_unfreeze_epoch = 0
+            args.question_conditioning = True
+            args.structured_query_conditioning = False
     else:
         adapter = TensorSoftPromptAdapter(
             latent_channels=latent_channels,
@@ -4275,7 +4928,7 @@ def main() -> None:
             learning_rate=float(args.global_lr),
             weight_decay=float(args.weight_decay),
             name="global",
-            include_frozen=True,
+            include_frozen=not adapter.residual_mode,
         )
         optimizer = torch.optim.AdamW(
             local_groups + global_groups,
@@ -4321,6 +4974,9 @@ def main() -> None:
         "ranking_loss_weight": float(args.ranking_loss_weight),
         "ranking_loss_margin": float(args.ranking_loss_margin),
         "ranking_loss_negative": str(args.ranking_loss_negative),
+        "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
+        "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
+        "swapped_question_max_records": int(args.swapped_question_max_records),
         "soft_prompt_tokens": int(args.soft_prompt_tokens),
         "adapter_layers": int(args.adapter_layers),
         "latent_pos_encoding": str(args.latent_pos_encoding),
@@ -4337,6 +4993,7 @@ def main() -> None:
             )
         ),
         "local_context_layer": int(args.local_context_layer),
+        "local_context_layers": [int(value) for value in parse_csv(args.local_context_layers)],
         "local_fusion_mode": str(args.local_fusion_mode),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "adapter_architecture": str(args.adapter_architecture),
@@ -4346,6 +5003,7 @@ def main() -> None:
         "local_adapter_layers": int(args.local_adapter_layers),
         "local_text_encoder_layers": int(args.local_text_encoder_layers),
         "local_gate_init": float(args.local_gate_init),
+        "local_text_gate_init": float(args.local_text_gate_init),
         "freeze_global_adapter": bool(args.freeze_global_adapter),
         "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
         "global_lr": float(args.global_lr),
@@ -4393,7 +5051,7 @@ def main() -> None:
         f"params={summary['trainable_adapter_parameters']:,} "
         f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
         f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
-        f"ranking:{float(args.ranking_loss_weight):g} "
+        f"ranking:{float(args.ranking_loss_weight):g},swap:{float(args.swapped_question_loss_weight):g} "
         f"checkpoint_load={checkpoint_load_report.get('mode')} "
         f"global/local_tensors={int(checkpoint_load_report.get('global_loaded_parameter_tensors', 0))}/"
         f"{int(checkpoint_load_report.get('local_loaded_parameter_tensors', 0))}"
@@ -4426,8 +5084,11 @@ def main() -> None:
             history["initial_eval"] = initial_metrics
             metrics_path = run_dir / "metrics_latest.json"
             dump_json(metrics_path, history)
-            initial_payload = flatten_numeric_metrics("initial_eval", initial_metrics)
-            add_accuracy_deltas("initial_eval", initial_metrics, initial_payload)
+            initial_payload = (
+                flatten_numeric_metrics("initial_eval", initial_metrics)
+                if bool(args.wandb_detailed_metrics)
+                else compact_accuracy_metrics("initial_eval", initial_metrics)
+            )
             wandb_logger.log(initial_payload, step=0)
             print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
             if device.type == "cuda":
@@ -4436,6 +5097,7 @@ def main() -> None:
             if (
                 isinstance(adapter, HybridGlobalLocalAdapter)
                 and adapter.freeze_global
+                and not adapter.residual_mode
                 and int(args.global_unfreeze_epoch) > 0
                 and epoch >= int(args.global_unfreeze_epoch)
             ):
@@ -4455,6 +5117,10 @@ def main() -> None:
             running_ranking_loss = 0.0
             running_weighted_ranking_loss = 0.0
             running_ranking_margin = 0.0
+            running_swapped_question_loss = 0.0
+            running_weighted_swapped_question_loss = 0.0
+            running_swapped_question_margin = 0.0
+            running_swapped_question_pairs = 0.0
             running_total_grad_norm = 0.0
             running_local_grad_norm = 0.0
             running_global_grad_norm = 0.0
@@ -4506,6 +5172,10 @@ def main() -> None:
                 running_ranking_loss += float(loss_parts["ranking_loss"])
                 running_weighted_ranking_loss += float(loss_parts["weighted_ranking_loss"])
                 running_ranking_margin += float(loss_parts["ranking_margin_mean"])
+                running_swapped_question_loss += float(loss_parts["swapped_question_loss"])
+                running_weighted_swapped_question_loss += float(loss_parts["weighted_swapped_question_loss"])
+                running_swapped_question_margin += float(loss_parts["swapped_question_margin_mean"])
+                running_swapped_question_pairs += float(loss_parts["swapped_question_pairs"])
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
                     if isinstance(adapter, HybridGlobalLocalAdapter):
@@ -4537,6 +5207,8 @@ def main() -> None:
                 average_ranking_loss = running_ranking_loss / step
                 average_weighted_ranking_loss = running_weighted_ranking_loss / step
                 average_ranking_margin = running_ranking_margin / step
+                average_swapped_question_loss = running_swapped_question_loss / step
+                average_swapped_question_margin = running_swapped_question_margin / step
                 average_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
                 average_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
                 average_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
@@ -4561,7 +5233,9 @@ def main() -> None:
                         "train_choice_01_loss": average_choice_01_loss,
                         "train_ranking_loss": average_ranking_loss,
                         "train_weighted_ranking_loss": average_weighted_ranking_loss,
-                        "train_ranking_margin": average_ranking_margin,
+                            "train_ranking_margin": average_ranking_margin,
+                            "train_swapped_question_loss": average_swapped_question_loss,
+                            "train_swapped_question_margin": average_swapped_question_margin,
                         "train_total_grad_norm": average_total_grad_norm,
                         "train_local_grad_norm": average_local_grad_norm,
                         "train_global_grad_norm": average_global_grad_norm,
@@ -4572,39 +5246,13 @@ def main() -> None:
                     wandb_logger.log(
                         {
                             "train_step/loss": average_loss,
-                            "train_step/ce_loss": average_ce_loss,
-                            "train_step/weighted_ce_loss": average_weighted_ce_loss,
                             "train_step/choice_ce_loss": average_choice_ce_loss,
-                            "train_step/weighted_choice_ce_loss": average_weighted_choice_ce_loss,
                             "train_step/choice_accuracy": average_choice_accuracy,
-                            "train_step/choice_01_loss": average_choice_01_loss,
                             "train_step/ranking_loss": average_ranking_loss,
-                            "train_step/weighted_ranking_loss": average_weighted_ranking_loss,
                             "train_step/ranking_margin": average_ranking_margin,
-                            "train_step/total_grad_norm": average_total_grad_norm,
-                            "train_step/local_grad_norm": average_local_grad_norm,
-                            "train_step/global_grad_norm": average_global_grad_norm,
-                            "train_step/current_loss": current_loss,
-                            "train_step/current_ce_loss": float(loss_parts["ce_loss"]),
-                            "train_step/current_weighted_ce_loss": float(loss_parts["weighted_ce_loss"]),
-                            "train_step/current_choice_ce_loss": float(loss_parts["choice_ce_loss"]),
-                            "train_step/current_weighted_choice_ce_loss": float(
-                                loss_parts["weighted_choice_ce_loss"]
-                            ),
-                            "train_step/current_choice_accuracy": float(loss_parts["choice_accuracy"]),
-                            "train_step/current_choice_01_loss": float(loss_parts["choice_01_loss"]),
-                            "train_step/current_ranking_loss": float(loss_parts["ranking_loss"]),
-                            "train_step/current_weighted_ranking_loss": float(loss_parts["weighted_ranking_loss"]),
-                            "train_step/current_ranking_margin": float(loss_parts["ranking_margin_mean"]),
-                            "train_step/epoch": float(epoch),
-                            "train_step/epoch_step": float(step),
+                            "train_step/swapped_question_loss": average_swapped_question_loss,
+                            "train_step/swapped_question_margin": average_swapped_question_margin,
                             "train_step/lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
-                            "train_step/local_lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
-                            "train_step/global_lr": optimizer_group_lr(optimizer, "global", 0.0),
-                            "train_step/global_trainable": float(
-                                isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
-                            ),
-                            "train_step/global_prompt_dropped": float(drop_global_for_batch),
                         },
                         step=global_step,
                     )
@@ -4619,6 +5267,10 @@ def main() -> None:
             train_ranking_loss = running_ranking_loss / max(1, len(train_loader))
             train_weighted_ranking_loss = running_weighted_ranking_loss / max(1, len(train_loader))
             train_ranking_margin = running_ranking_margin / max(1, len(train_loader))
+            train_swapped_question_loss = running_swapped_question_loss / max(1, len(train_loader))
+            train_weighted_swapped_question_loss = running_weighted_swapped_question_loss / max(1, len(train_loader))
+            train_swapped_question_margin = running_swapped_question_margin / max(1, len(train_loader))
+            train_swapped_question_pairs = running_swapped_question_pairs / max(1, len(train_loader))
             train_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
             train_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
             train_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
@@ -4644,6 +5296,10 @@ def main() -> None:
                 "train_ranking_loss": train_ranking_loss,
                 "train_weighted_ranking_loss": train_weighted_ranking_loss,
                 "train_ranking_margin": train_ranking_margin,
+                "train_swapped_question_loss": train_swapped_question_loss,
+                "train_weighted_swapped_question_loss": train_weighted_swapped_question_loss,
+                "train_swapped_question_margin": train_swapped_question_margin,
+                "train_swapped_question_pairs_per_batch": train_swapped_question_pairs,
                 "train_total_grad_norm": train_total_grad_norm,
                 "train_local_grad_norm": train_local_grad_norm,
                 "train_global_grad_norm": train_global_grad_norm,
@@ -4675,6 +5331,9 @@ def main() -> None:
                 "train/ranking_loss": float(train_ranking_loss),
                 "train/weighted_ranking_loss": float(train_weighted_ranking_loss),
                 "train/ranking_margin": float(train_ranking_margin),
+                "train/swapped_question_loss": float(train_swapped_question_loss),
+                "train/swapped_question_margin": float(train_swapped_question_margin),
+                "train/swapped_question_pairs_per_batch": float(train_swapped_question_pairs),
                 "train/total_grad_norm": float(train_total_grad_norm),
                 "train/local_grad_norm": float(train_local_grad_norm),
                 "train/global_grad_norm": float(train_global_grad_norm),
@@ -4687,7 +5346,7 @@ def main() -> None:
                 "adapter/local_anchor_gate": float(
                     adapter.local_adapter.anchor_gate.detach().float().cpu().item()
                     if isinstance(adapter, HybridGlobalLocalAdapter)
-                    and adapter.local_adapter.anchor_gate is not None
+                    and getattr(adapter.local_adapter, "anchor_gate", None) is not None
                     else 0.0
                 ),
                 "lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
@@ -4699,8 +5358,11 @@ def main() -> None:
                 "val/macro_latent_gain": float(val_macro_latent_gain),
                 "best_val/checkpoint_score": float(max(best_val_score, val_score)),
             }
-            wandb_payload.update(flatten_numeric_metrics("val", val_metrics))
-            add_accuracy_deltas("val", val_metrics, wandb_payload)
+            wandb_payload.update(
+                flatten_numeric_metrics("val", val_metrics)
+                if bool(args.wandb_detailed_metrics)
+                else compact_accuracy_metrics("val", val_metrics)
+            )
             if val_score > best_val_score:
                 best_val_score = val_score
                 best_epoch = epoch
@@ -4732,7 +5394,11 @@ def main() -> None:
                 epoch_payload["diagnostics"] = diagnostic_aggregate
                 history[f"epoch_{epoch:04d}"] = epoch_payload
                 dump_json(run_dir / "metrics_latest.json", history)
-                wandb_payload.update(flatten_numeric_metrics("diagnostics", diagnostic_aggregate))
+                wandb_payload.update(
+                    flatten_numeric_metrics("diagnostics", diagnostic_aggregate)
+                    if bool(args.wandb_detailed_metrics)
+                    else compact_diagnostic_metrics(diagnostic_aggregate)
+                )
                 diagnostic_suffix = (
                     f" diag_local_l2={float(diagnostic_aggregate['local_prompt_relative_l2_mean']):.4f}"
                     f" diag_margin_gain={float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
@@ -4769,8 +5435,11 @@ def main() -> None:
             baseline_modes=final_baseline_modes,
         )
         dump_json(run_dir / "test_metrics.json", test_metrics)
-        test_payload = flatten_numeric_metrics("test", test_metrics)
-        add_accuracy_deltas("test", test_metrics, test_payload)
+        test_payload = (
+            flatten_numeric_metrics("test", test_metrics)
+            if bool(args.wandb_detailed_metrics)
+            else compact_accuracy_metrics("test", test_metrics)
+        )
         wandb_logger.log(test_payload, step=global_step + 1)
         summary["result"] = {
             "best_epoch": int(best_epoch),

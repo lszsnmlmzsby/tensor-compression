@@ -103,6 +103,19 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
         self.assertIn(answer, choices)
         self.assertGreater(used_digits, 6)
 
+    def test_numeric_choices_shuffle_display_order_reproducibly(self) -> None:
+        first = labeled_numeric_choices(0.0, 0.5, 6, random.Random(11))
+        repeated = labeled_numeric_choices(0.0, 0.5, 6, random.Random(11))
+        orders = [
+            labeled_numeric_choices(0.0, 0.5, 6, random.Random(seed))[3]
+            for seed in range(8)
+        ]
+
+        self.assertEqual(first, repeated)
+        self.assertTrue(any(values != sorted(values) for values in orders))
+        answer_index = first[1].index(first[2])
+        self.assertEqual(first[3][answer_index], 0.0)
+
     def test_splits_samples_without_overlap(self) -> None:
         splits = split_sample_indices(
             sample_indices=list(range(10)),

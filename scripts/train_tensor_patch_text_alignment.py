@@ -739,20 +739,35 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(dim * 4, dim),
             nn.Dropout(float(dropout)),
         )
+        self.capture_attention = False
+        self.last_self_attention_weights: torch.Tensor | None = None
+        self.last_attention_weights: torch.Tensor | None = None
 
     def forward(self, queries: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        self_attended, _ = self.self_attn(
+        self_attended, self_weights = self.self_attn(
             self.self_norm(queries),
             self.self_norm(queries),
             self.self_norm(queries),
-            need_weights=False,
+            need_weights=bool(self.capture_attention),
+            average_attn_weights=False,
+        )
+        self.last_self_attention_weights = (
+            self_weights.detach().float().cpu()
+            if self.capture_attention and self_weights is not None
+            else None
         )
         queries = queries + self_attended
-        cross_attended, _ = self.cross_attn(
+        cross_attended, cross_weights = self.cross_attn(
             self.cross_query_norm(queries),
             self.cross_context_norm(context),
             self.cross_context_norm(context),
-            need_weights=False,
+            need_weights=bool(self.capture_attention),
+            average_attn_weights=False,
+        )
+        self.last_attention_weights = (
+            cross_weights.detach().float().cpu()
+            if self.capture_attention and cross_weights is not None
+            else None
         )
         queries = queries + cross_attended
         return queries + self.ffn(self.ffn_norm(queries))

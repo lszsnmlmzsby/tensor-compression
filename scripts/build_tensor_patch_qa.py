@@ -231,8 +231,13 @@ def labeled_numeric_choices(
         formatted = [f"{item:.{used_decimals}g}" for item in values]
     if len(set(formatted)) != len(formatted):
         raise ValueError(f"Numeric options remain ambiguous after 17 significant digits around {value}.")
-    option_text = "; ".join(f"{label}: {text}" for label, text in zip(LABELS_4, formatted))
-    return option_text, list(LABELS_4), LABELS_4[correct_index], values, used_decimals
+    options = list(zip(values, formatted, [index == correct_index for index in range(4)]))
+    rng.shuffle(options)
+    shuffled_values = [item[0] for item in options]
+    shuffled_formatted = [item[1] for item in options]
+    shuffled_correct_index = next(index for index, item in enumerate(options) if item[2])
+    option_text = "; ".join(f"{label}: {text}" for label, text in zip(LABELS_4, shuffled_formatted))
+    return option_text, list(LABELS_4), LABELS_4[shuffled_correct_index], shuffled_values, used_decimals
 
 
 def quadrant(row: int, col: int, size: int) -> str:

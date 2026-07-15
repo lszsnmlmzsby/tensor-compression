@@ -261,8 +261,8 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Start from stage-1 tensor/text alignment; do not reuse downstream QA-fitted parameters.
-  architecture: hybrid_local_qformer
+  # Clone the stage-1 Q-Former into a question-conditioned residual branch; do not reuse downstream QA weights.
+  architecture: residual_question_qformer
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
   soft_prompt_tokens: 16
   adapter_dim: 512
@@ -274,27 +274,30 @@ adapter:
   question_condition_gate_init: 0.0
   # Formal runs must let the model read coordinates/tasks/statistics from text instead of regex-parsed features.
   structured_query_conditioning: false
-  local_soft_prompt_tokens: 8
-  local_adapter_layers: 2
+  # Residual mode keeps the same 16 token positions and inherited four Q-Former layers as stage 1.
+  local_soft_prompt_tokens: 16
+  local_adapter_layers: 4
   # Frozen Qwen contextual tokens remain the only question input; no parsed coordinates or task IDs are used.
   local_question_input_mode: contextual_tokens
   local_context_layer: 6
-  # Condition learned queries with a causal last-token anchor, then attend text and latent in each block.
-  local_fusion_mode: anchor_queries
+  # Fuse full token sequences from a shallow lexical layer and a middle contextual layer.
+  local_context_layers: [2, 6]
+  local_fusion_mode: residual_qformer
   local_text_encoder_layers: 0
-  # The previous 0.1 gate left the local branch much weaker than the global branch.
-  local_gate_init: 0.5
-  # Freeze the stage-1 global branch for epoch 1, then fine-tune it from epoch 2.
+  # Keep both new text conditioning and the final residual small at initialization.
+  local_text_gate_init: 0.05
+  local_gate_init: 0.1
+  # The original stage-1 branch remains a fixed anchor; its cloned conditioned branch is trainable.
   freeze_global_adapter: true
-  global_unfreeze_epoch: 2
-  # Use one tenth of the local branch LR after unfreezing.
+  global_unfreeze_epoch: 0
+  # Retained for old hybrid checkpoints; unused while the residual reference is frozen.
   global_lr: 1.0e-5
-  # On a fraction of training batches, remove global prompts so local prompts cannot be bypassed.
-  global_prompt_dropout: 0.25
+  # Dropping the base would leave only a small residual; question grounding is enforced by swap loss instead.
+  global_prompt_dropout: 0.0
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_anchor_conditioned_qformer
+  run_name: tensor_patch_qa_residual_question_qformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -329,6 +332,11 @@ llm_training:
   ranking_loss_weight: 0.1
   ranking_loss_margin: 0.1
   ranking_loss_negative: shuffled
+  # For the same tensor/task, its own question-conditioned prompt must beat another question's prompt.
+  swapped_question_loss_weight: 0.1
+  swapped_question_loss_margin: 0.1
+  # Bound the extra frozen-LLM scoring graph so batch_size 16 remains practical on one 80GB GPU.
+  swapped_question_max_records: 8
   prompt_template: task_specific
   max_prompt_tokens: 512
   max_target_tokens: 8
@@ -374,3 +382,5 @@ wandb:
     - patch-alignment
   mode: online
   log_model: false
+  # false logs compact core/task curves; complete field/baseline/diagnostic matrices stay in local JSON files.
+  detailed_metrics: false
