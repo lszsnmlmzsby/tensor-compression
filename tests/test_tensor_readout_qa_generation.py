@@ -24,7 +24,7 @@ from build_tensor_readout_qa import (  # noqa: E402
     generate_split_records,
     split_sample_indices,
 )
-from build_tensor_patch_qa import build_questions, labeled_numeric_choices, question_seed  # noqa: E402
+from build_tensor_patch_qa import build_questions, labeled_numeric_choices, per_patch_zscore, question_seed  # noqa: E402
 
 
 def _write_synthetic_pdebench_file(path: Path) -> None:
@@ -88,6 +88,41 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
         self.assertNotEqual(variants[0]["question"], variants[1]["question"])
         self.assertEqual({variant["oracle"]["extreme"] for variant in variants}, {"minimum", "maximum"})
         self.assertEqual([variant["question_variant"] for variant in variants], [0, 1])
+
+    def test_patch_qa_questions_do_not_claim_latent_is_standardized(self) -> None:
+        record = {
+            "fields": ["Vx"],
+            "sample_index": 1,
+            "time_index": 2,
+            "row": 3,
+            "col": 4,
+            "patch_size": 4,
+        }
+        raw_patch = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+        qa_patch, stats = per_patch_zscore(raw_patch)
+
+        questions = build_questions(
+            record=record,
+            raw_patch=raw_patch,
+            normalized_patch=qa_patch,
+            mean=stats["mean"],
+            std=stats["std"],
+            tasks=["normalized_point_value"],
+            region_size=2,
+            spacing=0.5,
+            decimals=6,
+            include_oracle=True,
+            seed=question_seed(42, record),
+            scale=stats["scale"],
+        )
+
+        question = questions[0]["question"]
+        self.assertIn("encode a raw 4 by 4 patch", question)
+        self.assertIn("z = (x - mean) / scale", question)
+        self.assertNotIn("standardized patch is encoded", question)
+        self.assertEqual(questions[0]["metadata"]["tensor_encoding"], "alignment_checkpoint_encoder_input")
+        self.assertEqual(questions[0]["metadata"]["qa_value_space"], "per_patch_zscore")
+        self.assertAlmostEqual(float(qa_patch.mean().item()), 0.0, places=6)
 
     def test_numeric_choices_increase_display_precision_until_distinct(self) -> None:
         option_text, choices, answer, values, used_digits = labeled_numeric_choices(

@@ -239,7 +239,7 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
     prompt_data = record.get("prompt_data")
     if isinstance(prompt_data, Mapping):
         features[28] = math.tanh(float(prompt_data.get("mean", 0.0)))
-        features[29] = math.tanh(math.log1p(abs(float(prompt_data.get("std", 0.0)))))
+        features[29] = math.tanh(math.log1p(abs(float(prompt_data.get("scale", prompt_data.get("std", 0.0))))))
     return features
 
 
@@ -2029,13 +2029,14 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
     task_type = str(record.get("task_type", "")).strip()
     if task_type == "normalized_point_value":
         return (
-            "Rule: read the standardized value at the requested patch-local row and column from the tensor soft tokens. "
+            "Rule: read the raw value x at the requested patch-local row and column from the tensor soft tokens, "
+            "then use the mean and scale stated in the question to compute z = (x - mean) / scale. "
             "Choose the closest numeric option and return only its label."
         )
     if task_type == "raw_point_value_with_stats":
         return (
-            "Rule: read the standardized value z at the requested patch-local position from the tensor soft tokens, "
-            "then use x = z * standard deviation + mean with the statistics stated in the question. "
+            "Rule: read the raw value x at the requested patch-local position from the tensor soft tokens. "
+            "The stated mean and scale are reference statistics for the same patch. "
             "Choose the closest original-value option and return only its label."
         )
     if task_type == "point_bin":
@@ -2061,12 +2062,12 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
         )
     if task_type == "region_mean_compare":
         return (
-            "Rule: compare the mean standardized values in the two stated patch-local regions using the tensor soft tokens. "
+            "Rule: compare the mean raw values in the two stated patch-local regions using the tensor soft tokens. "
             "Return A if region A has the greater or tied mean; otherwise return B."
         )
     if task_type == "extreme_quadrant":
         return (
-            "Rule: locate the requested maximum or minimum in the standardized patch using the tensor soft tokens. "
+            "Rule: locate the requested maximum or minimum in the raw patch using the tensor soft tokens. "
             "Return A for top-left, B for top-right, C for bottom-left, or D for bottom-right."
         )
     if task_type == "max_speed_quadrant":
@@ -3370,12 +3371,12 @@ def records_for_baseline(
         digits = int(prompt_data.get("significant_digits", 6))
         patch_size = int(prompt_data.get("patch_size", 16))
         mean = float(shuffled_data.get("mean", prompt_data["mean"]))
-        std = float(shuffled_data.get("std", prompt_data["std"]))
+        scale = float(shuffled_data.get("scale", shuffled_data.get("std", prompt_data.get("scale", prompt_data["std"]))))
         question = (
-            f"A {patch_size} by {patch_size} patch of {prompt_data['field']} was standardized using "
-            "z = (x - mean) / standard deviation. "
-            f"Its mean is {mean:.{digits}g} and its standard deviation is {std:.{digits}g}. "
-            "The standardized patch is encoded in the tensor soft tokens. Which option is closest to the "
+            f"The tensor soft tokens encode a raw {patch_size} by {patch_size} patch of {prompt_data['field']}. "
+            "For reference, standardization would use z = (x - mean) / scale, "
+            f"where mean is {mean:.{digits}g} and scale is {scale:.{digits}g}. "
+            "Which option is closest to the "
             f"original value x at row {int(prompt_data['row'])}, column {int(prompt_data['col'])}? "
             f"Options: {prompt_data['option_text']}."
         )
@@ -3384,7 +3385,7 @@ def records_for_baseline(
         changed["query"] = question
         changed_prompt_data = dict(prompt_data)
         changed_prompt_data["mean"] = mean
-        changed_prompt_data["std"] = std
+        changed_prompt_data["scale"] = scale
         changed["prompt_data"] = changed_prompt_data
         updated.append(changed)
     return updated

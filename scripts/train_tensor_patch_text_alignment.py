@@ -1068,9 +1068,34 @@ def full_retrieval_accuracy(
     }
 
 
-def reconstruction_mse(compressor: nn.Module, latent_map: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def reconstruction_loss_with_diagnostics(
+    compressor: nn.Module,
+    latent_map: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
     reconstruction = compressor.decode({"latent_map": latent_map})
-    return F.mse_loss(reconstruction, target)
+    target_float = target.float()
+    reconstruction_float = reconstruction.float()
+    error_flat = (reconstruction_float - target_float).flatten(1)
+    target_flat = target_float.flatten(1)
+    mse_per_record = error_flat.square().mean(dim=1)
+    target_mean = target_flat.mean(dim=1, keepdim=True)
+    mean_baseline_mse_per_record = (target_flat - target_mean).square().mean(dim=1)
+    zero_baseline_mse_per_record = target_flat.square().mean(dim=1)
+    eps = torch.finfo(torch.float32).eps
+    relative_mse = mse_per_record / mean_baseline_mse_per_record.clamp_min(eps)
+    relative_rmse = mse_per_record.sqrt() / mean_baseline_mse_per_record.sqrt().clamp_min(eps)
+    loss = mse_per_record.mean()
+    diagnostics = {
+        "rmse": float(loss.detach().sqrt().cpu().item()),
+        "target_abs_mean": float(target_flat.abs().mean().detach().cpu().item()),
+        "target_std": float(mean_baseline_mse_per_record.mean().detach().sqrt().cpu().item()),
+        "mean_baseline_mse": float(mean_baseline_mse_per_record.mean().detach().cpu().item()),
+        "zero_baseline_mse": float(zero_baseline_mse_per_record.mean().detach().cpu().item()),
+        "relative_mse_to_mean_baseline": float(relative_mse.mean().detach().cpu().item()),
+        "relative_rmse_to_target_std": float(relative_rmse.mean().detach().cpu().item()),
+    }
+    return loss, diagnostics
 
 
 def hidden_at_last_non_padding(
@@ -1960,7 +1985,7 @@ def train_one_epoch(
             text_embedding,
             float(args.temperature),
         )
-        reconstruction = reconstruction_mse(compressor, latent, patches)
+        reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
@@ -1983,6 +2008,7 @@ def train_one_epoch(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -2052,6 +2078,7 @@ def pretrain_patch_encoder_one_epoch(
     compressor.train()
     total_loss = 0.0
     total_records = 0
+    metric_totals: dict[str, float] = {}
     progress = tqdm(loader, desc=f"pretrain patch AE epoch {epoch}", leave=False, disable=not is_main_process())
     for step, batch in enumerate(progress, start=1):
         patches = normalize_patch_batch(
@@ -2061,7 +2088,7 @@ def pretrain_patch_encoder_one_epoch(
             bool(args.resize_patch_to_compressor_input),
         ).to(device)
         latent = compressor.encode(patches)["latent_map"]
-        loss = reconstruction_mse(compressor, latent, patches)
+        loss, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         synchronize_gradients([compressor])
@@ -2074,14 +2101,22 @@ def pretrain_patch_encoder_one_epoch(
         batch_size = int(patches.shape[0])
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_records += batch_size
+        add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "")
         average_loss = total_loss / max(1, total_records)
-        progress.set_postfix(recon=f"{average_loss:.4f}")
+        progress.set_postfix(
+            recon=f"{average_loss:.4f}",
+            rel=f"{metric_totals.get('relative_rmse_to_target_std', 0.0) / max(1, total_records):.3f}",
+        )
         global_step += 1
         if wandb_logger is not None and int(args.log_interval) > 0 and step % int(args.log_interval) == 0:
             wandb_logger.log(
                 {
                     "patch_ae_pretrain_step/reconstruction_loss": average_loss,
                     "patch_ae_pretrain_step/current_reconstruction_loss": float(loss.detach().cpu().item()),
+                    "patch_ae_pretrain_step/relative_rmse_to_target_std": float(
+                        reconstruction_metrics["relative_rmse_to_target_std"]
+                    ),
+                    "patch_ae_pretrain_step/target_std": float(reconstruction_metrics["target_std"]),
                     "patch_ae_pretrain_step/epoch": float(epoch),
                     "patch_ae_pretrain_step/epoch_step": float(step),
                     "patch_ae_pretrain_step/lr": float(optimizer.param_groups[0]["lr"]),
@@ -2089,6 +2124,7 @@ def pretrain_patch_encoder_one_epoch(
                 step=global_step,
             )
     metrics = {"reconstruction_loss": total_loss / max(1, total_records)}
+    metrics.update(averaged_metrics(metric_totals, total_records))
     return average_metrics_across_processes(metrics), global_step
 
 
@@ -2105,6 +2141,7 @@ def evaluate_patch_encoder_reconstruction(
     compressor.eval()
     total_loss = 0.0
     total_records = 0
+    metric_totals: dict[str, float] = {}
     for batch in tqdm(loader, desc="eval patch AE reconstruction", leave=False, disable=not is_main_process()):
         patches = normalize_patch_batch(
             batch["patch"],
@@ -2113,11 +2150,14 @@ def evaluate_patch_encoder_reconstruction(
             bool(args.resize_patch_to_compressor_input),
         ).to(device)
         latent = compressor.encode(patches)["latent_map"]
-        loss = reconstruction_mse(compressor, latent, patches)
+        loss, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         batch_size = int(patches.shape[0])
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_records += batch_size
-    return {"reconstruction_loss": total_loss / max(1, total_records)}
+        add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "")
+    metrics = {"reconstruction_loss": total_loss / max(1, total_records)}
+    metrics.update(averaged_metrics(metric_totals, total_records))
+    return metrics
 
 
 @torch.no_grad()
@@ -2145,6 +2185,7 @@ def evaluate(
     metric_totals: dict[str, float] = {}
     collected_student_features: list[torch.Tensor] = []
     collected_teacher_features: list[torch.Tensor] = []
+    collected_global_records = 0
     train_compressor = train_compressor_during_alignment(args)
     if alignment_anchor is None and str(args.alignment_text_layout) == "values_shared_suffix":
         alignment_anchor = alignment_anchors_from_args(tokenizer, args, evaluation=True)[0]
@@ -2213,7 +2254,7 @@ def evaluate(
             centered_text_embedding,
             float(args.temperature),
         )
-        reconstruction = reconstruction_mse(compressor, latent, patches)
+        reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
@@ -2225,6 +2266,7 @@ def evaluate(
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
+        add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -2257,9 +2299,13 @@ def evaluate(
             "alignment_",
         )
         total_records += batch_size
-        if bool(args.global_retrieval_eval) and total_records <= int(args.global_retrieval_max_records):
-            collected_student_features.append(student_features.detach().float().cpu())
-            collected_teacher_features.append(teacher_features.detach().float().cpu())
+        if bool(args.global_retrieval_eval) and collected_global_records < int(args.global_retrieval_max_records):
+            remaining = int(args.global_retrieval_max_records) - int(collected_global_records)
+            take = min(int(batch_size), max(0, remaining))
+            if take > 0:
+                collected_student_features.append(student_features[:take].detach().float().cpu())
+                collected_teacher_features.append(teacher_features[:take].detach().float().cpu())
+                collected_global_records += int(take)
     metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
@@ -2268,11 +2314,7 @@ def evaluate(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
-    if (
-        bool(args.global_retrieval_eval)
-        and collected_student_features
-        and total_records <= int(args.global_retrieval_max_records)
-    ):
+    if bool(args.global_retrieval_eval) and collected_student_features:
         student_all = torch.cat(collected_student_features, dim=0)
         teacher_all = torch.cat(collected_teacher_features, dim=0)
         global_tensor, global_text = normalize_alignment_embeddings(student_all, teacher_all)
@@ -2288,6 +2330,7 @@ def evaluate(
                 ).items()
             }
         )
+        metrics["global_candidate_count"] = float(int(student_all.shape[0]))
         metrics.update(
             {
                 f"global_centered_{key}": value
@@ -2916,7 +2959,9 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"i2t={fmt_metric(metrics, 'i2t_accuracy')} "
         f"t2i={fmt_metric(metrics, 't2i_accuracy')} "
         f"global_i2t={fmt_metric(metrics, 'global_i2t_accuracy')} "
-        f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')}"
+        f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')} "
+        f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
+        f"recon_rel={fmt_metric(metrics, 'reconstruction_relative_rmse_to_target_std')}"
     )
 
 
@@ -3490,6 +3535,8 @@ def main() -> None:
                 wandb_logger=wandb_logger,
                 global_step=global_step,
             )
+            # In distributed runs every rank must keep doing comparable work before a NCCL barrier.
+            # If only rank 0 runs a long validation pass, the other ranks can time out while waiting.
             pretrain_val_metrics = evaluate_patch_encoder_reconstruction(
                 compressor=compressor,
                 loader=val_loader,
@@ -3497,7 +3544,7 @@ def main() -> None:
                 args=args,
                 compressor_input_size=compressor_input_size,
                 normalization_cfg=normalization_cfg,
-            ) if is_main_process() else {}
+            )
             if is_main_process():
                 pretrain_epoch_metrics = {
                     "train": pretrain_metrics,
@@ -3511,6 +3558,16 @@ def main() -> None:
                             "patch_ae_pretrain/reconstruction_loss": float(pretrain_metrics["reconstruction_loss"]),
                             "patch_ae_pretrain/val_reconstruction_loss": float(
                                 pretrain_val_metrics["reconstruction_loss"]
+                            ),
+                            "patch_ae_pretrain/relative_rmse_to_target_std": float(
+                                pretrain_metrics.get("relative_rmse_to_target_std", float("nan"))
+                            ),
+                            "patch_ae_pretrain/val_relative_rmse_to_target_std": float(
+                                pretrain_val_metrics.get("relative_rmse_to_target_std", float("nan"))
+                            ),
+                            "patch_ae_pretrain/target_std": float(pretrain_metrics.get("target_std", float("nan"))),
+                            "patch_ae_pretrain/val_target_std": float(
+                                pretrain_val_metrics.get("target_std", float("nan"))
                             ),
                             "patch_ae_pretrain/epoch": float(pretrain_epoch),
                             "patch_ae_pretrain/lr": float(compressor_optimizer.param_groups[0]["lr"]),
@@ -3529,7 +3586,9 @@ def main() -> None:
                 print(
                     f"patch_ae_pretrain_epoch={pretrain_epoch:04d} "
                     f"train_recon={pretrain_metrics['reconstruction_loss']:.4f} "
-                    f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f}"
+                    f"train_rel={pretrain_metrics.get('relative_rmse_to_target_std', float('nan')):.4f} "
+                    f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f} "
+                    f"val_rel={pretrain_val_metrics.get('relative_rmse_to_target_std', float('nan')):.4f}"
                 )
             distributed_barrier()
 
@@ -3563,18 +3622,18 @@ def main() -> None:
             epoch=epoch,
         )
         global_step += len(train_loader)
+        val_metrics = evaluate_anchor_bank(
+            compressor=compressor,
+            adapter=adapter,
+            llm=llm,
+            tokenizer=tokenizer,
+            loader=val_loader,
+            device=device,
+            args=args,
+            compressor_input_size=compressor_input_size,
+            normalization_cfg=normalization_cfg,
+        )
         if is_main_process():
-            val_metrics = evaluate_anchor_bank(
-                compressor=compressor,
-                adapter=adapter,
-                llm=llm,
-                tokenizer=tokenizer,
-                loader=val_loader,
-                device=device,
-                args=args,
-                compressor_input_size=compressor_input_size,
-                normalization_cfg=normalization_cfg,
-            )
             epoch_metrics = {"epoch": int(epoch), "train": train_metrics, "val": val_metrics}
             metrics_history[f"epoch_{epoch:04d}"] = epoch_metrics
             dump_json(run_dir / "metrics_latest.json", metrics_history)
@@ -3585,7 +3644,7 @@ def main() -> None:
                 args=args,
                 metrics=epoch_metrics,
                 compressor_config=compressor_config,
-                save_compressor=bool(args.train_patch_ae),
+                save_compressor=True,
             )
             selection_metric = (
                 "global_contrastive_loss"
@@ -3609,7 +3668,7 @@ def main() -> None:
                     args=args,
                     metrics=epoch_metrics,
                     compressor_config=compressor_config,
-                    save_compressor=bool(args.train_patch_ae),
+                    save_compressor=True,
                 )
             wandb_payload = {
                 "epoch": float(epoch),
@@ -3630,22 +3689,22 @@ def main() -> None:
             )
         distributed_barrier()
 
+    best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
+    adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
+    if "compressor_state_dict" in best_checkpoint:
+        compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
+    test_metrics = evaluate_anchor_bank(
+        compressor=compressor,
+        adapter=adapter,
+        llm=llm,
+        tokenizer=tokenizer,
+        loader=test_loader,
+        device=device,
+        args=args,
+        compressor_input_size=compressor_input_size,
+        normalization_cfg=normalization_cfg,
+    )
     if is_main_process():
-        best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
-        adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
-        if bool(args.train_patch_ae) and "compressor_state_dict" in best_checkpoint:
-            compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
-        test_metrics = evaluate_anchor_bank(
-            compressor=compressor,
-            adapter=adapter,
-            llm=llm,
-            tokenizer=tokenizer,
-            loader=test_loader,
-            device=device,
-            args=args,
-            compressor_input_size=compressor_input_size,
-            normalization_cfg=normalization_cfg,
-        )
         metrics_history["best"] = {
             "epoch": int(best_epoch),
             "metric": str(best_val_metric),

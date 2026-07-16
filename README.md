@@ -690,7 +690,7 @@ python scripts/prepare_tensor_llm_assets.py \
 | `local_text_encoder_layers` | 旧 `input_embeddings` 路径的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置设为 `0`。 |
 | `soft_prompt_scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`，使 soft prompt token 范数接近普通 token embedding；`0`：关闭尺度限制，保留线性输出。 |
 
-当前正式 adapter 的信息流是单向的：自然语言题干会去掉 `Options:` 后的候选列表，再追加通用 anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual Q-Former。每层 inherited query 先 cross-attend 完整问题 token，再做 query self-attention 和 latent cross-attention。完整 QA prompt（包括候选列表）仍直接进入 frozen LLM，因此 adapter 专注“应从 tensor 读取什么证据”，不负责学习 A/B/C/D 格式。梯度不会更新 LLM。`structured_query_conditioning: false` 时，代码不会通过 regex 提前提取任务、坐标、区域或 mean/std。
+当前正式 adapter 的信息流是单向的：自然语言题干会去掉 `Options:` 后的候选列表，再追加通用 anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual Q-Former。每层 inherited query 先 cross-attend 完整问题 token，再做 query self-attention 和 latent cross-attention。完整 QA prompt（包括候选列表）仍直接进入 frozen LLM，因此 adapter 专注“应从 tensor 读取什么证据”，不负责学习 A/B/C/D 格式。梯度不会更新 LLM。`structured_query_conditioning: false` 时，代码不会通过 regex 提前提取任务、坐标、区域或 mean/scale。
 
 #### `llm_training`
 
@@ -728,7 +728,7 @@ python scripts/prepare_tensor_llm_assets.py \
 | `max_prompt_tokens` | 文本 prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `max_target_tokens` | 答案最大 token 数。 | 正整数 | - |
 | `append_eos` | target 后是否追加 EOS。 | `true`、`false` | - |
-| `eval_baselines` | 评估 baseline 列表。 | `correct`、`global_only`、`local_only`、`no_latent`、`zero_latent`、`shuffled`、`random`、`shuffled_stats` | residual 模式下 `global_only` 是固定 stage-1 prompt，`local_only` 是 question-conditioned residual；其余测试无前缀、零/错配/随机 latent 和错配 mean/std。 |
+| `eval_baselines` | 评估 baseline 列表。 | `correct`、`global_only`、`local_only`、`no_latent`、`zero_latent`、`shuffled`、`random`、`shuffled_stats` | residual 模式下 `global_only` 是固定 stage-1 prompt，`local_only` 是 question-conditioned residual；其余测试无前缀、零/错配/随机 latent 和错配 mean/scale。 |
 | `choice_score` | 候选答案 NLL 计分方式。 | `mean`、`sum` | `mean`：按 token 数平均；`sum`：总 NLL。 |
 | `log_interval` | 训练日志间隔。 | 正整数 | - |
 
@@ -1211,7 +1211,7 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
 | `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
 | `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
 | `patch_ae_pretrain_last.pt` | 可选 patch AE reconstruction warmup 后的 checkpoint。 |
-| `alignment_best.pt`、`alignment_last.pt` | 对齐 adapter checkpoint；若开放 AE 训练，也会保存 compressor state。 |
+| `alignment_best.pt`、`alignment_last.pt` | 对齐 adapter checkpoint；始终保存 compressor config/state，方便下游直接复用同一个 patch AE。 |
 
 W&B 曲线：
 
@@ -1221,8 +1221,10 @@ W&B 曲线：
 | `patch_ae_pretrain_step/current_reconstruction_loss` | patch AE 当前 batch 重建误差。 |
 | `patch_ae_pretrain/reconstruction_loss` | patch AE 每个预训练 epoch 的平均重建误差。 |
 | `patch_ae_pretrain/val_reconstruction_loss` | patch AE 每个预训练 epoch 后的验证集重建误差，用于观察过拟合。 |
+| `patch_ae_pretrain/relative_rmse_to_target_std` | patch AE 预训练 RMSE / patch 自身 std；小于 1 才说明优于只预测 patch 均值。 |
 | `train/reconstruction_loss` | alignment 阶段训练集重建误差；`train_patch_ae: true` 时可观察 AE 是否继续变化。 |
 | `val/reconstruction_loss` | alignment 阶段验证集重建误差。 |
+| `train/reconstruction_relative_rmse_to_target_std`、`val/reconstruction_relative_rmse_to_target_std` | alignment 阶段重建相对误差诊断；用于判断裸 MSE 变大是量纲问题还是 AE 退化。 |
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
@@ -1325,17 +1327,17 @@ patch_encoder:
 
 ### 3.10 16x16 Patch QA 迁移
 
-第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE，因此归一化和 latent 与第一阶段完全一致。
+第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE，因此送入 AE 的 encoder input 与第一阶段完全一致；当前正式第一阶段使用 `normalization.mode: none`，所以 latent 编码的是 raw patch。QA 中需要的 z-score 目标由每个 raw patch 另行计算，并在问题文本中给出 mean/scale。
 
 当前任务使用固定、清晰的自然语言问题：
 
 | `task_type` | 目标 |
 |---|---|
-| `normalized_point_value` | 从 soft tokens 读取某点的标准化值，选择最接近的数值。 |
-| `raw_point_value_with_stats` | 文本给出 patch mean/std，结合 latent 中的标准化值和 `x=z*std+mean` 选择原始值。 |
-| `point_compare` | 比较 patch 内两个点的标准化值。 |
-| `region_mean_compare` | 比较两个局部区域的标准化均值。 |
-| `extreme_quadrant` | 定位最大值或最小值所在象限。 |
+| `normalized_point_value` | 从 soft tokens 读取 raw 点值，再用题面 mean/scale 计算 z-score，选择最接近的数值。 |
+| `raw_point_value_with_stats` | 从 soft tokens 读取 raw 点值；题面给出同一 patch 的 mean/scale 作为统计条件。 |
+| `point_compare` | 比较 patch 内两个 raw 点值。 |
+| `region_mean_compare` | 比较两个局部区域的 raw 均值。 |
+| `extreme_quadrant` | 定位 raw 最大值或最小值所在象限。 |
 
 先在配置中填写最新 checkpoint：
 
@@ -1444,7 +1446,7 @@ llm_training:
 
 `residual_question_qformer` 必须提供第一阶段 checkpoint，不能传 `--adapter-init-checkpoint none`。当前目标是利用已经验证有效的对齐初始化，不要求再运行随机初始化对照。
 
-训练器默认先在 512 条验证记录上运行训练前评估，再开始微调。每个 epoch 只评估 `correct` 和 `shuffled`；最终 best checkpoint 再完整评估 `zero_latent`、`no_latent` 和 `shuffled_stats`。patch QA 的 shuffled baseline 优先随机换成同字段、同任务、但不同 `sample_index` 的 patch，避免把同一 PDE 轨迹的相邻时间步误当成强负样本；只有 sanity 数据没有第二个 sample 时才退回不同 state。`shuffled_stats` 会同时替换自然语言和 legacy 元数据中的 mean/std。
+训练器默认先在 512 条验证记录上运行训练前评估，再开始微调。每个 epoch 只评估 `correct` 和 `shuffled`；最终 best checkpoint 再完整评估 `zero_latent`、`no_latent` 和 `shuffled_stats`。patch QA 的 shuffled baseline 优先随机换成同字段、同任务、但不同 `sample_index` 的 patch，避免把同一 PDE 轨迹的相邻时间步误当成强负样本；只有 sanity 数据没有第二个 sample 时才退回不同 state。`shuffled_stats` 会同时替换自然语言和记录元数据中的 mean/scale。
 
 启动前会生成 `data_audit.json`，检查 train/val/test 的 PDEBench sample 是否交叉、task/field/答案标签覆盖是否一致、QA id 是否重复、latent 文件是否存在、答案是否属于 choices、数值选项显示后是否重复。`prompt_audit.json` 记录每个 split/task 的 token 长度；正式配置禁止自然语言指令或 query 被静默截断。正式运行默认 `require_disjoint_splits: true`，并拒绝开启 `structured_query_conditioning`；overfit sanity wrapper 会显式标记为 `sanity_only`。
 

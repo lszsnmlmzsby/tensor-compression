@@ -24,7 +24,8 @@ data:
   qa_dir: /data/wyx/tensor_llm_assets/tensor_readout_qa_vx
   latent_dir: /data/wyx/tensor_llm_assets/tensor_readout_latents_vx_2x
 
-# Downstream QA over the normalized 16x16 patches used by patch alignment.
+# Downstream QA over 16x16 patches encoded by the stage-1 alignment AE.
+# Current stage-1 config encodes raw patch values; QA z-score targets are computed separately from each raw patch.
 # Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
 patch_qa:
   alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
@@ -165,7 +166,8 @@ patch_alignment:
   # patch_ae_config: build a patch-sized AE from patch_encoder below.
   # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
   encoder_source: patch_ae_config
-  # true: update AE encoder during alignment. For a fresh patch AE this should stay true.
+  # true: train the AE when it is newly constructed. If freeze_patch_ae_after_pretrain is true,
+  # this only affects the reconstruction warmup; the alignment phase trains only the Q-Former bridge.
   # false: freeze a loaded checkpoint encoder and train only the alignment adapter.
   # To reuse a trained patch AE, set:
   #   encoder_source: checkpoint
@@ -174,7 +176,9 @@ patch_alignment:
   #   patch_ae_pretrain_epochs: 0
   train_patch_ae: true
   # true: after reconstruction pretraining, freeze patch AE and train only the Q-Former/soft prompt bridge.
-  freeze_patch_ae_after_pretrain: false
+  # Raw multi-field reconstruction can dominate the alignment gradients.
+  # Pretrain the patch AE for reconstruction, then freeze it while the Q-Former learns the LLM bridge.
+  freeze_patch_ae_after_pretrain: true
   # Reconstruction-only warmup for a fresh patch AE before contrastive alignment starts.
   patch_ae_pretrain_epochs: 5
   # Used only when encoder_source: checkpoint.
@@ -213,7 +217,7 @@ patch_alignment:
   temperature: 0.07
   # Symmetric hidden-state InfoNCE is the primary alignment objective.
   contrastive_loss_weight: 1.0
-  # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
+  # Only contributes gradients while the AE is trainable; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
   # Both paths originate from the same raw patch; text serialization rounds it to text_decimal_places.
   teacher_text_source: raw
