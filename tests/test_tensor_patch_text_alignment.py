@@ -10,14 +10,17 @@ from scripts.train_tensor_patch_text_alignment import (
     build_numeric_probe_anchor,
     build_static_alignment_anchor,
     build_teacher_texts_for_batch,
-    probe_behavior_loss,
+    gather_with_grad,
+    hidden_at_last_non_padding,
+    normalize_alignment_embeddings,
     probe_contract_anchors,
-    probe_target_indices,
-    quantize_probe_values,
+    reject_removed_alignment_options,
     serialize_tensor_values,
     shared_suffix_token_ids,
     tokenize_contents_with_shared_suffix,
     validate_probe_anchor_contract,
+    validate_teacher_hidden_state_index,
+    validate_unmodified_tensor_path,
 )
 
 
@@ -66,7 +69,7 @@ def test_serialize_tensor_values_contains_only_values_and_shape_delimiters() -> 
     assert "representation" not in text.lower()
 
 
-def test_teacher_text_serializes_the_same_quantized_values_used_by_probe_labels() -> None:
+def test_teacher_text_serializes_raw_values_at_configured_precision() -> None:
     patches = torch.tensor([[[[1.00003, 1.00004], [0.0, 0.0]]]])
     args = SimpleNamespace(
         teacher_text_source="raw",
@@ -76,12 +79,13 @@ def test_teacher_text_serializes_the_same_quantized_values_used_by_probe_labels(
 
     texts = build_teacher_texts_for_batch({"patch": patches}, patches, args)
 
-    assert texts == ["[[[1.0000, 1.0000]; [0.0000, 0.0000]]]"]
+    assert texts == ["[[[1.0000, 1.0000]; [0.0000, 0.0000]]]"
 
 
-def test_probe_quantization_rejects_non_finite_values() -> None:
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_tensor_serialization_rejects_non_finite_values(value: float) -> None:
     with pytest.raises(ValueError, match="non-finite"):
-        quantize_probe_values(torch.tensor([float("nan")]), decimal_places=4)
+        serialize_tensor_values(torch.tensor([[[value]]]), decimal_places=4)
 
 
 def test_shared_suffix_is_tokenized_once_and_appended_exactly() -> None:
@@ -140,50 +144,101 @@ def test_eos_and_representation_are_distinct_configurable_anchors() -> None:
     assert representation_anchor.token_ids[-1] == ord(":") + 1
 
 
-def test_behavior_probe_is_deterministic_and_has_patch_derived_targets() -> None:
+def test_hidden_readout_tracks_last_text_token_after_soft_prefix() -> None:
+    prefix_tokens = 2
+    text_attention_mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+    hidden = torch.arange(2 * 5, dtype=torch.float32).reshape(2, 5, 1)
+
+    readout = hidden_at_last_non_padding(
+        [hidden],
+        text_attention_mask,
+        teacher_layer=0,
+        prefix_tokens=prefix_tokens,
+    )
+
+    assert readout[:, 0].tolist() == [3.0, 9.0]
+
+
+def test_teacher_hidden_state_index_rejects_non_contextual_embedding_output() -> None:
+    with pytest.raises(ValueError, match="input embedding"):
+        validate_teacher_hidden_state_index(0, 28)
+    with pytest.raises(ValueError, match="exceeds the LLM depth"):
+        validate_teacher_hidden_state_index(29, 28)
+
+    validate_teacher_hidden_state_index(1, 28)
+    validate_teacher_hidden_state_index(28, 28)
+
+
+def test_unmodified_tensor_path_rejects_normalization_and_clipping() -> None:
+    validate_unmodified_tensor_path({"mode": "none"})
+    validate_unmodified_tensor_path({})
+
+    with pytest.raises(ValueError, match="unmodified tensor path"):
+        validate_unmodified_tensor_path({"mode": "zscore"})
+    with pytest.raises(ValueError, match="clip_min/clip_max"):
+        validate_unmodified_tensor_path({"mode": "none", "clip_min": -1.0})
+
+
+def test_primary_alignment_only_l2_normalizes_raw_hidden() -> None:
+    student = torch.tensor([[3.0, 4.0], [0.0, 2.0]])
+    teacher = torch.tensor([[0.0, 5.0], [6.0, 8.0]])
+
+    student_embedding, teacher_embedding = normalize_alignment_embeddings(student, teacher)
+
+    assert torch.allclose(student_embedding, torch.nn.functional.normalize(student, dim=-1))
+    assert torch.allclose(teacher_embedding, torch.nn.functional.normalize(teacher, dim=-1))
+
+
+def test_single_process_embedding_gather_preserves_gradients() -> None:
+    embeddings = torch.tensor([[1.0, 2.0]], requires_grad=True)
+
+    gathered = gather_with_grad(embeddings)
+    gathered.square().sum().backward()
+
+    assert torch.equal(embeddings.grad, torch.tensor([[2.0, 4.0]]))
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "alignment_projection",
+        "center_embeddings",
+        "centered_contrastive_loss_weight",
+        "cosine_loss_weight",
+        "probe_answer_ce_weight",
+        "probe_teacher_kl_weight",
+        "probe_kl_temperature",
+        "probe_teacher_preflight_records",
+    ],
+)
+def test_removed_alignment_options_fail_before_training(option: str) -> None:
+    with pytest.raises(ValueError, match=option):
+        reject_removed_alignment_options({"patch_alignment": {option: False}})
+
+
+def test_probe_is_deterministic_and_contains_only_readout_metadata() -> None:
     tokenizer = CharacterTokenizer()
-    anchor = build_numeric_probe_anchor(
-        tokenizer=tokenizer,
-        patch_size=4,
-        channel_count=1,
-        families=["point_relation"],
-        region_size=2,
-        probe_index=7,
-        seed=42,
-        max_anchor_tokens=256,
-    )
-    same_anchor = build_numeric_probe_anchor(
-        tokenizer=tokenizer,
-        patch_size=4,
-        channel_count=1,
-        families=["point_relation"],
-        region_size=2,
-        probe_index=7,
-        seed=42,
-        max_anchor_tokens=256,
-    )
-    patches = torch.arange(32, dtype=torch.float32).reshape(2, 1, 4, 4)
-    targets = probe_target_indices(patches, anchor)
-    _channel, row_a, col_a, row_b, col_b = anchor.probe_parameters
-    expected = (
-        patches[:, 0, row_b, col_b] > patches[:, 0, row_a, col_a]
-    ).long()
+    kwargs = {
+        "tokenizer": tokenizer,
+        "patch_size": 4,
+        "channel_count": 1,
+        "families": ["point_relation"],
+        "region_size": 2,
+        "probe_index": 7,
+        "seed": 42,
+        "max_anchor_tokens": 256,
+    }
+
+    anchor = build_numeric_probe_anchor(**kwargs)
+    same_anchor = build_numeric_probe_anchor(**kwargs)
 
     assert anchor == same_anchor
     assert anchor.mode == "probe"
     assert anchor.probe_family == "point_relation"
-    assert anchor.probe_answers == ("larger", "smaller", "equal")
+    assert len(anchor.probe_parameters) == 5
     assert not any(marker in str(anchor.text) for marker in ("Answer", "A or B", "Choose", "?"))
+    assert str(anchor.text).startswith("\n")
     assert str(anchor.text).endswith(" is")
-    assert torch.equal(targets, expected)
-
-    rounded_patch = torch.zeros(1, 1, 4, 4)
-    rounded_patch[0, 0, row_a, col_a] = 1.00003
-    rounded_patch[0, 0, row_b, col_b] = 1.00004
-    raw_target = probe_target_indices(rounded_patch, anchor)
-    text_visible_target = probe_target_indices(quantize_probe_values(rounded_patch, 4), anchor)
-    assert raw_target.item() == 1
-    assert text_visible_target.item() == 2
 
 
 @pytest.mark.parametrize(
@@ -196,7 +251,7 @@ def test_behavior_probe_is_deterministic_and_has_patch_derived_targets() -> None
         "directional_change",
     ],
 )
-def test_behavior_probe_uses_varied_natural_stems_without_visible_choices(family: str) -> None:
+def test_probe_uses_four_distinct_natural_stems_without_choice_format(family: str) -> None:
     tokenizer = CharacterTokenizer()
     anchors = [
         build_numeric_probe_anchor(
@@ -205,23 +260,25 @@ def test_behavior_probe_uses_varied_natural_stems_without_visible_choices(family
             channel_count=1,
             families=[family],
             region_size=4,
-            probe_index=index,
+            probe_index=0,
             seed=19,
             max_anchor_tokens=256,
+            template_index=template_index,
         )
-        for index in range(24)
+        for template_index in range(4)
     ]
 
     assert {anchor.probe_template_index for anchor in anchors} == {0, 1, 2, 3}
+    assert len({anchor.token_ids for anchor in anchors}) == 4
     for anchor in anchors:
         text = str(anchor.text)
         assert text.startswith("\n")
         assert text.endswith(" is")
         assert not any(marker in text for marker in ("Answer", "A or B", "A/B", "Choose", "?"))
-        assert all(answer not in text for answer in anchor.probe_answers)
 
 
-def test_probe_contract_rejects_visible_answer_format_or_continuation() -> None:
+@pytest.mark.parametrize("invalid_text", ["\nAnswer: the value is", "\nIs the value positive?"])
+def test_probe_contract_rejects_visible_choice_format(invalid_text: str) -> None:
     tokenizer = CharacterTokenizer()
     anchor = build_numeric_probe_anchor(
         tokenizer=tokenizer,
@@ -234,10 +291,8 @@ def test_probe_contract_rejects_visible_answer_format_or_continuation() -> None:
         max_anchor_tokens=256,
     )
 
-    with pytest.raises(ValueError, match="forbidden answer-format"):
-        validate_probe_anchor_contract(replace(anchor, text="\nAnswer: the value is"))
-    with pytest.raises(ValueError, match="leaks canonical continuations"):
-        validate_probe_anchor_contract(replace(anchor, text="\nThe value is positive and its sign is"))
+    with pytest.raises(ValueError):
+        validate_probe_anchor_contract(replace(anchor, text=invalid_text))
 
 
 def test_probe_contract_preflight_covers_every_family_and_template() -> None:
@@ -263,76 +318,14 @@ def test_probe_contract_preflight_covers_every_family_and_template() -> None:
 
     assert len(anchors) == 20
     assert len({(anchor.probe_family, anchor.probe_template_index) for anchor in anchors}) == 20
-    assert all(len(anchor.probe_answers) == 3 for anchor in anchors)
+    for family in args.probe_families:
+        family_anchors = [anchor for anchor in anchors if anchor.probe_family == family]
+        assert len(family_anchors) == 4
+        assert len({anchor.token_ids for anchor in family_anchors}) == 4
+        assert len({anchor.probe_parameters for anchor in family_anchors}) == 1
 
 
-def test_probe_answer_ce_backpropagates_through_final_hidden() -> None:
-    class TinyCausalLM(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = torch.nn.Linear(4, 32, bias=False)
-
-        def get_output_embeddings(self) -> torch.nn.Module:
-            return self.lm_head
-
-    llm = TinyCausalLM()
-    for parameter in llm.parameters():
-        parameter.requires_grad_(False)
-    student_hidden = torch.randn(2, 4, requires_grad=True)
-    teacher_hidden = torch.randn(2, 4)
-    targets = torch.tensor([0, 1])
-
-    answer_ce, teacher_kl, metrics = probe_behavior_loss(
-        llm=llm,
-        student_final_hidden=student_hidden,
-        teacher_final_hidden=teacher_hidden,
-        targets=targets,
-        continuation_token_ids=(10, 11, 12),
-        kl_temperature=1.0,
-    )
-    (answer_ce + teacher_kl).backward()
-
-    assert torch.isfinite(answer_ce)
-    assert torch.isfinite(teacher_kl)
-    assert student_hidden.grad is not None
-    assert "answer_format_rate" in metrics
-    assert "completion_latent_gain" in metrics
-
-
-@pytest.mark.parametrize("family", ["region_mean_relation", "region_range_relation"])
-def test_region_probe_targets_cover_mean_and_range(family: str) -> None:
-    tokenizer = CharacterTokenizer()
-    anchor = build_numeric_probe_anchor(
-        tokenizer=tokenizer,
-        patch_size=6,
-        channel_count=1,
-        families=[family],
-        region_size=2,
-        probe_index=3,
-        seed=11,
-        max_anchor_tokens=256,
-    )
-    patches = torch.randn(4, 1, 6, 6)
-
-    targets = probe_target_indices(patches, anchor)
-    channel, row_a, col_a, row_b, col_b, size = anchor.probe_parameters
-    region_a = patches[:, channel, row_a : row_a + size, col_a : col_a + size].double()
-    region_b = patches[:, channel, row_b : row_b + size, col_b : col_b + size].double()
-    if family == "region_mean_relation":
-        score_a = region_a.sum(dim=(-2, -1))
-        score_b = region_b.sum(dim=(-2, -1))
-    else:
-        score_a = region_a.amax(dim=(-2, -1)) - region_a.amin(dim=(-2, -1))
-        score_b = region_b.amax(dim=(-2, -1)) - region_b.amin(dim=(-2, -1))
-    expected = torch.full((patches.shape[0],), 2, dtype=torch.long)
-    expected = torch.where(score_a > score_b, torch.zeros_like(expected), expected)
-    expected = torch.where(score_a < score_b, torch.ones_like(expected), expected)
-
-    assert targets.shape == (4,)
-    assert torch.equal(targets, expected)
-
-
-def test_probe_channel_text_and_target_use_the_same_channel() -> None:
+def test_probe_channel_text_matches_parameter_channel() -> None:
     tokenizer = CharacterTokenizer()
     anchor = build_numeric_probe_anchor(
         tokenizer=tokenizer,
@@ -345,44 +338,30 @@ def test_probe_channel_text_and_target_use_the_same_channel() -> None:
         max_anchor_tokens=256,
     )
     channel, row, col = anchor.probe_parameters
-    patches = torch.zeros(2, 3, 4, 4)
-    patches[0, channel, row, col] = 1.0
-    patches[1, channel, row, col] = -1.0
 
+    assert 0 <= channel < 3
+    assert 0 <= row < 4
+    assert 0 <= col < 4
     assert f"channel {channel + 1}" in str(anchor.text)
-    assert probe_target_indices(patches, anchor).tolist() == [0, 1]
 
 
-def test_sign_and_directional_completion_targets_match_sentence_semantics() -> None:
+@pytest.mark.parametrize("family", ["region_mean_relation", "region_range_relation"])
+def test_region_probe_parameters_are_distinct_and_in_bounds(family: str) -> None:
     tokenizer = CharacterTokenizer()
-    sign_anchor = build_numeric_probe_anchor(
+    anchor = build_numeric_probe_anchor(
         tokenizer=tokenizer,
-        patch_size=4,
-        channel_count=1,
-        families=["point_sign"],
+        patch_size=6,
+        channel_count=2,
+        families=[family],
         region_size=2,
-        probe_index=0,
-        seed=5,
+        probe_index=3,
+        seed=11,
         max_anchor_tokens=256,
     )
-    sign_patch = torch.zeros(3, 1, 4, 4)
-    _channel, row, col = sign_anchor.probe_parameters
-    sign_patch[:, 0, row, col] = torch.tensor([2.0, -2.0, 0.0])
-    assert probe_target_indices(sign_patch, sign_anchor).tolist() == [0, 1, 2]
+    channel, row_a, col_a, row_b, col_b, size = anchor.probe_parameters
 
-    direction_anchor = build_numeric_probe_anchor(
-        tokenizer=tokenizer,
-        patch_size=4,
-        channel_count=1,
-        families=["directional_change"],
-        region_size=2,
-        probe_index=0,
-        seed=9,
-        max_anchor_tokens=256,
-    )
-    direction_patch = torch.zeros(3, 1, 4, 4)
-    _channel, row_a, col_a, row_b, col_b = direction_anchor.probe_parameters
-    direction_patch[:, 0, row_a, col_a] = torch.tensor([1.0, 2.0, 1.0])
-    direction_patch[:, 0, row_b, col_b] = torch.tensor([2.0, 1.0, 1.0])
-    assert direction_anchor.probe_answers == ("higher", "lower", "unchanged")
-    assert probe_target_indices(direction_patch, direction_anchor).tolist() == [0, 1, 2]
+    assert 0 <= channel < 2
+    assert (row_a, col_a) != (row_b, col_b)
+    assert size == 2
+    assert 0 <= row_a <= 6 - size and 0 <= row_b <= 6 - size
+    assert 0 <= col_a <= 6 - size and 0 <= col_b <= 6 - size

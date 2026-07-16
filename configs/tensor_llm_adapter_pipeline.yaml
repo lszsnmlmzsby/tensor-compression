@@ -122,9 +122,9 @@ patch_alignment:
   # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
   #   tensor path: patch -> patch AE encoder -> Q-Former soft prompt -> frozen LLM
   #   text path: serialized patch -> frozen LLM
-  # Probe mode aligns conditioned shallow hidden residuals and final-layer natural completions.
+  # Probe mode directly aligns the two raw shallow hidden states at the shared readout token.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_natural_probe
+  run_name: tensor_patch_text_alignment_hidden_probe
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -204,36 +204,18 @@ patch_alignment:
   query_tokens: 16
   adapter_layers: 4
   adapter_heads: 8
-  # null means directly align to the LLM hidden size. This keeps the text teacher side fixed.
+  # null maps Q-Former outputs directly to the LLM input embedding width.
   projection_dim: null
-  # Optional CLIP-style alignment space on top of frozen LLM hidden states.
-  # The LLM still receives tensor soft prompts; this only changes the contrastive loss/eval space.
-  alignment_projection:
-    # Disabled for the behavior-probe run: no private projected retrieval space.
-    enabled: false
-    # Keep this lower than the LLM hidden size to avoid a high-capacity private matching space.
-    dim: 512
-    # Used only when layers > 1.
-    hidden_dim: 1024
-    # 1 = LayerNorm + Linear. Increase only as an ablation.
-    layers: 1
-    dropout: 0.0
-    # false gives student/teacher separate linear maps; true forces the same map on both branches.
-    shared: false
   dropout: 0.0
   # Bound each soft prompt dimension with tanh before feeding it to the frozen LLM.
   # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.
   soft_prompt_scale: 0.05
   temperature: 0.07
-  # Hidden retrieval remains an auxiliary alignment objective in behavior-probe mode.
-  contrastive_loss_weight: 0.5
-  # Optional auxiliary batch-centered InfoNCE. Keep small; it is a stabilizer, not the success metric.
-  centered_contrastive_loss_weight: 0.05
-  # Keep this at 0 for now: raw cosine can reward shared hidden-space directions without improving retrieval.
-  cosine_loss_weight: 0.0
+  # Symmetric hidden-state InfoNCE is the primary alignment objective.
+  contrastive_loss_weight: 1.0
   # Only contributes gradients when train_patch_ae is true; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
-  # The patch encoder also uses normalization.mode: none; the text branch serializes the same raw patch.
+  # Both paths originate from the same raw patch; text serialization rounds it to text_decimal_places.
   teacher_text_source: raw
   # Symmetric layout:
   #   teacher = canonical raw tensor values + one batch-shared setting-specific suffix
@@ -243,7 +225,8 @@ patch_alignment:
   # Select exactly one complete experiment: eos, representation, or probe. The formal run uses probe.
   alignment_anchor_mode: probe
   representation_suffix: "\nRepresentation:"
-  # Probe mode creates combinatorially many short natural sentence stems. No answer candidates appear in the input.
+  # Probe mode creates short natural sentence stems that condition the shared hidden-state readout.
+  # It does not define answer words, labels, LM-head CE, or teacher-logit distillation.
   # Every sample and DDP rank in a batch receives the same stem/coordinates, so InfoNCE cannot use prompt identity.
   probe_families:
     - point_sign
@@ -254,19 +237,9 @@ patch_alignment:
   probe_region_size: 4
   # Validation/global retrieval uses one fixed stem from each family in a separate complete pass.
   evaluation_probe_count: 5
-  # Final-layer behavior losses. KL is applied only where the frozen text Teacher answers correctly.
-  probe_answer_ce_weight: 0.2
-  probe_teacher_kl_weight: 0.2
-  probe_kl_temperature: 1.0
-  # Before AE warmup, run every family x template on this many real text-teacher records.
-  # The run aborts if Teacher KL is enabled but any family produces no strict canonical continuation.
-  probe_teacher_preflight_records: 8
   # Probe stems remain concise but need enough room for two coordinates or regions.
   # Representation does not append EOS; eos mode consists of the tokenizer's explicit EOS token alone.
   max_shared_suffix_tokens: 96
-  # false: main loss uses raw L2-normalized embeddings, so retrieval is globally comparable.
-  # true recreates the earlier batch-centered objective and should be used only as an ablation.
-  center_embeddings: false
   # Legacy prompt guard. In values_shared_suffix mode the suffix is tokenized separately and cannot be dropped.
   fail_on_text_anchor_missing: true
   # Fail if the numeric tensor body would be truncated before the separately preserved suffix.
@@ -282,7 +255,8 @@ patch_alignment:
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
-  # Qwen2.5-1.5B has 28 decoder layers; lower-middle layers are usually easier for input-level soft prompts.
+  # Hugging Face hidden_states[2] is the output after two transformer blocks.
+  # Index 0 is rejected because it is the non-contextual input embedding at the readout token.
   teacher_layer: 2
   log_interval: 20
 
