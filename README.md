@@ -1042,44 +1042,83 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_direct_probe.py \
 ```text
 tensor path:
   patch -> patch AE encoder -> latent tokens -> Q-Former adapter -> soft prompt tokens
-        -> frozen LLM -> middle-layer student hidden state
+        -> frozen LLM -> middle-layer student hidden + final-layer answer logits
 
 text path:
-  同一份 normalized/resized patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden state
+  同一份 raw patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden + final-layer answer logits
 ```
 
-当前默认对齐位置是：**冻结 LLM 浅层、最后一个非 padding token 的 hidden state**。teacher branch 的文本和 student branch 的短 anchor prompt 都以 `Representation:` 结尾；tokenizer 会把同一个 batch 中较短文本补 padding，最后一个非 padding token 就是每条真实输入文本的最后一个 token。Qwen2.5-1.5B 有 28 个 decoder layers，当前配置使用 `teacher_layer: 2`，避免直接对齐最后层的 next-token 决策状态。这个值不是理论常数，后续可以系统比较 `1/2/4/8/-1`；`0` 通常是 token embedding 输出，更多是 tokenizer/格式基线，不是已经读入上下文后的表示。
+当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；浅层对齐位置是 suffix 最后一个 token 的 hidden state。Qwen2.5-1.5B 有 28 个 decoder layers，当前使用 `teacher_layer: 2`，probe 的答案行为则始终读取最终层。
 
 注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
 
-Prompt 设置：
-
-Teacher branch 的默认 `compact` prompt 包含任务说明、字段名、patch 尺寸、完整数值矩阵和 anchor。默认 `teacher_text_source: normalized`，因此这里的数值矩阵来自 **AE 实际输入的 normalized/resized patch**，不是 HDF5 原始值；这样 teacher branch 和 tensor path 才表示同一个对象。
+Teacher branch 只包含原始数值和形状分隔符：
 
 ```text
-Represent this PDE tensor patch for numeric reasoning.
-fields=Vx patch_size=16
-Vx=[[...]; [...]; ...]
-Representation:
+[[[...]; [...]; ...]]
+<当前设置的共同 suffix>
 ```
 
-它不再包含 `sample_index`、`time_index`、`top_left`，因为 tensor path 只能看到 patch 数值，看不到这些采样元数据。旧格式可通过 `text_prompt_template: compact_with_metadata` 复现，但只建议做消融。若设置 `teacher_text_source: raw`，teacher branch 会读取原始 HDF5 数值；这会和默认 zscore AE 输入产生信息不一致，只建议作为 ablation。
+当前 `patch_encoder.normalization.mode: none` 且 `teacher_text_source: raw`，所以 AE 和文本 Teacher 都来自同一份未归一化 HDF5 patch；文本化时按 `text_decimal_places: 4` 保留四位小数。文本不含字段名、patch size、任务说明、`sample/time/top_left` 等信息。三层括号依次表示 channel、row、value 结构；当前 `field_sampling_mode: single` 下 channel 数为 1。去掉 normalization 后，各字段的数值尺度会直接影响共享 AE 的 reconstruction MSE，幅度大的字段可能占据更大梯度，这是本实验明确接受的性质。
 
-Student branch 的短 anchor prompt 不包含数值矩阵：
+Student branch 不再使用旧的说明 prompt：
 
 ```text
-Represent this PDE tensor patch for numeric reasoning.
-fields=Vx patch_size=16
-Representation:
+[16 continuous Q-Former prefix embeddings]
+<同一个共同 suffix>
 ```
 
-实际输入 LLM 的形式是：
+`alignment_anchor_mode` 是单选实验设置，不会在一次训练中混合三档：
+
+| 设置 | Teacher / Student 末尾 | 训练目标 |
+|---|---|---|
+| `eos` | tokenizer 的单个显式 EOS token | EOS 浅层 hidden InfoNCE |
+| `representation` | `\nRepresentation:` | 冒号浅层 hidden InfoNCE |
+| `probe` | batch 共享的自然句子 stem | conditioned-residual hidden InfoNCE + 最终层 continuation CE + Teacher KL |
+
+正式配置选择 `alignment_anchor_mode: probe`。EOS 是序列边界/readout token，不归类为自然语言 probe。CLIP 的 EOT pooling 和 E5 的 EOS pooling 都伴随 text encoder 或 LLM 的对比式适配，不能据此假定冻结 Qwen 的 EOS hidden 天生适合作为 embedding；`eos` 和 `representation` 保留为可单独运行的基线，而不占用正式 probe 实验的训练 batch。
+
+这一选择对应几类已验证但并不等价的做法：[CLIP](https://arxiv.org/abs/2103.00020) 读取 text encoder 最高层 EOT activation，并与 projection 一起端到端对比训练；[E5-Mistral](https://arxiv.org/abs/2401.00368) 使用最后 token/EOS pooling，但会对 LLM 做 embedding-oriented contrastive tuning；[BLIP-2](https://arxiv.org/abs/2301.12597) 第二阶段把 Q-Former 输出投到 LLM embedding 后作为前缀，并以语言建模行为训练，而不是假定 frozen LLM 的某个 EOS hidden 已经是对齐空间；[Prefix-Tuning](https://arxiv.org/abs/2101.00190) 同样通过完整生成似然约束连续前缀。由此，EOS 适合成为独立基线，短自然语言 probe 则更接近后续问答时的使用上下文。
+
+`representation` 和 `probe` 都使用 `add_special_tokens=False` 单独编码，后面不追加 EOS；否则三种设置最终都会退化成“读取 EOS hidden”。probe 不在 prompt 中列出候选项，也不使用统一的 `Answer:` 标记，而是从五类通用数值语义持续生成自然句子 stem：点值符号、两点关系、区域均值关系、区域值域关系和方向变化。坐标、区域和措辞随 batch 改变，目标 continuation 由与 Teacher 文本相同精度（当前四位小数）的 patch 计算，不使用字段名、样本元数据或下游任务标签。
 
 ```text
-[soft prompt tokens from tensor] + student anchor prompt
+The sign of the value at row 3, column 7 is
+  -> positive
+
+Compared with the value at row 12, column 5, the value at row 3, column 7 is
+  -> larger
+
+At row 9, column 11, relative to row 2, column 4, the value is
+  -> lower
 ```
 
-因此 student hidden 必须从 soft prompt 中获得数值信息，而不能从文本里偷看数值。
+同一 batch 的所有样本、Teacher/Student 两侧以及全部 DDP rank 使用完全相同的 stem 和坐标；不同 patch 的 continuation 可以不同。这样 InfoNCE 不能靠 prompt 身份识别正样本。每个 family 有四种短模板，并使用少量规范化自然 continuation，例如 `positive/negative/zero`、`larger/smaller/equal` 或 `higher/lower/unchanged`；这些词不显示在 prompt 中，只作为完整词表 CE 的目标。句干末尾刻意停在 `is`，因为这是 causal LM 的预测位置；与完整问句相比，正确词是语法自然的直接 next token，不需要 Teacher 先生成 `The answer is ...` 一类固定套话。
+
+代码强制执行以下 probe contract：
+
+- `probe_answers`（代码中的 `answers = (...)`）只定义类别索引到 continuation 的映射，不拼接到 Teacher 或 Student 输入。
+- stem 必须以换行开始、停在 ` is`，不得包含候选词、问号、`Answer:`、`Options:` 或 A/B 格式。
+- 每个 family 必须恰好定义四个模板；训练按 family 和 template 均匀循环，坐标仍由 seed 随机生成。
+- 点坐标必须互异；区域左上角必须互异且完整落在 patch 内；多通道时 prompt channel 与标签读取 channel 相同。
+- 标签只读取 Teacher 实际可见的 tensor，并在 `text_decimal_places` 精度量化后计算，避免文本显示相等而原始浮点标签不相等。
+- 当前行为 loss 只读一个 next-token 位置，因此每个带前导空格的 continuation 必须被实际 Qwen tokenizer 编成唯一单 token；否则启动失败。
+- 同一 batch 和所有 DDP rank 使用完全相同的 stem/token IDs；数值正文不允许静默截断。
+
+AE warmup 前会穷举全部 `5 families x 4 templates`。tokenization preflight 检查上述结构、所有 suffix 长度、正文截断、continuation token 和目标分布；任一模板在预检记录中少于两个有效类别会终止。Teacher behavior preflight 再用少量真实 patch 实际运行 frozen Qwen，记录候选内正确率、完整词表严格正确率、格式率、NLL 和每个 family 的 KL 激活情况。若 `probe_teacher_kl_weight > 0`，但任一 family 在全部预检记录上都没有一次严格规范输出，程序会先写出诊断 JSON 再终止，不进入五轮 AE 训练。
+
+为避免公共句子末 token 再次主导余弦方向，probe 的主 InfoNCE 不直接使用 raw hidden，而是使用冻结 Qwen 第 2 层的 tensor-conditioned residual：
+
+```text
+Teacher residual = hidden(tensor text + probe) - hidden(probe only)
+Student residual = hidden(tensor embeddings + probe) - hidden(probe only)
+```
+
+raw hidden 的 pairwise cosine 和 retrieval 仍单独记录为诊断。答案行为读取 Qwen 最终层同一位置，在单个位置计算完整词表 continuation CE；只有文本 Teacher 的完整词表 top-1 就是正确 continuation 时才参与 logits KL。
+
+probe 模式的全局 retrieval 使用 `evaluation_probe_count` 个固定 sentence stem，每个 family 在整个验证 split 上单独编码和检索，再做平均；同一个候选库内绝不混入不同 probe。EOS 和 representation 设置各自只运行自己的全局检索。数值正文和 suffix 分开 tokenization；正文超出 `max_text_tokens - suffix_tokens` 会直接失败。
+
+旧版“说明 + 字段 + 数值 + anchor / soft embeddings + 说明 + anchor”仍可通过 `alignment_text_layout: legacy_prompt` 复现，届时 `text_prompt_template` 才生效。
 
 默认 tensor path 不再把 `16x16` patch resize 到 `512x512`。脚本会按 `patch_alignment.patch_encoder` 构建一个 patch-sized AE：
 
@@ -1129,18 +1168,25 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
 loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teacher_embedding)
      + centered_contrastive_loss_weight * symmetric_InfoNCE(centered_tensor_embedding, centered_text_teacher_embedding)
      + cosine_loss_weight * (1 - cosine_similarity)
-     + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
+     + reconstruction_loss_weight * MSE(patch_AE_reconstruction, raw_patch)
+     + probe_answer_ce_weight * CE(student_final_layer_vocab_logits, correct_continuation_token)
+     + probe_teacher_kl_weight * KL(student_continuation_logits, correct_teacher_logits)
 ```
 
-这里的 `tensor_embedding` 默认不是 raw LLM hidden，而是 student branch 的 anchor hidden 经过 `alignment_projection.student` 后得到的对齐向量；`text_teacher_embedding` 是 teacher branch 的同层 anchor hidden 经过 `alignment_projection.teacher` 后得到的对齐向量。当前配置开启 `alignment_projection.enabled: true`，使用轻量 `LayerNorm + Linear` 投到 512 维 CLIP-style 对齐空间。raw LLM hidden 的检索结果会额外记录为 `hidden_*` 和 `global_hidden_*` 指标，用于判断 projection 是否只是掩盖了 LLM hidden 本身的各向异性。当前默认 `center_embeddings: false`，主 loss 直接优化投影后的 raw L2-normalized embedding；`centered_contrastive_loss_weight` 只作为小权重辅助项。`freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；若设为 `true`，alignment 阶段只训练 Q-Former/soft prompt bridge 和 projection head。
+最后两项只在 `alignment_anchor_mode: probe` 时非零。当前配置关闭 `alignment_projection.enabled`，所以 `tensor_embedding` 和 `text_teacher_embedding` 是两条路径在 Qwen 第 2 层 probe 末 token 的 conditioned residual hidden，经 L2 normalize 后进入 InfoNCE。continuation CE 读取 Qwen 最终层 hidden，并在该单一位置计算原始 LM head 的完整词表 logits；Teacher KL 只比较当前 family 的规范 continuation 分布。没有新增分类器或数值 decoder。`center_embeddings: false` 保证主 retrieval 全局可比较，centered InfoNCE 只保留 0.05 权重。
 
-脚本会检查 teacher/student tokenization 后的最后 token 附近是否仍包含 `Representation:`。默认 `fail_on_text_anchor_missing: true`，一旦文本过长导致 anchor 被截断，会直接报错，而不是继续训练一个语义位置已经错位的目标。默认 `fail_on_text_max_length_hit: true`，只要序列打满 `max_text_tokens` 也会报错；这比静默截断更严格，若触发应优先增大 `max_text_tokens`、减小 `patch_size` 或降低 `text_decimal_places`。
+`freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；设为 `true` 时只训练 Q-Former bridge。关闭 alignment projection 不会改变 Q-Former 输出维度，它仍直接生成与 Qwen input embedding 同维的连续 prefix embeddings。
+
+新布局会在 AE warmup 前逐 anchor 检查 tokenization，并输出最坏情况下的 `content_token_max`、`suffix_tokens` 和 `content_truncated`。anchor 单独编码，因此不会被截断；默认 `fail_on_text_max_length_hit: true` 会在任意数值正文超出预算时直接报错。`fail_on_text_anchor_missing` 只用于 `legacy_prompt` 兼容路径。`probe_teacher_preflight_records: 8` 控制每个模板实际送入 frozen Teacher 的预检样本数，20 个模板共检查 160 个 Teacher continuation。
 
 输出文件：
 
 | 文件 | 说明 |
 |---|---|
 | `run_summary.json` | patch 大小、字段、split plan、record overlap、encoder 来源、latent grid、LLM hidden size、teacher layer、adapter 参数量。 |
+| `probe_contract.json` | 启动时穷举的 20 个 stem、family/template、坐标、隐藏 continuation 和实际 token IDs。 |
+| `probe_tokenization_preflight.json` | 20 个 stem 的长度/截断检查，以及四位小数可见 tensor 上的类别分布。 |
+| `probe_teacher_preflight.json` | 训练前 20 个 probe 模板的 Teacher completion/strict/format/NLL，以及分 family 指标。 |
 | `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
 | `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
 | `patch_ae_pretrain_last.pt` | 可选 patch AE reconstruction warmup 后的 checkpoint。 |
@@ -1157,6 +1203,16 @@ W&B 曲线：
 | `train/reconstruction_loss` | alignment 阶段训练集重建误差；`train_patch_ae: true` 时可观察 AE 是否继续变化。 |
 | `val/reconstruction_loss` | alignment 阶段验证集重建误差。 |
 | `train/contrastive_loss`、`val/contrastive_loss` | tensor embedding 与 text teacher embedding 的对比学习 loss。 |
+| `train/probe_answer_ce`、`val/probe_answer_ce` | Student 最终层完整词表上的正确 continuation token 交叉熵。 |
+| `train/probe_completion_accuracy`、`val/probe_completion_accuracy` | 在当前 family 的规范 continuation 集合内是否选对。 |
+| `train/probe_shuffled_completion_accuracy`、`val/probe_shuffled_completion_accuracy` | batch 内循环错配 tensor hidden 后的 completion accuracy；probe 保持相同。 |
+| `train/probe_completion_latent_gain`、`val/probe_completion_latent_gain` | correct accuracy 减 shuffled accuracy；用于确认 continuation 依赖当前 tensor。 |
+| `train/probe_answer_token_accuracy`、`val/probe_answer_token_accuracy` | 完整词表 top-1 是否就是正确 continuation token。 |
+| `train/probe_answer_format_rate`、`val/probe_answer_format_rate` | 完整词表 top-1 是否属于该 family 的规范 continuation 集合。 |
+| `train/probe_teacher_completion_accuracy`、`val/probe_teacher_completion_accuracy` | 文本 Teacher 在规范 continuation 集合内的正确率。 |
+| `train/probe_teacher_answer_token_accuracy`、`val/probe_teacher_answer_token_accuracy` | 文本 Teacher 完整词表 top-1 是否为正确 continuation；KL 只在这些记录上启用。 |
+| `train/probe_teacher_kl`、`val/probe_teacher_kl` | Teacher 严格答对样本上的 continuation logits KL。 |
+| `train/alignment_student_conditioned_delta_norm`、`val/alignment_student_conditioned_delta_norm` | Student 减去 probe-only baseline 后的 hidden 范数。 |
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
 | `train/candidate_count` | 训练 InfoNCE 的候选数；单卡等于 batch size，多卡等于每卡 batch size 乘 GPU 数。 |
@@ -1220,23 +1276,34 @@ patch_alignment:
 | `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 默认 2。 |
 | `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`；`0`：关闭限制。 |
-| `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 是否在 LLM hidden 后接 projection head，再进行对比学习。 | 布尔开关 | 当前默认配置开启；关闭后退回 raw hidden alignment。 |
+| `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 是否在 LLM hidden 后接 projection head，再进行对比学习。 | 布尔开关 | 当前正式配置关闭，直接检验 raw Qwen hidden alignment；旧 projection 实验仍可复现。 |
 | `--alignment-projection-dim` | projection 后的对齐空间维度。 | 正整数 | 当前配置为 512；低于 LLM hidden size，降低私有匹配空间风险。 |
 | `--alignment-projection-layers` | projection head 层数。 | 正整数 | `1`：`LayerNorm + Linear`，默认；大于 1 会变成 MLP，只建议消融。 |
 | `--alignment-projection-hidden-dim` | MLP projection 的隐藏维度。 | 正整数 | 仅 `--alignment-projection-layers > 1` 时使用。 |
 | `--alignment-projection-dropout` | projection head dropout。 | 非负数 | 默认 0。 |
 | `--alignment-projection-shared` / `--no-alignment-projection-shared` | student/teacher 是否共享同一个 projection head。 | 布尔开关 | 默认 false：两条路径分布不同，先允许不同线性映射；true 是更强约束的消融。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
-| `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `normalized`、`raw` | `normalized`：使用 AE 实际输入，默认；`raw`：使用 HDF5 原始值，只建议消融。 |
+| `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `normalized`、`raw` | 当前配置为 `raw`；patch AE 同时使用 `normalization.mode: none`，所以两条路径输入一致。 |
+| `--alignment-text-layout` | Teacher/Student 的文本布局。 | `values_shared_suffix`、`legacy_prompt` | 默认前者：两侧内容都在同一个短 suffix 前；后者复现旧的不对称说明 prompt。 |
+| `--alignment-anchor-mode` | 本次训练使用的唯一对齐设置。 | `eos`、`representation`、`probe` | 正式配置为 `probe`；三档不会在一次训练中混合。 |
+| `--representation-suffix` | `representation` 模式的极短文本后缀。 | 字符串 | 当前为换行后接 `Representation:`；末尾不追加 EOS。 |
+| `--probe-families` | 自然补全 probe 的通用数值语义。 | `point_sign,point_relation,region_mean_relation,region_range_relation,directional_change` 的子集 | 每个 batch 生成共享 sentence stem/坐标和 tensor-derived continuation；输入不显示候选词。 |
+| `--probe-region-size` | 区域 probe 的正方形边长。 | 小于 patch size 的正整数 | 当前 4。 |
+| `--evaluation-probe-count` | 验证和 global retrieval 使用的固定 probe 数。 | 正整数 | 当前 5，每个 family 一个独立 pass。 |
+| `--probe-answer-ce-weight` | Student 最终层完整词表正确 continuation token CE 权重。 | 非负数 | 正式配置 0.2。 |
+| `--probe-teacher-kl-weight` | 严格答对的文本 Teacher 到 Student 的 continuation logits KL 权重。 | 非负数 | 正式配置 0.2。 |
+| `--probe-kl-temperature` | Teacher KL 温度。 | 正数 | 当前 1.0。 |
+| `--probe-teacher-preflight-records` | AE warmup 前每个 family/template 实际送入 frozen Teacher 的记录数。 | 非负整数 | 当前 8；20 个模板共检查 160 个 continuation，设 0 可关闭行为预检但不关闭结构/token 检查。 |
+| `--max-shared-suffix-tokens` | 单个非 EOS suffix 的 token 数硬上限。 | 正整数 | 当前 96；实际 token 数由 preflight 记录，超限直接失败。 |
 | `--center-embeddings` / `--no-center-embeddings` | 主 InfoNCE 前是否分别对 student/teacher batch hidden 减均值。 | 布尔开关 | 当前默认关闭；开启只建议做 batch-centered ablation。 |
 | `--fail-on-text-anchor-missing` / `--no-fail-on-text-anchor-missing` | tokenization 后 anchor 缺失时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录缺失比例。 |
 | `--fail-on-text-max-length-hit` / `--no-fail-on-text-max-length-hit` | tokenized 文本打满 `max_text_tokens` 时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录 `*_max_length_hit_fraction`。 |
 | `--global-retrieval-eval` / `--no-global-retrieval-eval` | eval 时是否额外计算整个 split 的 retrieval。 | 布尔开关 | 默认开启；比 batch 内 retrieval 更严格。 |
 | `--global-retrieval-max-records` | 允许全局 retrieval 的最大 split 条数。 | 正整数 | 默认 8192；超过则跳过，避免相似度矩阵过大。 |
 | `--global-retrieval-chunk-size` | 全局 retrieval 矩阵分块大小。 | 正整数 | 默认 1024；显存/内存紧张时调小。 |
-| `--text-prompt-template` | teacher branch 的数值矩阵 prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | `compact`：不含不可见元数据；`compact_with_metadata`：旧格式，含 sample/time/top_left；`plain`：仅矩阵文本。 |
-| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 当前配置为 2；位数越多 token 越多。 |
-| `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 2048。 |
+| `--text-prompt-template` | 旧 Teacher prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | 仅 `alignment_text_layout: legacy_prompt` 生效；新布局固定使用无字段的数值序列化。 |
+| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | raw-value 配置使用 4，避免小幅 density/pressure 变化在两位小数时消失。 |
+| `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 3072；严格 preflight 会报告真实长度并拒绝截断。 |
 | `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
 | `--teacher-layer` | 取 LLM 哪一层 hidden state。 | 整数 | 当前配置为 2；`0` 通常是 embedding 层输出，`-1` 表示最后一层。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |

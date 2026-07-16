@@ -66,7 +66,39 @@ class PatchRecord:
 @dataclass(frozen=True)
 class HiddenBatch:
     hidden: torch.Tensor
+    final_hidden: torch.Tensor
     metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class SharedSuffixTokenBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    metrics: dict[str, float]
+    suffix_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class AlignmentAnchor:
+    name: str
+    mode: str
+    token_ids: tuple[int, ...]
+    text: str | None = None
+    probe_family: str | None = None
+    probe_template_index: int | None = None
+    probe_parameters: tuple[int, ...] = ()
+    probe_answers: tuple[str, ...] = ()
+
+
+PROBE_FAMILIES = (
+    "point_sign",
+    "point_relation",
+    "region_mean_relation",
+    "region_range_relation",
+    "directional_change",
+)
+PROBE_TEMPLATES_PER_FAMILY = 4
+PROBE_FORBIDDEN_INPUT_MARKERS = ("answer:", "a or b", "a/b", "choose from", "options:", "?")
 
 
 def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
@@ -607,6 +639,25 @@ def serialize_patch_text(
     raise ValueError(f"Unsupported text_prompt_template: {prompt_template}")
 
 
+def serialize_tensor_values(patch: torch.Tensor, decimal_places: int) -> str:
+    """Serialize only tensor values and shape delimiters, without field or provenance text."""
+    if patch.ndim != 3:
+        raise ValueError(f"Expected a [channels,height,width] tensor, got {tuple(patch.shape)}.")
+    decimals = max(0, int(decimal_places))
+    channel_chunks: list[str] = []
+    for channel in patch.detach().cpu():
+        rows = [
+            "[" + ", ".join(f"{float(value):.{decimals}f}" for value in row) + "]"
+            for row in channel
+        ]
+        channel_chunks.append("[" + "; ".join(rows) + "]")
+    return "[" + "; ".join(channel_chunks) + "]"
+
+
+def serialize_tensor_value_batch(patches: torch.Tensor, decimal_places: int) -> list[str]:
+    return [serialize_tensor_values(patch, decimal_places) for patch in patches]
+
+
 def serialize_patch_batch(
     *,
     records: Sequence[Mapping[str, Any]],
@@ -1088,6 +1139,29 @@ def hidden_at_last_non_padding(
     return hidden[batch_indices, last_indices]
 
 
+def llm_backbone(llm: nn.Module) -> nn.Module:
+    backbone = getattr(llm, "model", None)
+    return backbone if isinstance(backbone, nn.Module) else llm
+
+
+@torch.no_grad()
+def probe_only_hidden(
+    llm: nn.Module,
+    anchor: AlignmentAnchor,
+    device: torch.device,
+    teacher_layer: int,
+) -> torch.Tensor:
+    input_ids = torch.tensor(anchor.token_ids, dtype=torch.long, device=device).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+    outputs = llm_backbone(llm)(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return hidden_at_last_non_padding(outputs.hidden_states, attention_mask, int(teacher_layer)).detach()
+
+
 def masked_token_norm(embeddings: torch.Tensor, attention_mask: torch.Tensor) -> float:
     mask = attention_mask.to(device=embeddings.device, dtype=torch.bool)
     if not bool(mask.any()):
@@ -1110,6 +1184,505 @@ def off_diagonal_cosine_mean(embeddings: torch.Tensor) -> float:
     batch_size = int(similarity.shape[0])
     off_diagonal_sum = similarity.sum() - similarity.diag().sum()
     return float((off_diagonal_sum / max(1, batch_size * (batch_size - 1))).cpu().item())
+
+
+def tokenizer_ids(tokenizer: Any, text: str) -> list[int]:
+    encoded = tokenizer(
+        str(text),
+        add_special_tokens=False,
+        truncation=False,
+    )["input_ids"]
+    if isinstance(encoded, torch.Tensor):
+        encoded = encoded.detach().cpu().tolist()
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return [int(token_id) for token_id in encoded]
+
+
+def tokenizer_batch_ids(tokenizer: Any, texts: Sequence[str]) -> list[list[int]]:
+    if not texts:
+        return []
+    encoded = tokenizer(
+        [str(text) for text in texts],
+        add_special_tokens=False,
+        truncation=False,
+    )["input_ids"]
+    if isinstance(encoded, torch.Tensor):
+        encoded = encoded.detach().cpu().tolist()
+    return [[int(token_id) for token_id in row] for row in encoded]
+
+
+def shared_suffix_token_ids(tokenizer: Any, suffix: str, max_suffix_tokens: int) -> tuple[int, ...]:
+    if not str(suffix):
+        raise ValueError("Alignment anchor text must not be empty.")
+    token_ids = tuple(tokenizer_ids(tokenizer, str(suffix)))
+    if not token_ids:
+        raise ValueError("Alignment anchor text tokenized to an empty sequence.")
+    if len(token_ids) > int(max_suffix_tokens):
+        raise ValueError(
+            "Alignment anchor text is too long after tokenization: "
+            f"{len(token_ids)} tokens exceeds max_shared_suffix_tokens={int(max_suffix_tokens)}."
+        )
+    return token_ids
+
+
+def build_static_alignment_anchor(
+    *,
+    tokenizer: Any,
+    mode: str,
+    representation_suffix: str,
+    max_anchor_tokens: int,
+) -> AlignmentAnchor:
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode == "eos":
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise ValueError("Tokenizer must define eos_token_id when the eos alignment anchor is enabled.")
+        return AlignmentAnchor(
+            name="eos",
+            mode="eos",
+            token_ids=(int(eos_token_id),),
+        )
+    if normalized_mode == "representation":
+        return AlignmentAnchor(
+            name="representation",
+            mode="representation",
+            token_ids=shared_suffix_token_ids(
+                tokenizer,
+                str(representation_suffix),
+                int(max_anchor_tokens),
+            ),
+            text=str(representation_suffix),
+        )
+    raise ValueError(f"Static alignment anchor mode must be eos or representation, got {mode!r}.")
+
+
+def validate_probe_anchor_contract(anchor: AlignmentAnchor) -> None:
+    if anchor.mode != "probe" or anchor.probe_family not in PROBE_FAMILIES:
+        raise ValueError("Probe contract validation requires a supported probe anchor.")
+    if anchor.probe_template_index is None or not 0 <= int(anchor.probe_template_index) < PROBE_TEMPLATES_PER_FAMILY:
+        raise ValueError(f"Probe anchor has an invalid template index: {anchor.probe_template_index!r}.")
+    text = str(anchor.text or "")
+    if not text.startswith("\n") or not text.endswith(" is"):
+        raise ValueError(f"Probe stem must start with a newline and end at a natural ' is' continuation: {text!r}.")
+    lowered = text.lower()
+    leaked_markers = [marker for marker in PROBE_FORBIDDEN_INPUT_MARKERS if marker in lowered]
+    if leaked_markers:
+        raise ValueError(f"Probe stem contains forbidden answer-format markers {leaked_markers}: {text!r}.")
+    if not anchor.probe_answers or len(anchor.probe_answers) != len(set(anchor.probe_answers)):
+        raise ValueError(f"Probe continuations must be non-empty and unique: {anchor.probe_answers!r}.")
+    leaked_answers = [answer for answer in anchor.probe_answers if str(answer).lower() in lowered]
+    if leaked_answers:
+        raise ValueError(f"Probe stem leaks canonical continuations {leaked_answers}: {text!r}.")
+
+
+def build_numeric_probe_anchor(
+    *,
+    tokenizer: Any,
+    patch_size: int,
+    channel_count: int,
+    families: str | Sequence[str],
+    region_size: int,
+    probe_index: int,
+    seed: int,
+    max_anchor_tokens: int,
+    template_index: int | None = None,
+) -> AlignmentAnchor:
+    probe_families = [family.lower() for family in parse_csv(families)]
+    if not probe_families:
+        raise ValueError("patch_alignment.probe_families must not be empty in probe mode.")
+    unsupported = sorted(set(probe_families) - set(PROBE_FAMILIES))
+    if unsupported:
+        raise ValueError(f"Unsupported probe families: {unsupported}.")
+    if int(patch_size) <= 1:
+        raise ValueError("Behavior probes require patch_size greater than 1.")
+    if int(channel_count) <= 0:
+        raise ValueError("Behavior probes require at least one tensor channel.")
+
+    family = probe_families[int(probe_index) % len(probe_families)]
+    rng = random.Random(int(seed) + 1_000_003 * int(probe_index))
+    channel = rng.randrange(int(channel_count))
+
+    def select_template(templates: Sequence[str]) -> tuple[int, str]:
+        if len(templates) != PROBE_TEMPLATES_PER_FAMILY:
+            raise ValueError(
+                f"Every probe family must define exactly {PROBE_TEMPLATES_PER_FAMILY} templates, "
+                f"but {family} defines {len(templates)}."
+            )
+        selected = (
+            int(template_index)
+            if template_index is not None
+            else (int(probe_index) // len(probe_families)) % PROBE_TEMPLATES_PER_FAMILY
+        )
+        if not 0 <= selected < PROBE_TEMPLATES_PER_FAMILY:
+            raise ValueError(
+                f"Probe template_index must be between 0 and {PROBE_TEMPLATES_PER_FAMILY - 1}, got {selected}."
+            )
+        return selected, str(templates[selected])
+
+    def point_text(row: int, col: int) -> str:
+        location = f"row {row + 1}, column {col + 1}"
+        if int(channel_count) > 1:
+            location += f" in channel {channel + 1}"
+        return location
+
+    def region_text(row: int, col: int, size: int) -> str:
+        location = f"rows {row + 1}-{row + size} and columns {col + 1}-{col + size}"
+        if int(channel_count) > 1:
+            location += f" in channel {channel + 1}"
+        return location
+
+    # `answers` maps tensor-derived class indices to hidden next-token targets; it is never serialized into the stem.
+    if family == "point_sign":
+        position = rng.randrange(int(patch_size) * int(patch_size))
+        row, col = divmod(position, int(patch_size))
+        location = point_text(row, col)
+        templates = (
+            f"\nThe value at {location} is",
+            f"\nAt {location}, the value is",
+            f"\nThe sign of the value at {location} is",
+            f"\nFor {location}, the recorded value is",
+        )
+        selected_template_index, text = select_template(templates)
+        parameters = (channel, row, col)
+        answers = ("positive", "negative", "zero")
+    elif family in {"point_relation", "directional_change"}:
+        first, second = rng.sample(range(int(patch_size) * int(patch_size)), 2)
+        row_a, col_a = divmod(first, int(patch_size))
+        row_b, col_b = divmod(second, int(patch_size))
+        location_a = point_text(row_a, col_a)
+        location_b = point_text(row_b, col_b)
+        if family == "point_relation":
+            templates = (
+                f"\nCompared with the value at {location_b}, the value at {location_a} is",
+                f"\nRelative to the value at {location_b}, the value at {location_a} is",
+                f"\nThe value at {location_a}, compared with the value at {location_b}, is",
+                f"\nWith the value at {location_b} as reference, the value at {location_a} is",
+            )
+            selected_template_index, text = select_template(templates)
+            answers = ("larger", "smaller", "equal")
+        else:
+            templates = (
+                f"\nAt {location_b}, relative to {location_a}, the value is",
+                f"\nCompared with its value at {location_a}, the value at {location_b} is",
+                f"\nThe value at {location_b}, compared with the value at {location_a}, is",
+                f"\nWith {location_a} as the starting point, the value at {location_b} is",
+            )
+            selected_template_index, text = select_template(templates)
+            answers = ("higher", "lower", "unchanged")
+        parameters = (channel, row_a, col_a, row_b, col_b)
+    else:
+        size = int(region_size)
+        if size <= 0 or size >= int(patch_size):
+            raise ValueError("patch_alignment.probe_region_size must be between 1 and patch_size - 1.")
+        positions_per_axis = int(patch_size) - size + 1
+        first, second = rng.sample(range(positions_per_axis * positions_per_axis), 2)
+        row_a, col_a = divmod(first, positions_per_axis)
+        row_b, col_b = divmod(second, positions_per_axis)
+        statistic = "mean" if family == "region_mean_relation" else "value range"
+        region_a = region_text(row_a, col_a, size)
+        region_b = region_text(row_b, col_b, size)
+        templates = (
+            f"\nCompared with the {statistic} over {region_b}, the {statistic} over {region_a} is",
+            f"\nRelative to the {statistic} over {region_b}, the {statistic} over {region_a} is",
+            f"\nThe {statistic} over {region_a}, compared with the {statistic} over {region_b}, is",
+            f"\nWith the {statistic} over {region_b} as reference, the {statistic} over {region_a} is",
+        )
+        selected_template_index, text = select_template(templates)
+        parameters = (channel, row_a, col_a, row_b, col_b, size)
+        answers = (
+            ("higher", "lower", "equal")
+            if family == "region_mean_relation"
+            else ("larger", "smaller", "equal")
+        )
+
+    anchor = AlignmentAnchor(
+        name=f"probe_{int(probe_index):02d}_{family}_t{selected_template_index}",
+        mode="probe",
+        token_ids=shared_suffix_token_ids(tokenizer, text, int(max_anchor_tokens)),
+        text=text,
+        probe_family=family,
+        probe_template_index=int(selected_template_index),
+        probe_parameters=parameters,
+        probe_answers=answers,
+    )
+    validate_probe_anchor_contract(anchor)
+    return anchor
+
+
+def probe_target_indices(patches: torch.Tensor, anchor: AlignmentAnchor) -> torch.Tensor:
+    family = anchor.probe_family
+    if family is None:
+        raise ValueError("probe_target_indices requires a behavior-probe anchor.")
+    if patches.ndim != 4:
+        raise ValueError(f"Expected probe patches [batch,channels,height,width], got {tuple(patches.shape)}.")
+    channel, *parameters = anchor.probe_parameters
+    values = patches[:, int(channel)].double()
+    if family == "point_sign":
+        row, col = parameters
+        scores = values[:, int(row), int(col)]
+        targets = torch.full_like(scores, 2, dtype=torch.long)
+        targets = torch.where(scores > 0, torch.zeros_like(targets), targets)
+        return torch.where(scores < 0, torch.ones_like(targets), targets)
+
+    row_a, col_a, row_b, col_b, *rest = parameters
+    if family in {"point_relation", "directional_change"}:
+        score_a = values[:, int(row_a), int(col_a)]
+        score_b = values[:, int(row_b), int(col_b)]
+    else:
+        size = int(rest[0])
+        region_a = values[:, int(row_a) : int(row_a) + size, int(col_a) : int(col_a) + size]
+        region_b = values[:, int(row_b) : int(row_b) + size, int(col_b) : int(col_b) + size]
+        if family == "region_mean_relation":
+            # Regions have the same area, so comparing sums avoids an unnecessary floating-point division.
+            score_a = region_a.sum(dim=(-2, -1))
+            score_b = region_b.sum(dim=(-2, -1))
+        elif family == "region_range_relation":
+            score_a = region_a.amax(dim=(-2, -1)) - region_a.amin(dim=(-2, -1))
+            score_b = region_b.amax(dim=(-2, -1)) - region_b.amin(dim=(-2, -1))
+        else:
+            raise ValueError(f"Unsupported probe family: {family}")
+    if family == "directional_change":
+        first, second = score_b, score_a
+    else:
+        first, second = score_a, score_b
+    targets = torch.full_like(first, 2, dtype=torch.long)
+    targets = torch.where(first > second, torch.zeros_like(targets), targets)
+    return torch.where(first < second, torch.ones_like(targets), targets)
+
+
+def quantize_probe_values(patches: torch.Tensor, decimal_places: int) -> torch.Tensor:
+    if not bool(torch.isfinite(patches).all()):
+        non_finite = int((~torch.isfinite(patches)).sum().item())
+        raise ValueError(f"Probe source tensor contains {non_finite} non-finite values.")
+    scale = float(10 ** max(0, int(decimal_places)))
+    return torch.round(patches.float() * scale) / scale
+
+
+def probe_answer_token_ids(tokenizer: Any, anchor: AlignmentAnchor) -> tuple[int, ...]:
+    if not anchor.probe_answers:
+        raise ValueError("probe_answer_token_ids requires a probe anchor with canonical continuations.")
+    token_ids: list[int] = []
+    for answer in anchor.probe_answers:
+        continuation = f" {answer}"
+        encoded = tokenizer_ids(tokenizer, continuation)
+        if len(encoded) != 1:
+            raise ValueError(
+                f"Probe continuation {continuation!r} must tokenize to one token, got {encoded}. "
+                "Choose a canonical one-token continuation or extend sequence scoring."
+            )
+        combined = tokenizer_ids(tokenizer, f"{anchor.text}{continuation}")
+        expected = list(anchor.token_ids) + encoded
+        if combined != expected:
+            raise ValueError(
+                f"Probe continuation {continuation!r} changes tokenization at the stem boundary. "
+                f"Expected stem+continuation IDs {expected}, got {combined}."
+            )
+        token_ids.append(int(encoded[0]))
+    if len(token_ids) != len(set(token_ids)):
+        raise ValueError(f"Probe continuations resolved to duplicate token IDs: {token_ids}.")
+    return tuple(token_ids)
+
+
+def probe_behavior_loss(
+    *,
+    llm: nn.Module,
+    student_final_hidden: torch.Tensor,
+    teacher_final_hidden: torch.Tensor,
+    targets: torch.Tensor,
+    continuation_token_ids: Sequence[int],
+    kl_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    output_embeddings = llm.get_output_embeddings()
+    if output_embeddings is None:
+        raise ValueError("The frozen causal LLM must expose an output embedding layer for probe scoring.")
+    student_vocab_logits = output_embeddings(student_final_hidden).float()
+    continuation_index = torch.tensor(
+        continuation_token_ids,
+        dtype=torch.long,
+        device=student_vocab_logits.device,
+    )
+    student_logits = student_vocab_logits.index_select(1, continuation_index)
+    with torch.no_grad():
+        teacher_vocab_logits = output_embeddings(teacher_final_hidden).float()
+        teacher_logits = teacher_vocab_logits.index_select(1, continuation_index)
+    answer_token_ids = continuation_index.index_select(0, targets)
+    answer_ce = F.cross_entropy(student_vocab_logits, answer_token_ids)
+    temperature = float(kl_temperature)
+    teacher_distribution = F.softmax(teacher_logits / temperature, dim=-1)
+    per_record_kl = F.kl_div(
+        F.log_softmax(student_logits / temperature, dim=-1),
+        teacher_distribution,
+        reduction="none",
+    ).sum(dim=-1) * (temperature**2)
+    teacher_completion_correct = teacher_logits.argmax(dim=-1) == targets
+    teacher_top_tokens = teacher_vocab_logits.argmax(dim=-1)
+    teacher_correct = teacher_top_tokens == answer_token_ids
+    if bool(teacher_correct.any()):
+        teacher_kl = per_record_kl[teacher_correct].mean()
+    else:
+        teacher_kl = per_record_kl.sum() * 0.0
+    student_top_tokens = student_vocab_logits.argmax(dim=-1)
+    student_completion_predictions = student_logits.argmax(dim=-1)
+    teacher_completion_predictions = teacher_logits.argmax(dim=-1)
+    if int(student_vocab_logits.shape[0]) > 1:
+        shuffled_targets = targets.roll(shifts=-1, dims=0)
+        shuffled_answer_token_ids = answer_token_ids.roll(shifts=-1, dims=0)
+        shuffled_completion_accuracy = (student_completion_predictions == shuffled_targets).float().mean()
+        shuffled_answer_ce = F.cross_entropy(student_vocab_logits, shuffled_answer_token_ids)
+    else:
+        shuffled_completion_accuracy = (student_completion_predictions == targets).float().mean()
+        shuffled_answer_ce = answer_ce.detach()
+    completion_accuracy = (student_completion_predictions == targets).float().mean()
+    student_correct_logits = student_logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    teacher_correct_logits = teacher_logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    student_incorrect_logits = student_logits.scatter(1, targets.unsqueeze(1), float("-inf")).amax(dim=1)
+    teacher_incorrect_logits = teacher_logits.scatter(1, targets.unsqueeze(1), float("-inf")).amax(dim=1)
+    metrics = {
+        "completion_accuracy": float(completion_accuracy.detach().cpu().item()),
+        "shuffled_completion_accuracy": float(shuffled_completion_accuracy.detach().cpu().item()),
+        "completion_latent_gain": float(
+            (completion_accuracy - shuffled_completion_accuracy).detach().cpu().item()
+        ),
+        "shuffled_answer_ce": float(shuffled_answer_ce.detach().cpu().item()),
+        "answer_token_accuracy": float(
+            (student_top_tokens == answer_token_ids).float().mean().detach().cpu().item()
+        ),
+        "answer_format_rate": float(
+            (student_top_tokens.unsqueeze(1) == continuation_index.unsqueeze(0))
+            .any(dim=1)
+            .float()
+            .mean()
+            .detach()
+            .cpu()
+            .item()
+        ),
+        "teacher_completion_accuracy": float(
+            teacher_completion_correct.float().mean().detach().cpu().item()
+        ),
+        "teacher_answer_token_accuracy": float(teacher_correct.float().mean().detach().cpu().item()),
+        "teacher_answer_nll": float(
+            F.cross_entropy(teacher_vocab_logits, answer_token_ids).detach().cpu().item()
+        ),
+        "teacher_answer_format_rate": float(
+            (teacher_top_tokens.unsqueeze(1) == continuation_index.unsqueeze(0))
+            .any(dim=1)
+            .float()
+            .mean()
+            .detach()
+            .cpu()
+            .item()
+        ),
+        "teacher_kl_active_fraction": float(teacher_correct.float().mean().detach().cpu().item()),
+        "target_class_0_fraction": float((targets == 0).float().mean().detach().cpu().item()),
+        "student_predicted_class_0_fraction": float(
+            (student_completion_predictions == 0).float().mean().detach().cpu().item()
+        ),
+        "teacher_predicted_class_0_fraction": float(
+            (teacher_completion_predictions == 0).float().mean().detach().cpu().item()
+        ),
+        "student_completion_margin": float(
+            (student_correct_logits - student_incorrect_logits).mean().detach().cpu().item()
+        ),
+        "teacher_completion_margin": float(
+            (teacher_correct_logits - teacher_incorrect_logits).mean().detach().cpu().item()
+        ),
+    }
+    return answer_ce, teacher_kl, metrics
+
+
+def tokenize_contents_with_anchor(
+    *,
+    tokenizer: Any,
+    contents: Sequence[str],
+    anchor: AlignmentAnchor,
+    max_tokens: int,
+    require_under_max_length: bool,
+    context: str,
+) -> SharedSuffixTokenBatch:
+    suffix_ids = tuple(int(token_id) for token_id in anchor.token_ids)
+    if not suffix_ids:
+        raise ValueError(f"Alignment anchor {anchor.name!r} has no token IDs.")
+    content_budget = int(max_tokens) - len(suffix_ids)
+    if content_budget <= 0:
+        raise ValueError(
+            "patch_alignment.max_text_tokens must leave room for tensor values before the alignment anchor. "
+            f"Got max_text_tokens={int(max_tokens)} and anchor_tokens={len(suffix_ids)}."
+        )
+
+    packed_rows: list[list[int]] = []
+    content_lengths: list[int] = []
+    truncated_count = 0
+    for content_ids in tokenizer_batch_ids(tokenizer, contents):
+        content_lengths.append(len(content_ids))
+        if len(content_ids) > content_budget:
+            truncated_count += 1
+            content_ids = content_ids[:content_budget]
+        packed_rows.append(content_ids + list(suffix_ids))
+
+    if not packed_rows:
+        raise ValueError(f"{context} received an empty batch.")
+    if require_under_max_length and truncated_count > 0:
+        raise ValueError(
+            f"{context} truncated numeric tensor content for {truncated_count}/{len(packed_rows)} sequences. "
+            "Increase patch_alignment.max_text_tokens or reduce patch_alignment.patch_size/text_decimal_places. "
+            "The alignment anchor was preserved, but training on incomplete tensor text is disabled."
+        )
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("Tokenizer must define pad_token_id before alignment-anchor tokenization.")
+    padded_length = max(len(row) for row in packed_rows)
+    input_ids = torch.full((len(packed_rows), padded_length), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((len(packed_rows), padded_length), dtype=torch.long)
+    for row_index, row in enumerate(packed_rows):
+        input_ids[row_index, : len(row)] = torch.tensor(row, dtype=torch.long)
+        attention_mask[row_index, : len(row)] = 1
+
+    lengths = attention_mask.sum(dim=1)
+    max_length_hits = int((lengths >= int(max_tokens)).sum().item())
+    batch_size = len(packed_rows)
+    metrics = {
+        "token_count_mean": float(lengths.float().mean().item()),
+        "token_count_max": float(lengths.max().item()),
+        "content_token_count_mean": float(sum(content_lengths) / max(1, batch_size)),
+        "content_token_count_max": float(max(content_lengths, default=0)),
+        "suffix_token_count": float(len(suffix_ids)),
+        "content_truncated_fraction": float(truncated_count / max(1, batch_size)),
+        "max_length_hit_fraction": float(max_length_hits / max(1, batch_size)),
+        "anchor_missing_fraction": 0.0,
+    }
+    return SharedSuffixTokenBatch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        metrics=metrics,
+        suffix_token_ids=suffix_ids,
+    )
+
+
+def tokenize_contents_with_shared_suffix(
+    *,
+    tokenizer: Any,
+    contents: Sequence[str],
+    suffix: str,
+    max_tokens: int,
+    max_suffix_tokens: int,
+    require_under_max_length: bool,
+    context: str,
+) -> SharedSuffixTokenBatch:
+    return tokenize_contents_with_anchor(
+        tokenizer=tokenizer,
+        contents=contents,
+        anchor=AlignmentAnchor(
+            name="shared_suffix",
+            mode="representation",
+            token_ids=shared_suffix_token_ids(tokenizer, suffix, max_suffix_tokens),
+            text=str(suffix),
+        ),
+        max_tokens=int(max_tokens),
+        require_under_max_length=bool(require_under_max_length),
+        context=str(context),
+    )
 
 
 def tokenizer_anchor_metrics(
@@ -1223,38 +1796,63 @@ def text_teacher_hidden(
     teacher_layer: int,
     require_anchor: bool,
     require_under_max_length: bool,
+    text_layout: str = "legacy_prompt",
+    shared_suffix: str = "\nRepresentation:",
+    max_shared_suffix_tokens: int = 8,
+    alignment_anchor: AlignmentAnchor | None = None,
 ) -> HiddenBatch:
-    encoded = tokenizer(
-        list(texts),
-        padding=True,
-        truncation=True,
-        max_length=int(max_tokens),
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded["attention_mask"].to(device)
-    metrics = tokenizer_anchor_metrics(
-        tokenizer=tokenizer,
-        input_ids=encoded["input_ids"],
-        attention_mask=encoded["attention_mask"],
-        max_tokens=int(max_tokens),
-        anchor_text="Representation:" if require_anchor else "",
-        require_anchor=bool(require_anchor),
-        require_under_max_length=bool(require_under_max_length),
-        context="teacher text",
-    )
+    if str(text_layout) == "values_shared_suffix":
+        anchor = alignment_anchor or AlignmentAnchor(
+            name="representation",
+            mode="representation",
+            token_ids=shared_suffix_token_ids(tokenizer, str(shared_suffix), int(max_shared_suffix_tokens)),
+            text=str(shared_suffix),
+        )
+        packed = tokenize_contents_with_anchor(
+            tokenizer=tokenizer,
+            contents=texts,
+            anchor=anchor,
+            max_tokens=int(max_tokens),
+            require_under_max_length=bool(require_under_max_length),
+            context="teacher tensor text",
+        )
+        input_ids = packed.input_ids.to(device)
+        attention_mask = packed.attention_mask.to(device)
+        metrics = dict(packed.metrics)
+    else:
+        encoded = tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=int(max_tokens),
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        metrics = tokenizer_anchor_metrics(
+            tokenizer=tokenizer,
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            max_tokens=int(max_tokens),
+            anchor_text="Representation:" if require_anchor else "",
+            require_anchor=bool(require_anchor),
+            require_under_max_length=bool(require_under_max_length),
+            context="teacher text",
+        )
     text_embeds = llm.get_input_embeddings()(input_ids)
     metrics["token_embedding_norm"] = masked_token_norm(text_embeds, attention_mask)
-    outputs = llm(
+    outputs = llm_backbone(llm)(
         input_ids=input_ids,
         attention_mask=attention_mask,
         output_hidden_states=True,
         use_cache=False,
     )
     hidden = hidden_at_last_non_padding(outputs.hidden_states, attention_mask, teacher_layer).detach()
+    final_hidden = hidden_at_last_non_padding(outputs.hidden_states, attention_mask, -1).detach()
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
     metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
-    return HiddenBatch(hidden=hidden, metrics=metrics)
+    metrics["final_hidden_norm"] = mean_token_norm(final_hidden.unsqueeze(1))
+    return HiddenBatch(hidden=hidden, final_hidden=final_hidden, metrics=metrics)
 
 
 def tensor_student_hidden(
@@ -1267,28 +1865,60 @@ def tensor_student_hidden(
     teacher_layer: int,
     patch_size: int | None,
     require_under_max_length: bool,
+    text_layout: str = "legacy_prompt",
+    shared_suffix: str = "\nRepresentation:",
+    max_shared_suffix_tokens: int = 8,
+    alignment_anchor: AlignmentAnchor | None = None,
 ) -> HiddenBatch:
-    encoded = tokenizer(
-        build_student_anchor_texts(records, patch_size_override=patch_size),
-        padding=True,
-        truncation=True,
-        max_length=int(max_tokens),
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"].to(device)
-    text_attention_mask = encoded["attention_mask"].to(device)
+    if str(text_layout) == "values_shared_suffix":
+        anchor = alignment_anchor or AlignmentAnchor(
+            name="representation",
+            mode="representation",
+            token_ids=shared_suffix_token_ids(tokenizer, str(shared_suffix), int(max_shared_suffix_tokens)),
+            text=str(shared_suffix),
+        )
+        suffix_ids = anchor.token_ids
+        if int(soft_prompts.shape[1]) + len(suffix_ids) > int(max_tokens):
+            raise ValueError(
+                "Student soft prompts plus shared suffix exceed patch_alignment.max_text_tokens: "
+                f"{int(soft_prompts.shape[1])}+{len(suffix_ids)}>{int(max_tokens)}."
+            )
+        input_ids = torch.tensor(suffix_ids, dtype=torch.long, device=device).unsqueeze(0).expand(
+            int(soft_prompts.shape[0]), -1
+        )
+        text_attention_mask = torch.ones_like(input_ids)
+        metrics = {
+            "token_count_mean": float(len(suffix_ids)),
+            "token_count_max": float(len(suffix_ids)),
+            "content_token_count_mean": 0.0,
+            "content_token_count_max": 0.0,
+            "suffix_token_count": float(len(suffix_ids)),
+            "content_truncated_fraction": 0.0,
+            "max_length_hit_fraction": 0.0,
+            "anchor_missing_fraction": 0.0,
+        }
+    else:
+        encoded = tokenizer(
+            build_student_anchor_texts(records, patch_size_override=patch_size),
+            padding=True,
+            truncation=True,
+            max_length=int(max_tokens),
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(device)
+        text_attention_mask = encoded["attention_mask"].to(device)
+        metrics = tokenizer_anchor_metrics(
+            tokenizer=tokenizer,
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            max_tokens=int(max_tokens),
+            anchor_text="Representation:",
+            require_anchor=True,
+            require_under_max_length=bool(require_under_max_length),
+            context="student anchor text",
+        )
     text_embeds = llm.get_input_embeddings()(input_ids)
     soft_prompts = soft_prompts.to(device=device, dtype=text_embeds.dtype)
-    metrics = tokenizer_anchor_metrics(
-        tokenizer=tokenizer,
-        input_ids=encoded["input_ids"],
-        attention_mask=encoded["attention_mask"],
-        max_tokens=int(max_tokens),
-        anchor_text="Representation:",
-        require_anchor=True,
-        require_under_max_length=bool(require_under_max_length),
-        context="student anchor text",
-    )
     metrics["text_token_embedding_norm"] = masked_token_norm(text_embeds, text_attention_mask)
     metrics["soft_prompt_token_norm"] = mean_token_norm(soft_prompts)
     inputs_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
@@ -1298,7 +1928,7 @@ def tensor_student_hidden(
         device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
-    outputs = llm(
+    outputs = llm_backbone(llm)(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
         output_hidden_states=True,
@@ -1310,9 +1940,16 @@ def tensor_student_hidden(
         teacher_layer,
         prefix_tokens=int(soft_prompts.shape[1]),
     )
+    final_hidden = hidden_at_last_non_padding(
+        outputs.hidden_states,
+        text_attention_mask,
+        -1,
+        prefix_tokens=int(soft_prompts.shape[1]),
+    )
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
     metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
-    return HiddenBatch(hidden=hidden, metrics=metrics)
+    metrics["final_hidden_norm"] = mean_token_norm(final_hidden.unsqueeze(1))
+    return HiddenBatch(hidden=hidden, final_hidden=final_hidden, metrics=metrics)
 
 
 def normalize_patch_batch(
@@ -1337,6 +1974,12 @@ def build_teacher_texts_for_batch(
     args: argparse.Namespace,
 ) -> list[str]:
     source = str(args.teacher_text_source).lower()
+    if str(args.alignment_text_layout) == "values_shared_suffix":
+        patches = batch["patch"] if source == "raw" else normalized_patches
+        if source not in {"raw", "normalized"}:
+            raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
+        visible_patches = quantize_probe_values(patches, int(args.text_decimal_places))
+        return serialize_tensor_value_batch(visible_patches, int(args.text_decimal_places))
     if source == "raw":
         return [str(text) for text in batch["texts"]]
     if source == "normalized":
@@ -1347,6 +1990,84 @@ def build_teacher_texts_for_batch(
             prompt_template=str(args.text_prompt_template),
         )
     raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
+
+
+def alignment_anchors_from_args(
+    tokenizer: Any,
+    args: argparse.Namespace,
+    *,
+    evaluation: bool,
+) -> list[AlignmentAnchor]:
+    mode = str(args.alignment_anchor_mode)
+    if mode == "probe":
+        channel_count = 1 if str(args.field_sampling_mode).lower() == "single" else len(parse_csv(args.fields))
+        probe_count = int(args.evaluation_probe_count) if evaluation else 1
+        return [
+            build_numeric_probe_anchor(
+                tokenizer=tokenizer,
+                patch_size=int(args.patch_size),
+                channel_count=int(channel_count),
+                families=args.probe_families,
+                region_size=int(args.probe_region_size),
+                probe_index=index,
+                seed=int(args.seed) + (100_000 if evaluation else 0),
+                max_anchor_tokens=int(args.max_shared_suffix_tokens),
+                template_index=(
+                    (index // len(args.probe_families) + index % len(args.probe_families))
+                    % PROBE_TEMPLATES_PER_FAMILY
+                    if evaluation
+                    else None
+                ),
+            )
+            for index in range(probe_count)
+        ]
+    return [
+        build_static_alignment_anchor(
+            tokenizer=tokenizer,
+            mode=mode,
+            representation_suffix=str(args.representation_suffix),
+            max_anchor_tokens=int(args.max_shared_suffix_tokens),
+        )
+    ]
+
+
+def probe_contract_anchors(tokenizer: Any, args: argparse.Namespace) -> list[AlignmentAnchor]:
+    if str(args.alignment_anchor_mode) != "probe":
+        return []
+    families = [family.lower() for family in parse_csv(args.probe_families)]
+    channel_count = 1 if str(args.field_sampling_mode).lower() == "single" else len(parse_csv(args.fields))
+    anchors: list[AlignmentAnchor] = []
+    for family_index, family in enumerate(families):
+        for template_index in range(PROBE_TEMPLATES_PER_FAMILY):
+            anchor = build_numeric_probe_anchor(
+                tokenizer=tokenizer,
+                patch_size=int(args.patch_size),
+                channel_count=int(channel_count),
+                families=[family],
+                region_size=int(args.probe_region_size),
+                # Keep coordinates fixed across templates so preflight isolates wording differences.
+                probe_index=family_index,
+                seed=int(args.seed) + 200_000,
+                max_anchor_tokens=int(args.max_shared_suffix_tokens),
+                template_index=template_index,
+            )
+            probe_answer_token_ids(tokenizer, anchor)
+            anchors.append(anchor)
+    expected_count = len(families) * PROBE_TEMPLATES_PER_FAMILY
+    observed_pairs = {(anchor.probe_family, anchor.probe_template_index) for anchor in anchors}
+    if len(anchors) != expected_count or len(observed_pairs) != expected_count:
+        raise ValueError(
+            "Probe contract preflight did not cover every family/template pair: "
+            f"expected={expected_count}, anchors={len(anchors)}, unique_pairs={len(observed_pairs)}."
+        )
+    for family in families:
+        family_stems = {anchor.token_ids for anchor in anchors if anchor.probe_family == family}
+        if len(family_stems) != PROBE_TEMPLATES_PER_FAMILY:
+            raise ValueError(
+                f"Probe templates for {family} collapsed to duplicate token sequences after tokenization: "
+                f"expected={PROBE_TEMPLATES_PER_FAMILY}, unique_token_sequences={len(family_stems)}."
+            )
+    return anchors
 
 
 def train_compressor_during_alignment(args: argparse.Namespace) -> bool:
@@ -1383,12 +2104,30 @@ def train_one_epoch(
     total_contrastive = 0.0
     total_cosine = 0.0
     total_reconstruction = 0.0
+    total_probe_answer_ce = 0.0
+    total_probe_teacher_kl = 0.0
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
+    training_anchors = alignment_anchors_from_args(tokenizer, args, evaluation=False)
     progress = tqdm(loader, desc=f"train align epoch {epoch}", leave=False, disable=not is_main_process())
     for step, batch in enumerate(progress, start=1):
+        if str(args.alignment_anchor_mode) == "probe":
+            global_batch_index = (int(epoch) - 1) * len(loader) + int(step) - 1
+            channel_count = int(batch["patch"].shape[1])
+            alignment_anchor = build_numeric_probe_anchor(
+                tokenizer=tokenizer,
+                patch_size=int(args.patch_size),
+                channel_count=channel_count,
+                families=args.probe_families,
+                region_size=int(args.probe_region_size),
+                probe_index=global_batch_index,
+                seed=int(args.seed),
+                max_anchor_tokens=int(args.max_shared_suffix_tokens),
+            )
+        else:
+            alignment_anchor = training_anchors[0]
         normalized_patches = normalize_patch_batch(
             batch["patch"],
             compressor_input_size,
@@ -1406,7 +2145,15 @@ def train_one_epoch(
                 int(args.max_text_tokens),
                 int(args.teacher_layer),
                 bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
-                bool(args.fail_on_text_max_length_hit) and str(args.text_prompt_template) != "plain",
+                bool(args.fail_on_text_max_length_hit)
+                and (
+                    str(args.alignment_text_layout) == "values_shared_suffix"
+                    or str(args.text_prompt_template) != "plain"
+                ),
+                text_layout=str(args.alignment_text_layout),
+                shared_suffix=str(args.shared_suffix),
+                max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+                alignment_anchor=alignment_anchor,
             )
         if train_compressor:
             latent = compressor.encode(patches)["latent_map"]
@@ -1423,15 +2170,36 @@ def train_one_epoch(
             int(args.max_text_tokens),
             int(args.teacher_layer),
             int(normalized_patches.shape[-1]),
-            bool(args.fail_on_text_max_length_hit),
+            bool(args.fail_on_text_max_length_hit)
+            and (
+                str(args.alignment_text_layout) == "values_shared_suffix"
+                or str(args.text_prompt_template) != "plain"
+            ),
+            text_layout=str(args.alignment_text_layout),
+            shared_suffix=str(args.shared_suffix),
+            max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+            alignment_anchor=alignment_anchor,
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        if projector is None:
-            student_features = student_hidden
-            teacher_features = teacher_hidden
+        if alignment_anchor.mode == "probe":
+            baseline_hidden = probe_only_hidden(
+                llm,
+                alignment_anchor,
+                device,
+                int(args.teacher_layer),
+            ).to(dtype=student_hidden.dtype)
+            student_alignment_hidden = student_hidden - baseline_hidden
+            teacher_alignment_hidden = teacher_hidden - baseline_hidden
         else:
-            student_features, teacher_features = projector(student_hidden, teacher_hidden)
+            baseline_hidden = student_hidden.new_zeros((1, student_hidden.shape[-1]))
+            student_alignment_hidden = student_hidden
+            teacher_alignment_hidden = teacher_hidden
+        if projector is None:
+            student_features = student_alignment_hidden
+            teacher_features = teacher_alignment_hidden
+        else:
+            student_features, teacher_features = projector(student_alignment_hidden, teacher_alignment_hidden)
         tensor_embedding, text_embedding = prepare_alignment_embeddings(
             student_features,
             teacher_features,
@@ -1469,12 +2237,35 @@ def train_one_epoch(
         )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
+        probe_answer_ce = student_hidden.new_zeros(())
+        probe_teacher_kl = student_hidden.new_zeros(())
+        probe_metrics: dict[str, float] = {}
+        if alignment_anchor.mode == "probe":
+            probe_source_patches = (
+                batch["patch"]
+                if str(args.teacher_text_source).lower() == "raw"
+                else normalized_patches
+            )
+            targets = probe_target_indices(
+                quantize_probe_values(probe_source_patches, int(args.text_decimal_places)).to(device),
+                alignment_anchor,
+            )
+            probe_answer_ce, probe_teacher_kl, probe_metrics = probe_behavior_loss(
+                llm=llm,
+                student_final_hidden=student_output.final_hidden,
+                teacher_final_hidden=teacher_output.final_hidden,
+                targets=targets,
+                continuation_token_ids=probe_answer_token_ids(tokenizer, alignment_anchor),
+                kl_temperature=float(args.probe_kl_temperature),
+            )
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.cosine_loss_weight) * cosine
             + reconstruction_weight * reconstruction
+            + float(args.probe_answer_ce_weight) * probe_answer_ce
+            + float(args.probe_teacher_kl_weight) * probe_teacher_kl
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -1492,6 +2283,8 @@ def train_one_epoch(
         total_contrastive += float(contrastive.detach().cpu().item()) * batch_size
         total_cosine += float(cosine.detach().cpu().item()) * batch_size
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
+        total_probe_answer_ce += float(probe_answer_ce.detach().cpu().item()) * batch_size
+        total_probe_teacher_kl += float(probe_teacher_kl.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(
@@ -1536,6 +2329,7 @@ def train_one_epoch(
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(metric_totals, probe_metrics, batch_size, "probe_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -1559,6 +2353,9 @@ def train_one_epoch(
                 ),
                 "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_tensor_embedding),
                 "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_text_embedding),
+                "probe_baseline_hidden_norm": mean_token_norm(baseline_hidden.unsqueeze(1)),
+                "student_conditioned_delta_norm": mean_token_norm(student_alignment_hidden.unsqueeze(1)),
+                "teacher_conditioned_delta_norm": mean_token_norm(teacher_alignment_hidden.unsqueeze(1)),
             },
             batch_size,
             "alignment_",
@@ -1569,12 +2366,15 @@ def train_one_epoch(
                 loss=f"{total_loss / max(1, total_records):.4f}",
                 i2t=f"{total_i2t / max(1, total_records):.3f}",
                 t2i=f"{total_t2i / max(1, total_records):.3f}",
+                anchor=alignment_anchor.name,
             )
     metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
         "cosine_loss": total_cosine / max(1, total_records),
         "reconstruction_loss": total_reconstruction / max(1, total_records),
+        "probe_answer_ce": total_probe_answer_ce / max(1, total_records),
+        "probe_teacher_kl": total_probe_teacher_kl / max(1, total_records),
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
@@ -1682,6 +2482,7 @@ def evaluate(
     args: argparse.Namespace,
     compressor_input_size: Sequence[int],
     normalization_cfg: Mapping[str, Any],
+    alignment_anchor: AlignmentAnchor | None = None,
 ) -> dict[str, float]:
     compressor.eval()
     adapter.eval()
@@ -1691,6 +2492,8 @@ def evaluate(
     total_contrastive = 0.0
     total_cosine = 0.0
     total_reconstruction = 0.0
+    total_probe_answer_ce = 0.0
+    total_probe_teacher_kl = 0.0
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
@@ -1700,6 +2503,18 @@ def evaluate(
     collected_student_hidden: list[torch.Tensor] = []
     collected_teacher_hidden: list[torch.Tensor] = []
     train_compressor = train_compressor_during_alignment(args)
+    if alignment_anchor is None and str(args.alignment_text_layout) == "values_shared_suffix":
+        alignment_anchor = alignment_anchors_from_args(tokenizer, args, evaluation=True)[0]
+    probe_continuation_token_ids = (
+        probe_answer_token_ids(tokenizer, alignment_anchor)
+        if alignment_anchor and alignment_anchor.mode == "probe"
+        else ()
+    )
+    evaluation_baseline_hidden = (
+        probe_only_hidden(llm, alignment_anchor, device, int(args.teacher_layer))
+        if alignment_anchor and alignment_anchor.mode == "probe"
+        else None
+    )
     for batch in tqdm(loader, desc="eval align", leave=False, disable=not is_main_process()):
         normalized_patches = normalize_patch_batch(
             batch["patch"],
@@ -1716,7 +2531,15 @@ def evaluate(
             int(args.max_text_tokens),
             int(args.teacher_layer),
             bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
-            bool(args.fail_on_text_max_length_hit) and str(args.text_prompt_template) != "plain",
+            bool(args.fail_on_text_max_length_hit)
+            and (
+                str(args.alignment_text_layout) == "values_shared_suffix"
+                or str(args.text_prompt_template) != "plain"
+            ),
+            text_layout=str(args.alignment_text_layout),
+            shared_suffix=str(args.shared_suffix),
+            max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+            alignment_anchor=alignment_anchor,
         )
         latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
@@ -1730,14 +2553,26 @@ def evaluate(
             int(args.teacher_layer),
             int(normalized_patches.shape[-1]),
             bool(args.fail_on_text_max_length_hit),
+            text_layout=str(args.alignment_text_layout),
+            shared_suffix=str(args.shared_suffix),
+            max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+            alignment_anchor=alignment_anchor,
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        if projector is None:
-            student_features = student_hidden
-            teacher_features = teacher_hidden
+        if evaluation_baseline_hidden is not None:
+            baseline_hidden = evaluation_baseline_hidden.to(dtype=student_hidden.dtype)
+            student_alignment_hidden = student_hidden - baseline_hidden
+            teacher_alignment_hidden = teacher_hidden - baseline_hidden
         else:
-            student_features, teacher_features = projector(student_hidden, teacher_hidden)
+            baseline_hidden = student_hidden.new_zeros((1, student_hidden.shape[-1]))
+            student_alignment_hidden = student_hidden
+            teacher_alignment_hidden = teacher_hidden
+        if projector is None:
+            student_features = student_alignment_hidden
+            teacher_features = teacher_alignment_hidden
+        else:
+            student_features, teacher_features = projector(student_alignment_hidden, teacher_alignment_hidden)
         tensor_embedding, text_embedding = prepare_alignment_embeddings(
             student_features,
             teacher_features,
@@ -1775,18 +2610,43 @@ def evaluate(
         )
         cosine = cosine_alignment_loss(tensor_embedding, text_embedding)
         reconstruction = reconstruction_mse(compressor, latent, patches)
+        probe_answer_ce = student_hidden.new_zeros(())
+        probe_teacher_kl = student_hidden.new_zeros(())
+        probe_metrics: dict[str, float] = {}
+        if alignment_anchor is not None and alignment_anchor.mode == "probe":
+            probe_source_patches = (
+                batch["patch"]
+                if str(args.teacher_text_source).lower() == "raw"
+                else normalized_patches
+            )
+            targets = probe_target_indices(
+                quantize_probe_values(probe_source_patches, int(args.text_decimal_places)).to(device),
+                alignment_anchor,
+            )
+            probe_answer_ce, probe_teacher_kl, probe_metrics = probe_behavior_loss(
+                llm=llm,
+                student_final_hidden=student_output.final_hidden,
+                teacher_final_hidden=teacher_output.final_hidden,
+                targets=targets,
+                continuation_token_ids=probe_continuation_token_ids,
+                kl_temperature=float(args.probe_kl_temperature),
+            )
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.cosine_loss_weight) * cosine
             + reconstruction_weight * reconstruction
+            + float(args.probe_answer_ce_weight) * probe_answer_ce
+            + float(args.probe_teacher_kl_weight) * probe_teacher_kl
         )
         batch_size = int(patches.shape[0])
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_contrastive += float(contrastive.detach().cpu().item()) * batch_size
         total_cosine += float(cosine.detach().cpu().item()) * batch_size
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
+        total_probe_answer_ce += float(probe_answer_ce.detach().cpu().item()) * batch_size
+        total_probe_teacher_kl += float(probe_teacher_kl.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(
@@ -1831,6 +2691,7 @@ def evaluate(
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(metric_totals, probe_metrics, batch_size, "probe_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -1854,6 +2715,9 @@ def evaluate(
                 ),
                 "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_tensor_embedding),
                 "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden_uncentered_text_embedding),
+                "probe_baseline_hidden_norm": mean_token_norm(baseline_hidden.unsqueeze(1)),
+                "student_conditioned_delta_norm": mean_token_norm(student_alignment_hidden.unsqueeze(1)),
+                "teacher_conditioned_delta_norm": mean_token_norm(teacher_alignment_hidden.unsqueeze(1)),
             },
             batch_size,
             "alignment_",
@@ -1869,6 +2733,8 @@ def evaluate(
         "contrastive_loss": total_contrastive / max(1, total_records),
         "cosine_loss": total_cosine / max(1, total_records),
         "reconstruction_loss": total_reconstruction / max(1, total_records),
+        "probe_answer_ce": total_probe_answer_ce / max(1, total_records),
+        "probe_teacher_kl": total_probe_teacher_kl / max(1, total_records),
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
@@ -1953,6 +2819,74 @@ def evaluate(
     elif bool(args.global_retrieval_eval):
         metrics["global_retrieval_skipped"] = 1.0
     return metrics
+
+
+def average_metric_dicts(metric_dicts: Sequence[Mapping[str, float]]) -> dict[str, float]:
+    keys = sorted({key for metrics in metric_dicts for key in metrics})
+    averaged: dict[str, float] = {}
+    for key in keys:
+        values = [float(metrics[key]) for metrics in metric_dicts if isinstance(metrics.get(key), (int, float))]
+        if values:
+            averaged[key] = sum(values) / len(values)
+    return averaged
+
+
+@torch.no_grad()
+def evaluate_anchor_bank(
+    *,
+    compressor: nn.Module,
+    adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
+    llm: nn.Module,
+    tokenizer: Any,
+    loader: DataLoader,
+    device: torch.device,
+    args: argparse.Namespace,
+    compressor_input_size: Sequence[int],
+    normalization_cfg: Mapping[str, Any],
+) -> dict[str, float]:
+    if str(args.alignment_text_layout) != "values_shared_suffix":
+        return evaluate(
+            compressor=compressor,
+            adapter=adapter,
+            projector=projector,
+            llm=llm,
+            tokenizer=tokenizer,
+            loader=loader,
+            device=device,
+            args=args,
+            compressor_input_size=compressor_input_size,
+            normalization_cfg=normalization_cfg,
+        )
+
+    anchors = alignment_anchors_from_args(tokenizer, args, evaluation=True)
+    metrics_by_anchor: list[tuple[AlignmentAnchor, dict[str, float]]] = []
+    for anchor in anchors:
+        metrics = evaluate(
+            compressor=compressor,
+            adapter=adapter,
+            projector=projector,
+            llm=llm,
+            tokenizer=tokenizer,
+            loader=loader,
+            device=device,
+            args=args,
+            compressor_input_size=compressor_input_size,
+            normalization_cfg=normalization_cfg,
+            alignment_anchor=anchor,
+        )
+        metrics_by_anchor.append((anchor, metrics))
+
+    combined = average_metric_dicts([metrics for _anchor, metrics in metrics_by_anchor])
+    for anchor, metrics in metrics_by_anchor:
+        combined.update({f"anchor_{anchor.name}_{key}": float(value) for key, value in metrics.items()})
+    probe_metrics = [metrics for anchor, metrics in metrics_by_anchor if anchor.mode == "probe"]
+    if probe_metrics:
+        combined.update(
+            {f"probe_macro_{key}": value for key, value in average_metric_dicts(probe_metrics).items()}
+        )
+    combined["evaluation_anchor_count"] = float(len(metrics_by_anchor))
+    return combined
 
 
 def parse_args() -> argparse.Namespace:
@@ -2041,6 +2975,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Use normalized AE-input patches or raw patches when serializing the teacher text branch.",
     )
+    parser.add_argument(
+        "--alignment-text-layout",
+        type=str,
+        choices=("values_shared_suffix", "legacy_prompt"),
+        default=None,
+        help=(
+            "values_shared_suffix serializes only tensor values and appends the same setting-specific suffix used after "
+            "student soft embeddings; legacy_prompt preserves the original asymmetric prompts."
+        ),
+    )
+    parser.add_argument("--shared-suffix", type=str, default=None)
+    parser.add_argument(
+        "--alignment-anchor-mode",
+        type=str,
+        choices=("eos", "representation", "probe"),
+        default=None,
+        help="Select exactly one stage-1 alignment setting.",
+    )
+    parser.add_argument("--representation-suffix", type=str, default=None)
+    parser.add_argument("--probe-families", type=str, default=None)
+    parser.add_argument("--probe-region-size", type=int, default=None)
+    parser.add_argument("--evaluation-probe-count", type=int, default=None)
+    parser.add_argument("--probe-answer-ce-weight", type=float, default=None)
+    parser.add_argument("--probe-teacher-kl-weight", type=float, default=None)
+    parser.add_argument("--probe-kl-temperature", type=float, default=None)
+    parser.add_argument("--probe-teacher-preflight-records", type=int, default=None)
+    parser.add_argument("--max-shared-suffix-tokens", type=int, default=None)
     parser.add_argument("--center-embeddings", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fail-on-text-anchor-missing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fail-on-text-max-length-hit", action=argparse.BooleanOptionalAction, default=None)
@@ -2191,6 +3152,48 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "cosine_loss_weight", first_nested(config, ["patch_alignment.cosine_loss_weight"]), 0.0)
     set_default(args, "reconstruction_loss_weight", first_nested(config, ["patch_alignment.reconstruction_loss_weight"]), 1.0)
     set_default(args, "teacher_text_source", first_nested(config, ["patch_alignment.teacher_text_source"]), "normalized")
+    set_default(
+        args,
+        "alignment_text_layout",
+        first_nested(config, ["patch_alignment.alignment_text_layout"]),
+        "legacy_prompt",
+    )
+    set_default(args, "shared_suffix", first_nested(config, ["patch_alignment.shared_suffix"]), "\nRepresentation:")
+    set_default(
+        args,
+        "alignment_anchor_mode",
+        first_nested(config, ["patch_alignment.alignment_anchor_mode"]),
+        "representation",
+    )
+    set_default(
+        args,
+        "representation_suffix",
+        first_nested(config, ["patch_alignment.representation_suffix"]),
+        args.shared_suffix,
+    )
+    set_default(
+        args,
+        "probe_families",
+        value_to_csv(first_nested(config, ["patch_alignment.probe_families"])),
+        "point_sign,point_relation,region_mean_relation,region_range_relation,directional_change",
+    )
+    set_default(args, "probe_region_size", first_nested(config, ["patch_alignment.probe_region_size"]), 4)
+    set_default(args, "evaluation_probe_count", first_nested(config, ["patch_alignment.evaluation_probe_count"]), 3)
+    set_default(args, "probe_answer_ce_weight", first_nested(config, ["patch_alignment.probe_answer_ce_weight"]), 0.2)
+    set_default(args, "probe_teacher_kl_weight", first_nested(config, ["patch_alignment.probe_teacher_kl_weight"]), 0.2)
+    set_default(args, "probe_kl_temperature", first_nested(config, ["patch_alignment.probe_kl_temperature"]), 1.0)
+    set_default(
+        args,
+        "probe_teacher_preflight_records",
+        first_nested(config, ["patch_alignment.probe_teacher_preflight_records"]),
+        8,
+    )
+    set_default(
+        args,
+        "max_shared_suffix_tokens",
+        first_nested(config, ["patch_alignment.max_shared_suffix_tokens"]),
+        96,
+    )
     set_default(args, "center_embeddings", first_nested(config, ["patch_alignment.center_embeddings"]), False)
     set_default(
         args,
@@ -2238,6 +3241,43 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("encoder_source=checkpoint requires --compressor-checkpoint or patch_alignment.compressor_checkpoint.")
     if int(args.max_text_tokens) <= 0:
         raise ValueError("patch_alignment.max_text_tokens must be positive.")
+    if int(args.max_shared_suffix_tokens) <= 0:
+        raise ValueError("patch_alignment.max_shared_suffix_tokens must be positive.")
+    args.alignment_anchor_mode = str(args.alignment_anchor_mode).lower()
+    args.probe_families = [family.lower() for family in parse_csv(args.probe_families)]
+    if str(args.alignment_text_layout) != "values_shared_suffix" and args.alignment_anchor_mode != "representation":
+        raise ValueError(
+            "eos/probe alignment_anchor_mode requires alignment_text_layout=values_shared_suffix."
+        )
+    if str(args.alignment_text_layout) == "values_shared_suffix":
+        valid_anchor_modes = {"eos", "representation", "probe"}
+        if args.alignment_anchor_mode not in valid_anchor_modes:
+            raise ValueError(
+                "patch_alignment.alignment_anchor_mode must be eos, representation, or probe."
+            )
+        if args.alignment_anchor_mode == "representation" and not str(args.representation_suffix):
+            raise ValueError("patch_alignment.representation_suffix must not be empty.")
+        if args.alignment_anchor_mode == "probe":
+            if not args.probe_families:
+                raise ValueError("patch_alignment.probe_families must not be empty in probe mode.")
+            unsupported_probe_families = sorted(
+                set(args.probe_families) - set(PROBE_FAMILIES)
+            )
+            if unsupported_probe_families:
+                raise ValueError(f"Unsupported patch_alignment.probe_families: {unsupported_probe_families}.")
+            if len(args.probe_families) != len(set(args.probe_families)):
+                raise ValueError("patch_alignment.probe_families must not contain duplicates.")
+            if int(args.probe_region_size) <= 0 or int(args.probe_region_size) >= int(args.patch_size):
+                raise ValueError("patch_alignment.probe_region_size must be between 1 and patch_size - 1.")
+            if int(args.evaluation_probe_count) <= 0:
+                raise ValueError("patch_alignment.evaluation_probe_count must be positive.")
+            for name in ("probe_answer_ce_weight", "probe_teacher_kl_weight"):
+                if float(getattr(args, name)) < 0.0:
+                    raise ValueError(f"patch_alignment.{name} must be non-negative.")
+            if float(args.probe_kl_temperature) <= 0.0:
+                raise ValueError("patch_alignment.probe_kl_temperature must be positive.")
+            if int(args.probe_teacher_preflight_records) < 0:
+                raise ValueError("patch_alignment.probe_teacher_preflight_records must be non-negative.")
     if int(args.text_preflight_records) < 0:
         raise ValueError("patch_alignment.text_preflight_records must be non-negative.")
     if int(args.global_retrieval_max_records) <= 0:
@@ -2301,9 +3341,19 @@ def preflight_teacher_text_tokenization(
     compressor_input_size: Sequence[int],
     normalization_cfg: Mapping[str, Any],
 ) -> dict[str, float]:
+    contract_anchors = (
+        probe_contract_anchors(tokenizer, args)
+        if str(args.alignment_text_layout) == "values_shared_suffix"
+        and str(args.alignment_anchor_mode) == "probe"
+        else []
+    )
     record_count = min(int(args.text_preflight_records), len(dataset))
     if record_count <= 0:
-        return {}
+        return {
+            "probe_contract_anchor_count": float(len(contract_anchors)),
+            "probe_contract_family_count": float(len(parse_csv(args.probe_families))),
+            "probe_contract_templates_per_family": float(PROBE_TEMPLATES_PER_FAMILY),
+        } if contract_anchors else {}
     items = [dataset[index] for index in range(record_count)]
     batch = collate_patch_text(items)
     normalized_patches = normalize_patch_batch(
@@ -2313,6 +3363,70 @@ def preflight_teacher_text_tokenization(
         bool(args.resize_patch_to_compressor_input),
     )
     texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+    if str(args.alignment_text_layout) == "values_shared_suffix":
+        anchors: list[AlignmentAnchor] = []
+        seen: set[tuple[str, tuple[int, ...]]] = set()
+        anchors_to_check = contract_anchors or (
+            alignment_anchors_from_args(tokenizer, args, evaluation=False)
+            + alignment_anchors_from_args(tokenizer, args, evaluation=True)
+        )
+        for anchor in anchors_to_check:
+            key = (anchor.mode, anchor.token_ids)
+            if key not in seen:
+                seen.add(key)
+                anchors.append(anchor)
+        anchor_metrics: list[tuple[AlignmentAnchor, dict[str, float]]] = []
+        for anchor in anchors:
+            packed = tokenize_contents_with_anchor(
+                tokenizer=tokenizer,
+                contents=texts,
+                anchor=anchor,
+                max_tokens=int(args.max_text_tokens),
+                require_under_max_length=bool(args.fail_on_text_max_length_hit),
+                context=f"teacher text preflight ({anchor.name})",
+            )
+            anchor_metrics.append((anchor, dict(packed.metrics)))
+        summary = average_metric_dicts([metrics for _anchor, metrics in anchor_metrics])
+        for risk_key in (
+            "token_count_max",
+            "content_token_count_max",
+            "suffix_token_count",
+            "content_truncated_fraction",
+            "max_length_hit_fraction",
+            "anchor_missing_fraction",
+        ):
+            summary[risk_key] = max(metrics[risk_key] for _anchor, metrics in anchor_metrics)
+        summary["anchor_count"] = float(len(anchor_metrics))
+        for anchor, metrics in anchor_metrics:
+            summary.update({f"anchor_{anchor.name}_{key}": value for key, value in metrics.items()})
+        if contract_anchors:
+            source_patches = (
+                batch["patch"]
+                if str(args.teacher_text_source).lower() == "raw"
+                else normalized_patches
+            )
+            visible_patches = quantize_probe_values(source_patches, int(args.text_decimal_places))
+            active_class_counts: list[int] = []
+            majority_fractions: list[float] = []
+            for anchor in contract_anchors:
+                targets = probe_target_indices(visible_patches, anchor)
+                class_counts = torch.bincount(targets.cpu(), minlength=len(anchor.probe_answers))
+                active_class_count = int((class_counts > 0).sum().item())
+                majority_fraction = float(class_counts.max().item() / max(1, int(targets.numel())))
+                active_class_counts.append(active_class_count)
+                majority_fractions.append(majority_fraction)
+                summary[f"anchor_{anchor.name}_target_active_classes"] = float(active_class_count)
+                summary[f"anchor_{anchor.name}_target_majority_fraction"] = majority_fraction
+                for class_index, count in enumerate(class_counts.tolist()):
+                    summary[f"anchor_{anchor.name}_target_class_{class_index}_fraction"] = float(
+                        count / max(1, int(targets.numel()))
+                    )
+            summary["probe_contract_anchor_count"] = float(len(contract_anchors))
+            summary["probe_contract_family_count"] = float(len(parse_csv(args.probe_families)))
+            summary["probe_contract_templates_per_family"] = float(PROBE_TEMPLATES_PER_FAMILY)
+            summary["probe_target_min_active_classes"] = float(min(active_class_counts))
+            summary["probe_target_max_majority_fraction"] = float(max(majority_fractions))
+        return summary
     encoded = tokenizer(
         texts,
         padding=True,
@@ -2331,6 +3445,131 @@ def preflight_teacher_text_tokenization(
         and str(args.text_prompt_template) != "plain",
         context="teacher text preflight",
     )
+
+
+@torch.no_grad()
+def preflight_probe_teacher_behavior(
+    *,
+    dataset: Dataset,
+    tokenizer: Any,
+    llm: nn.Module,
+    device: torch.device,
+    args: argparse.Namespace,
+    compressor_input_size: Sequence[int],
+    normalization_cfg: Mapping[str, Any],
+) -> dict[str, float]:
+    if str(args.alignment_anchor_mode) != "probe":
+        return {}
+    record_count = min(int(args.probe_teacher_preflight_records), len(dataset))
+    if record_count <= 0:
+        return {}
+    items = [dataset[index] for index in range(record_count)]
+    batch = collate_patch_text(items)
+    normalized_patches = normalize_patch_batch(
+        batch["patch"],
+        compressor_input_size,
+        normalization_cfg,
+        bool(args.resize_patch_to_compressor_input),
+    )
+    texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+    source_patches = (
+        batch["patch"]
+        if str(args.teacher_text_source).lower() == "raw"
+        else normalized_patches
+    )
+    visible_patches = quantize_probe_values(source_patches, int(args.text_decimal_places))
+    anchors = probe_contract_anchors(tokenizer, args)
+    output_embeddings = llm.get_output_embeddings()
+    if output_embeddings is None:
+        raise ValueError("The frozen causal LLM must expose an output embedding layer for probe preflight.")
+
+    total_records = 0
+    total_completion_correct = 0
+    total_strict_correct = 0
+    total_format_correct = 0
+    total_answer_nll = 0.0
+    family_totals: dict[str, dict[str, float]] = {}
+    metrics: dict[str, float] = {
+        "anchor_count": float(len(anchors)),
+        "record_count_per_anchor": float(record_count),
+    }
+    progress = tqdm(
+        anchors,
+        desc="probe teacher preflight",
+        leave=False,
+        disable=not is_main_process(),
+    )
+    for anchor in progress:
+        teacher_output = text_teacher_hidden(
+            llm,
+            tokenizer,
+            texts,
+            device,
+            int(args.max_text_tokens),
+            int(args.teacher_layer),
+            bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+            bool(args.fail_on_text_max_length_hit),
+            text_layout=str(args.alignment_text_layout),
+            shared_suffix=str(args.shared_suffix),
+            max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+            alignment_anchor=anchor,
+        )
+        targets = probe_target_indices(visible_patches, anchor).to(device=device, dtype=torch.long)
+        continuation_ids = torch.tensor(
+            probe_answer_token_ids(tokenizer, anchor),
+            dtype=torch.long,
+            device=device,
+        )
+        answer_token_ids = continuation_ids.index_select(0, targets)
+        vocab_logits = output_embeddings(teacher_output.final_hidden).float()
+        continuation_logits = vocab_logits.index_select(1, continuation_ids)
+        completion_correct = int((continuation_logits.argmax(dim=-1) == targets).sum().item())
+        top_tokens = vocab_logits.argmax(dim=-1)
+        strict_correct = int((top_tokens == answer_token_ids).sum().item())
+        format_correct = int(
+            (top_tokens.unsqueeze(1) == continuation_ids.unsqueeze(0)).any(dim=1).sum().item()
+        )
+        answer_nll_sum = float(F.cross_entropy(vocab_logits, answer_token_ids, reduction="sum").item())
+        anchor_records = int(targets.numel())
+        anchor_prefix = f"anchor_{anchor.name}"
+        metrics[f"{anchor_prefix}_completion_accuracy"] = completion_correct / max(1, anchor_records)
+        metrics[f"{anchor_prefix}_strict_accuracy"] = strict_correct / max(1, anchor_records)
+        metrics[f"{anchor_prefix}_format_rate"] = format_correct / max(1, anchor_records)
+        metrics[f"{anchor_prefix}_answer_nll"] = answer_nll_sum / max(1, anchor_records)
+
+        family = str(anchor.probe_family)
+        family_total = family_totals.setdefault(
+            family,
+            {"records": 0.0, "completion": 0.0, "strict": 0.0, "format": 0.0, "nll": 0.0},
+        )
+        family_total["records"] += anchor_records
+        family_total["completion"] += completion_correct
+        family_total["strict"] += strict_correct
+        family_total["format"] += format_correct
+        family_total["nll"] += answer_nll_sum
+        total_records += anchor_records
+        total_completion_correct += completion_correct
+        total_strict_correct += strict_correct
+        total_format_correct += format_correct
+        total_answer_nll += answer_nll_sum
+
+    metrics["teacher_completion_accuracy"] = total_completion_correct / max(1, total_records)
+    metrics["teacher_strict_accuracy"] = total_strict_correct / max(1, total_records)
+    metrics["teacher_answer_format_rate"] = total_format_correct / max(1, total_records)
+    metrics["teacher_answer_nll"] = total_answer_nll / max(1, total_records)
+    metrics["teacher_kl_active_fraction"] = metrics["teacher_strict_accuracy"]
+    for family, totals in family_totals.items():
+        family_records = max(1.0, totals["records"])
+        metrics[f"family_{family}_completion_accuracy"] = totals["completion"] / family_records
+        metrics[f"family_{family}_strict_accuracy"] = totals["strict"] / family_records
+        metrics[f"family_{family}_format_rate"] = totals["format"] / family_records
+        metrics[f"family_{family}_answer_nll"] = totals["nll"] / family_records
+
+    all_families_activate_kl = all(totals["strict"] > 0.0 for totals in family_totals.values())
+    metrics["teacher_kl_viable"] = float(
+        float(args.probe_teacher_kl_weight) <= 0.0 or all_families_activate_kl
+    )
+    return metrics
 
 
 def save_checkpoint(
@@ -2367,6 +3606,15 @@ def numeric_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]
     return payload
 
 
+def alignment_wandb_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
+    summary_metrics = {
+        key: value
+        for key, value in metrics.items()
+        if not key.startswith(("anchor_", "probe_macro_"))
+    }
+    return numeric_payload(prefix, summary_metrics)
+
+
 def fmt_metric(metrics: Mapping[str, Any], key: str) -> str:
     value = metrics.get(key)
     if isinstance(value, (int, float)):
@@ -2376,20 +3624,19 @@ def fmt_metric(metrics: Mapping[str, Any], key: str) -> str:
 
 def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
     return (
-        f"main_i2t={fmt_metric(metrics, 'i2t_accuracy')} "
-        f"main_t2i={fmt_metric(metrics, 't2i_accuracy')} "
-        f"centered_i2t={fmt_metric(metrics, 'centered_i2t_accuracy')} "
-        f"centered_t2i={fmt_metric(metrics, 'centered_t2i_accuracy')} "
-        f"uncentered_i2t={fmt_metric(metrics, 'uncentered_i2t_accuracy')} "
-        f"uncentered_t2i={fmt_metric(metrics, 'uncentered_t2i_accuracy')} "
+        f"i2t={fmt_metric(metrics, 'i2t_accuracy')} "
+        f"t2i={fmt_metric(metrics, 't2i_accuracy')} "
         f"global_i2t={fmt_metric(metrics, 'global_i2t_accuracy')} "
         f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')} "
-        f"global_centered_i2t={fmt_metric(metrics, 'global_centered_i2t_accuracy')} "
-        f"global_centered_t2i={fmt_metric(metrics, 'global_centered_t2i_accuracy')} "
-        f"global_uncentered_i2t={fmt_metric(metrics, 'global_uncentered_i2t_accuracy')} "
-        f"global_uncentered_t2i={fmt_metric(metrics, 'global_uncentered_t2i_accuracy')} "
-        f"global_hidden_uncentered_i2t={fmt_metric(metrics, 'global_hidden_uncentered_i2t_accuracy')} "
-        f"global_hidden_uncentered_t2i={fmt_metric(metrics, 'global_hidden_uncentered_t2i_accuracy')}"
+        f"completion={fmt_metric(metrics, 'probe_completion_accuracy')} "
+        f"shuffled={fmt_metric(metrics, 'probe_shuffled_completion_accuracy')} "
+        f"gain={fmt_metric(metrics, 'probe_completion_latent_gain')} "
+        f"strict={fmt_metric(metrics, 'probe_answer_token_accuracy')} "
+        f"format={fmt_metric(metrics, 'probe_answer_format_rate')} "
+        f"teacher_completion={fmt_metric(metrics, 'probe_teacher_completion_accuracy')} "
+        f"teacher_strict={fmt_metric(metrics, 'probe_teacher_answer_token_accuracy')} "
+        f"answer_ce={fmt_metric(metrics, 'probe_answer_ce')} "
+        f"teacher_kl={fmt_metric(metrics, 'probe_teacher_kl')}"
     )
 
 
@@ -2448,6 +3695,18 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "cosine_loss_weight": float(args.cosine_loss_weight),
             "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
             "teacher_text_source": str(args.teacher_text_source),
+            "alignment_text_layout": str(args.alignment_text_layout),
+            "shared_suffix": str(args.shared_suffix),
+            "alignment_anchor_mode": str(args.alignment_anchor_mode),
+            "representation_suffix": str(args.representation_suffix),
+            "probe_families": list(args.probe_families),
+            "probe_region_size": int(args.probe_region_size),
+            "evaluation_probe_count": int(args.evaluation_probe_count),
+            "probe_answer_ce_weight": float(args.probe_answer_ce_weight),
+            "probe_teacher_kl_weight": float(args.probe_teacher_kl_weight),
+            "probe_kl_temperature": float(args.probe_kl_temperature),
+            "probe_teacher_preflight_records": int(args.probe_teacher_preflight_records),
+            "max_shared_suffix_tokens": int(args.max_shared_suffix_tokens),
             "center_embeddings": bool(args.center_embeddings),
             "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
             "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
@@ -2639,7 +3898,10 @@ def main() -> None:
         "patch_size": int(args.patch_size),
         "decimal_places": int(args.text_decimal_places),
         "prompt_template": str(args.text_prompt_template),
-        "include_raw_text": str(args.teacher_text_source).lower() == "raw",
+        "include_raw_text": (
+            str(args.teacher_text_source).lower() == "raw"
+            and str(args.alignment_text_layout) == "legacy_prompt"
+        ),
     }
     train_dataset = PDEBenchPatchTextDataset(records=train_records, **dataset_kwargs)
     val_dataset = PDEBenchPatchTextDataset(records=val_records, **dataset_kwargs)
@@ -2665,12 +3927,109 @@ def main() -> None:
     )
     val_loader = make_loader(val_dataset, int(args.eval_batch_size), False, int(args.num_workers))
     test_loader = make_loader(test_dataset, int(args.eval_batch_size), False, int(args.num_workers))
+    probe_contract_anchor_bank = probe_contract_anchors(tokenizer, args)
+    if is_main_process() and probe_contract_anchor_bank:
+        dump_json(
+            run_dir / "probe_contract.json",
+            {
+                "family_count": len(parse_csv(args.probe_families)),
+                "templates_per_family": PROBE_TEMPLATES_PER_FAMILY,
+                "answers_are_input": False,
+                "anchors": [
+                    {
+                        "name": anchor.name,
+                        "text": anchor.text,
+                        "token_ids": list(anchor.token_ids),
+                        "token_count": len(anchor.token_ids),
+                        "probe_family": anchor.probe_family,
+                        "probe_template_index": anchor.probe_template_index,
+                        "probe_parameters": list(anchor.probe_parameters),
+                        "probe_answers": list(anchor.probe_answers),
+                        "probe_answer_token_ids": list(probe_answer_token_ids(tokenizer, anchor)),
+                    }
+                    for anchor in probe_contract_anchor_bank
+                ],
+            },
+        )
     text_preflight_metrics = preflight_teacher_text_tokenization(
         dataset=train_dataset,
         tokenizer=tokenizer,
         args=args,
         compressor_input_size=compressor_input_size,
         normalization_cfg=normalization_cfg,
+    )
+    if is_main_process() and text_preflight_metrics:
+        dump_json(run_dir / "probe_tokenization_preflight.json", text_preflight_metrics)
+    if text_preflight_metrics:
+        distributed_barrier()
+    if (
+        str(args.alignment_anchor_mode) == "probe"
+        and int(args.text_preflight_records) > 0
+        and text_preflight_metrics.get("probe_target_min_active_classes", 0.0) < 2.0
+    ):
+        raise ValueError(
+            "Probe tokenization preflight found a family/template with fewer than two target classes. "
+            f"See {run_dir / 'probe_tokenization_preflight.json'}. Increase text_preflight_records or "
+            "revise field/record sampling before a long run."
+        )
+    if (
+        is_main_process()
+        and str(args.alignment_anchor_mode) == "probe"
+        and int(args.probe_teacher_preflight_records) > 0
+    ):
+        print(
+            "probe_teacher_preflight_start "
+            f"families={len(parse_csv(args.probe_families))} "
+            f"templates_per_family={PROBE_TEMPLATES_PER_FAMILY} "
+            f"records_per_template={min(int(args.probe_teacher_preflight_records), len(train_dataset))}"
+        )
+    probe_teacher_preflight_metrics = preflight_probe_teacher_behavior(
+        dataset=train_dataset,
+        tokenizer=tokenizer,
+        llm=llm,
+        device=device,
+        args=args,
+        compressor_input_size=compressor_input_size,
+        normalization_cfg=normalization_cfg,
+    )
+    if is_main_process() and probe_teacher_preflight_metrics:
+        dump_json(run_dir / "probe_teacher_preflight.json", probe_teacher_preflight_metrics)
+        print(
+            "probe_teacher_preflight "
+            f"completion={probe_teacher_preflight_metrics['teacher_completion_accuracy']:.4f} "
+            f"strict={probe_teacher_preflight_metrics['teacher_strict_accuracy']:.4f} "
+            f"format={probe_teacher_preflight_metrics['teacher_answer_format_rate']:.4f} "
+            f"kl_active={probe_teacher_preflight_metrics['teacher_kl_active_fraction']:.4f} "
+            f"answer_nll={probe_teacher_preflight_metrics['teacher_answer_nll']:.4f}"
+        )
+    if probe_teacher_preflight_metrics:
+        distributed_barrier()
+    if (
+        probe_teacher_preflight_metrics
+        and float(args.probe_teacher_kl_weight) > 0.0
+        and probe_teacher_preflight_metrics["teacher_kl_viable"] == 0.0
+    ):
+        missing_kl_families = [
+            family
+            for family in parse_csv(args.probe_families)
+            if probe_teacher_preflight_metrics.get(f"family_{family}_strict_accuracy", 0.0) == 0.0
+        ]
+        raise ValueError(
+            "Probe Teacher preflight found no strict canonical continuation for these families: "
+            f"{missing_kl_families}. The configured Teacher KL would be inactive for them. "
+            f"See {run_dir / 'probe_contract.json'} and {run_dir / 'probe_teacher_preflight.json'}, "
+            "revise the continuation interface, "
+            "or explicitly set patch_alignment.probe_teacher_kl_weight: 0 before a long run."
+        )
+    training_anchors = (
+        alignment_anchors_from_args(tokenizer, args, evaluation=False)
+        if str(args.alignment_text_layout) == "values_shared_suffix"
+        else []
+    )
+    evaluation_anchors = (
+        alignment_anchors_from_args(tokenizer, args, evaluation=True)
+        if str(args.alignment_text_layout) == "values_shared_suffix"
+        else []
     )
 
     with torch.no_grad():
@@ -2781,6 +4140,71 @@ def main() -> None:
         },
         "teacher_layer": int(args.teacher_layer),
         "teacher_text_source": str(args.teacher_text_source),
+        "alignment_text_layout": str(args.alignment_text_layout),
+        "alignment_anchor_mode": str(args.alignment_anchor_mode),
+        "representation_suffix": str(args.representation_suffix),
+        "probe_families": list(args.probe_families),
+        "probe_region_size": int(args.probe_region_size),
+        "evaluation_probe_count": int(args.evaluation_probe_count),
+        "probe_answer_ce_weight": float(args.probe_answer_ce_weight),
+        "probe_teacher_kl_weight": float(args.probe_teacher_kl_weight),
+        "probe_kl_temperature": float(args.probe_kl_temperature),
+        "probe_teacher_preflight_records": int(args.probe_teacher_preflight_records),
+        "probe_contract_anchors": [
+            {
+                "name": anchor.name,
+                "text": anchor.text,
+                "token_ids": list(anchor.token_ids),
+                "token_count": len(anchor.token_ids),
+                "probe_family": anchor.probe_family,
+                "probe_template_index": anchor.probe_template_index,
+                "probe_parameters": list(anchor.probe_parameters),
+                "probe_answers": list(anchor.probe_answers),
+                "probe_answer_token_ids": list(probe_answer_token_ids(tokenizer, anchor)),
+            }
+            for anchor in probe_contract_anchor_bank
+        ],
+        "training_anchors": [
+            {
+                "name": anchor.name,
+                "mode": anchor.mode,
+                "text": anchor.text,
+                "token_ids": list(anchor.token_ids),
+                "token_count": len(anchor.token_ids),
+                "probe_family": anchor.probe_family,
+                "probe_template_index": anchor.probe_template_index,
+                "probe_parameters": list(anchor.probe_parameters),
+                "probe_answers": list(anchor.probe_answers),
+                "probe_answer_token_ids": (
+                    list(probe_answer_token_ids(tokenizer, anchor)) if anchor.mode == "probe" else []
+                ),
+            }
+            for anchor in training_anchors
+        ],
+        "evaluation_anchors": [
+            {
+                "name": anchor.name,
+                "mode": anchor.mode,
+                "text": anchor.text,
+                "token_ids": list(anchor.token_ids),
+                "token_count": len(anchor.token_ids),
+                "probe_family": anchor.probe_family,
+                "probe_template_index": anchor.probe_template_index,
+                "probe_parameters": list(anchor.probe_parameters),
+                "probe_answers": list(anchor.probe_answers),
+                "probe_answer_token_ids": (
+                    list(probe_answer_token_ids(tokenizer, anchor)) if anchor.mode == "probe" else []
+                ),
+            }
+            for anchor in evaluation_anchors
+        ],
+        "anchor_aggregation": {
+            "training_schedule": "one shared probe per batch; families and four templates cycle uniformly",
+            "primary_validation": "mean over fixed probes only when probe mode is selected",
+            "global_retrieval": "separate_candidate_library_per_anchor",
+            "probe_hidden": "conditioned_hidden_minus_probe_only_hidden",
+        },
+        "max_shared_suffix_tokens": int(args.max_shared_suffix_tokens),
         "center_embeddings": bool(args.center_embeddings),
         "contrastive_loss_weight": float(args.contrastive_loss_weight),
         "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
@@ -2792,12 +4216,19 @@ def main() -> None:
         "global_retrieval_chunk_size": int(args.global_retrieval_chunk_size),
         "text_preflight_records": int(args.text_preflight_records),
         "text_preflight": dict(text_preflight_metrics),
+        "probe_teacher_preflight": dict(probe_teacher_preflight_metrics),
         "adapter_type": str(args.adapter_type),
         "query_tokens": int(args.query_tokens),
         "adapter_layers": int(args.adapter_layers),
         "adapter_heads": int(args.adapter_heads),
         "soft_prompt_scale": float(args.soft_prompt_scale),
-        "alignment_mode": "input_soft_prompt_hidden",
+        "alignment_mode": (
+            "input_soft_prompt_natural_completion_probe"
+            if str(args.alignment_anchor_mode) == "probe"
+            else "input_soft_prompt_shared_suffix_hidden"
+            if str(args.alignment_text_layout) == "values_shared_suffix"
+            else "input_soft_prompt_hidden"
+        ),
         "distributed": {
             "enabled": bool(distributed_is_initialized()),
             "rank": int(distributed_rank()),
@@ -2834,6 +4265,9 @@ def main() -> None:
         )
         print(
             "alignment_objective "
+            f"text_layout={str(args.alignment_text_layout)} "
+            f"train_anchors={','.join(anchor.name for anchor in training_anchors) or 'legacy'} "
+            f"eval_anchors={','.join(anchor.name for anchor in evaluation_anchors) or 'legacy'} "
             f"center_embeddings={bool(args.center_embeddings)} "
             f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
             f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
@@ -2851,8 +4285,14 @@ def main() -> None:
                 "teacher_text_preflight "
                 f"token_mean={text_preflight_metrics.get('token_count_mean', 0.0):.1f} "
                 f"token_max={text_preflight_metrics.get('token_count_max', 0.0):.0f} "
+                f"content_token_max={text_preflight_metrics.get('content_token_count_max', 0.0):.0f} "
+                f"suffix_tokens={text_preflight_metrics.get('suffix_token_count', 0.0):.0f} "
+                f"content_truncated={text_preflight_metrics.get('content_truncated_fraction', 0.0):.3f} "
                 f"anchor_missing={text_preflight_metrics.get('anchor_missing_fraction', 0.0):.3f} "
-                f"max_len_hit={text_preflight_metrics.get('max_length_hit_fraction', 0.0):.3f}"
+                f"max_len_hit={text_preflight_metrics.get('max_length_hit_fraction', 0.0):.3f} "
+                f"probe_anchors={text_preflight_metrics.get('probe_contract_anchor_count', 0.0):.0f} "
+                f"min_active_classes={text_preflight_metrics.get('probe_target_min_active_classes', 0.0):.0f} "
+                f"max_target_majority={text_preflight_metrics.get('probe_target_max_majority_fraction', 0.0):.3f}"
             )
     wandb_logger = WandbLogger(config=build_wandb_config(args, run_summary), run_dir=run_dir) if is_main_process() else None
     global_step = 0
@@ -2954,7 +4394,7 @@ def main() -> None:
         )
         global_step += len(train_loader)
         if is_main_process():
-            val_metrics = evaluate(
+            val_metrics = evaluate_anchor_bank(
                 compressor=compressor,
                 adapter=adapter,
                 projector=alignment_projector,
@@ -2998,8 +4438,8 @@ def main() -> None:
                 "best_val/loss": float(best_val),
                 "best_val/epoch": float(best_epoch),
             }
-            wandb_payload.update(numeric_payload("train", train_metrics))
-            wandb_payload.update(numeric_payload("val", val_metrics))
+            wandb_payload.update(alignment_wandb_payload("train", train_metrics))
+            wandb_payload.update(alignment_wandb_payload("val", val_metrics))
             if wandb_logger is not None:
                 wandb_logger.log(wandb_payload, step=global_step)
             print(
@@ -3017,7 +4457,7 @@ def main() -> None:
             alignment_projector.load_state_dict(best_checkpoint["alignment_projector_state_dict"])
         if bool(args.train_patch_ae) and "compressor_state_dict" in best_checkpoint:
             compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
-        test_metrics = evaluate(
+        test_metrics = evaluate_anchor_bank(
             compressor=compressor,
             adapter=adapter,
             projector=alignment_projector,
@@ -3034,7 +4474,7 @@ def main() -> None:
         dump_json(run_dir / "metrics_latest.json", metrics_history)
         dump_json(run_dir / "test_metrics.json", test_metrics)
         if wandb_logger is not None:
-            wandb_logger.log(numeric_payload("test", test_metrics), step=global_step)
+            wandb_logger.log(alignment_wandb_payload("test", test_metrics), step=global_step)
             if bool(args.wandb_log_model):
                 log_checkpoint_artifact(
                     wandb_logger,
@@ -3056,7 +4496,10 @@ def main() -> None:
                 )
             wandb_logger.finish()
         print(f"Run directory: {run_dir}")
-        print(json.dumps({"best_epoch": best_epoch, "test": test_metrics}, ensure_ascii=False, indent=2))
+        print(
+            f"best_epoch={best_epoch} test_loss={float(test_metrics['loss']):.4f} "
+            f"test[{alignment_metric_summary(test_metrics)}]"
+        )
     distributed_barrier()
     cleanup_distributed()
 
