@@ -279,6 +279,17 @@ patch_alignment:
   # Hugging Face hidden_states[2] is the output after two transformer blocks.
   # Index 0 is rejected because it is the non-contextual input embedding at the readout token.
   teacher_layer: 2
+  # Read-only frozen-Qwen scan used before choosing teacher_layer. It never trains or loads the AE/Q-Former/projector.
+  # Run scripts/scan_tensor_teacher_layers.py; --anchor-mode can override probe with eos or representation.
+  layer_scan:
+    split: val
+    records: 128
+    batch_size: 8
+    layers: all
+    probe_count: 5
+    # Deterministic checkerboard perturbation as a fraction of each patch channel's standard deviation.
+    perturbation_scale: 0.01
+    device: auto
   log_interval: 20
 
 adapter:

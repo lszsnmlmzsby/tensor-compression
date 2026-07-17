@@ -1051,6 +1051,18 @@ text path:
 
 当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；对齐位置是 suffix 最后一个 token 的 hidden state。Qwen2.5-1.5B 有 28 个 decoder layers，Hugging Face 的 `hidden_states[2]` 表示经过前两个 Transformer block 后的输出；当前 `teacher_layer: 2` 只读该位置，不读取最终层或 LM head。`hidden_states[0]` 只是上下文化前的输入 embedding，共享 readout token 在该位置看不到前面的 tensor，因此程序会拒绝 `teacher_layer <= 0`。
 
+Transformer block 不会删除或重排序列位置。以 16 个 Q-Former soft embeddings 加 1 个 EOS 为例，每一层的零基下标 16（第 17 个位置）仍对应同一个 EOS readout；变化的是该位置经过更多 block 后的 hidden vector。只有 EOS 模式固定为 17 个 student 位置；probe/representation 模式的最后位置是一基 `16 + suffix_token_count`。该位置同样在所有层保持不变。padding 只用于对齐 batch 长度，不会作为 readout。
+
+在正式训练前可用只读扫描脚本比较 frozen teacher 的所有层。它沿用 config 中的数据切分、归一化、数值精度和 suffix，既不训练也不加载 AE、Q-Former 或 alignment projector：
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python scripts/scan_tensor_teacher_layers.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --anchor-mode probe
+```
+
+EOS 对照只需把最后一项改成 `--anchor-mode eos`。默认扫描 128 个验证 patch 和 `hidden_states[1..28]`；完整结果写入 `patch_alignment.output_root/teacher_layer_scan_*.json`。控制台的 `pair_cos` 越低表示跨样本角度坍缩越弱，`eff_rank` 越高表示变化占用的独立方向越多，`locality_margin = perturb_cos - pair_cos` 越高表示小扰动样本仍比无关样本更接近。不能仅凭最低 `pair_cos` 选层；优先选择三项同时较好的层，再进行一次正式训练。
+
 注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
 
 Teacher branch 只包含配置后的 tensor 数值和形状分隔符：
