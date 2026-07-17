@@ -1421,6 +1421,21 @@ def tokenize_contents_with_anchor(
         attention_mask[row_index, : len(row)] = 1
 
     lengths = attention_mask.sum(dim=1)
+    missing_anchor = 0
+    suffix_tensor = torch.tensor(suffix_ids, dtype=torch.long)
+    for row_index, length in enumerate(lengths.tolist()):
+        length = int(length)
+        if length < len(suffix_ids):
+            missing_anchor += 1
+            continue
+        observed_suffix = input_ids[row_index, length - len(suffix_ids) : length]
+        if not torch.equal(observed_suffix.cpu(), suffix_tensor):
+            missing_anchor += 1
+    if missing_anchor:
+        raise ValueError(
+            f"{context} did not preserve the alignment anchor at the final non-padding token for "
+            f"{missing_anchor}/{len(packed_rows)} sequences. This violates the shared-anchor readout contract."
+        )
     max_length_hits = int((lengths >= int(max_tokens)).sum().item())
     batch_size = len(packed_rows)
     metrics = {
@@ -1431,7 +1446,7 @@ def tokenize_contents_with_anchor(
         "suffix_token_count": float(len(suffix_ids)),
         "content_truncated_fraction": float(truncated_count / max(1, batch_size)),
         "max_length_hit_fraction": float(max_length_hits / max(1, batch_size)),
-        "anchor_missing_fraction": 0.0,
+        "anchor_missing_fraction": float(missing_anchor / max(1, batch_size)),
     }
     return SharedSuffixTokenBatch(
         input_ids=input_ids,

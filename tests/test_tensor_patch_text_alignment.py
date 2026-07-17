@@ -109,6 +109,27 @@ def test_shared_suffix_is_tokenized_once_and_appended_exactly() -> None:
         assert tuple(valid[-len(expected_suffix) :]) == expected_suffix
 
 
+def test_eos_anchor_is_preserved_at_final_non_padding_token() -> None:
+    tokenizer = CharacterTokenizer()
+    eos_anchor = build_static_alignment_anchor(
+        tokenizer=tokenizer,
+        mode="eos",
+        representation_suffix="\nRepresentation:",
+        max_anchor_tokens=32,
+    )
+    packed = tokenize_contents_with_anchor(
+        tokenizer=tokenizer,
+        contents=["[1.0]", "[2.0, 3.0]"],
+        anchor=eos_anchor,
+        max_tokens=64,
+        require_under_max_length=True,
+        context="test eos",
+    )
+
+    for row, length in zip(packed.input_ids, packed.attention_mask.sum(dim=1), strict=True):
+        assert int(row[int(length.item()) - 1].item()) == tokenizer.eos_token_id
+
+
 def test_shared_suffix_layout_rejects_truncated_tensor_content() -> None:
     tokenizer = CharacterTokenizer()
 
