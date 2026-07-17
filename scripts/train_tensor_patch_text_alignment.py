@@ -90,11 +90,11 @@ class AlignmentAnchor:
 
 
 PROBE_FAMILIES = (
-    "point_sign",
-    "point_relation",
-    "region_mean_relation",
-    "region_range_relation",
-    "directional_change",
+    "point_value",
+    "point_difference",
+    "point_mean",
+    "region_mean",
+    "region_range",
 )
 PROBE_TEMPLATES_PER_FAMILY = 4
 PROBE_FORBIDDEN_INPUT_MARKERS = ("answer:", "a or b", "a/b", "choose from", "options:", "?")
@@ -259,6 +259,14 @@ def gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     if not distributed_is_initialized():
         return tensor
     return torch.cat(tuple(differentiable_all_gather(tensor.contiguous())), dim=0)
+
+
+def gather_without_grad(tensor: torch.Tensor) -> torch.Tensor:
+    if not distributed_is_initialized():
+        return tensor.detach()
+    gathered = [torch.empty_like(tensor) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered, tensor.detach().contiguous())
+    return torch.cat(gathered, dim=0)
 
 
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -1018,33 +1026,194 @@ class AlignmentProjectionPair(nn.Module):
         return self.student(student_hidden.float()), self.teacher(teacher_hidden.float())
 
 
+class FixedTeacherWhitening(nn.Module):
+    """A frozen ZCA transform fitted on teacher hidden states from the train split."""
+
+    def __init__(self, hidden_dim: int, shrinkage: float, epsilon: float) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        if hidden_dim <= 0:
+            raise ValueError("Whitening hidden_dim must be positive.")
+        if not 0.0 <= float(shrinkage) <= 1.0:
+            raise ValueError("alignment_transform.whitening.shrinkage must be in [0, 1].")
+        if float(epsilon) <= 0.0:
+            raise ValueError("alignment_transform.whitening.epsilon must be positive.")
+        self.shrinkage = float(shrinkage)
+        self.epsilon = float(epsilon)
+        self.register_buffer("mean", torch.zeros(hidden_dim, dtype=torch.float32))
+        self.register_buffer("matrix", torch.eye(hidden_dim, dtype=torch.float32))
+        self.register_buffer("fitted_records", torch.zeros((), dtype=torch.long))
+        self.fit_metrics: dict[str, float] = {}
+
+    @property
+    def is_fitted(self) -> bool:
+        return int(self.fitted_records.item()) >= 2
+
+    @torch.no_grad()
+    def fit(self, teacher_hidden: torch.Tensor) -> dict[str, float]:
+        samples = teacher_hidden.detach().float()
+        if samples.ndim != 2 or int(samples.shape[1]) != int(self.mean.numel()):
+            raise ValueError(
+                "Teacher hidden states for whitening must have shape [records, hidden_dim]; "
+                f"got {tuple(samples.shape)} for hidden_dim={int(self.mean.numel())}."
+            )
+        record_count = int(samples.shape[0])
+        if record_count < 2:
+            raise ValueError("Whitening requires at least two teacher records.")
+        mean = samples.mean(dim=0)
+        centered = samples - mean
+        covariance = centered.T @ centered / float(record_count - 1)
+        average_variance = float(covariance.diag().mean().item())
+        if not np.isfinite(average_variance) or average_variance <= 0.0:
+            raise ValueError(f"Teacher covariance is degenerate: average_variance={average_variance!r}.")
+        identity = torch.eye(int(covariance.shape[0]), device=covariance.device, dtype=covariance.dtype)
+        regularized = (1.0 - self.shrinkage) * covariance + self.shrinkage * average_variance * identity
+        eigenvalues, eigenvectors = torch.linalg.eigh(regularized)
+        eigenvalue_floor = max(self.epsilon * average_variance, torch.finfo(eigenvalues.dtype).eps)
+        clamped = eigenvalues.clamp_min(eigenvalue_floor)
+        matrix = (eigenvectors * clamped.rsqrt().unsqueeze(0)) @ eigenvectors.T
+        if not bool(torch.isfinite(matrix).all()):
+            raise ValueError("Teacher whitening matrix contains non-finite values.")
+        self.mean.copy_(mean.to(device=self.mean.device, dtype=self.mean.dtype))
+        self.matrix.copy_(matrix.to(device=self.matrix.device, dtype=self.matrix.dtype))
+        self.fitted_records.fill_(record_count)
+        self.fit_metrics = {
+            "records": float(record_count),
+            "mean_norm": float(mean.norm().item()),
+            "average_variance": average_variance,
+            "eigenvalue_min": float(eigenvalues.min().item()),
+            "eigenvalue_max": float(eigenvalues.max().item()),
+            "eigenvalue_floor": float(eigenvalue_floor),
+            "regularized_condition_number": float((clamped.max() / clamped.min()).item()),
+        }
+        return dict(self.fit_metrics)
+
+    def transform(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not self.is_fitted:
+            raise RuntimeError("Teacher whitening must be fitted before alignment training or evaluation.")
+        hidden_float = hidden.float()
+        return (hidden_float - self.mean) @ self.matrix
+
+    def forward(
+        self,
+        student_hidden: torch.Tensor,
+        teacher_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The same affine map preserves a single shared coordinate system for both branches.
+        return self.transform(student_hidden), self.transform(teacher_hidden)
+
+
+AlignmentFeatureTransform = AlignmentProjectionPair | FixedTeacherWhitening
+
+
+def apply_alignment_feature_transform(
+    feature_transform: AlignmentFeatureTransform | None,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if feature_transform is None:
+        return student_hidden, teacher_hidden
+    return feature_transform(student_hidden, teacher_hidden)
+
+
+def exclude_semantic_false_negatives(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    query_target_ids: torch.Tensor | None,
+    candidate_target_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Exclude same-answer candidates from the denominator without changing the paired positive."""
+    if query_target_ids is None or candidate_target_ids is None:
+        return logits, {}
+    query_ids = query_target_ids.to(device=logits.device, dtype=torch.long).flatten()
+    candidate_ids = candidate_target_ids.to(device=logits.device, dtype=torch.long).flatten()
+    if int(query_ids.numel()) != int(logits.shape[0]) or int(candidate_ids.numel()) != int(logits.shape[1]):
+        raise ValueError(
+            "Semantic target IDs must match the contrastive logits: "
+            f"queries={query_ids.numel()}/{logits.shape[0]}, "
+            f"candidates={candidate_ids.numel()}/{logits.shape[1]}."
+        )
+    same_target = query_ids[:, None].eq(candidate_ids[None, :])
+    paired_positive = torch.zeros_like(same_target)
+    paired_positive.scatter_(1, labels[:, None], True)
+    false_negative_mask = same_target & ~paired_positive
+    masked_logits = logits.masked_fill(false_negative_mask, torch.finfo(logits.dtype).min)
+    possible_negative_count = max(1, int(logits.shape[1]) - 1)
+    valid_negative_count = (~false_negative_mask & ~paired_positive).sum(dim=1).float().mean()
+    return masked_logits, {
+        "semantic_collision_fraction": float(
+            (false_negative_mask.float().sum(dim=1) / possible_negative_count).mean().detach().cpu().item()
+        ),
+        "valid_negative_count": float(valid_negative_count.detach().cpu().item()),
+        "semantic_target_unique_fraction": float(
+            candidate_ids.unique().numel() / max(1, candidate_ids.numel())
+        ),
+    }
+
+
+@torch.no_grad()
+def semantic_top1_accuracy(
+    logits: torch.Tensor,
+    query_target_ids: torch.Tensor | None,
+    candidate_target_ids: torch.Tensor | None,
+) -> float:
+    if query_target_ids is None or candidate_target_ids is None:
+        return 0.0
+    query_ids = query_target_ids.to(device=logits.device, dtype=torch.long).flatten()
+    candidate_ids = candidate_target_ids.to(device=logits.device, dtype=torch.long).flatten()
+    predicted_ids = candidate_ids[logits.argmax(dim=1)]
+    return float(predicted_ids.eq(query_ids).float().mean().cpu().item())
+
+
 def symmetric_contrastive_loss(
     tensor_embedding: torch.Tensor,
     text_embedding: torch.Tensor,
     temperature: float,
+    semantic_target_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     logits = tensor_embedding @ text_embedding.T / max(float(temperature), 1.0e-6)
     labels = torch.arange(logits.shape[0], device=logits.device)
-    loss_i2t = F.cross_entropy(logits, labels)
-    loss_t2i = F.cross_entropy(logits.T, labels)
+    masked_logits, collision_metrics = exclude_semantic_false_negatives(
+        logits,
+        labels,
+        semantic_target_ids,
+        semantic_target_ids,
+    )
+    loss_i2t = F.cross_entropy(masked_logits, labels)
+    loss_t2i = F.cross_entropy(masked_logits.T, labels)
     loss = 0.5 * (loss_i2t + loss_t2i)
     with torch.no_grad():
         i2t_accuracy = (logits.argmax(dim=1) == labels).float().mean()
         t2i_accuracy = (logits.argmax(dim=0) == labels).float().mean()
-    return loss, {
+        strict_loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+        semantic_i2t_accuracy = semantic_top1_accuracy(logits, semantic_target_ids, semantic_target_ids)
+        semantic_t2i_accuracy = semantic_top1_accuracy(logits.T, semantic_target_ids, semantic_target_ids)
+    metrics = {
         "i2t_accuracy": float(i2t_accuracy.detach().cpu().item()),
         "t2i_accuracy": float(t2i_accuracy.detach().cpu().item()),
         "candidate_count": float(logits.shape[1]),
+        "strict_contrastive_loss": float(strict_loss.detach().cpu().item()),
     }
+    metrics.update(collision_metrics)
+    if semantic_target_ids is not None:
+        metrics["semantic_i2t_accuracy"] = semantic_i2t_accuracy
+        metrics["semantic_t2i_accuracy"] = semantic_t2i_accuracy
+    return loss, metrics
 
 
 def distributed_symmetric_contrastive_loss(
     tensor_embedding: torch.Tensor,
     text_embedding: torch.Tensor,
     temperature: float,
+    semantic_target_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if not distributed_is_initialized():
-        return symmetric_contrastive_loss(tensor_embedding, text_embedding, temperature)
+        return symmetric_contrastive_loss(
+            tensor_embedding,
+            text_embedding,
+            temperature,
+            semantic_target_ids,
+        )
     local_batch = int(tensor_embedding.shape[0])
     tensor_all = gather_with_grad(tensor_embedding)
     text_all = gather_with_grad(text_embedding)
@@ -1052,17 +1221,41 @@ def distributed_symmetric_contrastive_loss(
     labels = torch.arange(local_batch, device=tensor_embedding.device) + int(label_offset)
     logits_i2t = tensor_embedding @ text_all.T / max(float(temperature), 1.0e-6)
     logits_t2i = text_embedding @ tensor_all.T / max(float(temperature), 1.0e-6)
-    loss_i2t = F.cross_entropy(logits_i2t, labels)
-    loss_t2i = F.cross_entropy(logits_t2i, labels)
+    target_ids_all = gather_without_grad(semantic_target_ids) if semantic_target_ids is not None else None
+    masked_logits_i2t, collision_metrics = exclude_semantic_false_negatives(
+        logits_i2t,
+        labels,
+        semantic_target_ids,
+        target_ids_all,
+    )
+    masked_logits_t2i, _ = exclude_semantic_false_negatives(
+        logits_t2i,
+        labels,
+        semantic_target_ids,
+        target_ids_all,
+    )
+    loss_i2t = F.cross_entropy(masked_logits_i2t, labels)
+    loss_t2i = F.cross_entropy(masked_logits_t2i, labels)
     loss = 0.5 * (loss_i2t + loss_t2i)
     with torch.no_grad():
         i2t_accuracy = (logits_i2t.argmax(dim=1) == labels).float().mean()
         t2i_accuracy = (logits_t2i.argmax(dim=1) == labels).float().mean()
-    return loss, {
+        strict_loss = 0.5 * (
+            F.cross_entropy(logits_i2t, labels) + F.cross_entropy(logits_t2i, labels)
+        )
+        semantic_i2t_accuracy = semantic_top1_accuracy(logits_i2t, semantic_target_ids, target_ids_all)
+        semantic_t2i_accuracy = semantic_top1_accuracy(logits_t2i, semantic_target_ids, target_ids_all)
+    metrics = {
         "i2t_accuracy": float(i2t_accuracy.detach().cpu().item()),
         "t2i_accuracy": float(t2i_accuracy.detach().cpu().item()),
         "candidate_count": float(text_all.shape[0]),
+        "strict_contrastive_loss": float(strict_loss.detach().cpu().item()),
     }
+    metrics.update(collision_metrics)
+    if semantic_target_ids is not None:
+        metrics["semantic_i2t_accuracy"] = semantic_i2t_accuracy
+        metrics["semantic_t2i_accuracy"] = semantic_t2i_accuracy
+    return loss, metrics
 
 
 @torch.no_grad()
@@ -1089,6 +1282,7 @@ def full_retrieval_accuracy(
     text_embedding: torch.Tensor,
     temperature: float,
     chunk_size: int,
+    semantic_target_ids: torch.Tensor | None = None,
 ) -> dict[str, float]:
     tensor_cpu = tensor_embedding.detach().float().cpu()
     text_cpu = text_embedding.detach().float().cpu()
@@ -1101,23 +1295,70 @@ def full_retrieval_accuracy(
     t2i_correct = 0
     i2t_loss_sum = 0.0
     t2i_loss_sum = 0.0
+    strict_i2t_loss_sum = 0.0
+    strict_t2i_loss_sum = 0.0
+    semantic_i2t_correct = 0
+    semantic_t2i_correct = 0
+    target_ids = semantic_target_ids.detach().long().cpu().flatten() if semantic_target_ids is not None else None
+    if target_ids is not None and int(target_ids.numel()) != total:
+        raise ValueError(
+            f"Global semantic target count {target_ids.numel()} does not match retrieval rows {total}."
+        )
     for start in range(0, total, chunk):
         end = min(total, start + chunk)
         logits = tensor_cpu[start:end] @ text_cpu.T / max(float(temperature), 1.0e-6)
         local_labels = labels[start:end]
         i2t_correct += int((logits.argmax(dim=1) == local_labels).sum().item())
-        i2t_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
+        strict_i2t_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
+        masked_logits, _ = exclude_semantic_false_negatives(
+            logits,
+            local_labels,
+            target_ids[start:end] if target_ids is not None else None,
+            target_ids,
+        )
+        i2t_loss_sum += float(F.cross_entropy(masked_logits, local_labels, reduction="sum").item())
+        if target_ids is not None:
+            predictions = logits.argmax(dim=1)
+            semantic_i2t_correct += int(target_ids[predictions].eq(target_ids[start:end]).sum().item())
     for start in range(0, total, chunk):
         end = min(total, start + chunk)
         logits = text_cpu[start:end] @ tensor_cpu.T / max(float(temperature), 1.0e-6)
         local_labels = labels[start:end]
         t2i_correct += int((logits.argmax(dim=1) == local_labels).sum().item())
-        t2i_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
-    return {
+        strict_t2i_loss_sum += float(F.cross_entropy(logits, local_labels, reduction="sum").item())
+        masked_logits, _ = exclude_semantic_false_negatives(
+            logits,
+            local_labels,
+            target_ids[start:end] if target_ids is not None else None,
+            target_ids,
+        )
+        t2i_loss_sum += float(F.cross_entropy(masked_logits, local_labels, reduction="sum").item())
+        if target_ids is not None:
+            predictions = logits.argmax(dim=1)
+            semantic_t2i_correct += int(target_ids[predictions].eq(target_ids[start:end]).sum().item())
+    result = {
         "contrastive_loss": 0.5 * (i2t_loss_sum + t2i_loss_sum) / max(1, total),
+        "strict_contrastive_loss": 0.5 * (strict_i2t_loss_sum + strict_t2i_loss_sum) / max(1, total),
         "i2t_accuracy": i2t_correct / max(1, total),
         "t2i_accuracy": t2i_correct / max(1, total),
     }
+    if target_ids is not None:
+        _, counts = target_ids.unique(return_counts=True)
+        collision_count = (counts.float() * (counts.float() - 1.0)).sum()
+        result.update(
+            {
+                "semantic_i2t_accuracy": semantic_i2t_correct / max(1, total),
+                "semantic_t2i_accuracy": semantic_t2i_correct / max(1, total),
+                "semantic_collision_fraction": float(
+                    (collision_count / max(1, total * (total - 1))).item()
+                ),
+                "valid_negative_count": float(
+                    (total - counts.float().square().sum() / max(1, total)).item()
+                ),
+                "semantic_target_unique_fraction": float(counts.numel() / max(1, total)),
+            }
+        )
+    return result
 
 
 def reconstruction_loss_with_diagnostics(
@@ -1356,60 +1597,64 @@ def build_numeric_probe_anchor(
             location += f" in channel {channel + 1}"
         return location
 
-    if family == "point_sign":
+    if family == "point_value":
         position = rng.randrange(int(patch_size) * int(patch_size))
         row, col = divmod(position, int(patch_size))
         location = point_text(row, col)
         templates = (
             f"\nThe value at {location} is",
             f"\nAt {location}, the value is",
-            f"\nThe sign of the value at {location} is",
+            f"\nThe numeric value at {location} is",
             f"\nFor {location}, the recorded value is",
         )
         selected_template_index, text = select_template(templates)
         parameters = (channel, row, col)
-    elif family in {"point_relation", "directional_change"}:
+    elif family in {"point_difference", "point_mean"}:
         first, second = rng.sample(range(int(patch_size) * int(patch_size)), 2)
         row_a, col_a = divmod(first, int(patch_size))
         row_b, col_b = divmod(second, int(patch_size))
         location_a = point_text(row_a, col_a)
         location_b = point_text(row_b, col_b)
-        if family == "point_relation":
+        if family == "point_difference":
             templates = (
-                f"\nCompared with the value at {location_b}, the value at {location_a} is",
-                f"\nRelative to the value at {location_b}, the value at {location_a} is",
-                f"\nThe value at {location_a}, compared with the value at {location_b}, is",
-                f"\nWith the value at {location_b} as reference, the value at {location_a} is",
+                f"\nThe value at {location_a} minus the value at {location_b} is",
+                f"\nThe result of subtracting the value at {location_b} from the value at {location_a} is",
+                f"\nThe signed difference from {location_b} to {location_a} is",
+                f"\nThe signed difference, value at {location_a} minus value at {location_b}, is",
             )
-            selected_template_index, text = select_template(templates)
         else:
             templates = (
-                f"\nAt {location_b}, relative to {location_a}, the value is",
-                f"\nCompared with its value at {location_a}, the value at {location_b} is",
-                f"\nThe value at {location_b}, compared with the value at {location_a}, is",
-                f"\nWith {location_a} as the starting point, the value at {location_b} is",
+                f"\nThe mean of the values at {location_a} and {location_b} is",
+                f"\nThe result of averaging the values at {location_a} and {location_b} is",
+                f"\nThe two-point average for {location_a} and {location_b} is",
+                f"\nThe arithmetic mean of the values at {location_a} and {location_b} is",
             )
-            selected_template_index, text = select_template(templates)
+        selected_template_index, text = select_template(templates)
         parameters = (channel, row_a, col_a, row_b, col_b)
     else:
         size = int(region_size)
         if size <= 0 or size >= int(patch_size):
             raise ValueError("patch_alignment.probe_region_size must be between 1 and patch_size - 1.")
         positions_per_axis = int(patch_size) - size + 1
-        first, second = rng.sample(range(positions_per_axis * positions_per_axis), 2)
-        row_a, col_a = divmod(first, positions_per_axis)
-        row_b, col_b = divmod(second, positions_per_axis)
-        statistic = "mean" if family == "region_mean_relation" else "value range"
-        region_a = region_text(row_a, col_a, size)
-        region_b = region_text(row_b, col_b, size)
-        templates = (
-            f"\nCompared with the {statistic} over {region_b}, the {statistic} over {region_a} is",
-            f"\nRelative to the {statistic} over {region_b}, the {statistic} over {region_a} is",
-            f"\nThe {statistic} over {region_a}, compared with the {statistic} over {region_b}, is",
-            f"\nWith the {statistic} over {region_b} as reference, the {statistic} over {region_a} is",
-        )
+        position = rng.randrange(positions_per_axis * positions_per_axis)
+        row, col = divmod(position, positions_per_axis)
+        region = region_text(row, col, size)
+        if family == "region_mean":
+            templates = (
+                f"\nThe mean over {region} is",
+                f"\nThe average value over {region} is",
+                f"\nThe regional mean for {region} is",
+                f"\nThe result of averaging all values over {region} is",
+            )
+        else:
+            templates = (
+                f"\nThe maximum minus the minimum over {region} is",
+                f"\nThe max-minus-min range over {region} is",
+                f"\nThe difference between the maximum and minimum over {region} is",
+                f"\nThe numerical span from minimum to maximum over {region} is",
+            )
         selected_template_index, text = select_template(templates)
-        parameters = (channel, row_a, col_a, row_b, col_b, size)
+        parameters = (channel, row, col, size)
 
     anchor = AlignmentAnchor(
         name=f"probe_{int(probe_index):02d}_{family}_t{selected_template_index}",
@@ -1422,6 +1667,44 @@ def build_numeric_probe_anchor(
     )
     validate_probe_anchor_contract(anchor)
     return anchor
+
+
+def probe_targets_from_patches(
+    anchor: AlignmentAnchor,
+    patches: torch.Tensor,
+    decimal_places: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return hidden-only probe targets; these values are never appended to either LLM input."""
+    if anchor.mode != "probe" or anchor.probe_family not in PROBE_FAMILIES:
+        raise ValueError("Probe targets require a supported probe anchor.")
+    if patches.ndim != 4:
+        raise ValueError(f"Probe targets require [B,C,H,W] patches, got {tuple(patches.shape)}.")
+    decimals = int(decimal_places)
+    if decimals < 0 or decimals > 8:
+        raise ValueError(f"Probe target decimal_places must be between 0 and 8, got {decimals}.")
+    scale = float(10**decimals)
+    visible = torch.round(patches.detach().float() * scale) / scale
+    parameters = tuple(int(value) for value in anchor.probe_parameters)
+    family = str(anchor.probe_family)
+    if family == "point_value":
+        channel, row, col = parameters
+        targets = visible[:, channel, row, col]
+    elif family in {"point_difference", "point_mean"}:
+        channel, row_a, col_a, row_b, col_b = parameters
+        value_a = visible[:, channel, row_a, col_a]
+        value_b = visible[:, channel, row_b, col_b]
+        targets = value_a - value_b if family == "point_difference" else 0.5 * (value_a + value_b)
+    elif family in {"region_mean", "region_range"}:
+        channel, row, col, size = parameters
+        region = visible[:, channel, row : row + size, col : col + size].flatten(1)
+        targets = region.mean(dim=1) if family == "region_mean" else region.amax(dim=1) - region.amin(dim=1)
+    else:  # pragma: no cover - guarded by the contract above
+        raise ValueError(f"Unsupported probe family: {family!r}.")
+    if not bool(torch.isfinite(targets).all()):
+        raise ValueError(f"Probe family {family!r} produced non-finite targets.")
+    target_ids = torch.round(targets * scale).to(dtype=torch.long)
+    quantized_targets = target_ids.to(dtype=torch.float32) / scale
+    return quantized_targets, target_ids
 
 
 def tokenize_contents_with_anchor(
@@ -1820,9 +2103,7 @@ def build_teacher_texts_for_batch(
 ) -> list[str]:
     source = str(args.teacher_text_source).lower()
     if str(args.alignment_text_layout) == "values_shared_suffix":
-        patches = batch["patch"] if source == "raw" else normalized_patches
-        if source not in {"raw", "normalized"}:
-            raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
+        patches = teacher_source_patches(batch, normalized_patches, source)
         return serialize_tensor_value_batch(patches, int(args.text_decimal_places))
     if source == "raw":
         return [str(text) for text in batch["texts"]]
@@ -1834,6 +2115,66 @@ def build_teacher_texts_for_batch(
             prompt_template=str(args.text_prompt_template),
         )
     raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
+
+
+def teacher_source_patches(
+    batch: Mapping[str, Any],
+    normalized_patches: torch.Tensor,
+    source: str,
+) -> torch.Tensor:
+    normalized_source = str(source).lower()
+    if normalized_source == "raw":
+        return batch["patch"]
+    if normalized_source == "normalized":
+        return normalized_patches
+    raise ValueError(f"Unsupported teacher_text_source: {source}")
+
+
+def probe_targets_for_batch(
+    batch: Mapping[str, Any],
+    normalized_patches: torch.Tensor,
+    args: argparse.Namespace,
+    alignment_anchor: AlignmentAnchor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+    if alignment_anchor is None or alignment_anchor.mode != "probe":
+        return None, None
+    source_patches = teacher_source_patches(batch, normalized_patches, str(args.teacher_text_source))
+    return probe_targets_from_patches(
+        alignment_anchor,
+        source_patches,
+        int(args.text_decimal_places),
+    )
+
+
+@torch.no_grad()
+def target_geometry_metrics(embeddings: torch.Tensor, target_values: torch.Tensor | None) -> dict[str, float]:
+    if target_values is None or int(embeddings.shape[0]) < 2:
+        return {}
+    values = target_values.detach().float().to(embeddings.device).flatten()
+    normalized = F.normalize(embeddings.detach().float(), dim=-1)
+    similarity = normalized @ normalized.T
+    distance = (values[:, None] - values[None, :]).abs()
+    upper = torch.triu(torch.ones_like(similarity, dtype=torch.bool), diagonal=1)
+    pair_similarity = similarity[upper]
+    negative_distance = -distance[upper]
+    similarity_centered = pair_similarity - pair_similarity.mean()
+    distance_centered = negative_distance - negative_distance.mean()
+    denominator = similarity_centered.square().sum().sqrt() * distance_centered.square().sum().sqrt()
+    correlation = (
+        similarity_centered.mul(distance_centered).sum() / denominator.clamp_min(1.0e-12)
+        if pair_similarity.numel() > 1
+        else torch.zeros((), device=similarity.device)
+    )
+    nearest_logits = similarity.masked_fill(torch.eye(similarity.shape[0], device=similarity.device, dtype=torch.bool), -1.0e9)
+    nearest_indices = nearest_logits.argmax(dim=1)
+    return {
+        "target_abs_mean": float(values.abs().mean().cpu().item()),
+        "target_std": float(values.std(unbiased=False).cpu().item()),
+        "hidden_similarity_vs_negative_target_distance_pearson": float(correlation.cpu().item()),
+        "nearest_hidden_target_abs_error": float(
+            (values - values[nearest_indices]).abs().mean().cpu().item()
+        ),
+    }
 
 
 def duplicate_text_fraction(texts: Sequence[str]) -> float:
@@ -1928,7 +2269,7 @@ def train_one_epoch(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
-    projector: AlignmentProjectionPair | None,
+    projector: AlignmentFeatureTransform | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -1983,6 +2324,14 @@ def train_one_epoch(
         )
         patches = normalized_patches.to(device)
         texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+        probe_target_values, probe_target_ids = probe_targets_for_batch(
+            batch,
+            normalized_patches,
+            args,
+            alignment_anchor,
+        )
+        if probe_target_ids is not None:
+            probe_target_ids = probe_target_ids.to(device)
         teacher_duplicate_fraction = duplicate_text_fraction(texts)
         with torch.no_grad():
             teacher_output = text_teacher_hidden(
@@ -2009,6 +2358,8 @@ def train_one_epoch(
             with torch.no_grad():
                 latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
+        if soft_prompts.requires_grad:
+            soft_prompts.retain_grad()
         student_output = tensor_student_hidden(
             llm,
             tokenizer,
@@ -2030,11 +2381,11 @@ def train_one_epoch(
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        if projector is None:
-            student_features = student_hidden
-            teacher_features = teacher_hidden
-        else:
-            student_features, teacher_features = projector(student_hidden, teacher_hidden)
+        student_features, teacher_features = apply_alignment_feature_transform(
+            projector,
+            student_hidden,
+            teacher_hidden,
+        )
         tensor_embedding, text_embedding = normalize_alignment_embeddings(
             student_features,
             teacher_features,
@@ -2043,6 +2394,7 @@ def train_one_epoch(
             tensor_embedding,
             text_embedding,
             float(args.temperature),
+            probe_target_ids,
         )
         if float(args.centered_contrastive_loss_weight) > 0.0:
             centered_tensor_embedding, centered_text_embedding = centered_alignment_embeddings(
@@ -2053,6 +2405,7 @@ def train_one_epoch(
                 centered_tensor_embedding,
                 centered_text_embedding,
                 float(args.temperature),
+                probe_target_ids,
             )
         else:
             with torch.no_grad():
@@ -2064,6 +2417,7 @@ def train_one_epoch(
                     centered_tensor_embedding,
                     centered_text_embedding,
                     float(args.temperature),
+                    probe_target_ids,
                 )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
@@ -2075,6 +2429,11 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        soft_prompt_gradient_norm = (
+            float(soft_prompts.grad.detach().float().norm(dim=-1).mean().cpu().item())
+            if soft_prompts.grad is not None
+            else 0.0
+        )
         synchronize_gradients([compressor if train_compressor else None, adapter, projector])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -2090,6 +2449,7 @@ def train_one_epoch(
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
+        add_weighted_metrics(metric_totals, contrastive_metrics, batch_size, "contrastive_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -2109,6 +2469,18 @@ def train_one_epoch(
             "teacher_",
         )
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(
+            metric_totals,
+            target_geometry_metrics(teacher_hidden, probe_target_values),
+            batch_size,
+            "teacher_probe_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            target_geometry_metrics(student_hidden, probe_target_values),
+            batch_size,
+            "student_probe_",
+        )
         add_weighted_metrics(
             metric_totals,
             {
@@ -2131,6 +2503,7 @@ def train_one_epoch(
                 ),
                 "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(student_hidden),
                 "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(teacher_hidden),
+                "soft_prompt_gradient_norm": soft_prompt_gradient_norm,
             },
             batch_size,
             "alignment_",
@@ -2151,6 +2524,18 @@ def train_one_epoch(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
+    for key in (
+        "candidate_count",
+        "strict_contrastive_loss",
+        "semantic_i2t_accuracy",
+        "semantic_t2i_accuracy",
+        "semantic_collision_fraction",
+        "semantic_target_unique_fraction",
+        "valid_negative_count",
+    ):
+        prefixed_key = f"contrastive_{key}"
+        if prefixed_key in metrics:
+            metrics[key] = metrics[prefixed_key]
     return average_metrics_across_processes(metrics)
 
 
@@ -2260,7 +2645,7 @@ def evaluate(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
-    projector: AlignmentProjectionPair | None,
+    projector: AlignmentFeatureTransform | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -2285,6 +2670,7 @@ def evaluate(
     collected_teacher_features: list[torch.Tensor] = []
     collected_student_hidden: list[torch.Tensor] = []
     collected_teacher_hidden: list[torch.Tensor] = []
+    collected_probe_target_ids: list[torch.Tensor] = []
     collected_global_records = 0
     train_compressor = train_compressor_during_alignment(args)
     if alignment_anchor is None and str(args.alignment_text_layout) == "values_shared_suffix":
@@ -2298,6 +2684,14 @@ def evaluate(
         )
         patches = normalized_patches.to(device)
         teacher_texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+        probe_target_values, probe_target_ids = probe_targets_for_batch(
+            batch,
+            normalized_patches,
+            args,
+            alignment_anchor,
+        )
+        if probe_target_ids is not None:
+            probe_target_ids = probe_target_ids.to(device)
         teacher_output = text_teacher_hidden(
             llm,
             tokenizer,
@@ -2335,11 +2729,11 @@ def evaluate(
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        if projector is None:
-            student_features = student_hidden
-            teacher_features = teacher_hidden
-        else:
-            student_features, teacher_features = projector(student_hidden, teacher_hidden)
+        student_features, teacher_features = apply_alignment_feature_transform(
+            projector,
+            student_hidden,
+            teacher_hidden,
+        )
         tensor_embedding, text_embedding = normalize_alignment_embeddings(
             student_features,
             teacher_features,
@@ -2352,11 +2746,13 @@ def evaluate(
             tensor_embedding,
             text_embedding,
             float(args.temperature),
+            probe_target_ids,
         )
         centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
             centered_tensor_embedding,
             centered_text_embedding,
             float(args.temperature),
+            probe_target_ids,
         )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
@@ -2372,6 +2768,7 @@ def evaluate(
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
+        add_weighted_metrics(metric_totals, contrastive_metrics, batch_size, "contrastive_")
         add_weighted_metrics(
             metric_totals,
             {
@@ -2391,6 +2788,18 @@ def evaluate(
             "teacher_",
         )
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
+        add_weighted_metrics(
+            metric_totals,
+            target_geometry_metrics(teacher_hidden, probe_target_values),
+            batch_size,
+            "teacher_probe_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            target_geometry_metrics(student_hidden, probe_target_values),
+            batch_size,
+            "student_probe_",
+        )
         add_weighted_metrics(
             metric_totals,
             {
@@ -2426,6 +2835,8 @@ def evaluate(
                 collected_teacher_features.append(teacher_features[:take].detach().float().cpu())
                 collected_student_hidden.append(student_hidden[:take].detach().float().cpu())
                 collected_teacher_hidden.append(teacher_hidden[:take].detach().float().cpu())
+                if probe_target_ids is not None:
+                    collected_probe_target_ids.append(probe_target_ids[:take].detach().long().cpu())
                 collected_global_records += int(take)
     metrics = {
         "loss": total_loss / max(1, total_records),
@@ -2435,11 +2846,26 @@ def evaluate(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
+    for key in (
+        "candidate_count",
+        "strict_contrastive_loss",
+        "semantic_i2t_accuracy",
+        "semantic_t2i_accuracy",
+        "semantic_collision_fraction",
+        "semantic_target_unique_fraction",
+        "valid_negative_count",
+    ):
+        prefixed_key = f"contrastive_{key}"
+        if prefixed_key in metrics:
+            metrics[key] = metrics[prefixed_key]
     if bool(args.global_retrieval_eval) and collected_student_features:
         student_all = torch.cat(collected_student_features, dim=0)
         teacher_all = torch.cat(collected_teacher_features, dim=0)
         student_hidden_all = torch.cat(collected_student_hidden, dim=0)
         teacher_hidden_all = torch.cat(collected_teacher_hidden, dim=0)
+        probe_target_ids_all = (
+            torch.cat(collected_probe_target_ids, dim=0) if collected_probe_target_ids else None
+        )
         global_tensor, global_text = normalize_alignment_embeddings(student_all, teacher_all)
         global_centered_tensor, global_centered_text = centered_alignment_embeddings(student_all, teacher_all)
         metrics.update(
@@ -2450,6 +2876,7 @@ def evaluate(
                     global_text,
                     float(args.temperature),
                     int(args.global_retrieval_chunk_size),
+                    probe_target_ids_all,
                 ).items()
             }
         )
@@ -2462,6 +2889,7 @@ def evaluate(
                     global_centered_text,
                     float(args.temperature),
                     int(args.global_retrieval_chunk_size),
+                    probe_target_ids_all,
                 ).items()
             }
         )
@@ -2477,6 +2905,7 @@ def evaluate(
                     global_teacher_hidden,
                     float(args.temperature),
                     int(args.global_retrieval_chunk_size),
+                    probe_target_ids_all,
                 ).items()
             }
         )
@@ -2500,7 +2929,7 @@ def evaluate_anchor_bank(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
-    projector: AlignmentProjectionPair | None,
+    projector: AlignmentFeatureTransform | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -2619,6 +3048,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--projection-dim", type=int, default=None)
+    parser.add_argument(
+        "--alignment-transform-mode",
+        type=str,
+        choices=("none", "projection", "whitening"),
+        default=None,
+        help="Feature space used by stage-1 InfoNCE after the frozen LLM hidden readout.",
+    )
+    parser.add_argument("--alignment-whitening-records", type=int, default=None)
+    parser.add_argument("--alignment-whitening-shrinkage", type=float, default=None)
+    parser.add_argument("--alignment-whitening-epsilon", type=float, default=None)
+    # Legacy compatibility. Prefer --alignment-transform-mode for new runs.
     parser.add_argument("--alignment-projection-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--alignment-projection-dim", type=int, default=None)
     parser.add_argument("--alignment-projection-hidden-dim", type=int, default=None)
@@ -2767,11 +3207,50 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "adapter_layers", first_nested(config, ["patch_alignment.adapter_layers"]), 2)
     set_default(args, "adapter_heads", first_nested(config, ["patch_alignment.adapter_heads"]), 8)
     set_default(args, "projection_dim", first_nested(config, ["patch_alignment.projection_dim"]), None)
+    configured_transform_mode = first_nested(config, ["patch_alignment.alignment_transform.mode"])
+    legacy_projection_enabled = first_nested(config, ["patch_alignment.alignment_projection.enabled"])
+    if args.alignment_transform_mode is None:
+        args.alignment_transform_mode = configured_transform_mode
+    if args.alignment_transform_mode is None:
+        legacy_value = (
+            args.alignment_projection_enabled
+            if args.alignment_projection_enabled is not None
+            else legacy_projection_enabled
+        )
+        args.alignment_transform_mode = "projection" if bool(legacy_value) else "none"
+    else:
+        explicit_legacy_value = (
+            args.alignment_projection_enabled
+            if args.alignment_projection_enabled is not None
+            else legacy_projection_enabled
+        )
+        if explicit_legacy_value is not None and bool(explicit_legacy_value) != (
+            str(args.alignment_transform_mode).lower() == "projection"
+        ):
+            raise ValueError(
+                "Conflicting alignment transform settings: patch_alignment.alignment_transform.mode="
+                f"{args.alignment_transform_mode!r} but alignment_projection.enabled="
+                f"{bool(explicit_legacy_value)!r}. Remove the legacy enabled field."
+            )
+    args.alignment_transform_mode = str(args.alignment_transform_mode).lower()
+    args.alignment_projection_enabled = args.alignment_transform_mode == "projection"
     set_default(
         args,
-        "alignment_projection_enabled",
-        first_nested(config, ["patch_alignment.alignment_projection.enabled"]),
-        False,
+        "alignment_whitening_records",
+        first_nested(config, ["patch_alignment.alignment_transform.whitening.records"]),
+        8192,
+    )
+    set_default(
+        args,
+        "alignment_whitening_shrinkage",
+        first_nested(config, ["patch_alignment.alignment_transform.whitening.shrinkage"]),
+        0.01,
+    )
+    set_default(
+        args,
+        "alignment_whitening_epsilon",
+        first_nested(config, ["patch_alignment.alignment_transform.whitening.epsilon"]),
+        1.0e-5,
     )
     set_default(
         args,
@@ -2838,7 +3317,7 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         args,
         "probe_families",
         value_to_csv(first_nested(config, ["patch_alignment.probe_families"])),
-        "point_sign,point_relation,region_mean_relation,region_range_relation,directional_change",
+        "point_value,point_difference,point_mean,region_mean,region_range",
     )
     set_default(args, "probe_region_size", first_nested(config, ["patch_alignment.probe_region_size"]), 4)
     set_default(args, "evaluation_probe_count", first_nested(config, ["patch_alignment.evaluation_probe_count"]), 3)
@@ -2955,7 +3434,9 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
     if float(args.temperature) <= 0.0:
         raise ValueError("patch_alignment.temperature must be positive.")
-    if bool(args.alignment_projection_enabled):
+    if args.alignment_transform_mode not in {"none", "projection", "whitening"}:
+        raise ValueError("patch_alignment.alignment_transform.mode must be none, projection, or whitening.")
+    if args.alignment_transform_mode == "projection":
         if int(args.alignment_projection_dim) <= 0:
             raise ValueError("patch_alignment.alignment_projection.dim must be positive.")
         if int(args.alignment_projection_hidden_dim) <= 0:
@@ -2964,6 +3445,19 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             raise ValueError("patch_alignment.alignment_projection.layers must be positive.")
         if float(args.alignment_projection_dropout) < 0.0:
             raise ValueError("patch_alignment.alignment_projection.dropout must be non-negative.")
+    if args.alignment_transform_mode == "whitening":
+        if int(args.alignment_whitening_records) < 2:
+            raise ValueError("patch_alignment.alignment_transform.whitening.records must be at least 2.")
+        if not 0.0 <= float(args.alignment_whitening_shrinkage) <= 1.0:
+            raise ValueError("patch_alignment.alignment_transform.whitening.shrinkage must be in [0, 1].")
+        if float(args.alignment_whitening_epsilon) <= 0.0:
+            raise ValueError("patch_alignment.alignment_transform.whitening.epsilon must be positive.")
+    if int(args.text_decimal_places) < 0:
+        raise ValueError("patch_alignment.text_decimal_places must be non-negative.")
+    if str(args.alignment_anchor_mode) == "probe" and int(args.text_decimal_places) > 8:
+        raise ValueError(
+            "probe mode supports at most 8 text decimal places so quantized semantic target IDs remain stable."
+        )
     if float(args.contrastive_loss_weight) <= 0.0:
         raise ValueError("patch_alignment.contrastive_loss_weight must be positive for alignment training.")
     if float(args.centered_contrastive_loss_weight) < 0.0:
@@ -3108,12 +3602,211 @@ def preflight_teacher_text_tokenization(
     )
 
 
+@torch.no_grad()
+def preflight_teacher_probe_semantics(
+    *,
+    dataset: Dataset,
+    llm: nn.Module,
+    tokenizer: Any,
+    device: torch.device,
+    args: argparse.Namespace,
+    compressor_input_size: Sequence[int],
+    normalization_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    if str(args.alignment_anchor_mode) != "probe" or int(args.text_preflight_records) < 2:
+        return {}
+    record_limit = min(len(dataset), int(args.text_preflight_records), 16)
+    if record_limit < 2:
+        return {}
+    loader = DataLoader(
+        dataset,
+        batch_size=min(4, int(args.eval_batch_size), record_limit),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_patch_text,
+    )
+    by_anchor: dict[str, dict[str, float]] = {}
+    for alignment_anchor in alignment_anchors_from_args(tokenizer, args, evaluation=True):
+        hidden_rows: list[torch.Tensor] = []
+        target_rows: list[torch.Tensor] = []
+        target_id_rows: list[torch.Tensor] = []
+        collected = 0
+        for batch in loader:
+            normalized_patches = normalize_patch_batch(
+                batch["patch"],
+                compressor_input_size,
+                normalization_cfg,
+                bool(args.resize_patch_to_compressor_input),
+            )
+            teacher_texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+            target_values, target_ids = probe_targets_for_batch(
+                batch,
+                normalized_patches,
+                args,
+                alignment_anchor,
+            )
+            if target_values is None or target_ids is None:
+                raise RuntimeError("Probe semantic preflight did not produce probe targets.")
+            teacher_output = text_teacher_hidden(
+                llm,
+                tokenizer,
+                teacher_texts,
+                device,
+                int(args.max_text_tokens),
+                int(args.teacher_layer),
+                bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+                bool(args.fail_on_text_max_length_hit),
+                text_layout=str(args.alignment_text_layout),
+                shared_suffix=str(args.shared_suffix),
+                max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+                alignment_anchor=alignment_anchor,
+            )
+            take = min(int(teacher_output.hidden.shape[0]), record_limit - collected)
+            hidden_rows.append(teacher_output.hidden[:take].detach().float().cpu())
+            target_rows.append(target_values[:take].detach().float().cpu())
+            target_id_rows.append(target_ids[:take].detach().long().cpu())
+            collected += take
+            if collected >= record_limit:
+                break
+        hidden = torch.cat(hidden_rows, dim=0)
+        targets = torch.cat(target_rows, dim=0)
+        target_ids = torch.cat(target_id_rows, dim=0)
+        _, counts = target_ids.unique(return_counts=True)
+        metrics = target_geometry_metrics(hidden, targets)
+        metrics.update(
+            {
+                "record_count": float(collected),
+                "hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden),
+                "semantic_target_unique_fraction": float(counts.numel() / max(1, collected)),
+                "semantic_collision_fraction": float(
+                    ((counts.float() * (counts.float() - 1.0)).sum() / max(1, collected * (collected - 1))).item()
+                ),
+            }
+        )
+        by_anchor[alignment_anchor.name] = metrics
+    macro = average_metric_dicts(list(by_anchor.values()))
+    return {
+        "record_limit": int(record_limit),
+        "teacher_layer": int(args.teacher_layer),
+        "macro": macro,
+        "anchors": by_anchor,
+    }
+
+
+def gather_feature_rows(local_rows: torch.Tensor) -> torch.Tensor | None:
+    """Gather variable-length feature rows; only rank 0 retains the concatenated result."""
+    if not distributed_is_initialized():
+        return local_rows.detach().float()
+    length = torch.tensor([int(local_rows.shape[0])], device=local_rows.device, dtype=torch.long)
+    gathered_lengths = [torch.zeros_like(length) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered_lengths, length)
+    row_counts = [int(item.item()) for item in gathered_lengths]
+    max_rows = max(row_counts)
+    if max_rows <= 0:
+        return None
+    if int(local_rows.shape[0]) < max_rows:
+        padding = torch.zeros(
+            max_rows - int(local_rows.shape[0]),
+            int(local_rows.shape[1]),
+            device=local_rows.device,
+            dtype=local_rows.dtype,
+        )
+        local_rows = torch.cat([local_rows, padding], dim=0)
+    gathered = [torch.empty_like(local_rows) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered, local_rows.contiguous())
+    if not is_main_process():
+        return None
+    return torch.cat(
+        [rows[:count].detach().float() for rows, count in zip(gathered, row_counts, strict=True)],
+        dim=0,
+    )
+
+
+@torch.no_grad()
+def fit_teacher_whitening(
+    *,
+    whitener: FixedTeacherWhitening,
+    loader: DataLoader,
+    llm: nn.Module,
+    tokenizer: Any,
+    device: torch.device,
+    args: argparse.Namespace,
+    compressor_input_size: Sequence[int],
+    normalization_cfg: Mapping[str, Any],
+) -> dict[str, float]:
+    requested_records = min(int(args.alignment_whitening_records), len(loader.dataset))
+    if requested_records < 2:
+        raise ValueError("alignment_transform.whitening.records must select at least two train records.")
+    local_target = (requested_records + distributed_world_size() - 1) // distributed_world_size()
+    local_hidden: list[torch.Tensor] = []
+    local_count = 0
+    static_anchors = alignment_anchors_from_args(tokenizer, args, evaluation=False)
+    progress = tqdm(loader, desc="fit teacher whitening", leave=False, disable=not is_main_process())
+    for step, batch in enumerate(progress, start=1):
+        if local_count >= local_target:
+            break
+        if str(args.alignment_anchor_mode) == "probe":
+            alignment_anchor = build_numeric_probe_anchor(
+                tokenizer=tokenizer,
+                patch_size=int(args.patch_size),
+                channel_count=int(batch["patch"].shape[1]),
+                families=args.probe_families,
+                region_size=int(args.probe_region_size),
+                probe_index=int(step) - 1,
+                seed=int(args.seed),
+                max_anchor_tokens=int(args.max_shared_suffix_tokens),
+            )
+        else:
+            alignment_anchor = static_anchors[0]
+        normalized_patches = normalize_patch_batch(
+            batch["patch"],
+            compressor_input_size,
+            normalization_cfg,
+            bool(args.resize_patch_to_compressor_input),
+        )
+        teacher_texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+        teacher_output = text_teacher_hidden(
+            llm,
+            tokenizer,
+            teacher_texts,
+            device,
+            int(args.max_text_tokens),
+            int(args.teacher_layer),
+            bool(args.fail_on_text_anchor_missing) and str(args.text_prompt_template) != "plain",
+            bool(args.fail_on_text_max_length_hit)
+            and (
+                str(args.alignment_text_layout) == "values_shared_suffix"
+                or str(args.text_prompt_template) != "plain"
+            ),
+            text_layout=str(args.alignment_text_layout),
+            shared_suffix=str(args.shared_suffix),
+            max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
+            alignment_anchor=alignment_anchor,
+        )
+        take = min(int(teacher_output.hidden.shape[0]), local_target - local_count)
+        local_hidden.append(teacher_output.hidden[:take].detach().float())
+        local_count += int(take)
+    if not local_hidden:
+        raise ValueError("Teacher whitening loader produced no hidden states.")
+    gathered = gather_feature_rows(torch.cat(local_hidden, dim=0))
+    if is_main_process():
+        if gathered is None:
+            raise RuntimeError("Rank 0 did not receive teacher hidden states for whitening.")
+        fit_metrics = whitener.fit(gathered[:requested_records])
+    else:
+        fit_metrics = {}
+    broadcast_module_state(whitener)
+    fit_metrics = dict(broadcast_object_from_main(fit_metrics))
+    whitener.fit_metrics = fit_metrics
+    return fit_metrics
+
+
 def save_checkpoint(
     path: Path,
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
-    projector: AlignmentProjectionPair | None,
+    projector: AlignmentFeatureTransform | None,
     args: argparse.Namespace,
     metrics: Mapping[str, Any],
     compressor_config: Mapping[str, Any],
@@ -3126,7 +3819,10 @@ def save_checkpoint(
         "metrics": metrics,
     }
     if projector is not None:
-        payload["alignment_projector_state_dict"] = projector.state_dict()
+        payload["alignment_feature_transform_mode"] = str(args.alignment_transform_mode)
+        payload["alignment_feature_transform_state_dict"] = projector.state_dict()
+        if isinstance(projector, AlignmentProjectionPair):
+            payload["alignment_projector_state_dict"] = projector.state_dict()
     if save_compressor:
         payload["compressor_state_dict"] = compressor.state_dict()
     torch.save(payload, path)
@@ -3147,6 +3843,7 @@ def alignment_wandb_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str
         key: value
         for key, value in metrics.items()
         if not key.startswith(("anchor_", "probe_macro_"))
+        and (not key.startswith("contrastive_") or key == "contrastive_loss")
     }
     return numeric_payload(prefix, summary_metrics)
 
@@ -3162,10 +3859,14 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
     return (
         f"i2t={fmt_metric(metrics, 'i2t_accuracy')} "
         f"t2i={fmt_metric(metrics, 't2i_accuracy')} "
+        f"semantic_i2t={fmt_metric(metrics, 'semantic_i2t_accuracy')} "
         f"global_i2t={fmt_metric(metrics, 'global_i2t_accuracy')} "
         f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')} "
+        f"global_semantic_i2t={fmt_metric(metrics, 'global_semantic_i2t_accuracy')} "
         f"raw_global_i2t={fmt_metric(metrics, 'global_hidden_uncentered_i2t_accuracy')} "
         f"raw_global_t2i={fmt_metric(metrics, 'global_hidden_uncentered_t2i_accuracy')} "
+        f"collision={fmt_metric(metrics, 'semantic_collision_fraction')} "
+        f"prompt_grad={fmt_metric(metrics, 'alignment_soft_prompt_gradient_norm')} "
         f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
         f"recon_rel={fmt_metric(metrics, 'reconstruction_relative_rmse_to_target_std')}"
     )
@@ -3210,8 +3911,16 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "adapter_layers": int(args.adapter_layers),
             "adapter_heads": int(args.adapter_heads),
             "projection_dim": args.projection_dim,
+            "alignment_transform": {
+                "mode": str(args.alignment_transform_mode),
+                "whitening": {
+                    "records": int(args.alignment_whitening_records),
+                    "shrinkage": float(args.alignment_whitening_shrinkage),
+                    "epsilon": float(args.alignment_whitening_epsilon),
+                },
+            },
             "alignment_projection": {
-                "enabled": bool(args.alignment_projection_enabled),
+                "enabled": str(args.alignment_transform_mode) == "projection",
                 "dim": int(args.alignment_projection_dim),
                 "hidden_dim": int(args.alignment_projection_hidden_dim),
                 "layers": int(args.alignment_projection_layers),
@@ -3342,6 +4051,16 @@ def main() -> None:
             "--no-resize-patch-to-compressor-input requires compressor input_size to match patch_size. "
             f"Got input_size={compressor_input_size}, patch_size={args.patch_size}."
         )
+    if (
+        str(args.alignment_anchor_mode) == "probe"
+        and str(args.teacher_text_source).lower() == "normalized"
+        and tuple(compressor_input_size) != (int(args.patch_size), int(args.patch_size))
+    ):
+        raise ValueError(
+            "probe coordinates describe patch_alignment.patch_size, but normalized teacher text would use the "
+            f"resized compressor input_size={compressor_input_size}. Use a patch-sized encoder or raw teacher text "
+            "without value-changing normalization."
+        )
 
     device = resolve_device(args.device)
     compressor.to(device)
@@ -3469,6 +4188,28 @@ def main() -> None:
         )
     val_loader = make_loader(val_dataset, int(args.eval_batch_size), False, int(args.num_workers))
     test_loader = make_loader(test_dataset, int(args.eval_batch_size), False, int(args.num_workers))
+    whitening_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=distributed_world_size(),
+            rank=distributed_rank(),
+            shuffle=False,
+            drop_last=False,
+        )
+        if distributed_is_initialized() and str(args.alignment_transform_mode) == "whitening"
+        else None
+    )
+    whitening_loader = (
+        make_loader(
+            train_dataset,
+            int(args.eval_batch_size),
+            False,
+            int(args.num_workers),
+            sampler=whitening_sampler,
+        )
+        if str(args.alignment_transform_mode) == "whitening"
+        else None
+    )
     probe_contract_anchor_bank = probe_contract_anchors(tokenizer, args)
     if is_main_process() and probe_contract_anchor_bank:
         dump_json(
@@ -3511,6 +4252,28 @@ def main() -> None:
         if str(args.alignment_text_layout) == "values_shared_suffix"
         else []
     )
+    teacher_probe_preflight = preflight_teacher_probe_semantics(
+        dataset=train_dataset,
+        llm=llm,
+        tokenizer=tokenizer,
+        device=device,
+        args=args,
+        compressor_input_size=compressor_input_size,
+        normalization_cfg=normalization_cfg,
+    )
+    if is_main_process() and teacher_probe_preflight:
+        dump_json(run_dir / "teacher_probe_preflight.json", teacher_probe_preflight)
+        macro = teacher_probe_preflight["macro"]
+        print(
+            "teacher_probe_preflight "
+            f"records={teacher_probe_preflight['record_limit']} "
+            f"pair_cos={macro.get('hidden_pairwise_cosine', float('nan')):.6f} "
+            f"target_corr={macro.get('hidden_similarity_vs_negative_target_distance_pearson', float('nan')):.4f} "
+            f"nearest_target_error={macro.get('nearest_hidden_target_abs_error', float('nan')):.6g} "
+            f"target_unique={macro.get('semantic_target_unique_fraction', float('nan')):.4f}"
+        )
+    if teacher_probe_preflight:
+        distributed_barrier()
 
     with torch.no_grad():
         probe_patch = normalize_patch_batch(
@@ -3534,8 +4297,8 @@ def main() -> None:
         adapter_heads=int(args.adapter_heads),
         soft_prompt_scale=float(args.soft_prompt_scale),
     ).to(device)
-    alignment_projector: AlignmentProjectionPair | None = None
-    if bool(args.alignment_projection_enabled):
+    alignment_projector: AlignmentFeatureTransform | None = None
+    if str(args.alignment_transform_mode) == "projection":
         alignment_projector = AlignmentProjectionPair(
             input_dim=llm_hidden_size,
             output_dim=int(args.alignment_projection_dim),
@@ -3544,9 +4307,32 @@ def main() -> None:
             dropout=float(args.alignment_projection_dropout),
             shared=bool(args.alignment_projection_shared),
         ).to(device)
+    elif str(args.alignment_transform_mode) == "whitening":
+        alignment_projector = FixedTeacherWhitening(
+            hidden_dim=llm_hidden_size,
+            shrinkage=float(args.alignment_whitening_shrinkage),
+            epsilon=float(args.alignment_whitening_epsilon),
+        ).to(device)
     broadcast_module_state(compressor)
     broadcast_module_state(adapter)
     broadcast_module_state(alignment_projector)
+
+    whitening_metrics: dict[str, float] = {}
+    if isinstance(alignment_projector, FixedTeacherWhitening):
+        if whitening_loader is None:
+            raise RuntimeError("Whitening mode did not create a statistics DataLoader.")
+        whitening_metrics = fit_teacher_whitening(
+            whitener=alignment_projector,
+            loader=whitening_loader,
+            llm=llm,
+            tokenizer=tokenizer,
+            device=device,
+            args=args,
+            compressor_input_size=compressor_input_size,
+            normalization_cfg=normalization_cfg,
+        )
+        if is_main_process():
+            dump_json(run_dir / "alignment_whitening.json", whitening_metrics)
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
         bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
@@ -3607,8 +4393,22 @@ def main() -> None:
         "llm_num_hidden_layers": int(llm_num_hidden_layers),
         "projection_dim": int(projection_dim),
         "normalization": dict(normalization_cfg),
+        "alignment_transform": {
+            "mode": str(args.alignment_transform_mode),
+            "parameters": (
+                sum(parameter.numel() for parameter in alignment_projector.parameters())
+                if alignment_projector is not None
+                else 0
+            ),
+            "whitening": {
+                "records_requested": int(args.alignment_whitening_records),
+                "shrinkage": float(args.alignment_whitening_shrinkage),
+                "epsilon": float(args.alignment_whitening_epsilon),
+                "fit": dict(whitening_metrics),
+            },
+        },
         "alignment_projection": {
-            "enabled": bool(args.alignment_projection_enabled),
+            "enabled": str(args.alignment_transform_mode) == "projection",
             "dim": int(args.alignment_projection_dim),
             "hidden_dim": int(args.alignment_projection_hidden_dim),
             "layers": int(args.alignment_projection_layers),
@@ -3616,7 +4416,7 @@ def main() -> None:
             "shared": bool(args.alignment_projection_shared),
             "parameters": (
                 sum(parameter.numel() for parameter in alignment_projector.parameters())
-                if alignment_projector is not None
+                if isinstance(alignment_projector, AlignmentProjectionPair)
                 else 0
             ),
         },
@@ -3671,11 +4471,10 @@ def main() -> None:
             "training_schedule": "one shared probe per batch; families and four templates cycle uniformly",
             "primary_validation": "mean over fixed probes only when probe mode is selected",
             "global_retrieval": "separate_candidate_library_per_anchor",
-            "alignment_hidden": (
-                "projected_shared_anchor_hidden"
-                if alignment_projector is not None
-                else "raw_shared_anchor_hidden"
-            ),
+            "probe_target_visibility": "internal_diagnostic_only_never_appended_to_llm_input",
+            "negative_policy": "exclude_quantized_equal_probe_targets_keep_paired_positive",
+            "strict_retrieval_policy": "argmax_over_complete_unmasked_candidate_library",
+            "alignment_hidden": f"{args.alignment_transform_mode}_shared_anchor_hidden",
             "primary_embedding_centering": "none",
             "centered_retrieval": (
                 "auxiliary_loss_and_diagnostic"
@@ -3694,6 +4493,7 @@ def main() -> None:
         "checkpoint_selection": "global_contrastive_loss_with_batch_fallback",
         "text_preflight_records": int(args.text_preflight_records),
         "text_preflight": dict(text_preflight_metrics),
+        "teacher_probe_preflight": dict(teacher_probe_preflight),
         "adapter_type": str(args.adapter_type),
         "query_tokens": int(args.query_tokens),
         "adapter_layers": int(args.adapter_layers),
@@ -3718,9 +4518,14 @@ def main() -> None:
             "train_drop_last": bool(distributed_is_initialized()),
         },
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
-        "alignment_projector_parameters": (
+        "alignment_transform_trainable_parameters": (
             sum(parameter.numel() for parameter in alignment_projector.parameters() if parameter.requires_grad)
             if alignment_projector is not None
+            else 0
+        ),
+        "alignment_projector_parameters": (
+            sum(parameter.numel() for parameter in alignment_projector.parameters() if parameter.requires_grad)
+            if isinstance(alignment_projector, AlignmentProjectionPair)
             else 0
         ),
         "pretrain_trainable_compressor_parameters": sum(
@@ -3750,8 +4555,10 @@ def main() -> None:
             "embedding_centering=none "
             f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
             f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
-            f"alignment_projection={'enabled' if alignment_projector is not None else 'none'} "
-            f"projection_dim={int(args.alignment_projection_dim) if alignment_projector is not None else 'n/a'} "
+            f"alignment_transform={str(args.alignment_transform_mode)} "
+            f"projection_dim={int(args.alignment_projection_dim) if isinstance(alignment_projector, AlignmentProjectionPair) else 'n/a'} "
+            f"whitening_records={int(whitening_metrics.get('records', 0.0)) if isinstance(alignment_projector, FixedTeacherWhitening) else 'n/a'} "
+            f"whitening_condition={whitening_metrics.get('regularized_condition_number', 'n/a')} "
             f"distributed={bool(distributed_is_initialized())} "
             f"world_size={int(distributed_world_size())} "
             f"train_candidates={int(args.batch_size) * int(distributed_world_size())} "
@@ -3986,10 +4793,15 @@ def main() -> None:
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
     adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
     if alignment_projector is not None:
-        projector_state = best_checkpoint.get("alignment_projector_state_dict")
-        if not isinstance(projector_state, Mapping):
-            raise ValueError("Projection-enabled alignment checkpoint is missing alignment_projector_state_dict.")
-        alignment_projector.load_state_dict(projector_state)
+        transform_state = best_checkpoint.get("alignment_feature_transform_state_dict")
+        if transform_state is None and isinstance(alignment_projector, AlignmentProjectionPair):
+            transform_state = best_checkpoint.get("alignment_projector_state_dict")
+        if not isinstance(transform_state, Mapping):
+            raise ValueError(
+                f"{args.alignment_transform_mode}-mode alignment checkpoint is missing "
+                "alignment_feature_transform_state_dict."
+            )
+        alignment_projector.load_state_dict(transform_state)
     if "compressor_state_dict" in best_checkpoint:
         compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
     test_metrics = evaluate_anchor_bank(

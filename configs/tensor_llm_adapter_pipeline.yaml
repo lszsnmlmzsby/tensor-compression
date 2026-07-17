@@ -123,9 +123,9 @@ patch_alignment:
   # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
   #   tensor path: patch -> patch AE encoder -> Q-Former soft prompt -> frozen LLM
   #   text path: serialized patch -> frozen LLM
-  # Probe mode reads matching shallow hidden states; the optional projection below defines the contrastive space.
+  # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_projection_zscore
+  run_name: tensor_patch_text_alignment_whitening_zscore
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -214,10 +214,20 @@ patch_alignment:
   adapter_heads: 8
   # null maps Q-Former outputs directly to the LLM input embedding width.
   projection_dim: null
+  # none: raw LLM hidden; projection: trainable CLIP-style heads; whitening: one fixed teacher-fitted
+  # ZCA transform shared by both branches. Whitening is full-rank and is not used by stage 2.
+  alignment_transform:
+    mode: whitening
+    whitening:
+      # Fit once on this many records from the training split before optimization.
+      records: 8192
+      # Covariance shrinkage bounds noise amplification in low-variance directions.
+      shrinkage: 0.01
+      epsilon: 1.0e-5
   # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
-  # The Q-Former soft tokens still enter Qwen at its native 1536-dimensional embedding width.
+  # Used only when alignment_transform.mode is projection. The Q-Former soft tokens still enter
+  # Qwen at its native 1536-dimensional embedding width.
   alignment_projection:
-    enabled: true
     dim: 512
     hidden_dim: 1024
     # Keep this linear; a deeper head can memorize a private retrieval space.
@@ -246,15 +256,17 @@ patch_alignment:
   # Select exactly one complete experiment: eos, representation, or probe. The formal run uses probe.
   alignment_anchor_mode: probe
   representation_suffix: "\nRepresentation:"
-  # Probe mode creates short natural sentence stems that condition the shared hidden-state readout.
-  # It does not define answer words, labels, LM-head CE, or teacher-logit distillation.
+  # Probe mode uses short, continuous-valued numerical operations instead of low-cardinality classes.
+  # The scalar result is never appended to either LLM input. It is computed internally only to exclude
+  # quantized-equal answers from the InfoNCE negative set and to diagnose teacher semantics.
+  # There are no answer words, class labels, LM-head CE, or teacher-logit distillation.
   # Every sample and DDP rank in a batch receives the same stem/coordinates, so InfoNCE cannot use prompt identity.
   probe_families:
-    - point_sign
-    - point_relation
-    - region_mean_relation
-    - region_range_relation
-    - directional_change
+    - point_value
+    - point_difference
+    - point_mean
+    - region_mean
+    - region_range
   probe_region_size: 4
   # Validation/global retrieval uses one fixed stem from each family in a separate complete pass.
   evaluation_probe_count: 5
@@ -287,7 +299,7 @@ patch_alignment:
     batch_size: 8
     layers: all
     probe_count: 5
-    # Deterministic checkerboard perturbation as a fraction of each patch channel's standard deviation.
+    # Probe mode compares an on-target perturbation with an equal-size off-target control perturbation.
     perturbation_scale: 0.01
     device: auto
   log_interval: 20

@@ -6,8 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturbations
 from scripts.train_tensor_patch_text_alignment import (
+    AlignmentAnchor,
     AlignmentProjectionPair,
+    FixedTeacherWhitening,
+    apply_alignment_feature_transform,
     build_numeric_probe_anchor,
     build_static_alignment_anchor,
     build_teacher_texts_for_batch,
@@ -15,10 +19,13 @@ from scripts.train_tensor_patch_text_alignment import (
     gather_with_grad,
     hidden_at_last_non_padding,
     normalize_alignment_embeddings,
+    probe_targets_from_patches,
     probe_contract_anchors,
     reject_removed_alignment_options,
     serialize_tensor_values,
     shared_suffix_token_ids,
+    symmetric_contrastive_loss,
+    tokenize_contents_with_anchor,
     tokenize_contents_with_shared_suffix,
     validate_probe_anchor_contract,
     validate_teacher_hidden_state_index,
@@ -255,6 +262,38 @@ def test_primary_alignment_only_l2_normalizes_raw_hidden() -> None:
     assert torch.allclose(teacher_embedding, torch.nn.functional.normalize(teacher, dim=-1))
 
 
+def test_teacher_whitening_uses_one_fixed_transform_for_both_branches() -> None:
+    generator = torch.Generator().manual_seed(7)
+    teacher = torch.randn(128, 4, generator=generator)
+    teacher[:, 1] = 3.0 * teacher[:, 0] + 0.2 * teacher[:, 1]
+    student = teacher + 0.05 * torch.randn(128, 4, generator=generator)
+    whitener = FixedTeacherWhitening(hidden_dim=4, shrinkage=0.01, epsilon=1.0e-5)
+
+    metrics = whitener.fit(teacher)
+    student_features, teacher_features = apply_alignment_feature_transform(whitener, student, teacher)
+
+    assert metrics["records"] == 128.0
+    assert whitener.is_fitted
+    assert torch.allclose(
+        student_features - teacher_features,
+        (student - teacher) @ whitener.matrix,
+        atol=1.0e-5,
+    )
+    assert not any(parameter.requires_grad for parameter in whitener.parameters())
+
+
+def test_teacher_whitening_state_dict_restores_fitted_statistics() -> None:
+    teacher = torch.randn(64, 3, generator=torch.Generator().manual_seed(11))
+    fitted = FixedTeacherWhitening(hidden_dim=3, shrinkage=0.01, epsilon=1.0e-5)
+    fitted.fit(teacher)
+    restored = FixedTeacherWhitening(hidden_dim=3, shrinkage=0.01, epsilon=1.0e-5)
+
+    restored.load_state_dict(fitted.state_dict())
+
+    assert restored.is_fitted
+    assert torch.allclose(restored.transform(teacher), fitted.transform(teacher))
+
+
 def test_single_process_embedding_gather_preserves_gradients() -> None:
     embeddings = torch.tensor([[1.0, 2.0]], requires_grad=True)
 
@@ -280,13 +319,13 @@ def test_removed_alignment_options_fail_before_training(option: str) -> None:
         reject_removed_alignment_options({"patch_alignment": {option: False}})
 
 
-def test_probe_is_deterministic_and_contains_only_readout_metadata() -> None:
+def test_probe_is_deterministic_and_contains_no_answer_or_choice_metadata() -> None:
     tokenizer = CharacterTokenizer()
     kwargs = {
         "tokenizer": tokenizer,
         "patch_size": 4,
         "channel_count": 1,
-        "families": ["point_relation"],
+        "families": ["point_difference"],
         "region_size": 2,
         "probe_index": 7,
         "seed": 42,
@@ -298,7 +337,7 @@ def test_probe_is_deterministic_and_contains_only_readout_metadata() -> None:
 
     assert anchor == same_anchor
     assert anchor.mode == "probe"
-    assert anchor.probe_family == "point_relation"
+    assert anchor.probe_family == "point_difference"
     assert len(anchor.probe_parameters) == 5
     assert not any(marker in str(anchor.text) for marker in ("Answer", "A or B", "Choose", "?"))
     assert str(anchor.text).startswith("\n")
@@ -308,11 +347,11 @@ def test_probe_is_deterministic_and_contains_only_readout_metadata() -> None:
 @pytest.mark.parametrize(
     "family",
     [
-        "point_sign",
-        "point_relation",
-        "region_mean_relation",
-        "region_range_relation",
-        "directional_change",
+        "point_value",
+        "point_difference",
+        "point_mean",
+        "region_mean",
+        "region_range",
     ],
 )
 def test_probe_uses_four_distinct_natural_stems_without_choice_format(family: str) -> None:
@@ -348,7 +387,7 @@ def test_probe_contract_rejects_visible_choice_format(invalid_text: str) -> None
         tokenizer=tokenizer,
         patch_size=4,
         channel_count=1,
-        families=["point_sign"],
+        families=["point_value"],
         region_size=2,
         probe_index=0,
         seed=13,
@@ -364,11 +403,11 @@ def test_probe_contract_preflight_covers_every_family_and_template() -> None:
     args = SimpleNamespace(
         alignment_anchor_mode="probe",
         probe_families=[
-            "point_sign",
-            "point_relation",
-            "region_mean_relation",
-            "region_range_relation",
-            "directional_change",
+            "point_value",
+            "point_difference",
+            "point_mean",
+            "region_mean",
+            "region_range",
         ],
         field_sampling_mode="single",
         fields=["density", "pressure", "Vx", "Vy"],
@@ -395,7 +434,7 @@ def test_probe_channel_text_matches_parameter_channel() -> None:
         tokenizer=tokenizer,
         patch_size=4,
         channel_count=3,
-        families=["point_sign"],
+        families=["point_value"],
         region_size=2,
         probe_index=4,
         seed=31,
@@ -409,8 +448,8 @@ def test_probe_channel_text_matches_parameter_channel() -> None:
     assert f"channel {channel + 1}" in str(anchor.text)
 
 
-@pytest.mark.parametrize("family", ["region_mean_relation", "region_range_relation"])
-def test_region_probe_parameters_are_distinct_and_in_bounds(family: str) -> None:
+@pytest.mark.parametrize("family", ["region_mean", "region_range"])
+def test_region_probe_parameters_are_in_bounds(family: str) -> None:
     tokenizer = CharacterTokenizer()
     anchor = build_numeric_probe_anchor(
         tokenizer=tokenizer,
@@ -422,10 +461,88 @@ def test_region_probe_parameters_are_distinct_and_in_bounds(family: str) -> None
         seed=11,
         max_anchor_tokens=256,
     )
-    channel, row_a, col_a, row_b, col_b, size = anchor.probe_parameters
+    channel, row, col, size = anchor.probe_parameters
 
     assert 0 <= channel < 2
-    assert (row_a, col_a) != (row_b, col_b)
     assert size == 2
-    assert 0 <= row_a <= 6 - size and 0 <= row_b <= 6 - size
-    assert 0 <= col_a <= 6 - size and 0 <= col_b <= 6 - size
+    assert 0 <= row <= 6 - size
+    assert 0 <= col <= 6 - size
+
+
+@pytest.mark.parametrize(
+    ("family", "parameters", "expected"),
+    [
+        ("point_value", (0, 0, 1), 2.0),
+        ("point_difference", (0, 1, 1, 0, 0), 5.0),
+        ("point_mean", (0, 0, 0, 0, 2), 2.0),
+        ("region_mean", (0, 0, 0, 2), 3.25),
+        ("region_range", (0, 0, 0, 2), 5.0),
+    ],
+)
+def test_probe_targets_match_visible_numeric_operation(
+    family: str,
+    parameters: tuple[int, ...],
+    expected: float,
+) -> None:
+    patch = torch.tensor(
+        [[[[1.0, 2.0, 3.0], [4.0, 6.0, 8.0], [10.0, 12.0, 14.0]]]]
+    )
+    anchor = AlignmentAnchor(
+        name="test",
+        mode="probe",
+        token_ids=(1,),
+        text="\nTest value is",
+        probe_family=family,
+        probe_template_index=0,
+        probe_parameters=parameters,
+    )
+
+    values, target_ids = probe_targets_from_patches(anchor, patch, decimal_places=2)
+
+    assert values.tolist() == pytest.approx([expected])
+    assert target_ids.tolist() == [round(expected * 100)]
+
+
+def test_semantic_collisions_are_excluded_from_loss_but_strict_retrieval_is_preserved() -> None:
+    tensor_embedding = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    text_embedding = tensor_embedding.clone()
+    target_ids = torch.tensor([10, 10, 20])
+
+    loss, metrics = symmetric_contrastive_loss(
+        tensor_embedding,
+        text_embedding,
+        temperature=1.0,
+        semantic_target_ids=target_ids,
+    )
+
+    assert float(loss.item()) < metrics["strict_contrastive_loss"]
+    assert metrics["semantic_collision_fraction"] > 0.0
+    assert metrics["semantic_i2t_accuracy"] > metrics["i2t_accuracy"]
+    assert metrics["semantic_t2i_accuracy"] > metrics["t2i_accuracy"]
+
+
+def test_layer_scan_control_changes_equal_number_of_off_target_values() -> None:
+    patch = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+    anchor = AlignmentAnchor(
+        name="difference",
+        mode="probe",
+        token_ids=(1,),
+        text="\nThe difference is",
+        probe_family="point_difference",
+        probe_template_index=0,
+        probe_parameters=(0, 1, 1, 2, 2),
+    )
+
+    target_perturbed, control_perturbed = probe_target_and_control_perturbations(
+        patch,
+        anchor,
+        scale=0.1,
+    )
+    original_target, _ = probe_targets_from_patches(anchor, patch, decimal_places=4)
+    changed_target, _ = probe_targets_from_patches(anchor, target_perturbed, decimal_places=4)
+    control_target, _ = probe_targets_from_patches(anchor, control_perturbed, decimal_places=4)
+
+    assert int(target_perturbed.ne(patch).sum().item()) == 2
+    assert int(control_perturbed.ne(patch).sum().item()) == 2
+    assert not torch.equal(changed_target, original_target)
+    assert torch.equal(control_target, original_target)

@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     AlignmentAnchor,
     PDEBenchPatchTextDataset,
+    PROBE_FAMILIES,
     alignment_anchors_from_args,
     build_axis_split_plan,
     build_patch_records,
@@ -28,6 +29,7 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     llm_backbone,
     normalize_patch_batch,
     parse_csv,
+    probe_targets_from_patches,
     resolve_device,
     resolve_field_keys,
     serialize_patch_batch,
@@ -141,7 +143,7 @@ def resolve_scan_args(args: argparse.Namespace, config: Mapping[str, Any]) -> Si
             None,
             config,
             ["patch_alignment.probe_families"],
-            "point_sign,point_relation,region_mean_relation,region_range_relation,directional_change",
+            "point_value,point_difference,point_mean,region_mean,region_range",
         )
     )
     root.probe_region_size = int(
@@ -205,6 +207,18 @@ def resolve_scan_args(args: argparse.Namespace, config: Mapping[str, Any]) -> Si
         raise ValueError("layer_scan.perturbation_scale cannot be negative.")
     if root.alignment_text_layout != "values_shared_suffix" and root.alignment_anchor_mode != "representation":
         raise ValueError("eos/probe layer scans require alignment_text_layout=values_shared_suffix.")
+    if root.alignment_anchor_mode not in {"eos", "representation", "probe"}:
+        raise ValueError("layer_scan.anchor_mode must be eos, representation, or probe.")
+    if root.alignment_anchor_mode == "probe":
+        unsupported = sorted(set(root.probe_families) - set(PROBE_FAMILIES))
+        if unsupported:
+            raise ValueError(f"Unsupported patch_alignment.probe_families: {unsupported}.")
+        if not root.probe_families or root.evaluation_probe_count <= 0:
+            raise ValueError("Probe layer scans require non-empty probe_families and a positive probe_count.")
+        if root.probe_region_size <= 0 or root.probe_region_size >= root.patch_size:
+            raise ValueError("patch_alignment.probe_region_size must be between 1 and patch_size - 1.")
+        if not 0 <= root.text_decimal_places <= 8:
+            raise ValueError("Probe layer scans require text_decimal_places between 0 and 8.")
     validate_teacher_tensor_source(root.normalization, root.teacher_text_source)
     return root
 
@@ -299,6 +313,97 @@ def perturb_patches(patches: torch.Tensor, scale: float) -> torch.Tensor:
     return patches + float(scale) * amplitude * pattern
 
 
+def probe_target_and_control_perturbations(
+    patches: torch.Tensor,
+    anchor: AlignmentAnchor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply equal-cardinality perturbations on and outside the values named by a probe."""
+    if anchor.mode != "probe":
+        raise ValueError("Target/control perturbations require a probe anchor.")
+    target = patches.clone()
+    control = patches.clone()
+    height, width = int(patches.shape[-2]), int(patches.shape[-1])
+    family = str(anchor.probe_family)
+    parameters = tuple(int(value) for value in anchor.probe_parameters)
+
+    for batch_index in range(int(patches.shape[0])):
+        if family == "point_value":
+            channel, row, col = parameters
+            target_positions = [(row, col)]
+            target_signs = [1.0]
+            excluded = set(target_positions)
+        elif family in {"point_difference", "point_mean"}:
+            channel, row_a, col_a, row_b, col_b = parameters
+            target_positions = [(row_a, col_a), (row_b, col_b)]
+            target_signs = [1.0, -1.0] if family == "point_difference" else [1.0, 1.0]
+            excluded = set(target_positions)
+        elif family in {"region_mean", "region_range"}:
+            channel, row, col, size = parameters
+            region_positions = [
+                (region_row, region_col)
+                for region_row in range(row, row + size)
+                for region_col in range(col, col + size)
+            ]
+            excluded = set(region_positions)
+            if family == "region_mean":
+                target_positions = region_positions
+                target_signs = [1.0] * len(target_positions)
+            else:
+                region = patches[batch_index, channel, row : row + size, col : col + size].flatten()
+                max_index = int(region.argmax().item())
+                min_index = int(region.argmin().item())
+                if min_index == max_index:
+                    min_index = (max_index + 1) % int(region.numel())
+                target_positions = [region_positions[max_index], region_positions[min_index]]
+                target_signs = [1.0, -1.0]
+        else:
+            raise ValueError(f"Unsupported probe family for layer scan: {family!r}.")
+
+        offsets = [
+            (row_offset, col_offset)
+            for row_offset in range(height)
+            for col_offset in range(width)
+            if row_offset != 0 or col_offset != 0
+        ]
+        offsets.sort(
+            key=lambda offset: (
+                abs(offset[0] - height // 2) + abs(offset[1] - width // 2),
+                offset[0],
+                offset[1],
+            )
+        )
+        control_positions: list[tuple[int, int]] | None = None
+        for row_offset, col_offset in offsets:
+            translated = [
+                ((target_row + row_offset) % height, (target_col + col_offset) % width)
+                for target_row, target_col in target_positions
+            ]
+            if len(set(translated)) == len(target_positions) and not set(translated).intersection(excluded):
+                control_positions = translated
+                break
+        if control_positions is None:
+            raise ValueError(
+                f"Probe {anchor.name!r} covers too much of the patch for a translated equal-size disjoint control: "
+                f"target_values={len(target_positions)}, patch_shape=({height},{width})."
+            )
+        amplitude = (
+            patches[batch_index, channel].float().std(unbiased=False)
+            .clamp_min(torch.finfo(torch.float32).eps)
+            .to(dtype=patches.dtype)
+            * float(scale)
+        )
+        for (target_row, target_col), (control_row, control_col), sign in zip(
+            target_positions,
+            control_positions,
+            target_signs,
+            strict=True,
+        ):
+            target[batch_index, channel, target_row, target_col] += amplitude * float(sign)
+            control[batch_index, channel, control_row, control_col] += amplitude * float(sign)
+    return target, control
+
+
 def teacher_texts_from_patches(
     batch: Mapping[str, Any],
     source_patches: torch.Tensor,
@@ -352,12 +457,24 @@ def collect_anchor_hidden(
     args: SimpleNamespace,
     layers: Sequence[int],
     anchor: AlignmentAnchor | None,
-) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], dict[str, Any]]:
+) -> tuple[
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor] | None,
+    dict[str, Any],
+]:
     original_by_layer: dict[int, list[torch.Tensor]] = {int(layer): [] for layer in layers}
-    perturbed_by_layer: dict[int, list[torch.Tensor]] = {int(layer): [] for layer in layers}
+    target_perturbed_by_layer: dict[int, list[torch.Tensor]] = {int(layer): [] for layer in layers}
+    control_perturbed_by_layer: dict[int, list[torch.Tensor]] | None = (
+        {int(layer): [] for layer in layers} if anchor is not None and anchor.mode == "probe" else None
+    )
     position_values: list[int] = []
-    perturbed_text_changes = 0
+    target_perturbed_text_changes = 0
+    control_perturbed_text_changes = 0
     total_texts = 0
+    target_probe_change_sum = 0.0
+    control_probe_change_sum = 0.0
+    total_probe_targets = 0
     readout_token_ids: set[int] = set()
 
     for batch in loader:
@@ -368,16 +485,48 @@ def collect_anchor_hidden(
             False,
         )
         source = normalized if args.teacher_text_source == "normalized" else batch["patch"].float()
-        perturbed = perturb_patches(source, float(args.perturbation_scale))
+        if anchor is not None and anchor.mode == "probe":
+            target_perturbed, control_perturbed = probe_target_and_control_perturbations(
+                source,
+                anchor,
+                float(args.perturbation_scale),
+            )
+            original_targets, _ = probe_targets_from_patches(anchor, source, int(args.text_decimal_places))
+            target_targets, _ = probe_targets_from_patches(
+                anchor, target_perturbed, int(args.text_decimal_places)
+            )
+            control_targets, _ = probe_targets_from_patches(
+                anchor, control_perturbed, int(args.text_decimal_places)
+            )
+            target_probe_change_sum += float((target_targets - original_targets).abs().sum().item())
+            control_probe_change_sum += float((control_targets - original_targets).abs().sum().item())
+            total_probe_targets += int(original_targets.numel())
+        else:
+            target_perturbed = perturb_patches(source, float(args.perturbation_scale))
+            control_perturbed = None
         original_texts = teacher_texts_from_patches(batch, source, args)
-        perturbed_texts = teacher_texts_from_patches(batch, perturbed, args)
+        target_perturbed_texts = teacher_texts_from_patches(batch, target_perturbed, args)
+        control_perturbed_texts = (
+            teacher_texts_from_patches(batch, control_perturbed, args)
+            if control_perturbed is not None
+            else None
+        )
         total_texts += len(original_texts)
-        perturbed_text_changes += sum(a != b for a, b in zip(original_texts, perturbed_texts, strict=True))
+        target_perturbed_text_changes += sum(
+            a != b for a, b in zip(original_texts, target_perturbed_texts, strict=True)
+        )
+        if control_perturbed_texts is not None:
+            control_perturbed_text_changes += sum(
+                a != b for a, b in zip(original_texts, control_perturbed_texts, strict=True)
+            )
 
-        for texts, destination in (
+        variants: list[tuple[Sequence[str], dict[int, list[torch.Tensor]]]] = [
             (original_texts, original_by_layer),
-            (perturbed_texts, perturbed_by_layer),
-        ):
+            (target_perturbed_texts, target_perturbed_by_layer),
+        ]
+        if control_perturbed_texts is not None and control_perturbed_by_layer is not None:
+            variants.append((control_perturbed_texts, control_perturbed_by_layer))
+        for texts, destination in variants:
             input_ids, attention_mask = tokenize_teacher_batch(tokenizer, texts, args, anchor)
             indices = readout_indices(attention_mask)
             if destination is original_by_layer:
@@ -405,7 +554,14 @@ def collect_anchor_hidden(
                 destination[int(layer)].append(readout_hidden(hidden, indices).float().cpu())
 
     original = {layer: torch.cat(parts, dim=0) for layer, parts in original_by_layer.items()}
-    perturbed = {layer: torch.cat(parts, dim=0) for layer, parts in perturbed_by_layer.items()}
+    target_perturbed = {
+        layer: torch.cat(parts, dim=0) for layer, parts in target_perturbed_by_layer.items()
+    }
+    control_perturbed = (
+        {layer: torch.cat(parts, dim=0) for layer, parts in control_perturbed_by_layer.items()}
+        if control_perturbed_by_layer is not None
+        else None
+    )
     metadata = {
         "readout_position_zero_based_min": min(position_values),
         "readout_position_zero_based_max": max(position_values),
@@ -413,9 +569,16 @@ def collect_anchor_hidden(
         "readout_position_one_based_max": max(position_values) + 1,
         "readout_token_ids": sorted(readout_token_ids),
         "readout_tokens": [tokenizer.decode([token_id]) for token_id in sorted(readout_token_ids)],
-        "perturbed_text_changed_fraction": float(perturbed_text_changes / max(1, total_texts)),
+        "target_perturbed_text_changed_fraction": float(
+            target_perturbed_text_changes / max(1, total_texts)
+        ),
+        "control_perturbed_text_changed_fraction": float(
+            control_perturbed_text_changes / max(1, total_texts)
+        ),
+        "target_probe_value_abs_change_mean": float(target_probe_change_sum / max(1, total_probe_targets)),
+        "control_probe_value_abs_change_mean": float(control_probe_change_sum / max(1, total_probe_targets)),
     }
-    return original, perturbed, metadata
+    return original, target_perturbed, control_perturbed, metadata
 
 
 def average_layer_metrics(per_anchor: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, float]]:
@@ -433,27 +596,43 @@ def average_layer_metrics(per_anchor: Mapping[str, Mapping[str, Any]]) -> dict[s
 
 
 def print_summary(layers: Mapping[str, Mapping[str, float]]) -> None:
-    print("layer  pair_cos  nn_cos  eff_rank  perturb_cos  locality_margin")
+    has_control = all("target_to_control_sensitivity_ratio" in metrics for metrics in layers.values())
+    if has_control:
+        print("layer  pair_cos  nn_cos  eff_rank  target_l2  control_l2  target/control")
+    else:
+        print("layer  pair_cos  nn_cos  eff_rank  perturb_l2")
     for layer in sorted(layers, key=int):
         metrics = layers[layer]
-        print(
+        prefix = (
             f"{int(layer):>5d}  "
             f"{metrics['off_diagonal_cosine_mean']:>8.6f}  "
             f"{metrics['nearest_neighbor_cosine_mean']:>7.5f}  "
-            f"{metrics['effective_rank_participation']:>8.2f}  "
-            f"{metrics['perturbed_pair_cosine_mean']:>11.6f}  "
-            f"{metrics['locality_margin']:>15.6f}"
+            f"{metrics['effective_rank_participation']:>8.2f}"
         )
+        if has_control:
+            print(
+                prefix
+                + f"  {metrics['target_perturbed_relative_l2_mean']:>9.6f}"
+                + f"  {metrics['control_perturbed_relative_l2_mean']:>10.6f}"
+                + f"  {metrics['target_to_control_sensitivity_ratio']:>14.6f}"
+            )
+        else:
+            print(prefix + f"  {metrics['target_perturbed_relative_l2_mean']:>10.6f}")
     by_cosine = sorted(layers, key=lambda layer: layers[layer]["off_diagonal_cosine_mean"])
     by_rank = sorted(
         layers,
         key=lambda layer: layers[layer]["effective_rank_participation"],
         reverse=True,
     )
-    by_margin = sorted(layers, key=lambda layer: layers[layer]["locality_margin"], reverse=True)
     print("lowest_pairwise_cosine_layers=" + ",".join(by_cosine[:5]))
     print("highest_effective_rank_layers=" + ",".join(by_rank[:5]))
-    print("highest_locality_margin_layers=" + ",".join(by_margin[:5]))
+    if has_control:
+        by_sensitivity = sorted(
+            layers,
+            key=lambda layer: layers[layer]["target_to_control_sensitivity_ratio"],
+            reverse=True,
+        )
+        print("highest_target_control_sensitivity_layers=" + ",".join(by_sensitivity[:5]))
 
 
 def main() -> None:
@@ -536,7 +715,7 @@ def main() -> None:
     for anchor_index, anchor in enumerate(anchors):
         anchor_name = anchor.name if anchor is not None else "legacy_prompt"
         print(f"scan_anchor={anchor_index + 1}/{len(anchors)} name={anchor_name}")
-        original, perturbed, metadata = collect_anchor_hidden(
+        original, target_perturbed, control_perturbed, metadata = collect_anchor_hidden(
             llm=llm,
             tokenizer=tokenizer,
             loader=loader,
@@ -548,10 +727,23 @@ def main() -> None:
         layer_metrics: dict[str, dict[str, float]] = {}
         for layer in layers:
             metrics = representation_metrics(original[layer])
-            metrics.update(paired_metrics(original[layer], perturbed[layer]))
-            metrics["locality_margin"] = (
-                metrics["perturbed_pair_cosine_mean"] - metrics["off_diagonal_cosine_mean"]
+            metrics.update(
+                {
+                    f"target_{key}": value
+                    for key, value in paired_metrics(original[layer], target_perturbed[layer]).items()
+                }
             )
+            if control_perturbed is not None:
+                control_metrics = paired_metrics(original[layer], control_perturbed[layer])
+                metrics.update({f"control_{key}": value for key, value in control_metrics.items()})
+                metrics["target_to_control_sensitivity_ratio"] = (
+                    metrics["target_perturbed_relative_l2_mean"]
+                    / max(1.0e-12, metrics["control_perturbed_relative_l2_mean"])
+                )
+                metrics["target_minus_control_relative_l2"] = (
+                    metrics["target_perturbed_relative_l2_mean"]
+                    - metrics["control_perturbed_relative_l2_mean"]
+                )
             layer_metrics[str(layer)] = metrics
         per_anchor[anchor_name] = {
             "anchor": (
@@ -599,8 +791,14 @@ def main() -> None:
         "metric_guidance": {
             "off_diagonal_cosine_mean": "Lower means less cross-record angular collapse, but is not sufficient alone.",
             "effective_rank_participation": "Higher means variation occupies more independent directions.",
-            "locality_margin": (
-                "Perturbed-pair cosine minus unrelated-record cosine; higher means locally stable yet discriminative."
+            "target_perturbed_relative_l2_mean": (
+                "Relative hidden change after perturbing exactly the values named by the probe."
+            ),
+            "control_perturbed_relative_l2_mean": (
+                "Relative hidden change after an equal-cardinality perturbation outside the probe support."
+            ),
+            "target_to_control_sensitivity_ratio": (
+                "Values above 1 indicate stronger readout sensitivity to probe-relevant than off-target values."
             ),
         },
         "averaged_across_anchors": averaged,
