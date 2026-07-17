@@ -1045,21 +1045,22 @@ tensor path:
         -> frozen LLM -> middle-layer student hidden
 
 text path:
-  同一份 raw patch 序列化为文本 -> frozen LLM -> middle-layer teacher hidden
+  同一份 configured patch（当前为 per-patch z-score）序列化为文本
+        -> frozen LLM -> middle-layer teacher hidden
 ```
 
 当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；对齐位置是 suffix 最后一个 token 的 hidden state。Qwen2.5-1.5B 有 28 个 decoder layers，Hugging Face 的 `hidden_states[2]` 表示经过前两个 Transformer block 后的输出；当前 `teacher_layer: 2` 只读该位置，不读取最终层或 LM head。`hidden_states[0]` 只是上下文化前的输入 embedding，共享 readout token 在该位置看不到前面的 tensor，因此程序会拒绝 `teacher_layer <= 0`。
 
 注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
 
-Teacher branch 只包含原始数值和形状分隔符：
+Teacher branch 只包含配置后的 tensor 数值和形状分隔符：
 
 ```text
 [[[...]; [...]; ...]]
 <当前设置的共同 suffix>
 ```
 
-当前 `patch_encoder.normalization.mode: none` 且 `teacher_text_source: raw`，所以 AE 和文本 Teacher 都来自同一份未归一化 HDF5 patch。tensor path 保留 raw float32，Teacher 为了文本化按 `text_decimal_places: 4` 保留四位小数；两者来源相同，但不是逐 bit 相同。不对 encoder 输入做同样量化，因为下游会读取 raw tensor，强制量化会另外制造训练/推理差距。正式 `values_shared_suffix` 路径会强制检查 raw source、`normalization.mode: none` 且没有 `clip_min/clip_max`、Q-Former 和正的 InfoNCE 权重，任一契约被改动都会在 AE warmup 前报错。文本不含字段名、patch size、任务说明、`sample/time/top_left` 等信息。三层括号依次表示 channel、row、value 结构；当前 `field_sampling_mode: single` 下 channel 数为 1。去掉 normalization 后，各字段的数值尺度会直接影响共享 AE 的 reconstruction MSE，幅度大的字段可能占据更大梯度，这是本实验明确接受的性质。
+当前 `patch_encoder.normalization.mode: zscore`、`scope: channel` 且 `teacher_text_source: normalized`。每个单字段 patch 使用自身 mean/std 标准化，AE 与文本 Teacher 接收同一份标准化 tensor；Teacher 文本按 `text_decimal_places: 4` 量化，因此来源相同但不是逐 bit 相同。若 normalization 或 clipping 改变了 AE 输入，程序会强制要求 `teacher_text_source: normalized`，防止两条分支静默读取不同数值。文本不含字段名、patch size、任务说明、`sample/time/top_left` 等信息。三层括号依次表示 channel、row、value 结构；当前 `field_sampling_mode: single` 下 channel 数为 1。
 
 Student branch 不再使用旧的说明 prompt：
 
@@ -1074,7 +1075,7 @@ Student branch 不再使用旧的说明 prompt：
 |---|---|---|
 | `eos` | tokenizer 的单个显式 EOS token | EOS 浅层 hidden InfoNCE |
 | `representation` | `\nRepresentation:` | 冒号浅层 hidden InfoNCE |
-| `probe` | batch 共享的自然句子 stem | shared-anchor raw hidden InfoNCE |
+| `probe` | batch 共享的自然句子 stem | shared-anchor hidden，经可选 projection 后做 InfoNCE |
 
 正式配置选择 `alignment_anchor_mode: probe`。EOS 是序列边界/readout token，不归类为自然语言 probe。CLIP 的 EOT pooling 和 E5 的 EOS pooling 都伴随 text encoder 或 LLM 的对比式适配，不能据此假定冻结 Qwen 的 EOS hidden 天生适合作为 embedding；`eos` 和 `representation` 保留为可单独运行的基线，而不占用正式 probe 实验的训练 batch。
 
@@ -1090,7 +1091,7 @@ Compared with the value at row 12, column 5, the value at row 3, column 7 is
 At row 9, column 11, relative to row 2, column 4, the value is
 ```
 
-同一 batch 的所有样本、Teacher/Student 两侧以及全部 DDP rank 使用完全相同的 stem 和坐标，这样 InfoNCE 不能靠 prompt 身份识别正样本。每个 family 有四种短模板。句干末尾的 `is` 是两条路径共享的 readout token；程序直接比较它在第 2 层的 raw hidden，不计算其 next-token logits，也不要求它续写某个规范词。
+同一 batch 的所有样本、Teacher/Student 两侧以及全部 DDP rank 使用完全相同的 stem 和坐标，这样 InfoNCE 不能靠 prompt 身份识别正样本。每个 family 有四种短模板。句干末尾的 `is` 是两条路径共享的 readout token；程序读取它在第 2 层的 raw hidden，当前再经过 alignment projection 做对比；不计算 next-token logits，也不要求续写某个规范词。
 
 代码强制执行以下 probe contract：
 
@@ -1102,15 +1103,16 @@ At row 9, column 11, relative to row 2, column 4, the value is
 
 AE warmup 前会穷举全部 `5 families x 4 templates`。tokenization preflight 检查上述结构、每个 family 的四种模板是否保持不同 token 序列、所有 suffix 长度和正文截断。任一结构或 tokenization 契约失败都会在训练前终止。
 
-正式目标不减 probe-only baseline、不做 batch centering，也不经过 alignment projection：
+正式目标不减 probe-only baseline；主对比空间使用一层 CLIP-style alignment projection：
 
 ```text
-Teacher = L2_normalize(hidden(tensor text + probe))
-Student = L2_normalize(hidden(tensor embeddings + probe))
+Teacher = L2_normalize(teacher_projection(hidden(tensor text + probe)))
+Student = L2_normalize(student_projection(hidden(tensor embeddings + probe)))
 loss = symmetric_InfoNCE(Student, Teacher)
+     + 0.1 * centered_symmetric_InfoNCE(Student, Teacher)
 ```
 
-batch-centered retrieval 仍以无梯度指标记录，用来观察 hidden 各向异性，但不参与 loss、checkpoint 选择或主结论。训练不读取 Qwen 最终层 hidden，也不调用 LM head；第 2 层 shared-anchor raw hidden 是唯一对齐表示。
+student/teacher projection 默认是独立的 `LayerNorm + Linear(1536,512)`，只服务第一阶段 loss 和 retrieval，不改变送入 Qwen 的 1536 维 soft prompt。第 2 层 raw hidden 的 retrieval、pairwise cosine 仍单独记录为 `hidden_*` 诊断，避免把 projection 高分误认为 Qwen raw hidden 已自然对齐。centered InfoNCE 以 `0.1` 作为辅助项；未居中的 projection retrieval 仍是主指标和 checkpoint 依据。训练不读取 Qwen 最终层 hidden，也不调用 LM head。
 
 probe 模式的全局 retrieval 使用 `evaluation_probe_count` 个固定 sentence stem，每个 family 在整个验证 split 上单独编码和检索，再做平均；同一个候选库内绝不混入不同 probe。EOS 和 representation 设置各自只运行自己的全局检索。数值正文和 suffix 分开 tokenization；正文超出 `max_text_tokens - suffix_tokens` 会直接失败。
 
@@ -1144,7 +1146,7 @@ torchrun --standalone --nproc_per_node=4 \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-多卡模式会自动读取 `WORLD_SIZE/RANK/LOCAL_RANK`，`CUDA_VISIBLE_DEVICES` 中的物理 GPU 会在各进程内重新编号为 `cuda:0...`。`batch_size` 是**每卡 batch**，全局每步样本数和 InfoNCE 候选数均为 `batch_size * GPU数`；例如当前 `batch_size: 32`、4 张 GPU 时是全局 batch 128，每个样本看到 128 个候选。训练使用可微分 all-gather，远端样本作为负样本时的 candidate-side 梯度也会回传；随后再对共享模型参数梯度做 rank 间平均。`train_records` 是整个训练 split 的记录数，不会按 GPU 再复制；`DistributedSampler` 把它分给各 rank，所以每个 epoch 的优化步数约为 `train_records / (batch_size * GPU数)`。只有 rank 0 写 JSON、保存 checkpoint、运行 val/test 和记录 W&B。
+多卡模式会自动读取 `WORLD_SIZE/RANK/LOCAL_RANK`，`CUDA_VISIBLE_DEVICES` 中的物理 GPU 会在各进程内重新编号为 `cuda:0...`。`batch_size` 是**每卡 batch**，全局每步样本数和 InfoNCE 候选数均为 `batch_size * GPU数`；例如当前 `batch_size: 96`、4 张 GPU 时是全局 batch 384，每个样本看到 384 个候选。训练使用可微分 all-gather，远端样本作为负样本时的 candidate-side 梯度也会回传；随后再对共享模型参数梯度做 rank 间平均。`train_records` 是整个训练 split 的记录数，不会按 GPU 再复制；`DistributedSampler` 把它分给各 rank，所以每个 epoch 的优化步数约为 `train_records / (batch_size * GPU数)`。只有 rank 0 写 JSON、保存 checkpoint 和记录 W&B；所有 rank 都执行相同的 val/test 前向，避免长时间单-rank 评估导致 NCCL barrier 超时。
 
 小规模 smoke test：
 
@@ -1186,16 +1188,17 @@ torchrun --standalone --nproc_per_node=2 \
 
 ```text
 loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teacher_embedding)
-     + reconstruction_loss_weight * MSE(patch_AE_reconstruction, raw_patch)
+     + centered_contrastive_loss_weight * centered_symmetric_InfoNCE(...)
+     + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
-第一阶段脚本不包含 post-hidden alignment projection；`tensor_embedding` 和 `text_teacher_embedding` 就是两条路径在 Qwen 第 2 层 probe 末 token 的 raw hidden，经 L2 normalize 后进入 InfoNCE。没有 baseline subtraction、batch-centered 训练项、答案分类、LM-head CE、Teacher logits KL、数值 decoder 或新增任务 head。
+第一阶段默认启用 post-hidden alignment projection；两条路径在 Qwen 第 2 层 probe 末 token 的 raw hidden 分别经过独立的一层 `LayerNorm + Linear` 后进入 InfoNCE。projection 可由 `alignment_projection.enabled` 关闭。代码没有 baseline subtraction、答案分类、LM-head CE、Teacher logits KL、数值 decoder 或新增任务 head。
 
-旧配置中的 `alignment_projection`、`center_embeddings`、centered/cosine 辅助 loss 和 probe answer/KL 字段不会被静默忽略；脚本会在加载模型前列出残留字段并终止。
+旧配置中的 `center_embeddings`、cosine loss 和 probe answer/KL 字段不会被静默忽略；脚本会在加载模型前列出残留字段并终止。`alignment_projection` 和 `centered_contrastive_loss_weight` 是当前受支持设置。
 
 脚本同样会在长训练前拒绝无效边界：`epochs <= 0`、空 DataLoader、0 层 Q-Former、单卡 batch 1 导致 InfoNCE 没有负样本、新建随机 AE 却被冻结，以及可训练 AE 却关闭 reconstruction loss。
 
-`alignment_best.pt` 优先按整个验证 split 的未居中 `global_contrastive_loss` 选择；全局评估被记录数上限跳过时才回退到 batch `contrastive_loss`。AE reconstruction 波动和 centered 诊断都不会改变 adapter 的 best checkpoint；重建误差仍参与训练并单独记录。
+`alignment_best.pt` 优先按整个验证 split 的未居中 projection `global_contrastive_loss` 选择；全局评估被记录数上限跳过时才回退到 batch `contrastive_loss`。AE warmup 另按验证 reconstruction loss 保存 `patch_ae_pretrain_best.pt`，并在 alignment 前自动恢复 best；`last` 只保留作诊断。centered 辅助项不会改变 checkpoint 选择指标。
 
 `freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；设为 `true` 时只训练 Q-Former bridge。Q-Former 的必要输出线性层直接生成与 Qwen input embedding 同维的连续 prefix embeddings。
 
@@ -1210,8 +1213,8 @@ loss = contrastive_loss_weight * symmetric_InfoNCE(tensor_embedding, text_teache
 | `probe_tokenization_preflight.json` | 20 个 stem 的长度、token 序列和数值正文截断检查。 |
 | `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
 | `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
-| `patch_ae_pretrain_last.pt` | 可选 patch AE reconstruction warmup 后的 checkpoint。 |
-| `alignment_best.pt`、`alignment_last.pt` | 对齐 adapter checkpoint；始终保存 compressor config/state，方便下游直接复用同一个 patch AE。 |
+| `patch_ae_pretrain_best.pt`、`patch_ae_pretrain_last.pt` | patch AE 验证最优和最后一轮 checkpoint；alignment 自动恢复 best。 |
+| `alignment_best.pt`、`alignment_last.pt` | 对齐 adapter、alignment projector 和 compressor checkpoint；下游只加载 adapter/compressor，projector 仅用于第一阶段评估。 |
 
 W&B 曲线：
 
@@ -1229,10 +1232,12 @@ W&B 曲线：
 | `train/i2t_accuracy`、`val/i2t_accuracy` | batch 内 tensor-to-text retrieval accuracy。 |
 | `train/t2i_accuracy`、`val/t2i_accuracy` | batch 内 text-to-tensor retrieval accuracy。 |
 | `train/candidate_count` | 训练 InfoNCE 的候选数；单卡等于 batch size，多卡等于每卡 batch size 乘 GPU 数。 |
-| `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | 无梯度的 batch-centered 诊断 retrieval；不参与训练或 checkpoint 选择。 |
+| `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | batch-centered projection retrieval；当前以 0.1 权重参与辅助 InfoNCE，不作为 checkpoint 指标。 |
 | `val/global_i2t_accuracy`、`val/global_t2i_accuracy` | 整个验证 split 内的未居中 retrieval accuracy，是主要全局指标。 |
 | `val/global_centered_i2t_accuracy`、`val/global_centered_t2i_accuracy` | 整个验证 split 内的 centered retrieval，仅用于诊断 hidden 各向异性。 |
+| `val/global_hidden_uncentered_i2t_accuracy`、`val/global_hidden_uncentered_t2i_accuracy` | 不经过 alignment projection 的 raw Qwen hidden 全局 retrieval；仅用于判断投影层前后的差距。 |
 | `train/teacher_anchor_missing_fraction`、`val/teacher_anchor_missing_fraction` | teacher text tokenization 后 anchor 缺失比例；默认应为 0，否则代码会报错。 |
+| `train/teacher_duplicate_text_fraction`、`val/teacher_duplicate_text_fraction` | 当前 batch 中量化后 teacher tensor 文本的重复比例；非 0 表示 InfoNCE 可能把等价文本当作负样本。 |
 | `train/teacher_max_length_hit_fraction`、`val/teacher_max_length_hit_fraction` | teacher text 达到 `max_text_tokens` 的比例；非 0 时应考虑增大上下文或减小 patch/text 精度。 |
 | `train/student_soft_prompt_token_norm`、`val/student_soft_prompt_token_norm` | soft prompt token 的平均范数。 |
 | `train/student_text_token_embedding_norm`、`val/student_text_token_embedding_norm` | 普通文本 token embedding 的平均范数，可和 soft prompt norm 对比。 |
@@ -1248,7 +1253,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
   --wandb-mode online
 ```
 
-已训练 patch AE 可以按路径冻结复用。第一次训练后，优先用 `alignment_best.pt`；如果只想用 reconstruction warmup 后的 AE，则用 `patch_ae_pretrain_last.pt`：
+已训练 patch AE 可以按路径冻结复用。第一次训练后，优先用 `alignment_best.pt`；如果只想用 reconstruction warmup 后的 AE，则用 `patch_ae_pretrain_best.pt`：
 
 ```yaml
 patch_alignment:
@@ -1285,7 +1290,7 @@ patch_alignment:
 | `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`；`0`：关闭限制。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
-| `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `raw` | 正式 `values_shared_suffix` 路径强制为 `raw`，并要求 patch AE 使用 `normalization.mode: none`。 |
+| `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `raw`、`normalized` | 当前为 `normalized`；只要 AE 启用 normalization/clipping，就必须使用该值。 |
 | `--alignment-text-layout` | Teacher/Student 的文本布局。 | `values_shared_suffix`、`legacy_prompt` | 默认前者：两侧内容都在同一个短 suffix 前；后者复现旧的不对称说明 prompt。 |
 | `--alignment-anchor-mode` | 本次训练使用的唯一对齐设置。 | `eos`、`representation`、`probe` | 正式配置为 `probe`；三档不会在一次训练中混合。 |
 | `--representation-suffix` | `representation` 模式的极短文本后缀。 | 字符串 | 当前为换行后接 `Representation:`；末尾不追加 EOS。 |
@@ -1306,6 +1311,11 @@ patch_alignment:
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
 | `--contrastive-loss-weight` | symmetric InfoNCE 权重。 | 非负数 | 当前主要优化项，默认 1.0。 |
 | `--projection-dim` | Q-Former 输出到 LLM 的 soft prompt 维度。 | `null` 或 LLM hidden size | 默认 `null` 自动匹配 LLM hidden size；这是输入桥接层，不是 post-hidden 对齐投影。 |
+| `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 是否启用 post-hidden CLIP-style 对齐空间。 | 布尔开关 | 当前开启；只改变第一阶段 loss/retrieval，不改变送入 LLM 的 soft prompt。 |
+| `--alignment-projection-dim` | post-hidden 对齐空间宽度。 | 正整数 | 当前 512。 |
+| `--alignment-projection-layers` | 每侧 projection head 层数。 | 正整数 | 当前 1，即 `LayerNorm + Linear`。 |
+| `--alignment-projection-shared` / `--no-alignment-projection-shared` | student/teacher 是否共享 projection 参数。 | 布尔开关 | 当前 false，允许补偿两种输入布局差异。 |
+| `--centered-contrastive-loss-weight` | centered InfoNCE 辅助权重。 | 非负数 | 当前 0.1；主指标仍是未居中的 projection retrieval。 |
 | `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | 默认读取 `wandb.enabled`。 |
 | `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 patch AE/alignment checkpoint artifact。 | 布尔开关 | 默认读取 `wandb.log_model`。 |
@@ -1327,7 +1337,7 @@ patch_encoder:
 
 ### 3.10 16x16 Patch QA 迁移
 
-第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE，因此送入 AE 的 encoder input 与第一阶段完全一致；当前正式第一阶段使用 `normalization.mode: none`，所以 latent 编码的是 raw patch。QA 中需要的 z-score 目标由每个 raw patch 另行计算，并在问题文本中给出 mean/scale。
+第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE 及其 normalization config，因此 latent 编码的是当前 per-patch z-score tensor，与第一阶段 encoder 输入一致。QA 仍从 raw patch 计算数值标准答案和题面 mean/scale；alignment projector 不进入下游，Q-Former soft tokens 保持 Qwen 的原生 embedding 维度。
 
 当前任务使用固定、清晰的自然语言问题：
 

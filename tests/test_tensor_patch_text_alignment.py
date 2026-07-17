@@ -7,9 +7,11 @@ import pytest
 import torch
 
 from scripts.train_tensor_patch_text_alignment import (
+    AlignmentProjectionPair,
     build_numeric_probe_anchor,
     build_static_alignment_anchor,
     build_teacher_texts_for_batch,
+    duplicate_text_fraction,
     gather_with_grad,
     hidden_at_last_non_padding,
     normalize_alignment_embeddings,
@@ -20,7 +22,7 @@ from scripts.train_tensor_patch_text_alignment import (
     tokenize_contents_with_shared_suffix,
     validate_probe_anchor_contract,
     validate_teacher_hidden_state_index,
-    validate_unmodified_tensor_path,
+    validate_teacher_tensor_source,
 )
 
 
@@ -80,6 +82,26 @@ def test_teacher_text_serializes_raw_values_at_configured_precision() -> None:
     texts = build_teacher_texts_for_batch({"patch": patches}, patches, args)
 
     assert texts == ["[[[1.0000, 1.0000]; [0.0000, 0.0000]]]"
+
+
+def test_teacher_text_uses_normalized_patch_when_configured() -> None:
+    raw = torch.tensor([[[[10.0, 20.0]]]])
+    normalized = torch.tensor([[[[-1.0, 1.0]]]])
+    args = SimpleNamespace(
+        teacher_text_source="normalized",
+        alignment_text_layout="values_shared_suffix",
+        text_decimal_places=2,
+    )
+
+    texts = build_teacher_texts_for_batch({"patch": raw}, normalized, args)
+
+    assert texts == ["[[[-1.00, 1.00]]]"]
+
+
+def test_duplicate_text_fraction_reports_false_negative_risk() -> None:
+    assert duplicate_text_fraction([]) == 0.0
+    assert duplicate_text_fraction(["a", "b", "c"]) == 0.0
+    assert duplicate_text_fraction(["a", "a", "b", "b"]) == 0.5
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -190,14 +212,37 @@ def test_teacher_hidden_state_index_rejects_non_contextual_embedding_output() ->
     validate_teacher_hidden_state_index(28, 28)
 
 
-def test_unmodified_tensor_path_rejects_normalization_and_clipping() -> None:
-    validate_unmodified_tensor_path({"mode": "none"})
-    validate_unmodified_tensor_path({})
+def test_normalized_tensor_path_requires_normalized_teacher_text() -> None:
+    validate_teacher_tensor_source({"mode": "none"}, "raw")
+    validate_teacher_tensor_source({"mode": "none"}, "normalized")
+    validate_teacher_tensor_source({"mode": "zscore"}, "normalized")
+    validate_teacher_tensor_source({"mode": "none", "clip_min": -1.0}, "normalized")
 
-    with pytest.raises(ValueError, match="unmodified tensor path"):
-        validate_unmodified_tensor_path({"mode": "zscore"})
-    with pytest.raises(ValueError, match="clip_min/clip_max"):
-        validate_unmodified_tensor_path({"mode": "none", "clip_min": -1.0})
+    with pytest.raises(ValueError, match="teacher_text_source=normalized"):
+        validate_teacher_tensor_source({"mode": "zscore"}, "raw")
+    with pytest.raises(ValueError, match="teacher_text_source=normalized"):
+        validate_teacher_tensor_source({"mode": "none", "clip_min": -1.0}, "raw")
+
+
+def test_alignment_projection_pair_has_separate_trainable_heads() -> None:
+    projector = AlignmentProjectionPair(
+        input_dim=8,
+        output_dim=4,
+        hidden_dim=16,
+        layers=1,
+        dropout=0.0,
+        shared=False,
+    )
+    student = torch.randn(3, 8, requires_grad=True)
+    teacher = torch.randn(3, 8)
+
+    student_projected, teacher_projected = projector(student, teacher)
+    (student_projected.square().mean() + teacher_projected.square().mean()).backward()
+
+    assert student_projected.shape == (3, 4)
+    assert teacher_projected.shape == (3, 4)
+    assert projector.student is not projector.teacher
+    assert all(parameter.grad is not None for parameter in projector.parameters())
 
 
 def test_primary_alignment_only_l2_normalizes_raw_hidden() -> None:
@@ -222,9 +267,7 @@ def test_single_process_embedding_gather_preserves_gradients() -> None:
 @pytest.mark.parametrize(
     "option",
     [
-        "alignment_projection",
         "center_embeddings",
-        "centered_contrastive_loss_weight",
         "cosine_loss_weight",
         "probe_answer_ce_weight",
         "probe_teacher_kl_weight",

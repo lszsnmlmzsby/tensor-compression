@@ -99,9 +99,7 @@ PROBE_FAMILIES = (
 PROBE_TEMPLATES_PER_FAMILY = 4
 PROBE_FORBIDDEN_INPUT_MARKERS = ("answer:", "a or b", "a/b", "choose from", "options:", "?")
 REMOVED_PATCH_ALIGNMENT_OPTIONS = (
-    "alignment_projection",
     "center_embeddings",
-    "centered_contrastive_loss_weight",
     "cosine_loss_weight",
     "probe_answer_ce_weight",
     "probe_teacher_kl_weight",
@@ -127,19 +125,24 @@ def reject_removed_alignment_options(config: Mapping[str, Any]) -> None:
     if configured:
         raise ValueError(
             "Removed patch_alignment options are still present in the config: "
-            f"{configured}. Delete them before running the raw-hidden alignment objective."
+            f"{configured}. Delete them before running the alignment objective."
         )
 
 
-def validate_unmodified_tensor_path(normalization_cfg: Mapping[str, Any]) -> None:
-    normalization_mode = str(normalization_cfg.get("mode", "none")).lower()
-    clip_min = normalization_cfg.get("clip_min")
-    clip_max = normalization_cfg.get("clip_max")
-    if normalization_mode != "none" or clip_min is not None or clip_max is not None:
+def validate_teacher_tensor_source(
+    normalization_cfg: Mapping[str, Any],
+    teacher_text_source: str,
+) -> None:
+    mode = str((normalization_cfg or {}).get("mode", "none")).lower()
+    clip_min = (normalization_cfg or {}).get("clip_min")
+    clip_max = (normalization_cfg or {}).get("clip_max")
+    source = str(teacher_text_source).lower()
+    if source not in {"raw", "normalized"}:
+        raise ValueError("patch_alignment.teacher_text_source must be raw or normalized.")
+    if (mode != "none" or clip_min is not None or clip_max is not None) and source != "normalized":
         raise ValueError(
-            "values_shared_suffix requires an unmodified tensor path: normalization.mode=none and no "
-            f"clip_min/clip_max. Resolved values are mode={normalization_mode!r}, "
-            f"clip_min={clip_min!r}, clip_max={clip_max!r}."
+            "A normalized or clipped patch encoder requires patch_alignment.teacher_text_source=normalized "
+            "so the tensor and text branches receive the same values."
         )
 
 
@@ -256,15 +259,6 @@ def gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     if not distributed_is_initialized():
         return tensor
     return torch.cat(tuple(differentiable_all_gather(tensor.contiguous())), dim=0)
-
-
-@torch.no_grad()
-def gather_without_grad(tensor: torch.Tensor) -> torch.Tensor:
-    if not distributed_is_initialized():
-        return tensor.detach()
-    gathered = [torch.zeros_like(tensor) for _ in range(distributed_world_size())]
-    dist.all_gather(gathered, tensor.detach().contiguous())
-    return torch.cat(gathered, dim=0)
 
 
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -966,6 +960,64 @@ class TensorPatchAlignmentAdapter(nn.Module):
         return self.forward_soft_prompts(latent_map)
 
 
+def build_projection_head(
+    input_dim: int,
+    output_dim: int,
+    hidden_dim: int,
+    layers: int,
+    dropout: float,
+) -> nn.Module:
+    input_dim = int(input_dim)
+    output_dim = int(output_dim)
+    hidden_dim = int(hidden_dim)
+    layers = int(layers)
+    if layers <= 0:
+        raise ValueError("alignment_projection.layers must be positive.")
+    if layers == 1:
+        return nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, output_dim))
+
+    modules: list[nn.Module] = [
+        nn.LayerNorm(input_dim),
+        nn.Linear(input_dim, hidden_dim),
+        nn.GELU(),
+    ]
+    if float(dropout) > 0.0:
+        modules.append(nn.Dropout(float(dropout)))
+    for _ in range(layers - 2):
+        modules.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
+        if float(dropout) > 0.0:
+            modules.append(nn.Dropout(float(dropout)))
+    modules.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*modules)
+
+
+class AlignmentProjectionPair(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        layers: int,
+        dropout: float,
+        shared: bool,
+    ) -> None:
+        super().__init__()
+        self.shared = bool(shared)
+        self.student = build_projection_head(input_dim, output_dim, hidden_dim, layers, dropout)
+        self.teacher = (
+            self.student
+            if self.shared
+            else build_projection_head(input_dim, output_dim, hidden_dim, layers, dropout)
+        )
+
+    def forward(
+        self,
+        student_hidden: torch.Tensor,
+        teacher_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.student(student_hidden.float()), self.teacher(teacher_hidden.float())
+
+
 def symmetric_contrastive_loss(
     tensor_embedding: torch.Tensor,
     text_embedding: torch.Tensor,
@@ -1553,18 +1605,6 @@ def centered_alignment_embeddings(
     return F.normalize(tensor_embedding, dim=-1), F.normalize(text_embedding, dim=-1)
 
 
-@torch.no_grad()
-def distributed_centered_retrieval_diagnostic(
-    student_hidden: torch.Tensor,
-    teacher_hidden: torch.Tensor,
-    temperature: float,
-) -> dict[str, float]:
-    student_all = gather_without_grad(student_hidden.float())
-    teacher_all = gather_without_grad(teacher_hidden.float())
-    centered_student, centered_teacher = centered_alignment_embeddings(student_all, teacher_all)
-    return retrieval_accuracy(centered_student, centered_teacher, temperature)
-
-
 def add_weighted_metrics(
     totals: dict[str, float],
     metrics: Mapping[str, float],
@@ -1796,6 +1836,13 @@ def build_teacher_texts_for_batch(
     raise ValueError(f"Unsupported teacher_text_source: {args.teacher_text_source}")
 
 
+def duplicate_text_fraction(texts: Sequence[str]) -> float:
+    if not texts:
+        return 0.0
+    unique_count = len(set(str(text) for text in texts))
+    return float((len(texts) - unique_count) / len(texts))
+
+
 def alignment_anchors_from_args(
     tokenizer: Any,
     args: argparse.Namespace,
@@ -1881,6 +1928,7 @@ def train_one_epoch(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -1895,6 +1943,8 @@ def train_one_epoch(
     if hasattr(sampler, "set_epoch"):
         sampler.set_epoch(int(epoch))
     adapter.train()
+    if projector is not None:
+        projector.train()
     train_compressor = train_compressor_during_alignment(args)
     if train_compressor:
         compressor.train()
@@ -1933,6 +1983,7 @@ def train_one_epoch(
         )
         patches = normalized_patches.to(device)
         texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
+        teacher_duplicate_fraction = duplicate_text_fraction(texts)
         with torch.no_grad():
             teacher_output = text_teacher_hidden(
                 llm,
@@ -1979,37 +2030,52 @@ def train_one_epoch(
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        student_features = student_hidden
-        teacher_features = teacher_hidden
+        if projector is None:
+            student_features = student_hidden
+            teacher_features = teacher_hidden
+        else:
+            student_features, teacher_features = projector(student_hidden, teacher_hidden)
         tensor_embedding, text_embedding = normalize_alignment_embeddings(
             student_features,
             teacher_features,
         )
-        with torch.no_grad():
-            centered_tensor_embedding, centered_text_embedding = centered_alignment_embeddings(
-                student_features,
-                teacher_features,
-            )
-            centered_diagnostic_metrics = distributed_centered_retrieval_diagnostic(
-                student_features,
-                teacher_features,
-                float(args.temperature),
-            )
         contrastive, contrastive_metrics = distributed_symmetric_contrastive_loss(
             tensor_embedding,
             text_embedding,
             float(args.temperature),
         )
+        if float(args.centered_contrastive_loss_weight) > 0.0:
+            centered_tensor_embedding, centered_text_embedding = centered_alignment_embeddings(
+                student_features,
+                teacher_features,
+            )
+            centered_contrastive, centered_contrastive_metrics = distributed_symmetric_contrastive_loss(
+                centered_tensor_embedding,
+                centered_text_embedding,
+                float(args.temperature),
+            )
+        else:
+            with torch.no_grad():
+                centered_tensor_embedding, centered_text_embedding = centered_alignment_embeddings(
+                    student_features,
+                    teacher_features,
+                )
+                centered_contrastive, centered_contrastive_metrics = distributed_symmetric_contrastive_loss(
+                    centered_tensor_embedding,
+                    centered_text_embedding,
+                    float(args.temperature),
+                )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
+            + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + reconstruction_weight * reconstruction
         )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        synchronize_gradients([compressor if train_compressor else None, adapter])
+        synchronize_gradients([compressor if train_compressor else None, adapter, projector])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
                 [parameter for group in optimizer.param_groups for parameter in group["params"]],
@@ -2027,15 +2093,21 @@ def train_one_epoch(
         add_weighted_metrics(
             metric_totals,
             {
-                "contrastive_loss": float(centered_diagnostic_metrics["contrastive_loss"]),
-                "i2t_accuracy": float(centered_diagnostic_metrics["i2t_accuracy"]),
-                "t2i_accuracy": float(centered_diagnostic_metrics["t2i_accuracy"]),
-                "candidate_count": float(centered_diagnostic_metrics["candidate_count"]),
+                "contrastive_loss": float(centered_contrastive.detach().cpu().item()),
+                "i2t_accuracy": float(centered_contrastive_metrics["i2t_accuracy"]),
+                "t2i_accuracy": float(centered_contrastive_metrics["t2i_accuracy"]),
+                "candidate_count": float(centered_contrastive_metrics["candidate_count"]),
             },
             batch_size,
             "centered_",
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
+        add_weighted_metrics(
+            metric_totals,
+            {"duplicate_text_fraction": teacher_duplicate_fraction},
+            batch_size,
+            "teacher_",
+        )
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
             metric_totals,
@@ -2051,6 +2123,14 @@ def train_one_epoch(
                 "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
                 "centered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_tensor_embedding),
                 "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
+                "hidden_positive_cosine": float(
+                    F.cosine_similarity(student_hidden.detach().float(), teacher_hidden.detach().float(), dim=-1)
+                    .mean()
+                    .cpu()
+                    .item()
+                ),
+                "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(student_hidden),
+                "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(teacher_hidden),
             },
             batch_size,
             "alignment_",
@@ -2180,6 +2260,7 @@ def evaluate(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -2191,6 +2272,8 @@ def evaluate(
 ) -> dict[str, float]:
     compressor.eval()
     adapter.eval()
+    if projector is not None:
+        projector.eval()
     total_loss = 0.0
     total_contrastive = 0.0
     total_reconstruction = 0.0
@@ -2200,6 +2283,8 @@ def evaluate(
     metric_totals: dict[str, float] = {}
     collected_student_features: list[torch.Tensor] = []
     collected_teacher_features: list[torch.Tensor] = []
+    collected_student_hidden: list[torch.Tensor] = []
+    collected_teacher_hidden: list[torch.Tensor] = []
     collected_global_records = 0
     train_compressor = train_compressor_during_alignment(args)
     if alignment_anchor is None and str(args.alignment_text_layout) == "values_shared_suffix":
@@ -2212,10 +2297,11 @@ def evaluate(
             bool(args.resize_patch_to_compressor_input),
         )
         patches = normalized_patches.to(device)
+        teacher_texts = build_teacher_texts_for_batch(batch, normalized_patches, args)
         teacher_output = text_teacher_hidden(
             llm,
             tokenizer,
-            build_teacher_texts_for_batch(batch, normalized_patches, args),
+            teacher_texts,
             device,
             int(args.max_text_tokens),
             int(args.teacher_layer),
@@ -2249,8 +2335,11 @@ def evaluate(
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
-        student_features = student_hidden
-        teacher_features = teacher_hidden
+        if projector is None:
+            student_features = student_hidden
+            teacher_features = teacher_hidden
+        else:
+            student_features, teacher_features = projector(student_hidden, teacher_hidden)
         tensor_embedding, text_embedding = normalize_alignment_embeddings(
             student_features,
             teacher_features,
@@ -2264,7 +2353,7 @@ def evaluate(
             text_embedding,
             float(args.temperature),
         )
-        centered_diagnostic_metrics = retrieval_accuracy(
+        centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
             centered_tensor_embedding,
             centered_text_embedding,
             float(args.temperature),
@@ -2273,6 +2362,7 @@ def evaluate(
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
+            + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + reconstruction_weight * reconstruction
         )
         batch_size = int(patches.shape[0])
@@ -2285,15 +2375,21 @@ def evaluate(
         add_weighted_metrics(
             metric_totals,
             {
-                "contrastive_loss": float(centered_diagnostic_metrics["contrastive_loss"]),
-                "i2t_accuracy": float(centered_diagnostic_metrics["i2t_accuracy"]),
-                "t2i_accuracy": float(centered_diagnostic_metrics["t2i_accuracy"]),
-                "candidate_count": float(centered_diagnostic_metrics["candidate_count"]),
+                "contrastive_loss": float(centered_contrastive.detach().cpu().item()),
+                "i2t_accuracy": float(centered_contrastive_metrics["i2t_accuracy"]),
+                "t2i_accuracy": float(centered_contrastive_metrics["t2i_accuracy"]),
+                "candidate_count": float(centered_contrastive_metrics["candidate_count"]),
             },
             batch_size,
             "centered_",
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
+        add_weighted_metrics(
+            metric_totals,
+            {"duplicate_text_fraction": duplicate_text_fraction(teacher_texts)},
+            batch_size,
+            "teacher_",
+        )
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
             metric_totals,
@@ -2309,6 +2405,14 @@ def evaluate(
                 "teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(text_embedding),
                 "centered_student_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_tensor_embedding),
                 "centered_teacher_embedding_pairwise_cosine": off_diagonal_cosine_mean(centered_text_embedding),
+                "hidden_positive_cosine": float(
+                    F.cosine_similarity(student_hidden.float(), teacher_hidden.float(), dim=-1)
+                    .mean()
+                    .cpu()
+                    .item()
+                ),
+                "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(student_hidden),
+                "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(teacher_hidden),
             },
             batch_size,
             "alignment_",
@@ -2320,6 +2424,8 @@ def evaluate(
             if take > 0:
                 collected_student_features.append(student_features[:take].detach().float().cpu())
                 collected_teacher_features.append(teacher_features[:take].detach().float().cpu())
+                collected_student_hidden.append(student_hidden[:take].detach().float().cpu())
+                collected_teacher_hidden.append(teacher_hidden[:take].detach().float().cpu())
                 collected_global_records += int(take)
     metrics = {
         "loss": total_loss / max(1, total_records),
@@ -2332,6 +2438,8 @@ def evaluate(
     if bool(args.global_retrieval_eval) and collected_student_features:
         student_all = torch.cat(collected_student_features, dim=0)
         teacher_all = torch.cat(collected_teacher_features, dim=0)
+        student_hidden_all = torch.cat(collected_student_hidden, dim=0)
+        teacher_hidden_all = torch.cat(collected_teacher_hidden, dim=0)
         global_tensor, global_text = normalize_alignment_embeddings(student_all, teacher_all)
         global_centered_tensor, global_centered_text = centered_alignment_embeddings(student_all, teacher_all)
         metrics.update(
@@ -2357,6 +2465,21 @@ def evaluate(
                 ).items()
             }
         )
+        global_hidden, global_teacher_hidden = normalize_alignment_embeddings(
+            student_hidden_all,
+            teacher_hidden_all,
+        )
+        metrics.update(
+            {
+                f"global_hidden_uncentered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_hidden,
+                    global_teacher_hidden,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                ).items()
+            }
+        )
     elif bool(args.global_retrieval_eval):
         metrics["global_retrieval_skipped"] = 1.0
     return metrics
@@ -2377,6 +2500,7 @@ def evaluate_anchor_bank(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     llm: nn.Module,
     tokenizer: Any,
     loader: DataLoader,
@@ -2389,6 +2513,7 @@ def evaluate_anchor_bank(
         return evaluate(
             compressor=compressor,
             adapter=adapter,
+            projector=projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=loader,
@@ -2404,6 +2529,7 @@ def evaluate_anchor_bank(
         metrics = evaluate(
             compressor=compressor,
             adapter=adapter,
+            projector=projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=loader,
@@ -2493,10 +2619,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
     parser.add_argument("--projection-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--alignment-projection-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-hidden-dim", type=int, default=None)
+    parser.add_argument("--alignment-projection-layers", type=int, default=None)
+    parser.add_argument("--alignment-projection-dropout", type=float, default=None)
+    parser.add_argument("--alignment-projection-shared", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--contrastive-loss-weight", type=float, default=None)
+    parser.add_argument("--centered-contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--reconstruction-loss-weight", type=float, default=None)
     parser.add_argument(
         "--teacher-text-source",
@@ -2634,10 +2767,52 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "adapter_layers", first_nested(config, ["patch_alignment.adapter_layers"]), 2)
     set_default(args, "adapter_heads", first_nested(config, ["patch_alignment.adapter_heads"]), 8)
     set_default(args, "projection_dim", first_nested(config, ["patch_alignment.projection_dim"]), None)
+    set_default(
+        args,
+        "alignment_projection_enabled",
+        first_nested(config, ["patch_alignment.alignment_projection.enabled"]),
+        False,
+    )
+    set_default(
+        args,
+        "alignment_projection_dim",
+        first_nested(config, ["patch_alignment.alignment_projection.dim"]),
+        512,
+    )
+    set_default(
+        args,
+        "alignment_projection_hidden_dim",
+        first_nested(config, ["patch_alignment.alignment_projection.hidden_dim"]),
+        1024,
+    )
+    set_default(
+        args,
+        "alignment_projection_layers",
+        first_nested(config, ["patch_alignment.alignment_projection.layers"]),
+        1,
+    )
+    set_default(
+        args,
+        "alignment_projection_dropout",
+        first_nested(config, ["patch_alignment.alignment_projection.dropout"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "alignment_projection_shared",
+        first_nested(config, ["patch_alignment.alignment_projection.shared"]),
+        False,
+    )
     set_default(args, "dropout", first_nested(config, ["patch_alignment.dropout"]), 0.0)
     set_default(args, "soft_prompt_scale", first_nested(config, ["patch_alignment.soft_prompt_scale"]), 0.05)
     set_default(args, "temperature", first_nested(config, ["patch_alignment.temperature"]), 0.07)
     set_default(args, "contrastive_loss_weight", first_nested(config, ["patch_alignment.contrastive_loss_weight"]), 1.0)
+    set_default(
+        args,
+        "centered_contrastive_loss_weight",
+        first_nested(config, ["patch_alignment.centered_contrastive_loss_weight"]),
+        0.0,
+    )
     set_default(args, "reconstruction_loss_weight", first_nested(config, ["patch_alignment.reconstruction_loss_weight"]), 1.0)
     set_default(args, "teacher_text_source", first_nested(config, ["patch_alignment.teacher_text_source"]), "normalized")
     set_default(
@@ -2780,8 +2955,19 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
     if float(args.temperature) <= 0.0:
         raise ValueError("patch_alignment.temperature must be positive.")
+    if bool(args.alignment_projection_enabled):
+        if int(args.alignment_projection_dim) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.dim must be positive.")
+        if int(args.alignment_projection_hidden_dim) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.hidden_dim must be positive.")
+        if int(args.alignment_projection_layers) <= 0:
+            raise ValueError("patch_alignment.alignment_projection.layers must be positive.")
+        if float(args.alignment_projection_dropout) < 0.0:
+            raise ValueError("patch_alignment.alignment_projection.dropout must be non-negative.")
     if float(args.contrastive_loss_weight) <= 0.0:
         raise ValueError("patch_alignment.contrastive_loss_weight must be positive for alignment training.")
+    if float(args.centered_contrastive_loss_weight) < 0.0:
+        raise ValueError("patch_alignment.centered_contrastive_loss_weight must be non-negative.")
     if float(args.reconstruction_loss_weight) < 0.0:
         raise ValueError("patch_alignment.reconstruction_loss_weight must be non-negative.")
     if bool(args.train_patch_ae) and float(args.reconstruction_loss_weight) <= 0.0:
@@ -2799,10 +2985,10 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
                 "values_shared_suffix requires a positive patch_alignment.text_preflight_records so tensor text "
                 "truncation is checked before AE warmup."
             )
-        if str(args.teacher_text_source).lower() != "raw":
+        teacher_source = str(args.teacher_text_source).lower()
+        if teacher_source not in {"raw", "normalized"}:
             raise ValueError(
-                "values_shared_suffix requires patch_alignment.teacher_text_source=raw so both paths originate "
-                "from the same unnormalized patch. The Teacher still sees the configured decimal serialization."
+                "values_shared_suffix requires patch_alignment.teacher_text_source to be raw or normalized."
             )
         if str(args.adapter_type).lower() != "qformer":
             raise ValueError(
@@ -2927,6 +3113,7 @@ def save_checkpoint(
     *,
     compressor: nn.Module,
     adapter: TensorPatchAlignmentAdapter,
+    projector: AlignmentProjectionPair | None,
     args: argparse.Namespace,
     metrics: Mapping[str, Any],
     compressor_config: Mapping[str, Any],
@@ -2938,6 +3125,8 @@ def save_checkpoint(
         "args": redacted_args(args),
         "metrics": metrics,
     }
+    if projector is not None:
+        payload["alignment_projector_state_dict"] = projector.state_dict()
     if save_compressor:
         payload["compressor_state_dict"] = compressor.state_dict()
     torch.save(payload, path)
@@ -2975,6 +3164,8 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"t2i={fmt_metric(metrics, 't2i_accuracy')} "
         f"global_i2t={fmt_metric(metrics, 'global_i2t_accuracy')} "
         f"global_t2i={fmt_metric(metrics, 'global_t2i_accuracy')} "
+        f"raw_global_i2t={fmt_metric(metrics, 'global_hidden_uncentered_i2t_accuracy')} "
+        f"raw_global_t2i={fmt_metric(metrics, 'global_hidden_uncentered_t2i_accuracy')} "
         f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
         f"recon_rel={fmt_metric(metrics, 'reconstruction_relative_rmse_to_target_std')}"
     )
@@ -3019,10 +3210,19 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "adapter_layers": int(args.adapter_layers),
             "adapter_heads": int(args.adapter_heads),
             "projection_dim": args.projection_dim,
+            "alignment_projection": {
+                "enabled": bool(args.alignment_projection_enabled),
+                "dim": int(args.alignment_projection_dim),
+                "hidden_dim": int(args.alignment_projection_hidden_dim),
+                "layers": int(args.alignment_projection_layers),
+                "dropout": float(args.alignment_projection_dropout),
+                "shared": bool(args.alignment_projection_shared),
+            },
             "dropout": float(args.dropout),
             "soft_prompt_scale": float(args.soft_prompt_scale),
             "temperature": float(args.temperature),
             "contrastive_loss_weight": float(args.contrastive_loss_weight),
+            "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
             "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
             "teacher_text_source": str(args.teacher_text_source),
             "alignment_text_layout": str(args.alignment_text_layout),
@@ -3133,8 +3333,7 @@ def main() -> None:
     validate_field_shapes(args.hdf5_path, field_keys)
     compressor_input_size = tuple(int(dim) for dim in compressor_config["model"]["input_size"])
     normalization_cfg = dict(compressor_config.get("data", {}).get("dataset", {}).get("normalization", {}))
-    if str(args.alignment_text_layout) == "values_shared_suffix":
-        validate_unmodified_tensor_path(normalization_cfg)
+    validate_teacher_tensor_source(normalization_cfg, str(args.teacher_text_source))
     if not bool(args.resize_patch_to_compressor_input) and tuple(compressor_input_size) != (
         int(args.patch_size),
         int(args.patch_size),
@@ -3335,8 +3534,19 @@ def main() -> None:
         adapter_heads=int(args.adapter_heads),
         soft_prompt_scale=float(args.soft_prompt_scale),
     ).to(device)
+    alignment_projector: AlignmentProjectionPair | None = None
+    if bool(args.alignment_projection_enabled):
+        alignment_projector = AlignmentProjectionPair(
+            input_dim=llm_hidden_size,
+            output_dim=int(args.alignment_projection_dim),
+            hidden_dim=int(args.alignment_projection_hidden_dim),
+            layers=int(args.alignment_projection_layers),
+            dropout=float(args.alignment_projection_dropout),
+            shared=bool(args.alignment_projection_shared),
+        ).to(device)
     broadcast_module_state(compressor)
     broadcast_module_state(adapter)
+    broadcast_module_state(alignment_projector)
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
         bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
@@ -3396,6 +3606,20 @@ def main() -> None:
         "llm_hidden_size": int(llm_hidden_size),
         "llm_num_hidden_layers": int(llm_num_hidden_layers),
         "projection_dim": int(projection_dim),
+        "normalization": dict(normalization_cfg),
+        "alignment_projection": {
+            "enabled": bool(args.alignment_projection_enabled),
+            "dim": int(args.alignment_projection_dim),
+            "hidden_dim": int(args.alignment_projection_hidden_dim),
+            "layers": int(args.alignment_projection_layers),
+            "dropout": float(args.alignment_projection_dropout),
+            "shared": bool(args.alignment_projection_shared),
+            "parameters": (
+                sum(parameter.numel() for parameter in alignment_projector.parameters())
+                if alignment_projector is not None
+                else 0
+            ),
+        },
         "teacher_layer": int(args.teacher_layer),
         "teacher_transformer_blocks_applied": int(args.teacher_layer),
         "teacher_text_source": str(args.teacher_text_source),
@@ -3447,12 +3671,21 @@ def main() -> None:
             "training_schedule": "one shared probe per batch; families and four templates cycle uniformly",
             "primary_validation": "mean over fixed probes only when probe mode is selected",
             "global_retrieval": "separate_candidate_library_per_anchor",
-            "alignment_hidden": "raw_shared_anchor_hidden",
+            "alignment_hidden": (
+                "projected_shared_anchor_hidden"
+                if alignment_projector is not None
+                else "raw_shared_anchor_hidden"
+            ),
             "primary_embedding_centering": "none",
-            "centered_retrieval": "diagnostic_only",
+            "centered_retrieval": (
+                "auxiliary_loss_and_diagnostic"
+                if float(args.centered_contrastive_loss_weight) > 0.0
+                else "diagnostic_only"
+            ),
         },
         "max_shared_suffix_tokens": int(args.max_shared_suffix_tokens),
         "contrastive_loss_weight": float(args.contrastive_loss_weight),
+        "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
         "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
         "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
         "global_retrieval_eval": bool(args.global_retrieval_eval),
@@ -3485,6 +3718,11 @@ def main() -> None:
             "train_drop_last": bool(distributed_is_initialized()),
         },
         "adapter_parameters": sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad),
+        "alignment_projector_parameters": (
+            sum(parameter.numel() for parameter in alignment_projector.parameters() if parameter.requires_grad)
+            if alignment_projector is not None
+            else 0
+        ),
         "pretrain_trainable_compressor_parameters": sum(
             parameter.numel() for parameter in compressor.parameters() if parameter.requires_grad
         ),
@@ -3507,9 +3745,13 @@ def main() -> None:
             f"text_layout={str(args.alignment_text_layout)} "
             f"train_anchors={','.join(anchor.name for anchor in training_anchors) or 'legacy'} "
             f"eval_anchors={','.join(anchor.name for anchor in evaluation_anchors) or 'legacy'} "
+            f"normalization={str(normalization_cfg.get('mode', 'none'))} "
+            f"teacher_source={str(args.teacher_text_source)} "
             "embedding_centering=none "
             f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
-            "alignment_projection=none "
+            f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
+            f"alignment_projection={'enabled' if alignment_projector is not None else 'none'} "
+            f"projection_dim={int(args.alignment_projection_dim) if alignment_projector is not None else 'n/a'} "
             f"distributed={bool(distributed_is_initialized())} "
             f"world_size={int(distributed_world_size())} "
             f"train_candidates={int(args.batch_size) * int(distributed_world_size())} "
@@ -3531,6 +3773,8 @@ def main() -> None:
     global_step = 0
 
     metrics_history: dict[str, Any] = {}
+    best_patch_ae_val = float("inf")
+    best_patch_ae_epoch = 0
     if bool(args.train_patch_ae) and int(args.patch_ae_pretrain_epochs) > 0:
         compressor_optimizer = torch.optim.AdamW(
             [parameter for parameter in compressor.parameters() if parameter.requires_grad],
@@ -3593,11 +3837,26 @@ def main() -> None:
                     run_dir / "patch_ae_pretrain_last.pt",
                     compressor=compressor,
                     adapter=adapter,
+                    projector=alignment_projector,
                     args=args,
                     metrics=pretrain_epoch_metrics,
                     compressor_config=compressor_config,
                     save_compressor=True,
                 )
+                current_patch_ae_val = float(pretrain_val_metrics["reconstruction_loss"])
+                if current_patch_ae_val < best_patch_ae_val:
+                    best_patch_ae_val = current_patch_ae_val
+                    best_patch_ae_epoch = int(pretrain_epoch)
+                    save_checkpoint(
+                        run_dir / "patch_ae_pretrain_best.pt",
+                        compressor=compressor,
+                        adapter=adapter,
+                        projector=alignment_projector,
+                        args=args,
+                        metrics=pretrain_epoch_metrics,
+                        compressor_config=compressor_config,
+                        save_compressor=True,
+                    )
                 print(
                     f"patch_ae_pretrain_epoch={pretrain_epoch:04d} "
                     f"train_recon={pretrain_metrics['reconstruction_loss']:.4f} "
@@ -3607,6 +3866,20 @@ def main() -> None:
                 )
             distributed_barrier()
 
+        best_patch_ae = torch.load(run_dir / "patch_ae_pretrain_best.pt", map_location=device)
+        compressor.load_state_dict(best_patch_ae["compressor_state_dict"])
+        if is_main_process():
+            metrics_history["patch_ae_pretrain_best"] = {
+                "epoch": int(best_patch_ae_epoch),
+                "val_reconstruction_loss": float(best_patch_ae_val),
+            }
+            dump_json(run_dir / "metrics_latest.json", metrics_history)
+            print(
+                f"patch_ae_pretrain_restored_best epoch={best_patch_ae_epoch:04d} "
+                f"val_recon={best_patch_ae_val:.6g}"
+            )
+        distributed_barrier()
+
     if bool(args.alignment_train_patch_ae):
         for parameter in compressor.parameters():
             parameter.requires_grad_(True)
@@ -3615,6 +3888,8 @@ def main() -> None:
             parameter.requires_grad_(False)
         compressor.eval()
     optimizer_params = list(adapter.parameters())
+    if alignment_projector is not None:
+        optimizer_params += list(alignment_projector.parameters())
     if bool(args.alignment_train_patch_ae):
         optimizer_params += [parameter for parameter in compressor.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(optimizer_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -3626,6 +3901,7 @@ def main() -> None:
         train_metrics = train_one_epoch(
             compressor=compressor,
             adapter=adapter,
+            projector=alignment_projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=train_loader,
@@ -3640,6 +3916,7 @@ def main() -> None:
         val_metrics = evaluate_anchor_bank(
             compressor=compressor,
             adapter=adapter,
+            projector=alignment_projector,
             llm=llm,
             tokenizer=tokenizer,
             loader=val_loader,
@@ -3656,6 +3933,7 @@ def main() -> None:
                 run_dir / "alignment_last.pt",
                 compressor=compressor,
                 adapter=adapter,
+                projector=alignment_projector,
                 args=args,
                 metrics=epoch_metrics,
                 compressor_config=compressor_config,
@@ -3680,6 +3958,7 @@ def main() -> None:
                     run_dir / "alignment_best.pt",
                     compressor=compressor,
                     adapter=adapter,
+                    projector=alignment_projector,
                     args=args,
                     metrics=epoch_metrics,
                     compressor_config=compressor_config,
@@ -3706,11 +3985,17 @@ def main() -> None:
 
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
     adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
+    if alignment_projector is not None:
+        projector_state = best_checkpoint.get("alignment_projector_state_dict")
+        if not isinstance(projector_state, Mapping):
+            raise ValueError("Projection-enabled alignment checkpoint is missing alignment_projector_state_dict.")
+        alignment_projector.load_state_dict(projector_state)
     if "compressor_state_dict" in best_checkpoint:
         compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
     test_metrics = evaluate_anchor_bank(
         compressor=compressor,
         adapter=adapter,
+        projector=alignment_projector,
         llm=llm,
         tokenizer=tokenizer,
         loader=test_loader,

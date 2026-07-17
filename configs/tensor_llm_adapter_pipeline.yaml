@@ -123,9 +123,9 @@ patch_alignment:
   # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
   #   tensor path: patch -> patch AE encoder -> Q-Former soft prompt -> frozen LLM
   #   text path: serialized patch -> frozen LLM
-  # Probe mode directly aligns the two raw shallow hidden states at the shared readout token.
+  # Probe mode reads matching shallow hidden states; the optional projection below defines the contrastive space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_hidden_probe
+  run_name: tensor_patch_text_alignment_projection_zscore
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -156,8 +156,9 @@ patch_alignment:
   ensure_disjoint_records: true
   seed: 42
   device: auto
-  batch_size: 32
-  eval_batch_size: 32
+  # Per-GPU batch. Four GPUs provide 384 in-batch contrastive candidates.
+  batch_size: 96
+  eval_batch_size: 96
   epochs: 4
   lr: 1.0e-4
   weight_decay: 1.0e-4
@@ -171,15 +172,13 @@ patch_alignment:
   # false: freeze a loaded checkpoint encoder and train only the alignment adapter.
   # To reuse a trained patch AE, set:
   #   encoder_source: checkpoint
-  #   compressor_checkpoint: /path/to/alignment_best.pt or patch_ae_pretrain_last.pt
+  #   compressor_checkpoint: /path/to/alignment_best.pt or patch_ae_pretrain_best.pt
   #   train_patch_ae: false
   #   patch_ae_pretrain_epochs: 0
   train_patch_ae: true
-  # true: after reconstruction pretraining, freeze patch AE and train only the Q-Former/soft prompt bridge.
-  # Raw multi-field reconstruction can dominate the alignment gradients.
-  # Pretrain the patch AE for reconstruction, then freeze it while the Q-Former learns the LLM bridge.
-  freeze_patch_ae_after_pretrain: true
-  # Reconstruction-only warmup for a fresh patch AE before contrastive alignment starts.
+  # false matches the successful projection run: restore the best warmup AE, then jointly refine it.
+  freeze_patch_ae_after_pretrain: false
+  # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
   patch_ae_pretrain_epochs: 5
   # Used only when encoder_source: checkpoint.
   compressor_checkpoint: null
@@ -189,8 +188,13 @@ patch_alignment:
   resize_patch_to_compressor_input: false
   patch_encoder:
     normalization:
-      # Keep the tensor values unchanged in both the AE and text-teacher branches.
-      mode: none
+      # none disables normalization; zscore normalizes each sampled field patch independently.
+      # When enabled, teacher_text_source must be normalized so both branches see identical values.
+      mode: zscore
+      scope: channel
+      stats_path: null
+      clip_min: null
+      clip_max: null
     model:
       name: conv_token_autoencoder_2d
       input_size: [16, 16]
@@ -210,6 +214,17 @@ patch_alignment:
   adapter_heads: 8
   # null maps Q-Former outputs directly to the LLM input embedding width.
   projection_dim: null
+  # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
+  # The Q-Former soft tokens still enter Qwen at its native 1536-dimensional embedding width.
+  alignment_projection:
+    enabled: true
+    dim: 512
+    hidden_dim: 1024
+    # Keep this linear; a deeper head can memorize a private retrieval space.
+    layers: 1
+    dropout: 0.0
+    # Separate maps let the text and soft-prefix branches compensate for their different input layouts.
+    shared: false
   dropout: 0.0
   # Bound each soft prompt dimension with tanh before feeding it to the frozen LLM.
   # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.
@@ -217,12 +232,14 @@ patch_alignment:
   temperature: 0.07
   # Symmetric hidden-state InfoNCE is the primary alignment objective.
   contrastive_loss_weight: 1.0
+  # Small auxiliary centered InfoNCE matches the previous successful projection run.
+  centered_contrastive_loss_weight: 0.1
   # Only contributes gradients while the AE is trainable; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
-  # Both paths originate from the same raw patch; text serialization rounds it to text_decimal_places.
-  teacher_text_source: raw
+  # Serialize the same z-scored patch that enters the AE.
+  teacher_text_source: normalized
   # Symmetric layout:
-  #   teacher = canonical raw tensor values + one batch-shared setting-specific suffix
+  #   teacher = configured raw/normalized tensor values + one batch-shared setting-specific suffix
   #   student = 16 continuous Q-Former embeddings + the exact same suffix token IDs
   # No field names, task instructions, sample/time metadata, or patch-size text enter either branch.
   alignment_text_layout: values_shared_suffix
@@ -254,7 +271,7 @@ patch_alignment:
   global_retrieval_chunk_size: 1024
   # Used only with alignment_text_layout: legacy_prompt.
   text_prompt_template: compact
-  # Raw density/pressure variations can disappear at two decimal places; keep four and fail on truncation.
+  # Four decimals preserve normalized local differences; preflight fails instead of silently truncating.
   text_decimal_places: 4
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
