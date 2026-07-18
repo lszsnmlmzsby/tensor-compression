@@ -55,6 +55,8 @@ except ImportError as exc:  # pragma: no cover - exercised only in missing-depen
 
 IGNORE_INDEX = -100
 STRUCTURED_QUERY_FEATURE_DIM = 32
+PATCH_QA_FORMAT = "tensor_patch_qa_v2"
+PATCH_QA_PROMPT_CONTRACT = "encoder_zscore_one_based_v2"
 SUPPORTED_BASELINE_MODES = {
     "correct",
     "global_only",
@@ -155,6 +157,7 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
     has_grid_shape = isinstance(grid_shape, Sequence) and not isinstance(grid_shape, str)
     height = int(grid_shape[0]) if has_grid_shape and len(grid_shape) >= 1 else 512
     width = int(grid_shape[1]) if has_grid_shape and len(grid_shape) >= 2 else 512
+    coordinate_origin = int(metadata.get("coordinate_origin", 0))
     task_type = str(record.get("task_type", ""))
     query = str(record.get("query") or record.get("question") or "")
     choices = record.get("choices")
@@ -183,8 +186,8 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
 
     point = re.search(r"row(?:=|\s+)(\d+)[,\s]+col(?:umn)?(?:=|\s+)(\d+)", query, re.IGNORECASE)
     if point:
-        row = int(point.group(1))
-        col = int(point.group(2))
+        row = int(point.group(1)) - coordinate_origin
+        col = int(point.group(2)) - coordinate_origin
         features[16] = _normalize_coordinate(row, height)
         features[17] = _normalize_coordinate(col, width)
 
@@ -195,6 +198,12 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
     ) or re.search(r"A=\((\d+),(\d+)\)\s+B=\((\d+),(\d+)\)", query)
     if point_pair:
         row_a, col_a, row_b, col_b = [int(group) for group in point_pair.groups()]
+        row_a, col_a, row_b, col_b = (
+            row_a - coordinate_origin,
+            col_a - coordinate_origin,
+            row_b - coordinate_origin,
+            col_b - coordinate_origin,
+        )
         features[16] = _normalize_coordinate(row_a, height)
         features[17] = _normalize_coordinate(col_a, width)
         features[18] = _normalize_coordinate(row_b, height)
@@ -213,6 +222,12 @@ def structured_query_features_for_record(record: Mapping[str, Any]) -> list[floa
     )
     if region_pair:
         row_a, col_a, row_b, col_b = [int(group) for group in region_pair.groups()]
+        row_a, col_a, row_b, col_b = (
+            row_a - coordinate_origin,
+            col_a - coordinate_origin,
+            row_b - coordinate_origin,
+            col_b - coordinate_origin,
+        )
         size_match = re.search(r"two (\d+) by (\d+) regions", query, re.IGNORECASE)
         region_h = int(size_match.group(1)) if size_match else 1
         region_w = int(size_match.group(2)) if size_match else region_h
@@ -1272,6 +1287,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=None, help="Optional tensor-LLM pipeline YAML config.")
     parser.add_argument("--qa-dir", type=str, default=None)
     parser.add_argument("--latent-dir", type=str, default=None)
+    parser.add_argument(
+        "--qa-alignment-checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint provenance expected in patch QA metadata; useful for isolated transfer tests.",
+    )
     parser.add_argument("--model-name-or-path", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--hf-home", type=str, default=None)
@@ -1973,6 +1994,33 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         metadata = json.load(handle)
     if not isinstance(metadata, Mapping):
         raise ValueError(f"Expected a JSON object in {metadata_path}.")
+    metadata_format = str(metadata.get("format", ""))
+    prompt_contract = str(metadata.get("prompt_contract", ""))
+    coordinate_origin = int(metadata.get("natural_language_coordinate_origin", -1))
+    if bool(args.require_disjoint_splits) and (
+        metadata_format != PATCH_QA_FORMAT
+        or prompt_contract != PATCH_QA_PROMPT_CONTRACT
+        or coordinate_origin != 1
+    ):
+        raise ValueError(
+            "Formal patch QA training requires regenerated encoder-zscore, one-based natural-language prompts. "
+            f"Observed format={metadata_format!r}, prompt_contract={prompt_contract!r}, "
+            f"coordinate_origin={coordinate_origin}. Run scripts/build_tensor_patch_qa.py with the current code; "
+            "matching latent files will be reused."
+        )
+    qa_fields = [str(field) for field in metadata.get("fields", [])]
+    alignment_fields = [str(field) for field in metadata.get("alignment_fields", [])]
+    allow_unseen_alignment_fields = bool(metadata.get("allow_unseen_alignment_fields", False))
+    unseen_alignment_fields = sorted(set(qa_fields) - set(alignment_fields))
+    if bool(args.require_disjoint_splits) and (
+        not alignment_fields or (unseen_alignment_fields and not allow_unseen_alignment_fields)
+    ):
+        raise ValueError(
+            "Formal patch QA metadata does not prove that stage 1 covered every QA field: "
+            f"qa_fields={qa_fields}, alignment_fields={alignment_fields}, "
+            f"unseen={unseen_alignment_fields}, allow_unseen={allow_unseen_alignment_fields}. "
+            "Regenerate with a matching multi-field stage-1 checkpoint."
+        )
     observed_alignment = metadata.get("alignment_checkpoint")
     configured_alignment = getattr(args, "qa_alignment_checkpoint", None)
     if observed_alignment and configured_alignment:
@@ -2014,9 +2062,14 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "available": True,
         "path": str(metadata_path),
+        "format": metadata_format,
+        "prompt_contract": prompt_contract,
+        "natural_language_coordinate_origin": coordinate_origin,
         "alignment_checkpoint": str(observed_alignment or ""),
         "hdf5_path": str(metadata.get("hdf5_path", "")),
-        "fields": list(metadata.get("fields", [])),
+        "fields": qa_fields,
+        "alignment_fields": alignment_fields,
+        "allow_unseen_alignment_fields": allow_unseen_alignment_fields,
         "patch_size": int(metadata.get("patch_size", -1)),
         "split_mode": split_mode,
         "question_seed_mode": question_seed_mode,
@@ -2029,14 +2082,14 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
     task_type = str(record.get("task_type", "")).strip()
     if task_type == "normalized_point_value":
         return (
-            "Rule: read the raw value x at the requested patch-local row and column from the tensor soft tokens, "
-            "then use the mean and scale stated in the question to compute z = (x - mean) / scale. "
+            "Rule: read the standardized value z directly at the requested patch-local row and column from "
+            "the tensor soft tokens. "
             "Choose the closest numeric option and return only its label."
         )
     if task_type == "raw_point_value_with_stats":
         return (
-            "Rule: read the raw value x at the requested patch-local position from the tensor soft tokens. "
-            "The stated mean and scale are reference statistics for the same patch. "
+            "Rule: read standardized z at the requested patch-local position from the tensor soft tokens, then "
+            "recover the original value with x = mean + scale * z using the stated patch statistics. "
             "Choose the closest original-value option and return only its label."
         )
     if task_type == "point_bin":
@@ -2048,7 +2101,8 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
         )
     if task_type == "point_compare":
         return (
-            "Rule: compare the requested field value at point A with point B using the tensor soft tokens. "
+            "Rule: compare the standardized values at point A and point B using the tensor soft tokens; "
+            "per-patch standardization preserves their original ordering. "
             "Choice A means point A is greater than or tied with point B. "
             "Choice B means point B is strictly greater than point A. "
             "Return exactly A or B and no extra text."
@@ -2062,12 +2116,14 @@ def task_specific_instruction(record: Mapping[str, Any]) -> str:
         )
     if task_type == "region_mean_compare":
         return (
-            "Rule: compare the mean raw values in the two stated patch-local regions using the tensor soft tokens. "
+            "Rule: compare the standardized means in the two stated patch-local regions using the tensor soft "
+            "tokens; per-patch standardization preserves their original ordering. "
             "Return A if region A has the greater or tied mean; otherwise return B."
         )
     if task_type == "extreme_quadrant":
         return (
-            "Rule: locate the requested maximum or minimum in the raw patch using the tensor soft tokens. "
+            "Rule: locate the requested maximum or minimum in the standardized patch using the tensor soft "
+            "tokens; per-patch standardization preserves extrema and their locations. "
             "Return A for top-left, B for top-right, C for bottom-left, or D for bottom-right."
         )
     if task_type == "max_speed_quadrant":
@@ -3373,8 +3429,8 @@ def records_for_baseline(
         mean = float(shuffled_data.get("mean", prompt_data["mean"]))
         scale = float(shuffled_data.get("scale", shuffled_data.get("std", prompt_data.get("scale", prompt_data["std"]))))
         question = (
-            f"The tensor soft tokens encode a raw {patch_size} by {patch_size} patch of {prompt_data['field']}. "
-            "For reference, standardization would use z = (x - mean) / scale, "
+            f"The tensor soft tokens encode the per-patch standardized {patch_size} by {patch_size} matrix z "
+            f"of {prompt_data['field']}. Recover an original value with x = mean + scale * z, "
             f"where mean is {mean:.{digits}g} and scale is {scale:.{digits}g}. "
             "Which option is closest to the "
             f"original value x at row {int(prompt_data['row'])}, column {int(prompt_data['col'])}? "

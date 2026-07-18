@@ -24,7 +24,14 @@ from build_tensor_readout_qa import (  # noqa: E402
     generate_split_records,
     split_sample_indices,
 )
-from build_tensor_patch_qa import build_questions, labeled_numeric_choices, per_patch_zscore, question_seed  # noqa: E402
+from build_tensor_patch_qa import (  # noqa: E402
+    build_questions,
+    labeled_numeric_choices,
+    per_patch_zscore,
+    question_seed,
+    validate_alignment_field_coverage,
+    validate_patch_qa_encoder_normalization,
+)
 
 
 def _write_synthetic_pdebench_file(path: Path) -> None:
@@ -89,7 +96,7 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
         self.assertEqual({variant["oracle"]["extreme"] for variant in variants}, {"minimum", "maximum"})
         self.assertEqual([variant["question_variant"] for variant in variants], [0, 1])
 
-    def test_patch_qa_questions_do_not_claim_latent_is_standardized(self) -> None:
+    def test_patch_qa_questions_describe_encoder_value_space_and_one_based_coordinates(self) -> None:
         record = {
             "fields": ["Vx"],
             "sample_index": 1,
@@ -117,12 +124,46 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
         )
 
         question = questions[0]["question"]
-        self.assertIn("encode a raw 4 by 4 patch", question)
+        self.assertIn("encode the per-patch standardized 4 by 4 matrix z", question)
         self.assertIn("z = (x - mean) / scale", question)
-        self.assertNotIn("standardized patch is encoded", question)
+        self.assertIn(
+            f"row {int(questions[0]['oracle']['row']) + 1}, column {int(questions[0]['oracle']['col']) + 1}",
+            question,
+        )
         self.assertEqual(questions[0]["metadata"]["tensor_encoding"], "alignment_checkpoint_encoder_input")
         self.assertEqual(questions[0]["metadata"]["qa_value_space"], "per_patch_zscore")
+        self.assertEqual(questions[0]["metadata"]["prompt_contract"], "encoder_zscore_one_based_v2")
+        self.assertEqual(questions[0]["metadata"]["coordinate_origin"], 1)
         self.assertAlmostEqual(float(qa_patch.mean().item()), 0.0, places=6)
+
+    def test_patch_qa_normalization_matches_alignment_encoder_contract(self) -> None:
+        raw_patch = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+        qa_patch, stats = per_patch_zscore(raw_patch)
+        expected = (raw_patch - raw_patch.mean()) / (raw_patch.std(unbiased=False) + 1.0e-6)
+        self.assertTrue(torch.allclose(qa_patch, expected))
+        self.assertAlmostEqual(stats["scale"], float(raw_patch.std(unbiased=False).item()) + 1.0e-6)
+        validate_patch_qa_encoder_normalization(
+            {"mode": "zscore", "scope": "channel", "clip_min": None, "clip_max": None}
+        )
+        with self.assertRaisesRegex(ValueError, "require the stage-1 encoder input"):
+            validate_patch_qa_encoder_normalization({"mode": "none", "scope": "channel"})
+
+    def test_patch_qa_rejects_fields_unseen_during_alignment(self) -> None:
+        checkpoint_args = {"fields": "Vx"}
+        with self.assertRaisesRegex(ValueError, "absent from stage-1 alignment"):
+            validate_alignment_field_coverage(
+                checkpoint_args,
+                ["density", "Vx"],
+                allow_unseen=False,
+            )
+        self.assertEqual(
+            validate_alignment_field_coverage(
+                checkpoint_args,
+                ["density", "Vx"],
+                allow_unseen=True,
+            ),
+            ["Vx"],
+        )
 
     def test_numeric_choices_increase_display_precision_until_distinct(self) -> None:
         option_text, choices, answer, values, used_digits = labeled_numeric_choices(

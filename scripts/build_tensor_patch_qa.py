@@ -51,6 +51,8 @@ TASKS = (
     "extreme_quadrant",
 )
 LABELS_4 = ("A", "B", "C", "D")
+PATCH_QA_FORMAT = "tensor_patch_qa_v2"
+PATCH_QA_PROMPT_CONTRACT = "encoder_zscore_one_based_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storage-dtype", choices=("float16", "float32"), default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--include-oracle", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--allow-unseen-alignment-fields",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow QA fields that were absent from stage-1 alignment (cross-field transfer only).",
+    )
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     config = load_yaml_mapping(args.config)
@@ -129,6 +137,12 @@ def parse_args() -> argparse.Namespace:
     set_default(args, "storage_dtype", first_nested(config, ["patch_qa.storage_dtype"]), "float16")
     set_default(args, "seed", first_nested(config, ["patch_qa.seed", "runtime.seed"]), 42)
     set_default(args, "include_oracle", first_nested(config, ["patch_qa.include_oracle"]), False)
+    set_default(
+        args,
+        "allow_unseen_alignment_fields",
+        first_nested(config, ["patch_qa.allow_unseen_alignment_fields"]),
+        False,
+    )
     set_default(args, "overwrite", first_nested(config, ["patch_qa.overwrite"]), False)
     for name in ("alignment_checkpoint", "hdf5_path", "qa_dir", "latent_dir", "fields"):
         if not getattr(args, name):
@@ -199,6 +213,45 @@ def validate_reusable_latent_metadata(
         )
 
 
+def validate_alignment_field_coverage(
+    checkpoint_args: Mapping[str, Any],
+    qa_fields: Sequence[str],
+    *,
+    allow_unseen: bool,
+) -> list[str]:
+    alignment_fields = parse_csv(checkpoint_args.get("fields"))
+    if not alignment_fields:
+        if bool(allow_unseen):
+            return []
+        raise ValueError(
+            "The stage-1 checkpoint does not record its alignment fields, so downstream field coverage cannot "
+            "be verified. Use a checkpoint with args.fields provenance or explicitly set "
+            "patch_qa.allow_unseen_alignment_fields=true for a cross-field transfer experiment."
+        )
+    unseen = sorted(set(str(field) for field in qa_fields) - set(alignment_fields))
+    if unseen and not bool(allow_unseen):
+        raise ValueError(
+            "Patch QA requests fields that were absent from stage-1 alignment: "
+            f"unseen={unseen}, alignment_fields={alignment_fields}. Train stage 1 on all requested fields, "
+            "restrict patch_qa.fields, or explicitly set patch_qa.allow_unseen_alignment_fields=true to label "
+            "this as a cross-field transfer experiment."
+        )
+    return alignment_fields
+
+
+def validate_patch_qa_encoder_normalization(normalization_cfg: Mapping[str, Any]) -> None:
+    mode = str(normalization_cfg.get("mode", "none")).lower()
+    scope = str(normalization_cfg.get("scope", "global")).lower()
+    clip_min = normalization_cfg.get("clip_min")
+    clip_max = normalization_cfg.get("clip_max")
+    if mode != "zscore" or scope != "channel" or clip_min is not None or clip_max is not None:
+        raise ValueError(
+            "The current patch QA prompts require the stage-1 encoder input to be unclipped per-patch z-score "
+            "data (normalization mode=zscore, scope=channel, clip_min/clip_max=null). "
+            f"Got mode={mode!r}, scope={scope!r}, clip_min={clip_min!r}, clip_max={clip_max!r}."
+        )
+
+
 def patch_id(record: Mapping[str, Any]) -> str:
     field = str(record["fields"][0])
     return (
@@ -259,7 +312,8 @@ def per_patch_zscore(
     patch_float = patch.float()
     mean = patch_float.mean()
     std = patch_float.std(unbiased=False)
-    scale = std.clamp_min(float(eps))
+    # Match normalize_tensor(mode=zscore) exactly so QA targets describe the cached encoder input.
+    scale = std + float(eps)
     z_patch = (patch_float - mean) / scale
     return z_patch, {
         "mean": float(mean.item()),
@@ -294,10 +348,13 @@ def common_record(
         "answer": str(answer),
         "metadata": {
             "dataset": "PDEBench",
+            "prompt_contract": PATCH_QA_PROMPT_CONTRACT,
             "tensor_encoding": "alignment_checkpoint_encoder_input",
             "qa_value_space": "per_patch_zscore",
             "grid_shape": [int(patch_record["patch_size"]), int(patch_record["patch_size"])],
             "coordinate_order": "row_col",
+            "coordinate_origin": 1,
+            "oracle_coordinate_origin": 0,
             "field": str(patch_record["fields"][0]),
         },
     }
@@ -333,16 +390,20 @@ def build_questions(
     while row_b == row_a and col_b == col_a:
         row_b, col_b = rng.randrange(size), rng.randrange(size)
 
+    def display_coordinate(index: int) -> int:
+        return int(index) + 1
+
     if "normalized_point_value" in tasks:
         z_value = float(normalized_patch[0, row_a, col_a].item())
         option_text, choices, answer, numeric_choices, _used_decimals = labeled_numeric_choices(
             z_value, spacing, decimals, rng
         )
         question = (
-            f"The tensor soft tokens encode a raw {size} by {size} patch of {field}. "
-            f"For this question, standardize values with z = (x - mean) / scale, "
+            f"The tensor soft tokens encode the per-patch standardized {size} by {size} matrix z of {field}. "
+            f"The standardization is z = (x - mean) / scale, "
             f"where mean is {mean:.{decimals}g} and scale is {standardization_scale:.{decimals}g}. "
-            f"Which option is closest to the standardized value at row {row_a}, column {col_a}? "
+            f"Which option is closest to z at row {display_coordinate(row_a)}, "
+            f"column {display_coordinate(col_a)}? "
             f"Options: {option_text}."
         )
         oracle = {
@@ -375,11 +436,12 @@ def build_questions(
             raw_value, raw_spacing, decimals, rng
         )
         question = (
-            f"The tensor soft tokens encode a raw {size} by {size} patch of {field}. "
-            f"For reference, standardization would use z = (x - mean) / scale, "
+            f"The tensor soft tokens encode the per-patch standardized {size} by {size} matrix z of {field}. "
+            f"Recover an original value with x = mean + scale * z, "
             f"where mean is {mean:.{used_decimals}g} and scale is {standardization_scale:.{used_decimals}g}. "
             f"Which option is closest to the "
-            f"original value x at row {row_a}, column {col_a}? Options: {option_text}."
+            f"original value x at row {display_coordinate(row_a)}, "
+            f"column {display_coordinate(col_a)}? Options: {option_text}."
         )
         oracle = {
             "row": row_a,
@@ -406,8 +468,8 @@ def build_questions(
             "mean": mean,
             "std": std,
             "scale": standardization_scale,
-            "row": row_a,
-            "col": col_a,
+            "row": display_coordinate(row_a),
+            "col": display_coordinate(col_a),
             "option_text": option_text,
             "significant_digits": int(used_decimals),
             "option_significant_digits": int(used_decimals),
@@ -430,9 +492,10 @@ def build_questions(
         raw_value_b = float(raw_patch[0, row_b, col_b].item())
         answer = "A" if raw_value_a >= raw_value_b else "B"
         question = (
-            f"The tensor soft tokens encode a raw {size} by {size} patch of {field}. "
-            f"Which location has the larger value: "
-            f"A at row {row_a}, column {col_a}, or B at row {row_b}, column {col_b}?"
+            f"The tensor soft tokens encode the per-patch standardized {size} by {size} matrix of {field}; "
+            "standardization preserves value order. Which location has the larger value: "
+            f"A at row {display_coordinate(row_a)}, column {display_coordinate(col_a)}, or B at row "
+            f"{display_coordinate(row_b)}, column {display_coordinate(col_b)}?"
         )
         oracle = {
             "point_a": [row_a, col_a],
@@ -472,9 +535,11 @@ def build_questions(
         mean_b = float(raw_patch[0, row0_b : row0_b + region, col0_b : col0_b + region].mean().item())
         answer = "A" if mean_a >= mean_b else "B"
         question = (
-            f"The tensor soft tokens encode a raw {size} by {size} patch of {field}. "
+            f"The tensor soft tokens encode the per-patch standardized {size} by {size} matrix of {field}; "
+            "standardization preserves the ordering of region means. "
             f"Compare the mean values of two {region} by {region} regions. "
-            f"Region A starts at row {row0_a}, column {col0_a}; region B starts at row {row0_b}, column {col0_b}. "
+            f"Region A starts at row {display_coordinate(row0_a)}, column {display_coordinate(col0_a)}; "
+            f"region B starts at row {display_coordinate(row0_b)}, column {display_coordinate(col0_b)}. "
             "Which region has the larger mean?"
         )
         oracle = {
@@ -508,7 +573,8 @@ def build_questions(
         answer = quadrant(row, col, size)
         extreme = "maximum" if find_maximum else "minimum"
         question = (
-            f"The tensor soft tokens encode a raw {size} by {size} patch of {field}. "
+            f"The tensor soft tokens encode the per-patch standardized {size} by {size} matrix of {field}; "
+            "standardization preserves extrema and their locations. "
             f"Which quadrant contains the {extreme} value? "
             "The quadrants are top-left, top-right, bottom-left, and bottom-right."
         )
@@ -551,11 +617,17 @@ def main() -> None:
     if int(args.patch_size) != int(checkpoint_args.get("patch_size", args.patch_size)):
         raise ValueError("patch_qa.patch_size must match the alignment checkpoint patch_size.")
     fields = parse_csv(args.fields)
+    alignment_fields = validate_alignment_field_coverage(
+        checkpoint_args,
+        fields,
+        allow_unseen=bool(args.allow_unseen_alignment_fields),
+    )
     validate_field_shapes(args.hdf5_path, fields)
     model_cfg = compressor_config.get("model", {})
     if int(model_cfg.get("in_channels", 1)) != 1:
         raise ValueError("Patch QA single-field mode requires a single-channel alignment compressor.")
     normalization_cfg = dict(compressor_config.get("data", {}).get("dataset", {}).get("normalization", {}))
+    validate_patch_qa_encoder_normalization(normalization_cfg)
     device = resolve_device(args.device)
     compressor.to(device).eval()
     for parameter in compressor.parameters():
@@ -635,6 +707,11 @@ def main() -> None:
             for patch in raw_batch:
                 encoder_input, _state = normalize_tensor(patch, normalization_cfg)
                 qa_patch, qa_stats = per_patch_zscore(patch)
+                if not torch.allclose(encoder_input.float(), qa_patch.float(), rtol=1.0e-5, atol=1.0e-6):
+                    raise ValueError(
+                        "Patch QA value space differs from the alignment encoder input despite the normalization "
+                        "preflight. Refusing to generate semantically inconsistent prompts and latents."
+                    )
                 encoder_input_items.append(encoder_input)
                 qa_patch_items.append(qa_patch)
                 stats.append(qa_stats)
@@ -707,15 +784,20 @@ def main() -> None:
         }
 
     metadata = {
-        "format": "tensor_patch_qa_v1",
+        "format": PATCH_QA_FORMAT,
+        "prompt_contract": PATCH_QA_PROMPT_CONTRACT,
         "hdf5_path": str(args.hdf5_path),
         "alignment_checkpoint": str(args.alignment_checkpoint),
+        "alignment_fields": alignment_fields,
+        "allow_unseen_alignment_fields": bool(args.allow_unseen_alignment_fields),
         "qa_dir": str(qa_dir),
         "latent_dir": str(latent_root),
         "fields": fields,
         "patch_size": int(args.patch_size),
         "encoder_input_normalization": normalization_cfg,
         "qa_value_space": "per_patch_zscore_from_raw_patch",
+        "natural_language_coordinate_origin": 1,
+        "oracle_coordinate_origin": 0,
         "split_mode": str(args.split_mode),
         "question_seed_mode": "sha256(seed|patch_id|variant)",
         "question_variants": question_variants,

@@ -15,6 +15,7 @@ from scripts.train_tensor_patch_text_alignment import (
     build_numeric_probe_anchor,
     build_static_alignment_anchor,
     build_teacher_texts_for_batch,
+    checkpoint_selection_value,
     duplicate_text_fraction,
     gather_with_grad,
     hidden_at_last_non_padding,
@@ -28,6 +29,7 @@ from scripts.train_tensor_patch_text_alignment import (
     tokenize_contents_with_anchor,
     tokenize_contents_with_shared_suffix,
     validate_probe_anchor_contract,
+    validate_teacher_probe_preflight,
     validate_teacher_hidden_state_index,
     validate_teacher_tensor_source,
 )
@@ -282,6 +284,47 @@ def test_teacher_whitening_uses_one_fixed_transform_for_both_branches() -> None:
     assert not any(parameter.requires_grad for parameter in whitener.parameters())
 
 
+def test_teacher_pca_whitening_discards_low_variance_directions() -> None:
+    generator = torch.Generator().manual_seed(9)
+    teacher = torch.randn(512, 6, generator=generator)
+    teacher[:, 2:] *= 0.01
+    whitener = FixedTeacherWhitening(
+        hidden_dim=6,
+        output_dim=2,
+        shrinkage=0.01,
+        epsilon=1.0e-5,
+    )
+
+    metrics = whitener.fit(teacher)
+    transformed = whitener.transform(teacher)
+
+    assert transformed.shape == (512, 2)
+    assert whitener.matrix.shape == (6, 2)
+    assert metrics["output_dim"] == 2.0
+    assert metrics["explained_variance_ratio"] > 0.99
+    assert torch.allclose(
+        transformed.mean(dim=0),
+        torch.zeros(2),
+        atol=1.0e-4,
+    )
+
+
+def test_teacher_pca_whitening_can_fit_within_anchor_covariance() -> None:
+    anchor_a = torch.randn(64, 4, generator=torch.Generator().manual_seed(20)) + 100.0
+    anchor_b = torch.randn(64, 4, generator=torch.Generator().manual_seed(21)) - 100.0
+    teacher = torch.cat([anchor_a, anchor_b], dim=0)
+    residuals = torch.cat(
+        [anchor_a - anchor_a.mean(dim=0), anchor_b - anchor_b.mean(dim=0)],
+        dim=0,
+    )
+    whitener = FixedTeacherWhitening(hidden_dim=4, output_dim=2, shrinkage=0.01, epsilon=1.0e-5)
+
+    metrics = whitener.fit(teacher, covariance_residuals=residuals)
+
+    assert metrics["within_anchor_covariance"] == 1.0
+    assert metrics["output_dim"] == 2.0
+
+
 def test_teacher_whitening_state_dict_restores_fitted_statistics() -> None:
     teacher = torch.randn(64, 3, generator=torch.Generator().manual_seed(11))
     fitted = FixedTeacherWhitening(hidden_dim=3, shrinkage=0.01, epsilon=1.0e-5)
@@ -519,6 +562,38 @@ def test_semantic_collisions_are_excluded_from_loss_but_strict_retrieval_is_pres
     assert metrics["semantic_collision_fraction"] > 0.0
     assert metrics["semantic_i2t_accuracy"] > metrics["i2t_accuracy"]
     assert metrics["semantic_t2i_accuracy"] > metrics["t2i_accuracy"]
+
+
+def test_checkpoint_selection_uses_strict_transformed_and_native_losses() -> None:
+    args = SimpleNamespace(
+        centered_contrastive_loss_weight=0.1,
+        native_centered_contrastive_loss_weight=0.1,
+    )
+    metrics = {
+        "global_strict_contrastive_loss": 2.0,
+        "global_centered_strict_contrastive_loss": 3.0,
+        "global_hidden_centered_strict_contrastive_loss": 5.0,
+    }
+
+    name, value = checkpoint_selection_value(metrics, args)
+
+    assert name == (
+        "global_strict_contrastive_loss+0.1*global_centered_strict_contrastive_loss"
+        "+0.1*global_hidden_centered_strict_contrastive_loss"
+    )
+    assert value == pytest.approx(2.8)
+
+
+def test_teacher_probe_preflight_rejects_unsupported_enabled_probe() -> None:
+    preflight = {
+        "anchors": {
+            "point_value": {"hidden_similarity_vs_negative_target_distance_pearson": 0.4},
+            "region_range": {"hidden_similarity_vs_negative_target_distance_pearson": 0.02},
+        }
+    }
+
+    with pytest.raises(ValueError, match="region_range=0.0200"):
+        validate_teacher_probe_preflight(preflight, minimum_correlation=0.1)
 
 
 def test_layer_scan_control_changes_equal_number_of_off_target_values() -> None:

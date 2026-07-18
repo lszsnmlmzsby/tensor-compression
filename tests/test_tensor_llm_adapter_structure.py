@@ -16,6 +16,8 @@ from train_tensor_llm_adapter import (  # noqa: E402
     build_local_conditioning_prompt,
     parse_generated_choice,
     same_state_question_swap_indices,
+    structured_query_features_for_record,
+    task_specific_instruction,
 )
 from train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
 
@@ -31,6 +33,31 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):
+    def test_one_based_question_coordinates_map_to_zero_based_structured_features(self) -> None:
+        one_based = {
+            "task_type": "normalized_point_value",
+            "question": "Read row 1, column 16.",
+            "metadata": {"grid_shape": [16, 16], "coordinate_origin": 1},
+            "choices": ["A", "B", "C", "D"],
+        }
+        zero_based = {
+            **one_based,
+            "question": "Read row 0, column 15.",
+            "metadata": {"grid_shape": [16, 16], "coordinate_origin": 0},
+        }
+
+        self.assertEqual(
+            structured_query_features_for_record(one_based),
+            structured_query_features_for_record(zero_based),
+        )
+
+    def test_numeric_task_instructions_match_standardized_encoder_input(self) -> None:
+        normalized = task_specific_instruction({"task_type": "normalized_point_value"})
+        raw = task_specific_instruction({"task_type": "raw_point_value_with_stats"})
+
+        self.assertIn("read the standardized value z directly", normalized)
+        self.assertIn("x = mean + scale * z", raw)
+
     def test_local_prompt_contains_numeric_options_and_exact_output_contract(self) -> None:
         record = {
             "qa_id": "numeric-1",

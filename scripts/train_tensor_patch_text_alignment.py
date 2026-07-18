@@ -1027,13 +1027,24 @@ class AlignmentProjectionPair(nn.Module):
 
 
 class FixedTeacherWhitening(nn.Module):
-    """A frozen ZCA transform fitted on teacher hidden states from the train split."""
+    """A frozen PCA-whitening transform fitted on train-split teacher hidden states."""
 
-    def __init__(self, hidden_dim: int, shrinkage: float, epsilon: float) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        shrinkage: float,
+        epsilon: float,
+        output_dim: int | None = None,
+    ) -> None:
         super().__init__()
         hidden_dim = int(hidden_dim)
+        output_dim = hidden_dim if output_dim is None else int(output_dim)
         if hidden_dim <= 0:
             raise ValueError("Whitening hidden_dim must be positive.")
+        if output_dim <= 0 or output_dim > hidden_dim:
+            raise ValueError(
+                f"Whitening output_dim must be in [1, {hidden_dim}], got {output_dim}."
+            )
         if not 0.0 <= float(shrinkage) <= 1.0:
             raise ValueError("alignment_transform.whitening.shrinkage must be in [0, 1].")
         if float(epsilon) <= 0.0:
@@ -1041,7 +1052,7 @@ class FixedTeacherWhitening(nn.Module):
         self.shrinkage = float(shrinkage)
         self.epsilon = float(epsilon)
         self.register_buffer("mean", torch.zeros(hidden_dim, dtype=torch.float32))
-        self.register_buffer("matrix", torch.eye(hidden_dim, dtype=torch.float32))
+        self.register_buffer("matrix", torch.zeros(hidden_dim, output_dim, dtype=torch.float32))
         self.register_buffer("fitted_records", torch.zeros((), dtype=torch.long))
         self.fit_metrics: dict[str, float] = {}
 
@@ -1050,7 +1061,11 @@ class FixedTeacherWhitening(nn.Module):
         return int(self.fitted_records.item()) >= 2
 
     @torch.no_grad()
-    def fit(self, teacher_hidden: torch.Tensor) -> dict[str, float]:
+    def fit(
+        self,
+        teacher_hidden: torch.Tensor,
+        covariance_residuals: torch.Tensor | None = None,
+    ) -> dict[str, float]:
         samples = teacher_hidden.detach().float()
         if samples.ndim != 2 or int(samples.shape[1]) != int(self.mean.numel()):
             raise ValueError(
@@ -1061,17 +1076,31 @@ class FixedTeacherWhitening(nn.Module):
         if record_count < 2:
             raise ValueError("Whitening requires at least two teacher records.")
         mean = samples.mean(dim=0)
-        centered = samples - mean
+        centered = (
+            samples - mean
+            if covariance_residuals is None
+            else covariance_residuals.detach().float()
+        )
+        if centered.shape != samples.shape:
+            raise ValueError(
+                "Whitening covariance residuals must match teacher hidden shape; "
+                f"got {tuple(centered.shape)} and {tuple(samples.shape)}."
+            )
         covariance = centered.T @ centered / float(record_count - 1)
         average_variance = float(covariance.diag().mean().item())
         if not np.isfinite(average_variance) or average_variance <= 0.0:
             raise ValueError(f"Teacher covariance is degenerate: average_variance={average_variance!r}.")
-        identity = torch.eye(int(covariance.shape[0]), device=covariance.device, dtype=covariance.dtype)
-        regularized = (1.0 - self.shrinkage) * covariance + self.shrinkage * average_variance * identity
-        eigenvalues, eigenvectors = torch.linalg.eigh(regularized)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        order = torch.argsort(eigenvalues, descending=True)
+        eigenvalues = eigenvalues[order]
+        eigenvectors = eigenvectors[:, order]
+        output_dim = int(self.matrix.shape[1])
+        selected_values = eigenvalues[:output_dim]
+        selected_vectors = eigenvectors[:, :output_dim]
+        regularized = (1.0 - self.shrinkage) * selected_values + self.shrinkage * average_variance
         eigenvalue_floor = max(self.epsilon * average_variance, torch.finfo(eigenvalues.dtype).eps)
-        clamped = eigenvalues.clamp_min(eigenvalue_floor)
-        matrix = (eigenvectors * clamped.rsqrt().unsqueeze(0)) @ eigenvectors.T
+        clamped = regularized.clamp_min(eigenvalue_floor)
+        matrix = selected_vectors * clamped.rsqrt().unsqueeze(0)
         if not bool(torch.isfinite(matrix).all()):
             raise ValueError("Teacher whitening matrix contains non-finite values.")
         self.mean.copy_(mean.to(device=self.mean.device, dtype=self.mean.dtype))
@@ -1081,8 +1110,16 @@ class FixedTeacherWhitening(nn.Module):
             "records": float(record_count),
             "mean_norm": float(mean.norm().item()),
             "average_variance": average_variance,
+            "input_dim": float(samples.shape[1]),
+            "output_dim": float(output_dim),
+            "within_anchor_covariance": float(covariance_residuals is not None),
             "eigenvalue_min": float(eigenvalues.min().item()),
             "eigenvalue_max": float(eigenvalues.max().item()),
+            "selected_eigenvalue_min": float(selected_values.min().item()),
+            "selected_eigenvalue_max": float(selected_values.max().item()),
+            "explained_variance_ratio": float(
+                selected_values.clamp_min(0.0).sum().div(eigenvalues.clamp_min(0.0).sum().clamp_min(1.0e-12)).item()
+            ),
             "eigenvalue_floor": float(eigenvalue_floor),
             "regularized_condition_number": float((clamped.max() / clamped.min()).item()),
         }
@@ -2419,11 +2456,26 @@ def train_one_epoch(
                     float(args.temperature),
                     probe_target_ids,
                 )
+        if float(args.native_centered_contrastive_loss_weight) > 0.0:
+            native_centered_student, native_centered_teacher = centered_alignment_embeddings(
+                student_hidden,
+                teacher_hidden,
+            )
+            native_centered_contrastive, native_centered_metrics = distributed_symmetric_contrastive_loss(
+                native_centered_student,
+                native_centered_teacher,
+                float(args.temperature),
+                probe_target_ids,
+            )
+        else:
+            native_centered_contrastive = student_hidden.new_zeros(())
+            native_centered_metrics = {}
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
+            + float(args.native_centered_contrastive_loss_weight) * native_centered_contrastive
             + reconstruction_weight * reconstruction
         )
 
@@ -2460,6 +2512,15 @@ def train_one_epoch(
             },
             batch_size,
             "centered_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            {
+                "contrastive_loss": float(native_centered_contrastive.detach().cpu().item()),
+                **native_centered_metrics,
+            },
+            batch_size,
+            "native_centered_",
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(
@@ -2754,11 +2815,22 @@ def evaluate(
             float(args.temperature),
             probe_target_ids,
         )
+        native_centered_student, native_centered_teacher = centered_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+        )
+        native_centered_contrastive, native_centered_metrics = symmetric_contrastive_loss(
+            native_centered_student,
+            native_centered_teacher,
+            float(args.temperature),
+            probe_target_ids,
+        )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
             float(args.contrastive_loss_weight) * contrastive
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
+            + float(args.native_centered_contrastive_loss_weight) * native_centered_contrastive
             + reconstruction_weight * reconstruction
         )
         batch_size = int(patches.shape[0])
@@ -2779,6 +2851,15 @@ def evaluate(
             },
             batch_size,
             "centered_",
+        )
+        add_weighted_metrics(
+            metric_totals,
+            {
+                "contrastive_loss": float(native_centered_contrastive.detach().cpu().item()),
+                **native_centered_metrics,
+            },
+            batch_size,
+            "native_centered_",
         )
         add_weighted_metrics(metric_totals, teacher_output.metrics, batch_size, "teacher_")
         add_weighted_metrics(
@@ -2909,6 +2990,22 @@ def evaluate(
                 ).items()
             }
         )
+        global_hidden_centered, global_teacher_hidden_centered = centered_alignment_embeddings(
+            student_hidden_all,
+            teacher_hidden_all,
+        )
+        metrics.update(
+            {
+                f"global_hidden_centered_{key}": value
+                for key, value in full_retrieval_accuracy(
+                    global_hidden_centered,
+                    global_teacher_hidden_centered,
+                    float(args.temperature),
+                    int(args.global_retrieval_chunk_size),
+                    probe_target_ids_all,
+                ).items()
+            }
+        )
     elif bool(args.global_retrieval_eval):
         metrics["global_retrieval_skipped"] = 1.0
     return metrics
@@ -2922,6 +3019,58 @@ def average_metric_dicts(metric_dicts: Sequence[Mapping[str, float]]) -> dict[st
         if values:
             averaged[key] = sum(values) / len(values)
     return averaged
+
+
+def checkpoint_selection_value(metrics: Mapping[str, Any], args: argparse.Namespace) -> tuple[str, float]:
+    primary_key = (
+        "global_strict_contrastive_loss"
+        if "global_strict_contrastive_loss" in metrics
+        else "strict_contrastive_loss"
+    )
+    value = float(metrics[primary_key])
+    centered_key = (
+        "global_centered_strict_contrastive_loss"
+        if "global_centered_strict_contrastive_loss" in metrics
+        else "centered_strict_contrastive_loss"
+    )
+    centered_weight = float(args.centered_contrastive_loss_weight)
+    if centered_weight > 0.0:
+        if centered_key not in metrics:
+            raise ValueError(f"Validation metrics are missing centered checkpoint metric {centered_key!r}.")
+        value += centered_weight * float(metrics[centered_key])
+    native_key = (
+        "global_hidden_centered_strict_contrastive_loss"
+        if "global_hidden_centered_strict_contrastive_loss" in metrics
+        else "native_centered_strict_contrastive_loss"
+    )
+    native_weight = float(args.native_centered_contrastive_loss_weight)
+    if native_weight > 0.0:
+        if native_key not in metrics:
+            raise ValueError(f"Validation metrics are missing native checkpoint metric {native_key!r}.")
+        value += native_weight * float(metrics[native_key])
+    return (
+        f"{primary_key}+{centered_weight:g}*{centered_key}+{native_weight:g}*{native_key}",
+        value,
+    )
+
+
+def validate_teacher_probe_preflight(
+    preflight: Mapping[str, Any],
+    minimum_correlation: float | None,
+) -> None:
+    if not preflight or minimum_correlation is None:
+        return
+    failures: list[str] = []
+    for name, metrics in dict(preflight.get("anchors") or {}).items():
+        correlation = float(metrics["hidden_similarity_vs_negative_target_distance_pearson"])
+        if not np.isfinite(correlation) or correlation < float(minimum_correlation):
+            failures.append(f"{name}={correlation:.4f}")
+    if failures:
+        raise ValueError(
+            "Frozen teacher probe preflight is below patch_alignment.teacher_probe_min_correlation="
+            f"{float(minimum_correlation):.4f}: {', '.join(failures)}. "
+            "Do not train against a probe the selected teacher layer does not represent reliably."
+        )
 
 
 @torch.no_grad()
@@ -3056,6 +3205,7 @@ def parse_args() -> argparse.Namespace:
         help="Feature space used by stage-1 InfoNCE after the frozen LLM hidden readout.",
     )
     parser.add_argument("--alignment-whitening-records", type=int, default=None)
+    parser.add_argument("--alignment-whitening-dim", type=int, default=None)
     parser.add_argument("--alignment-whitening-shrinkage", type=float, default=None)
     parser.add_argument("--alignment-whitening-epsilon", type=float, default=None)
     # Legacy compatibility. Prefer --alignment-transform-mode for new runs.
@@ -3070,7 +3220,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--centered-contrastive-loss-weight", type=float, default=None)
+    parser.add_argument("--native-centered-contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--reconstruction-loss-weight", type=float, default=None)
+    parser.add_argument("--alignment-patch-ae-lr-scale", type=float, default=None)
     parser.add_argument(
         "--teacher-text-source",
         type=str,
@@ -3100,6 +3252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-families", type=str, default=None)
     parser.add_argument("--probe-region-size", type=int, default=None)
     parser.add_argument("--evaluation-probe-count", type=int, default=None)
+    parser.add_argument("--teacher-probe-min-correlation", type=float, default=None)
     parser.add_argument("--max-shared-suffix-tokens", type=int, default=None)
     parser.add_argument("--fail-on-text-anchor-missing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--fail-on-text-max-length-hit", action=argparse.BooleanOptionalAction, default=None)
@@ -3242,6 +3395,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     )
     set_default(
         args,
+        "alignment_whitening_dim",
+        first_nested(config, ["patch_alignment.alignment_transform.whitening.dim"]),
+        512,
+    )
+    set_default(
+        args,
         "alignment_whitening_shrinkage",
         first_nested(config, ["patch_alignment.alignment_transform.whitening.shrinkage"]),
         0.01,
@@ -3292,7 +3451,19 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         first_nested(config, ["patch_alignment.centered_contrastive_loss_weight"]),
         0.0,
     )
+    set_default(
+        args,
+        "native_centered_contrastive_loss_weight",
+        first_nested(config, ["patch_alignment.native_centered_contrastive_loss_weight"]),
+        0.0,
+    )
     set_default(args, "reconstruction_loss_weight", first_nested(config, ["patch_alignment.reconstruction_loss_weight"]), 1.0)
+    set_default(
+        args,
+        "alignment_patch_ae_lr_scale",
+        first_nested(config, ["patch_alignment.alignment_patch_ae_lr_scale"]),
+        1.0,
+    )
     set_default(args, "teacher_text_source", first_nested(config, ["patch_alignment.teacher_text_source"]), "normalized")
     set_default(
         args,
@@ -3321,6 +3492,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     )
     set_default(args, "probe_region_size", first_nested(config, ["patch_alignment.probe_region_size"]), 4)
     set_default(args, "evaluation_probe_count", first_nested(config, ["patch_alignment.evaluation_probe_count"]), 3)
+    set_default(
+        args,
+        "teacher_probe_min_correlation",
+        first_nested(config, ["patch_alignment.teacher_probe_min_correlation"]),
+        None,
+    )
     set_default(
         args,
         "max_shared_suffix_tokens",
@@ -3419,6 +3596,10 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
                 raise ValueError("patch_alignment.probe_region_size must be between 1 and patch_size - 1.")
             if int(args.evaluation_probe_count) <= 0:
                 raise ValueError("patch_alignment.evaluation_probe_count must be positive.")
+            if args.teacher_probe_min_correlation is not None and not -1.0 <= float(
+                args.teacher_probe_min_correlation
+            ) <= 1.0:
+                raise ValueError("patch_alignment.teacher_probe_min_correlation must be in [-1, 1].")
     if int(args.text_preflight_records) < 0:
         raise ValueError("patch_alignment.text_preflight_records must be non-negative.")
     if int(args.global_retrieval_max_records) <= 0:
@@ -3448,6 +3629,8 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     if args.alignment_transform_mode == "whitening":
         if int(args.alignment_whitening_records) < 2:
             raise ValueError("patch_alignment.alignment_transform.whitening.records must be at least 2.")
+        if int(args.alignment_whitening_dim) <= 0:
+            raise ValueError("patch_alignment.alignment_transform.whitening.dim must be positive.")
         if not 0.0 <= float(args.alignment_whitening_shrinkage) <= 1.0:
             raise ValueError("patch_alignment.alignment_transform.whitening.shrinkage must be in [0, 1].")
         if float(args.alignment_whitening_epsilon) <= 0.0:
@@ -3462,8 +3645,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.contrastive_loss_weight must be positive for alignment training.")
     if float(args.centered_contrastive_loss_weight) < 0.0:
         raise ValueError("patch_alignment.centered_contrastive_loss_weight must be non-negative.")
+    if float(args.native_centered_contrastive_loss_weight) < 0.0:
+        raise ValueError("patch_alignment.native_centered_contrastive_loss_weight must be non-negative.")
     if float(args.reconstruction_loss_weight) < 0.0:
         raise ValueError("patch_alignment.reconstruction_loss_weight must be non-negative.")
+    if not 0.0 < float(args.alignment_patch_ae_lr_scale) <= 1.0:
+        raise ValueError("patch_alignment.alignment_patch_ae_lr_scale must be in (0, 1].")
     if bool(args.train_patch_ae) and float(args.reconstruction_loss_weight) <= 0.0:
         raise ValueError(
             "train_patch_ae=true requires a positive patch_alignment.reconstruction_loss_weight."
@@ -3615,7 +3802,7 @@ def preflight_teacher_probe_semantics(
 ) -> dict[str, Any]:
     if str(args.alignment_anchor_mode) != "probe" or int(args.text_preflight_records) < 2:
         return {}
-    record_limit = min(len(dataset), int(args.text_preflight_records), 16)
+    record_limit = min(len(dataset), int(args.text_preflight_records), 32)
     if record_limit < 2:
         return {}
     loader = DataLoader(
@@ -3626,7 +3813,7 @@ def preflight_teacher_probe_semantics(
         collate_fn=collate_patch_text,
     )
     by_anchor: dict[str, dict[str, float]] = {}
-    for alignment_anchor in alignment_anchors_from_args(tokenizer, args, evaluation=True):
+    for alignment_anchor in probe_contract_anchors(tokenizer, args):
         hidden_rows: list[torch.Tensor] = []
         target_rows: list[torch.Tensor] = []
         target_id_rows: list[torch.Tensor] = []
@@ -3739,6 +3926,7 @@ def fit_teacher_whitening(
         raise ValueError("alignment_transform.whitening.records must select at least two train records.")
     local_target = (requested_records + distributed_world_size() - 1) // distributed_world_size()
     local_hidden: list[torch.Tensor] = []
+    local_anchor_groups: list[torch.Tensor] = []
     local_count = 0
     static_anchors = alignment_anchors_from_args(tokenizer, args, evaluation=False)
     progress = tqdm(loader, desc="fit teacher whitening", leave=False, disable=not is_main_process())
@@ -3784,15 +3972,37 @@ def fit_teacher_whitening(
             alignment_anchor=alignment_anchor,
         )
         take = min(int(teacher_output.hidden.shape[0]), local_target - local_count)
-        local_hidden.append(teacher_output.hidden[:take].detach().float())
+        selected_hidden = teacher_output.hidden[:take].detach().float()
+        local_hidden.append(selected_hidden)
+        anchor_group = int(step) - 1 if str(args.alignment_anchor_mode) == "probe" else 0
+        local_anchor_groups.append(
+            torch.full(
+                (int(take), 1),
+                float(anchor_group),
+                device=selected_hidden.device,
+                dtype=torch.float32,
+            )
+        )
         local_count += int(take)
     if not local_hidden:
         raise ValueError("Teacher whitening loader produced no hidden states.")
     gathered = gather_feature_rows(torch.cat(local_hidden, dim=0))
+    gathered_anchor_groups = gather_feature_rows(torch.cat(local_anchor_groups, dim=0))
     if is_main_process():
-        if gathered is None:
+        if gathered is None or gathered_anchor_groups is None:
             raise RuntimeError("Rank 0 did not receive teacher hidden states for whitening.")
-        fit_metrics = whitener.fit(gathered[:requested_records])
+        fitted_hidden = gathered[:requested_records]
+        fitted_groups = gathered_anchor_groups[:requested_records, 0].long()
+        covariance_residuals = torch.empty_like(fitted_hidden)
+        for group in fitted_groups.unique():
+            group_mask = fitted_groups.eq(group)
+            group_hidden = fitted_hidden[group_mask]
+            covariance_residuals[group_mask] = group_hidden - group_hidden.mean(dim=0, keepdim=True)
+        fit_metrics = whitener.fit(
+            fitted_hidden,
+            covariance_residuals=covariance_residuals,
+        )
+        fit_metrics["anchor_groups"] = float(fitted_groups.unique().numel())
     else:
         fit_metrics = {}
     broadcast_module_state(whitener)
@@ -3865,6 +4075,8 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"global_semantic_i2t={fmt_metric(metrics, 'global_semantic_i2t_accuracy')} "
         f"raw_global_i2t={fmt_metric(metrics, 'global_hidden_uncentered_i2t_accuracy')} "
         f"raw_global_t2i={fmt_metric(metrics, 'global_hidden_uncentered_t2i_accuracy')} "
+        f"raw_centered_global_i2t={fmt_metric(metrics, 'global_hidden_centered_i2t_accuracy')} "
+        f"raw_centered_global_t2i={fmt_metric(metrics, 'global_hidden_centered_t2i_accuracy')} "
         f"collision={fmt_metric(metrics, 'semantic_collision_fraction')} "
         f"prompt_grad={fmt_metric(metrics, 'alignment_soft_prompt_gradient_norm')} "
         f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
@@ -3915,6 +4127,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
                 "mode": str(args.alignment_transform_mode),
                 "whitening": {
                     "records": int(args.alignment_whitening_records),
+                    "dim": int(args.alignment_whitening_dim),
                     "shrinkage": float(args.alignment_whitening_shrinkage),
                     "epsilon": float(args.alignment_whitening_epsilon),
                 },
@@ -3932,7 +4145,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "temperature": float(args.temperature),
             "contrastive_loss_weight": float(args.contrastive_loss_weight),
             "centered_contrastive_loss_weight": float(args.centered_contrastive_loss_weight),
+            "native_centered_contrastive_loss_weight": float(args.native_centered_contrastive_loss_weight),
             "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
+            "alignment_patch_ae_lr_scale": float(args.alignment_patch_ae_lr_scale),
             "teacher_text_source": str(args.teacher_text_source),
             "alignment_text_layout": str(args.alignment_text_layout),
             "shared_suffix": str(args.shared_suffix),
@@ -3941,6 +4156,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "probe_families": list(args.probe_families),
             "probe_region_size": int(args.probe_region_size),
             "evaluation_probe_count": int(args.evaluation_probe_count),
+            "teacher_probe_min_correlation": args.teacher_probe_min_correlation,
             "max_shared_suffix_tokens": int(args.max_shared_suffix_tokens),
             "fail_on_text_anchor_missing": bool(args.fail_on_text_anchor_missing),
             "fail_on_text_max_length_hit": bool(args.fail_on_text_max_length_hit),
@@ -4272,6 +4488,10 @@ def main() -> None:
             f"nearest_target_error={macro.get('nearest_hidden_target_abs_error', float('nan')):.6g} "
             f"target_unique={macro.get('semantic_target_unique_fraction', float('nan')):.4f}"
         )
+    validate_teacher_probe_preflight(
+        teacher_probe_preflight,
+        args.teacher_probe_min_correlation,
+    )
     if teacher_probe_preflight:
         distributed_barrier()
 
@@ -4312,6 +4532,7 @@ def main() -> None:
             hidden_dim=llm_hidden_size,
             shrinkage=float(args.alignment_whitening_shrinkage),
             epsilon=float(args.alignment_whitening_epsilon),
+            output_dim=int(args.alignment_whitening_dim),
         ).to(device)
     broadcast_module_state(compressor)
     broadcast_module_state(adapter)
@@ -4383,6 +4604,7 @@ def main() -> None:
         "freeze_patch_ae_after_pretrain": bool(args.freeze_patch_ae_after_pretrain),
         "alignment_train_patch_ae": bool(args.alignment_train_patch_ae),
         "patch_ae_pretrain_epochs": int(args.patch_ae_pretrain_epochs),
+        "alignment_patch_ae_lr_scale": float(args.alignment_patch_ae_lr_scale),
         "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
         "resize_patch_to_compressor_input": bool(args.resize_patch_to_compressor_input),
         "compressor_input_size": list(compressor_input_size),
@@ -4402,11 +4624,13 @@ def main() -> None:
             ),
             "whitening": {
                 "records_requested": int(args.alignment_whitening_records),
+                "dim": int(args.alignment_whitening_dim),
                 "shrinkage": float(args.alignment_whitening_shrinkage),
                 "epsilon": float(args.alignment_whitening_epsilon),
                 "fit": dict(whitening_metrics),
             },
         },
+        "native_centered_contrastive_loss_weight": float(args.native_centered_contrastive_loss_weight),
         "alignment_projection": {
             "enabled": str(args.alignment_transform_mode) == "projection",
             "dim": int(args.alignment_projection_dim),
@@ -4429,6 +4653,7 @@ def main() -> None:
         "probe_families": list(args.probe_families),
         "probe_region_size": int(args.probe_region_size),
         "evaluation_probe_count": int(args.evaluation_probe_count),
+        "teacher_probe_min_correlation": args.teacher_probe_min_correlation,
         "probe_contract_anchors": [
             {
                 "name": anchor.name,
@@ -4555,9 +4780,12 @@ def main() -> None:
             "embedding_centering=none "
             f"contrastive_weight={float(args.contrastive_loss_weight):.4g} "
             f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
+            f"native_centered_weight={float(args.native_centered_contrastive_loss_weight):.4g} "
             f"alignment_transform={str(args.alignment_transform_mode)} "
             f"projection_dim={int(args.alignment_projection_dim) if isinstance(alignment_projector, AlignmentProjectionPair) else 'n/a'} "
             f"whitening_records={int(whitening_metrics.get('records', 0.0)) if isinstance(alignment_projector, FixedTeacherWhitening) else 'n/a'} "
+            f"whitening_dim={int(whitening_metrics.get('output_dim', 0.0)) if isinstance(alignment_projector, FixedTeacherWhitening) else 'n/a'} "
+            f"whitening_variance={whitening_metrics.get('explained_variance_ratio', 'n/a')} "
             f"whitening_condition={whitening_metrics.get('regularized_condition_number', 'n/a')} "
             f"distributed={bool(distributed_is_initialized())} "
             f"world_size={int(distributed_world_size())} "
@@ -4694,14 +4922,27 @@ def main() -> None:
         for parameter in compressor.parameters():
             parameter.requires_grad_(False)
         compressor.eval()
-    optimizer_params = list(adapter.parameters())
+    bridge_parameters = list(adapter.parameters())
     if alignment_projector is not None:
-        optimizer_params += list(alignment_projector.parameters())
+        bridge_parameters += [parameter for parameter in alignment_projector.parameters() if parameter.requires_grad]
+    optimizer_groups: list[dict[str, Any]] = [
+        {
+            "name": "alignment_bridge",
+            "params": bridge_parameters,
+            "lr": float(args.lr),
+        }
+    ]
     if bool(args.alignment_train_patch_ae):
-        optimizer_params += [parameter for parameter in compressor.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(optimizer_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
+        optimizer_groups.append(
+            {
+                "name": "patch_ae",
+                "params": [parameter for parameter in compressor.parameters() if parameter.requires_grad],
+                "lr": float(args.lr) * float(args.alignment_patch_ae_lr_scale),
+            }
+        )
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=float(args.weight_decay))
 
-    best_val_contrastive = float("inf")
+    best_val_selection = float("inf")
     best_val_metric = ""
     best_epoch = 0
     for epoch in range(1, int(args.epochs) + 1):
@@ -4746,20 +4987,15 @@ def main() -> None:
                 compressor_config=compressor_config,
                 save_compressor=True,
             )
-            selection_metric = (
-                "global_contrastive_loss"
-                if "global_contrastive_loss" in val_metrics
-                else "contrastive_loss"
-            )
+            selection_metric, selection_value = checkpoint_selection_value(val_metrics, args)
             if best_val_metric and selection_metric != best_val_metric:
                 raise RuntimeError(
                     "Validation checkpoint metric changed during one run: "
                     f"{best_val_metric!r} -> {selection_metric!r}."
                 )
             best_val_metric = selection_metric
-            selection_value = float(val_metrics[selection_metric])
-            if selection_value < best_val_contrastive:
-                best_val_contrastive = selection_value
+            if selection_value < best_val_selection:
+                best_val_selection = selection_value
                 best_epoch = int(epoch)
                 save_checkpoint(
                     run_dir / "alignment_best.pt",
@@ -4773,8 +5009,14 @@ def main() -> None:
                 )
             wandb_payload = {
                 "epoch": float(epoch),
-                "lr": float(optimizer.param_groups[0]["lr"]),
-                "best_val/contrastive_loss": float(best_val_contrastive),
+                "lr/alignment_bridge": float(optimizer.param_groups[0]["lr"]),
+                "lr/patch_ae": float(
+                    next(
+                        (group["lr"] for group in optimizer.param_groups if group.get("name") == "patch_ae"),
+                        0.0,
+                    )
+                ),
+                "best_val/selection_value": float(best_val_selection),
                 "best_val/epoch": float(best_epoch),
             }
             wandb_payload.update(alignment_wandb_payload("train", train_metrics))
@@ -4820,7 +5062,7 @@ def main() -> None:
         metrics_history["best"] = {
             "epoch": int(best_epoch),
             "metric": str(best_val_metric),
-            "val_contrastive_loss": float(best_val_contrastive),
+            "val_selection_value": float(best_val_selection),
         }
         metrics_history["test"] = test_metrics
         dump_json(run_dir / "metrics_latest.json", metrics_history)

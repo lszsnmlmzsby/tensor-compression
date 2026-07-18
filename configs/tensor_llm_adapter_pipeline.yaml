@@ -25,7 +25,7 @@ data:
   latent_dir: /data/wyx/tensor_llm_assets/tensor_readout_latents_vx_2x
 
 # Downstream QA over 16x16 patches encoded by the stage-1 alignment AE.
-# Current stage-1 config encodes raw patch values; QA z-score targets are computed separately from each raw patch.
+# Current stage-1 config encodes a per-patch z-score matrix; QA keeps raw mean/scale for reversible value queries.
 # Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
 patch_qa:
   alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
@@ -37,6 +37,8 @@ patch_qa:
     - pressure
     - Vx
     - Vy
+  # Reject silent four-field QA from a Vx-only stage-1 checkpoint. Enable only for an explicit transfer study.
+  allow_unseen_alignment_fields: false
   patch_size: 16
   train_patches: 16384
   val_patches: 1024
@@ -125,7 +127,7 @@ patch_alignment:
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_whitening_zscore
+  run_name: tensor_patch_text_alignment_pca_whitening_zscore
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -138,7 +140,7 @@ patch_alignment:
   field_sampling_mode: single
   patch_size: 16
   # Number of random patch records created in-memory per split after applying split_mode.
-  train_records: 262144
+  train_records: 1048576
   val_records: 8192
   test_records: 8192
   sample_indices: all
@@ -156,10 +158,10 @@ patch_alignment:
   ensure_disjoint_records: true
   seed: 42
   device: auto
-  # Per-GPU batch. Four GPUs provide 384 in-batch contrastive candidates.
-  batch_size: 96
-  eval_batch_size: 96
-  epochs: 4
+  # Per-GPU batch. Four GPUs provide 128 in-batch contrastive candidates at the 2k-token teacher length.
+  batch_size: 32
+  eval_batch_size: 32
+  epochs: 2
   lr: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
@@ -178,8 +180,10 @@ patch_alignment:
   train_patch_ae: true
   # false matches the successful projection run: restore the best warmup AE, then jointly refine it.
   freeze_patch_ae_after_pretrain: false
+  # Jointly refine the AE without letting the contrastive objective erase reconstruction-relevant features.
+  alignment_patch_ae_lr_scale: 0.1
   # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
-  patch_ae_pretrain_epochs: 5
+  patch_ae_pretrain_epochs: 1
   # Used only when encoder_source: checkpoint.
   compressor_checkpoint: null
   compressor_config: null
@@ -215,13 +219,15 @@ patch_alignment:
   # null maps Q-Former outputs directly to the LLM input embedding width.
   projection_dim: null
   # none: raw LLM hidden; projection: trainable CLIP-style heads; whitening: one fixed teacher-fitted
-  # ZCA transform shared by both branches. Whitening is full-rank and is not used by stage 2.
+  # PCA transform shared by both branches. Whitening has no learned parameters and is not used by stage 2.
   alignment_transform:
     mode: whitening
     whitening:
       # Fit once on this many records from the training split before optimization.
       records: 8192
-      # Covariance shrinkage bounds noise amplification in low-variance directions.
+      # Keep the highest-variance teacher directions and discard unstable low-variance directions.
+      dim: 512
+      # Covariance shrinkage bounds amplification in retained directions.
       shrinkage: 0.01
       epsilon: 1.0e-5
   # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
@@ -244,6 +250,8 @@ patch_alignment:
   contrastive_loss_weight: 1.0
   # Small auxiliary centered InfoNCE matches the previous successful projection run.
   centered_contrastive_loss_weight: 0.1
+  # Keep improvement in Qwen's native hidden space instead of only the disposable PCA retrieval space.
+  native_centered_contrastive_loss_weight: 0.1
   # Only contributes gradients while the AE is trainable; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
   # Serialize the same z-scored patch that enters the AE.
@@ -265,11 +273,11 @@ patch_alignment:
     - point_value
     - point_difference
     - point_mean
-    - region_mean
-    - region_range
   probe_region_size: 4
-  # Validation/global retrieval uses one fixed stem from each family in a separate complete pass.
-  evaluation_probe_count: 5
+  # Validation/global retrieval uses one fixed stem from each enabled family in a separate complete pass.
+  evaluation_probe_count: 3
+  # Abort before AE warmup if the frozen teacher does not encode an enabled probe's numeric target.
+  teacher_probe_min_correlation: 0.1
   # Probe stems remain concise but need enough room for two coordinates or regions.
   # Representation does not append EOS; eos mode consists of the tokenizer's explicit EOS token alone.
   max_shared_suffix_tokens: 96
@@ -283,8 +291,8 @@ patch_alignment:
   global_retrieval_chunk_size: 1024
   # Used only with alignment_text_layout: legacy_prompt.
   text_prompt_template: compact
-  # Four decimals preserve normalized local differences; preflight fails instead of silently truncating.
-  text_decimal_places: 4
+  # Three decimals preserve local differences while shortening the shallow teacher's numeric context.
+  text_decimal_places: 3
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
