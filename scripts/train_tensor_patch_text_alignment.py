@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -8,6 +9,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
@@ -201,7 +203,10 @@ def setup_distributed_from_env(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         args.device = f"cuda:{local_rank}"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(
+        backend=backend,
+        timeout=timedelta(seconds=float(args.distributed_timeout_seconds)),
+    )
     args.distributed = True
     args.rank = distributed_rank()
     args.local_rank = local_rank
@@ -214,9 +219,16 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
-def distributed_barrier() -> None:
+def distributed_barrier(stage: str | None = None) -> None:
     if distributed_is_initialized():
+        if stage is not None:
+            print(
+                f"ddp_wait rank={distributed_rank()} stage={stage}",
+                flush=True,
+            )
         dist.barrier()
+        if stage is not None and is_main_process():
+            print(f"ddp_synced stage={stage}", flush=True)
 
 
 def broadcast_object_from_main(value: Any) -> Any:
@@ -237,31 +249,173 @@ def broadcast_module_state(module: nn.Module | None) -> None:
             dist.broadcast(buffer.data, src=0)
 
 
+def stable_name_fingerprint(names: Sequence[str]) -> int:
+    digest = hashlib.sha256("\n".join(names).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) % (2**62)
+
+
+def distributed_collective_device() -> torch.device:
+    if torch.cuda.is_available() and (not distributed_is_initialized() or dist.get_backend() == "nccl"):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def gradient_parameter_entries(
+    modules: Sequence[nn.Module | None],
+) -> list[tuple[str, nn.Parameter]]:
+    entries: list[tuple[str, nn.Parameter]] = []
+    seen: set[int] = set()
+    for module_index, module in enumerate(modules):
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            if not parameter.requires_grad or id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            entries.append((f"module_{module_index}.{name}", parameter))
+    return entries
+
+
+def verify_distributed_signature(values: torch.Tensor, description: str) -> None:
+    if not distributed_is_initialized():
+        return
+    gathered = [torch.empty_like(values) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered, values)
+    signatures = [tuple(int(item) for item in tensor.cpu().tolist()) for tensor in gathered]
+    if any(signature != signatures[0] for signature in signatures[1:]):
+        raise RuntimeError(f"Distributed {description} differs across ranks: {signatures}.")
+
+
 def synchronize_gradients(modules: Sequence[nn.Module | None]) -> None:
     if not distributed_is_initialized():
         return
-    world_size = float(distributed_world_size())
-    for module in modules:
-        if module is None:
+    entries = gradient_parameter_entries(modules)
+    if not entries:
+        return
+    missing = [name for name, parameter in entries if parameter.grad is None]
+    signature_names = [
+        f"{name}:{tuple(parameter.shape)}:{parameter.dtype}:{parameter.device.type}"
+        for name, parameter in entries
+    ]
+    signature = torch.tensor(
+        [
+            len(entries),
+            sum(parameter.numel() for _name, parameter in entries),
+            len(missing),
+            stable_name_fingerprint(signature_names),
+        ],
+        dtype=torch.int64,
+        device=distributed_collective_device(),
+    )
+    verify_distributed_signature(signature, "gradient schema")
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(
+            "Trainable parameters are missing gradients before distributed synchronization: "
+            f"{preview}{' ...' if len(missing) > 8 else ''}."
+        )
+
+    buckets: dict[tuple[torch.device, torch.dtype], list[nn.Parameter]] = {}
+    for _name, parameter in entries:
+        gradient = parameter.grad
+        if gradient is None:  # pragma: no cover - guarded above
             continue
-        for parameter in module.parameters():
-            if parameter.grad is None:
-                continue
-            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-            parameter.grad.div_(world_size)
+        if gradient.is_sparse:
+            raise TypeError("Sparse gradients are not supported by flat distributed synchronization.")
+        buckets.setdefault((gradient.device, gradient.dtype), []).append(parameter)
+
+    world_size = float(distributed_world_size())
+    for parameters in buckets.values():
+        flat = torch.cat([parameter.grad.reshape(-1) for parameter in parameters])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+        offset = 0
+        with torch.no_grad():
+            for parameter in parameters:
+                count = parameter.numel()
+                parameter.grad.copy_(flat[offset : offset + count].view_as(parameter))
+                offset += count
 
 
 def average_metrics_across_processes(metrics: Mapping[str, float]) -> dict[str, float]:
     if not distributed_is_initialized():
         return dict(metrics)
-    averaged: dict[str, float] = {}
-    for key, value in metrics.items():
-        if not isinstance(value, (int, float)):
-            continue
-        tensor = torch.tensor(float(value), device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"))
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        averaged[key] = float((tensor / distributed_world_size()).detach().cpu().item())
-    return averaged
+    keys = sorted(
+        key
+        for key, value in metrics.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+    if not keys:
+        return {}
+    device = distributed_collective_device()
+    signature = torch.tensor(
+        [len(keys), stable_name_fingerprint(keys)],
+        dtype=torch.int64,
+        device=device,
+    )
+    verify_distributed_signature(signature, "metric schema")
+    values = torch.tensor([float(metrics[key]) for key in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values.div_(distributed_world_size())
+    return {key: float(value) for key, value in zip(keys, values.cpu().tolist(), strict=True)}
+
+
+def weighted_average_metrics_across_processes(
+    metrics: Mapping[str, float],
+    local_weight: int,
+) -> dict[str, float]:
+    if not distributed_is_initialized():
+        return dict(metrics)
+    keys = sorted(
+        key
+        for key, value in metrics.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+    if not keys:
+        return {}
+    device = distributed_collective_device()
+    signature = torch.tensor(
+        [len(keys), stable_name_fingerprint(keys)],
+        dtype=torch.int64,
+        device=device,
+    )
+    verify_distributed_signature(signature, "weighted metric schema")
+    weight = max(0, int(local_weight))
+    values = torch.tensor(
+        [float(metrics[key]) * weight for key in keys] + [float(weight)],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    total_weight = float(values[-1].item())
+    if total_weight <= 0.0:
+        raise RuntimeError("Distributed metric aggregation received zero total records.")
+    return {
+        key: float(value / total_weight)
+        for key, value in zip(keys, values[:-1].cpu().tolist(), strict=True)
+    }
+
+
+def gather_variable_rows_without_grad(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather uneven row shards on every rank while preserving paired row order."""
+    if not distributed_is_initialized():
+        return tensor.detach()
+    device = distributed_collective_device()
+    local = tensor.detach().contiguous().to(device)
+    row_count = torch.tensor([local.shape[0]], dtype=torch.int64, device=device)
+    gathered_counts = [torch.empty_like(row_count) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered_counts, row_count)
+    counts = [int(item.item()) for item in gathered_counts]
+    max_rows = max(counts)
+    padded_shape = (max_rows, *local.shape[1:])
+    padded = torch.zeros(padded_shape, dtype=local.dtype, device=device)
+    padded[: local.shape[0]].copy_(local)
+    gathered = [torch.empty_like(padded) for _ in range(distributed_world_size())]
+    dist.all_gather(gathered, padded)
+    return torch.cat(
+        [shard[:count].cpu() for shard, count in zip(gathered, counts, strict=True)],
+        dim=0,
+    )
 
 
 def gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
@@ -808,6 +962,27 @@ class PDEBenchPatchTextDataset(Dataset):
             decimal_places=int(self.decimal_places),
             prompt_template=str(self.prompt_template),
         )
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Partition evaluation records exactly once across ranks, without padding duplicates."""
+
+    def __init__(self, dataset: Dataset, num_replicas: int, rank: int) -> None:
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0 or not 0 <= self.rank < self.num_replicas:
+            raise ValueError(
+                f"Invalid distributed sampler rank={self.rank}, replicas={self.num_replicas}."
+            )
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        if self.rank >= len(self.dataset):
+            return 0
+        return (len(self.dataset) - 1 - self.rank) // self.num_replicas + 1
 
 
 def collate_patch_text(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -2610,6 +2785,18 @@ def train_compressor_during_alignment(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "alignment_train_patch_ae", args.train_patch_ae))
 
 
+def set_frozen_llm_student_mode(llm: nn.Module, gradient_checkpointing: bool) -> None:
+    if not bool(gradient_checkpointing):
+        llm.eval()
+        return
+    # HF decoder checkpointing is active only in train mode. Keep stochastic layers
+    # disabled so the frozen teacher/student mapping remains deterministic.
+    llm.train()
+    for module in llm.modules():
+        if isinstance(module, nn.Dropout):
+            module.eval()
+
+
 def train_one_epoch(
     *,
     compressor: nn.Module,
@@ -2631,6 +2818,7 @@ def train_one_epoch(
     adapter.train()
     if projector is not None:
         projector.train()
+    set_frozen_llm_student_mode(llm, bool(args.llm_gradient_checkpointing))
     train_compressor = train_compressor_during_alignment(args)
     if train_compressor:
         compressor.train()
@@ -2678,6 +2866,8 @@ def train_one_epoch(
         if probe_target_ids is not None:
             probe_target_ids = probe_target_ids.to(device)
         teacher_duplicate_fraction = duplicate_text_fraction(texts)
+        llm_was_training = llm.training
+        llm.eval()
         with torch.no_grad():
             teacher_output = text_teacher_hidden(
                 llm,
@@ -2697,6 +2887,8 @@ def train_one_epoch(
                 max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
                 alignment_anchor=alignment_anchor,
             )
+        if llm_was_training:
+            set_frozen_llm_student_mode(llm, bool(args.llm_gradient_checkpointing))
         if train_compressor:
             latent = compressor.encode(patches)["latent_map"]
         else:
@@ -3061,7 +3253,94 @@ def evaluate_patch_encoder_reconstruction(
         add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "")
     metrics = {"reconstruction_loss": total_loss / max(1, total_records)}
     metrics.update(averaged_metrics(metric_totals, total_records))
-    return metrics
+    return weighted_average_metrics_across_processes(metrics, total_records)
+
+
+@torch.no_grad()
+def global_retrieval_metrics_from_features(
+    student_features: torch.Tensor,
+    teacher_features: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    probe_target_ids: torch.Tensor | None,
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    global_tensor, global_text = normalize_alignment_embeddings(student_features, teacher_features)
+    global_centered_tensor, global_centered_text = centered_alignment_embeddings(
+        student_features,
+        teacher_features,
+    )
+    retrieval_kwargs = {
+        "temperature": float(args.temperature),
+        "chunk_size": int(args.global_retrieval_chunk_size),
+        "semantic_target_ids": probe_target_ids,
+        "i2t_weight": float(args.contrastive_i2t_weight),
+        "t2i_weight": float(args.contrastive_t2i_weight),
+    }
+    result.update(
+        {
+            f"global_{key}": value
+            for key, value in full_retrieval_accuracy(
+                global_tensor,
+                global_text,
+                **retrieval_kwargs,
+            ).items()
+        }
+    )
+    result["global_candidate_count"] = float(int(student_features.shape[0]))
+    result.update(
+        {
+            f"global_centered_{key}": value
+            for key, value in full_retrieval_accuracy(
+                global_centered_tensor,
+                global_centered_text,
+                **retrieval_kwargs,
+            ).items()
+        }
+    )
+    global_hidden, global_teacher_hidden = normalize_alignment_embeddings(
+        student_hidden,
+        teacher_hidden,
+    )
+    result.update(
+        {
+            f"global_hidden_uncentered_{key}": value
+            for key, value in full_retrieval_accuracy(
+                global_hidden,
+                global_teacher_hidden,
+                **retrieval_kwargs,
+            ).items()
+        }
+    )
+    global_hidden_centered, global_teacher_hidden_centered = centered_alignment_embeddings(
+        student_hidden,
+        teacher_hidden,
+    )
+    result.update(
+        {
+            f"global_hidden_centered_{key}": value
+            for key, value in full_retrieval_accuracy(
+                global_hidden_centered,
+                global_teacher_hidden_centered,
+                **retrieval_kwargs,
+            ).items()
+        }
+    )
+    transformed_mean_loss, transformed_mean_metrics = branch_mean_alignment_loss(
+        student_features,
+        teacher_features,
+    )
+    native_mean_loss, native_mean_metrics = branch_mean_alignment_loss(
+        student_hidden,
+        teacher_hidden,
+    )
+    result["global_mean_alignment_loss"] = float(
+        (0.5 * (transformed_mean_loss + native_mean_loss)).cpu().item()
+    )
+    result.update(prefixed_metrics(transformed_mean_metrics, "global_mean_alignment_transformed"))
+    result.update(prefixed_metrics(native_mean_metrics, "global_mean_alignment_native"))
+    return result
 
 
 @torch.no_grad()
@@ -3081,6 +3360,7 @@ def evaluate(
 ) -> dict[str, float]:
     compressor.eval()
     adapter.eval()
+    llm.eval()
     if projector is not None:
         projector.eval()
     total_loss = 0.0
@@ -3095,7 +3375,7 @@ def evaluate(
     collected_student_hidden: list[torch.Tensor] = []
     collected_teacher_hidden: list[torch.Tensor] = []
     collected_probe_target_ids: list[torch.Tensor] = []
-    collected_global_records = 0
+    distributed_eval = distributed_is_initialized()
     train_compressor = train_compressor_during_alignment(args)
     if alignment_anchor is None and str(args.alignment_text_layout) == "values_shared_suffix":
         alignment_anchor = alignment_anchors_from_args(tokenizer, args, evaluation=True)[0]
@@ -3165,8 +3445,14 @@ def evaluate(
         centered_tensor_embedding, centered_text_embedding = centered_alignment_embeddings(
             student_features,
             teacher_features,
+            distributed_batch=distributed_eval,
         )
-        contrastive, contrastive_metrics = symmetric_contrastive_loss(
+        contrastive_loss_fn = (
+            distributed_symmetric_contrastive_loss
+            if distributed_eval
+            else symmetric_contrastive_loss
+        )
+        contrastive, contrastive_metrics = contrastive_loss_fn(
             tensor_embedding,
             text_embedding,
             float(args.temperature),
@@ -3174,7 +3460,7 @@ def evaluate(
             i2t_weight=float(args.contrastive_i2t_weight),
             t2i_weight=float(args.contrastive_t2i_weight),
         )
-        centered_contrastive, centered_contrastive_metrics = symmetric_contrastive_loss(
+        centered_contrastive, centered_contrastive_metrics = contrastive_loss_fn(
             centered_tensor_embedding,
             centered_text_embedding,
             float(args.temperature),
@@ -3185,8 +3471,9 @@ def evaluate(
         native_centered_student, native_centered_teacher = centered_alignment_embeddings(
             student_hidden,
             teacher_hidden,
+            distributed_batch=distributed_eval,
         )
-        native_centered_contrastive, native_centered_metrics = symmetric_contrastive_loss(
+        native_centered_contrastive, native_centered_metrics = contrastive_loss_fn(
             native_centered_student,
             native_centered_teacher,
             float(args.temperature),
@@ -3197,10 +3484,12 @@ def evaluate(
         transformed_mean_loss, transformed_mean_metrics = branch_mean_alignment_loss(
             student_features,
             teacher_features,
+            distributed_batch=distributed_eval,
         )
         native_mean_loss, native_mean_metrics = branch_mean_alignment_loss(
             student_hidden,
             teacher_hidden,
+            distributed_batch=distributed_eval,
         )
         mean_alignment_loss = 0.5 * (transformed_mean_loss + native_mean_loss)
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
@@ -3295,17 +3584,13 @@ def evaluate(
             "alignment_",
         )
         total_records += batch_size
-        if bool(args.global_retrieval_eval) and collected_global_records < int(args.global_retrieval_max_records):
-            remaining = int(args.global_retrieval_max_records) - int(collected_global_records)
-            take = min(int(batch_size), max(0, remaining))
-            if take > 0:
-                collected_student_features.append(student_features[:take].detach().float().cpu())
-                collected_teacher_features.append(teacher_features[:take].detach().float().cpu())
-                collected_student_hidden.append(student_hidden[:take].detach().float().cpu())
-                collected_teacher_hidden.append(teacher_hidden[:take].detach().float().cpu())
-                if probe_target_ids is not None:
-                    collected_probe_target_ids.append(probe_target_ids[:take].detach().long().cpu())
-                collected_global_records += int(take)
+        if bool(args.global_retrieval_eval):
+            collected_student_features.append(student_features.detach().float().cpu())
+            collected_teacher_features.append(teacher_features.detach().float().cpu())
+            collected_student_hidden.append(student_hidden.detach().float().cpu())
+            collected_teacher_hidden.append(teacher_hidden.detach().float().cpu())
+            if probe_target_ids is not None:
+                collected_probe_target_ids.append(probe_target_ids.detach().long().cpu())
     metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
@@ -3336,6 +3621,7 @@ def evaluate(
         prefixed_key = f"contrastive_{key}"
         if prefixed_key in metrics:
             metrics[key] = metrics[prefixed_key]
+    metrics = weighted_average_metrics_across_processes(metrics, total_records)
     if bool(args.global_retrieval_eval) and collected_student_features:
         student_all = torch.cat(collected_student_features, dim=0)
         teacher_all = torch.cat(collected_teacher_features, dim=0)
@@ -3344,86 +3630,33 @@ def evaluate(
         probe_target_ids_all = (
             torch.cat(collected_probe_target_ids, dim=0) if collected_probe_target_ids else None
         )
-        global_tensor, global_text = normalize_alignment_embeddings(student_all, teacher_all)
-        global_centered_tensor, global_centered_text = centered_alignment_embeddings(student_all, teacher_all)
-        metrics.update(
-            {
-                f"global_{key}": value
-                for key, value in full_retrieval_accuracy(
-                    global_tensor,
-                    global_text,
-                    float(args.temperature),
-                    int(args.global_retrieval_chunk_size),
-                    probe_target_ids_all,
-                    i2t_weight=float(args.contrastive_i2t_weight),
-                    t2i_weight=float(args.contrastive_t2i_weight),
-                ).items()
-            }
+        if distributed_is_initialized():
+            student_all = gather_variable_rows_without_grad(student_all)
+            teacher_all = gather_variable_rows_without_grad(teacher_all)
+            student_hidden_all = gather_variable_rows_without_grad(student_hidden_all)
+            teacher_hidden_all = gather_variable_rows_without_grad(teacher_hidden_all)
+            if probe_target_ids_all is not None:
+                probe_target_ids_all = gather_variable_rows_without_grad(probe_target_ids_all)
+        max_global_records = int(args.global_retrieval_max_records)
+        student_all = student_all[:max_global_records]
+        teacher_all = teacher_all[:max_global_records]
+        student_hidden_all = student_hidden_all[:max_global_records]
+        teacher_hidden_all = teacher_hidden_all[:max_global_records]
+        if probe_target_ids_all is not None:
+            probe_target_ids_all = probe_target_ids_all[:max_global_records]
+        global_metrics = (
+            global_retrieval_metrics_from_features(
+                student_all,
+                teacher_all,
+                student_hidden_all,
+                teacher_hidden_all,
+                probe_target_ids_all,
+                args,
+            )
+            if is_main_process()
+            else {}
         )
-        metrics["global_candidate_count"] = float(int(student_all.shape[0]))
-        metrics.update(
-            {
-                f"global_centered_{key}": value
-                for key, value in full_retrieval_accuracy(
-                    global_centered_tensor,
-                    global_centered_text,
-                    float(args.temperature),
-                    int(args.global_retrieval_chunk_size),
-                    probe_target_ids_all,
-                    i2t_weight=float(args.contrastive_i2t_weight),
-                    t2i_weight=float(args.contrastive_t2i_weight),
-                ).items()
-            }
-        )
-        global_hidden, global_teacher_hidden = normalize_alignment_embeddings(
-            student_hidden_all,
-            teacher_hidden_all,
-        )
-        metrics.update(
-            {
-                f"global_hidden_uncentered_{key}": value
-                for key, value in full_retrieval_accuracy(
-                    global_hidden,
-                    global_teacher_hidden,
-                    float(args.temperature),
-                    int(args.global_retrieval_chunk_size),
-                    probe_target_ids_all,
-                    i2t_weight=float(args.contrastive_i2t_weight),
-                    t2i_weight=float(args.contrastive_t2i_weight),
-                ).items()
-            }
-        )
-        global_hidden_centered, global_teacher_hidden_centered = centered_alignment_embeddings(
-            student_hidden_all,
-            teacher_hidden_all,
-        )
-        metrics.update(
-            {
-                f"global_hidden_centered_{key}": value
-                for key, value in full_retrieval_accuracy(
-                    global_hidden_centered,
-                    global_teacher_hidden_centered,
-                    float(args.temperature),
-                    int(args.global_retrieval_chunk_size),
-                    probe_target_ids_all,
-                    i2t_weight=float(args.contrastive_i2t_weight),
-                    t2i_weight=float(args.contrastive_t2i_weight),
-                ).items()
-            }
-        )
-        global_transformed_mean_loss, global_transformed_mean_metrics = branch_mean_alignment_loss(
-            student_all,
-            teacher_all,
-        )
-        global_native_mean_loss, global_native_mean_metrics = branch_mean_alignment_loss(
-            student_hidden_all,
-            teacher_hidden_all,
-        )
-        metrics["global_mean_alignment_loss"] = float(
-            (0.5 * (global_transformed_mean_loss + global_native_mean_loss)).cpu().item()
-        )
-        metrics.update(prefixed_metrics(global_transformed_mean_metrics, "global_mean_alignment_transformed"))
-        metrics.update(prefixed_metrics(global_native_mean_metrics, "global_mean_alignment_native"))
+        metrics.update(broadcast_object_from_main(global_metrics))
     elif bool(args.global_retrieval_eval):
         metrics["global_retrieval_skipped"] = 1.0
     return metrics
@@ -3617,6 +3850,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ensure-disjoint-records", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--distributed-timeout-seconds", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -3636,6 +3870,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-home", type=str, default=None)
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--torch-dtype", type=str, choices=("auto", "float32", "float16", "bfloat16"), default=None)
+    parser.add_argument("--llm-gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-type", type=str, choices=("qformer", "pooled_mlp"), default=None)
     parser.add_argument("--query-tokens", type=int, default=None)
@@ -3793,6 +4028,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "weight_decay", first_nested(config, ["patch_alignment.weight_decay"]), 1.0e-4)
     set_default(args, "grad_clip_norm", first_nested(config, ["patch_alignment.grad_clip_norm"]), 1.0)
     set_default(args, "num_workers", first_nested(config, ["patch_alignment.num_workers"]), 0)
+    set_default(
+        args,
+        "distributed_timeout_seconds",
+        first_nested(config, ["patch_alignment.distributed_timeout_seconds"]),
+        1800.0,
+    )
     set_default(args, "train_patch_ae", first_nested(config, ["patch_alignment.train_patch_ae"]), args.encoder_source == "patch_ae_config")
     set_default(args, "freeze_patch_ae_after_pretrain", first_nested(config, ["patch_alignment.freeze_patch_ae_after_pretrain"]), True)
     set_default(args, "patch_ae_pretrain_epochs", first_nested(config, ["patch_alignment.patch_ae_pretrain_epochs"]), 0)
@@ -3804,6 +4045,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     )
     set_default(args, "trust_remote_code", first_nested(config, ["model.trust_remote_code"]), False)
     set_default(args, "torch_dtype", first_nested(config, ["model.torch_dtype"]), "bfloat16")
+    set_default(
+        args,
+        "llm_gradient_checkpointing",
+        first_nested(config, ["patch_alignment.llm_gradient_checkpointing"]),
+        False,
+    )
     set_default(args, "adapter_dim", first_nested(config, ["patch_alignment.adapter_dim"]), 512)
     set_default(args, "adapter_type", first_nested(config, ["patch_alignment.adapter_type"]), "qformer")
     set_default(args, "query_tokens", first_nested(config, ["patch_alignment.query_tokens"]), 8)
@@ -4041,6 +4288,8 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             raise ValueError(f"patch_alignment.{name} must be positive.")
     if int(args.patch_ae_pretrain_epochs) < 0:
         raise ValueError("patch_alignment.patch_ae_pretrain_epochs must be non-negative.")
+    if float(args.distributed_timeout_seconds) <= 0.0:
+        raise ValueError("patch_alignment.distributed_timeout_seconds must be positive.")
     for name in ("adapter_dim", "query_tokens", "adapter_layers", "adapter_heads"):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"patch_alignment.{name} must be positive.")
@@ -4563,7 +4812,9 @@ def save_checkpoint(
             payload["alignment_projector_state_dict"] = projector.state_dict()
     if save_compressor:
         payload["compressor_state_dict"] = compressor.state_dict()
-    torch.save(payload, path)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)
 
 
 def numeric_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -4853,6 +5104,14 @@ def main() -> None:
             llm_num_hidden_layers = int(getattr(llm.config, "num_hidden_layers", -1))
             validate_teacher_hidden_state_index(int(args.teacher_layer), llm_num_hidden_layers)
             active_teacher_layers = truncate_llm_backbone_to_layer(llm, int(args.teacher_layer))
+            if bool(args.llm_gradient_checkpointing):
+                try:
+                    llm.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+                except TypeError:
+                    llm.gradient_checkpointing_enable()
+                llm.config.use_cache = False
             llm.to(device)
         distributed_barrier()
     if llm is None:
@@ -4962,8 +5221,49 @@ def main() -> None:
             "The training DataLoader has zero batches. In distributed mode, train_records must provide at least "
             "one full global batch because drop_last=true."
         )
-    val_loader = make_loader(val_dataset, int(args.eval_batch_size), False, int(args.num_workers))
-    test_loader = make_loader(test_dataset, int(args.eval_batch_size), False, int(args.num_workers))
+    val_sampler = (
+        DistributedEvalSampler(val_dataset, distributed_world_size(), distributed_rank())
+        if distributed_is_initialized()
+        else None
+    )
+    test_sampler = (
+        DistributedEvalSampler(test_dataset, distributed_world_size(), distributed_rank())
+        if distributed_is_initialized()
+        else None
+    )
+    if distributed_is_initialized() and (
+        len(val_dataset) < distributed_world_size() or len(test_dataset) < distributed_world_size()
+    ):
+        raise ValueError(
+            "Distributed evaluation requires val_records and test_records to be at least WORLD_SIZE "
+            "so every rank participates in the same collectives."
+        )
+    distributed_eval_batch = int(args.eval_batch_size) * int(distributed_world_size())
+    if distributed_is_initialized() and (
+        len(val_dataset) % distributed_eval_batch != 0
+        or len(test_dataset) % distributed_eval_batch != 0
+    ):
+        raise ValueError(
+            "Distributed val_records and test_records must be divisible by "
+            "WORLD_SIZE * eval_batch_size. This keeps every evaluation step aligned across ranks "
+            "without dropping or padding samples. "
+            f"Got val={len(val_dataset)}, test={len(test_dataset)}, "
+            f"global_eval_batch={distributed_eval_batch}."
+        )
+    val_loader = make_loader(
+        val_dataset,
+        int(args.eval_batch_size),
+        False,
+        int(args.num_workers),
+        sampler=val_sampler,
+    )
+    test_loader = make_loader(
+        test_dataset,
+        int(args.eval_batch_size),
+        False,
+        int(args.num_workers),
+        sampler=test_sampler,
+    )
     whitening_sampler = (
         DistributedSampler(
             train_dataset,
@@ -5168,6 +5468,11 @@ def main() -> None:
             "test": summarize_records(test_records),
             "overlap": dict(overlap_summary),
         },
+        "distributed_evaluation": {
+            "exact_nonpadding_shards": bool(distributed_is_initialized()),
+            "val_local_records": len(val_sampler) if val_sampler is not None else len(val_dataset),
+            "test_local_records": len(test_sampler) if test_sampler is not None else len(test_dataset),
+        },
         "encoder_source": str(args.encoder_source),
         "compressor_checkpoint": str(args.compressor_checkpoint) if args.compressor_checkpoint else None,
         "train_patch_ae": bool(args.train_patch_ae),
@@ -5183,6 +5488,7 @@ def main() -> None:
         "latent_token_count": int(latent_grid[0] * latent_grid[1]),
         "llm_hidden_size": int(llm_hidden_size),
         "llm_num_hidden_layers": int(llm_num_hidden_layers),
+        "llm_gradient_checkpointing": bool(args.llm_gradient_checkpointing),
         "active_teacher_layers": (
             int(active_teacher_layers) if active_teacher_layers is not None else int(llm_num_hidden_layers)
         ),
@@ -5485,7 +5791,7 @@ def main() -> None:
                     f"val_recon={pretrain_val_metrics['reconstruction_loss']:.4f} "
                     f"val_rel={pretrain_val_metrics.get('relative_rmse_to_target_std', float('nan')):.4f}"
                 )
-            distributed_barrier()
+            distributed_barrier(f"patch_ae_pretrain_epoch_{pretrain_epoch:04d}_saved")
 
         best_patch_ae = torch.load(run_dir / "patch_ae_pretrain_best.pt", map_location=device)
         compressor.load_state_dict(best_patch_ae["compressor_state_dict"])
@@ -5499,7 +5805,7 @@ def main() -> None:
                 f"patch_ae_pretrain_restored_best epoch={best_patch_ae_epoch:04d} "
                 f"val_recon={best_patch_ae_val:.6g}"
             )
-        distributed_barrier()
+        distributed_barrier("patch_ae_pretrain_best_restored")
 
     if bool(args.alignment_train_patch_ae):
         for parameter in compressor.parameters():
@@ -5616,7 +5922,7 @@ def main() -> None:
                 f"val[{alignment_metric_summary(val_metrics)}] "
                 f"select={selection_metric}:{selection_value:.4f}"
             )
-        distributed_barrier()
+        distributed_barrier(f"alignment_epoch_{epoch:04d}_checkpointed")
 
     best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
     adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
@@ -5685,7 +5991,7 @@ def main() -> None:
             f"test[{alignment_metric_summary(test_metrics)}] "
             f"duration_hours={run_summary['duration_seconds'] / 3600.0:.2f}"
         )
-    distributed_barrier()
+    distributed_barrier("final_test_written")
     cleanup_distributed()
 
 

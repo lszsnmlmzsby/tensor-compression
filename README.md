@@ -1049,7 +1049,7 @@ text path:
         -> frozen LLM -> middle-layer teacher hidden
 ```
 
-当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；对齐位置是 suffix 最后一个 token 的 hidden state。当前候选 backbone 是 Qwen2.5-32B-Instruct；配置中的 `teacher_layer: 32` 只是稀疏 layer scan 前的合法占位值，长训练前必须替换为 point-value 扫描选出的层。`hidden_states[0]` 只是上下文化前的输入 embedding，共享 readout token 在该位置看不到前面的 tensor，因此程序会拒绝 `teacher_layer <= 0`。
+当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；对齐位置是 suffix 最后一个 token 的 hidden state。当前候选 backbone 是 Qwen2.5-32B-Instruct；稀疏扫描中 Layer 2-40 的 target/control 约为 1，Layer 56 达到 1.81，因此正式配置使用 `teacher_layer: 56`，并建议长训练前用八个 point-value 模板在 48-64 层做一次局部确认。`hidden_states[0]` 只是上下文化前的输入 embedding，共享 readout token 在该位置看不到前面的 tensor，因此程序会拒绝 `teacher_layer <= 0`。
 
 Transformer block 不会删除或重排序列位置。以 16 个 Q-Former soft embeddings 加 1 个 EOS 为例，每一层的零基下标 16（第 17 个位置）仍对应同一个 EOS readout；变化的是该位置经过更多 block 后的 hidden vector。只有 EOS 模式固定为 17 个 student 位置；probe/representation 模式的最后位置是一基 `16 + suffix_token_count`。该位置同样在所有层保持不变。padding 只用于对齐 batch 长度，不会作为 readout。
 
@@ -1176,7 +1176,9 @@ torchrun --standalone --nproc_per_node=4 \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-多卡模式会自动读取 `WORLD_SIZE/RANK/LOCAL_RANK`，`CUDA_VISIBLE_DEVICES` 中的物理 GPU 会在各进程内重新编号为 `cuda:0...`。`batch_size` 是**每卡 batch**，全局每步样本数和 InfoNCE 候选数均为 `batch_size * GPU数`；当前 32B 保守起点 `batch_size: 4`、4 张 GPU 时是全局 batch 16，smoke 后应在显存允许时提高。DDP 会在每卡复制一份截断后的 frozen teacher，不会分片 32B 权重。训练使用可微分 all-gather，远端样本作为负样本时的 candidate-side 梯度也会回传。`train_records` 是整个训练 split 的记录数，不会按 GPU 再复制。
+多卡模式会自动读取 `WORLD_SIZE/RANK/LOCAL_RANK`，`CUDA_VISIBLE_DEVICES` 中的物理 GPU 会在各进程内重新编号为 `cuda:0...`。`batch_size` 是**每卡 batch**，全局每步样本数和 InfoNCE 候选数均为 `batch_size * GPU数`；Layer 56 先用命令行覆盖 `--batch-size 1` 做 smoke，正式配置为每卡 4，并启用 frozen-backbone activation checkpointing。这里 Teacher 虽有约 1800 个文本 token，但无梯度；需要反向的 Student 只有 soft prefix 和短 suffix。smoke 显存充足后可测试每卡 8，优先扩大真实同-probe negatives。DDP 会在每卡复制一份截断后的 frozen teacher，不会分片 32B 权重。训练使用可微分 all-gather，远端样本作为负样本时的 candidate-side 梯度也会回传；参数梯度按 dtype/device 扁平分桶后同步，不再为每个参数单独发起 NCCL collective。验证/测试使用无 padding 的精确 rank 分片，每条样本只编码一次，再 gather 全局 retrieval 候选。`train_records` 是整个训练 split 的记录数，不会按 GPU 再复制。
+
+`distributed_timeout_seconds` 默认 1800。epoch 和 checkpoint 边界会打印 `ddp_wait` / `ddp_synced` 阶段名；若某个 rank 失步，参数梯度和指标 key 的跨 rank schema 检查会尽量在真正的 collective 顺序分叉前给出明确错误。checkpoint 先写同目录临时文件再原子替换，避免中断留下半写文件。
 
 小规模 smoke test：
 
@@ -1194,7 +1196,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_patch_text_alignment.py \
   --run-name tensor_patch_text_alignment_smoke
 ```
 
-这个 smoke test 只检查完整数据/模型/反向传播/评估链路，不用于判断效果；它仍会运行当前 12 个 probe contract 和数值正文 tokenization preflight。`--patch-ae-pretrain-epochs 0` 很重要，否则会继承正式配置的 AE warmup。
+这个 smoke test 只检查完整数据/模型/反向传播/评估链路，不用于判断效果；它仍会运行当前 8 个 probe contract 和数值正文 tokenization preflight。当前正式配置已经复用已训练 AE 并将 warmup 设为 0，命令行保留 `--patch-ae-pretrain-epochs 0` 是为了让 smoke 的意图明确。
 
 两卡分布式 smoke test：
 
@@ -1213,6 +1215,25 @@ torchrun --standalone --nproc_per_node=2 \
   --text-preflight-records 32 \
   --run-name tensor_patch_text_alignment_ddp_smoke
 ```
+
+与当前服务器布局一致的四卡 Layer-56 smoke（优先运行这一条）：
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,4,5,6 \
+torchrun --standalone --nproc_per_node=4 \
+  scripts/train_tensor_patch_text_alignment.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml \
+  --train-records 256 \
+  --val-records 64 \
+  --test-records 64 \
+  --alignment-whitening-records 128 \
+  --epochs 1 \
+  --batch-size 1 \
+  --eval-batch-size 1 \
+  --run-name tensor_patch_text_alignment_qwen25_32b_layer56_ddp_smoke
+```
+
+这条命令使用全局 batch 4，只检查 Layer 56 的显存、反向传播、扁平梯度同步、精确验证分片、checkpoint 和最终 test。成功时应出现 `ddp_synced stage=alignment_epoch_0001_checkpointed`、`ddp_synced stage=final_test_written`，并生成可读取的 `alignment_best.pt` 与 `test_metrics.json`。之后再按配置的每卡 batch 4 启动正式训练；若 OOM，依次尝试每卡 2、1，而不是降低训练记录数来掩盖显存问题。
 
 主要 loss：
 
@@ -1346,7 +1367,7 @@ patch_alignment:
 | `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 当前归一化 patch 使用 3。 |
 | `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 3072；严格 preflight 会报告真实长度并拒绝截断。 |
 | `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
-| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | `1..num_hidden_layers` | 32B 配置暂用 32；必须先按 layer scan 结果确定最终值。0/负数和超过模型深度的索引会在 AE warmup 前终止。 |
+| `--teacher-layer` | 取 LLM 哪一层 hidden state。 | `1..num_hidden_layers` | 当前 32B 配置使用 56；0/负数和超过模型深度的索引会在 AE warmup 前终止。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
 | `--contrastive-loss-weight` | 未中心化 symmetric InfoNCE 权重。 | 非负数 | 当前 0.25，保留绝对空间约束但不让公共 probe 方向主导训练。 |
 | `--contrastive-i2t-weight` / `--contrastive-t2i-weight` | 两个 retrieval 方向在每个 InfoNCE 中的相对权重，会自动归一化。 | 非负数，和为正 | 当前 i2t=0.75、t2i=0.25；i2t 对应最终 tensor→text 部署，t2i 保留为防 hubness 的辅助约束。 |

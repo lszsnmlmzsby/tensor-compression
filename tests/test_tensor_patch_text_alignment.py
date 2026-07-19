@@ -10,6 +10,7 @@ from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturba
 from scripts.train_tensor_patch_text_alignment import (
     AlignmentAnchor,
     AlignmentProjectionPair,
+    DistributedEvalSampler,
     FixedTeacherWhitening,
     PROBE_TEMPLATE_COUNTS,
     alignment_anchors_from_args,
@@ -21,6 +22,7 @@ from scripts.train_tensor_patch_text_alignment import (
     checkpoint_selection_value,
     duplicate_text_fraction,
     gather_with_grad,
+    gradient_parameter_entries,
     hidden_at_last_non_padding,
     normalize_alignment_embeddings,
     probe_targets_from_patches,
@@ -28,6 +30,7 @@ from scripts.train_tensor_patch_text_alignment import (
     reject_removed_alignment_options,
     serialize_tensor_values,
     shared_suffix_token_ids,
+    stable_name_fingerprint,
     symmetric_contrastive_loss,
     top1_candidate_usage_metrics,
     truncate_llm_backbone_to_layer,
@@ -281,6 +284,27 @@ def test_transformer_block_capture_precedes_final_backbone_norm() -> None:
 
     assert torch.equal(captured[1], torch.ones_like(inputs))
     assert torch.equal(captured[2], torch.full_like(inputs, 3.0))
+
+
+def test_distributed_eval_sampler_partitions_without_padding_duplicates() -> None:
+    dataset = list(range(10))
+    shards = [list(DistributedEvalSampler(dataset, num_replicas=3, rank=rank)) for rank in range(3)]
+
+    assert shards == [[0, 3, 6, 9], [1, 4, 7], [2, 5, 8]]
+    assert sorted(index for shard in shards for index in shard) == list(range(10))
+    assert sum(len(shard) for shard in shards) == len(dataset)
+
+
+def test_gradient_parameter_entries_are_stable_and_deduplicate_shared_modules() -> None:
+    first = torch.nn.Linear(3, 2)
+    second = torch.nn.Linear(2, 1, bias=False)
+    entries = gradient_parameter_entries([first, second, first])
+    names = [name for name, _parameter in entries]
+
+    assert names == ["module_0.weight", "module_0.bias", "module_1.weight"]
+    assert len({id(parameter) for _name, parameter in entries}) == len(entries)
+    assert stable_name_fingerprint(names) == stable_name_fingerprint(list(names))
+    assert stable_name_fingerprint(names) != stable_name_fingerprint(list(reversed(names)))
 
 
 def test_teacher_hidden_state_index_rejects_non_contextual_embedding_output() -> None:

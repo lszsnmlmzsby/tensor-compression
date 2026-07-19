@@ -74,7 +74,7 @@ compressor:
 
 model:
   name_or_path: Qwen/Qwen2.5-32B-Instruct
-  local_dir: null
+  local_dir: /data/wyx/tensor_llm_assets/models/Qwen2.5-32B-Instruct
   revision: main
   trust_remote_code: false
   torch_dtype: bfloat16
@@ -128,7 +128,7 @@ patch_alignment:
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_qwen25_32b_point_value
+  run_name: tensor_patch_text_alignment_qwen25_32b_layer56_point_value
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -140,10 +140,10 @@ patch_alignment:
   # single: sample one field per record, so multiple fields enlarge the single-channel patch pool.
   field_sampling_mode: single
   patch_size: 16
-  # Number of random patch records created in-memory per split after applying split_mode.
-  # First establish that the stronger teacher improves alignment before scaling record exposure.
-  train_records: 131072
-  val_records: 4096
+  # Layer 56 is much more expensive than the Layer-2 diagnostic. Use a 1k validation library
+  # for checkpoint selection, then retain a 4k held-out test library for the formal final metric.
+  train_records: 32768
+  val_records: 1024
   test_records: 4096
   sample_indices: all
   time_indices: all
@@ -169,6 +169,10 @@ patch_alignment:
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   num_workers: 0
+  # Fail with stage diagnostics if a rank stops participating; normal long I/O should not hit this.
+  distributed_timeout_seconds: 1800
+  # Required for backpropagating soft-prefix gradients through 56 frozen 32B transformer blocks.
+  llm_gradient_checkpointing: true
   # patch_ae_config: build a patch-sized AE from patch_encoder below.
   # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
   encoder_source: checkpoint
@@ -181,14 +185,14 @@ patch_alignment:
   #   train_patch_ae: false
   #   patch_ae_pretrain_epochs: 0
   train_patch_ae: false
-  # Reuse only the four-field reconstruction AE from this checkpoint; loader ignores its old Q-Former.
+  # Reuse only the reconstruction AE from the successful 32B Layer-2 warmup; loader ignores its old Q-Former.
   freeze_patch_ae_after_pretrain: true
   # Jointly refine the AE without letting the contrastive objective erase reconstruction-relevant features.
   alignment_patch_ae_lr_scale: 0.1
   # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
   patch_ae_pretrain_epochs: 0
   # Used only when encoder_source: checkpoint.
-  compressor_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
+  compressor_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260719_225204_tensor_patch_text_alignment_qwen25_32b_point_value/patch_ae_pretrain_best.pt
   compressor_config: null
   # With patch_ae_config this should be false. Set true only when loading a checkpoint whose input_size
   # differs from patch_size, for example the legacy 512x512 compressor.
@@ -259,7 +263,7 @@ patch_alignment:
   contrastive_direction_weights:
     i2t: 0.75
     t2i: 0.25
-  # The primary residual objective uses one DDP-global mean over all 128 same-probe records.
+  # The primary residual objective uses one DDP-global mean over the current same-probe global batch.
   centered_contrastive_loss_weight: 1.0
   # Preserve the same discriminative residual geometry in Qwen's native hidden space for stage 2.
   native_centered_contrastive_loss_weight: 0.25
@@ -310,18 +314,19 @@ patch_alignment:
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
-  # Provisional half-depth candidate. Replace it with the point-value layer-scan winner before a long run.
+  # The 32B scan first shows clear probe-location selectivity in the late layers; Layer 56 has the
+  # strongest observed target/control response (1.81) while retaining more rank than Layer 64.
   # Index 0 is rejected because it is the non-contextual input embedding at the readout token.
-  teacher_layer: 32
+  teacher_layer: 56
   # Read-only frozen-Qwen scan used before choosing teacher_layer. It never trains or loads the AE/Q-Former/projector.
   # Run scripts/scan_tensor_teacher_layers.py; --anchor-mode can override probe with eos or representation.
   layer_scan:
     split: val
-    records: 32
+    records: 64
     batch_size: 1
-    # Sparse first pass; refine around the best layer before training.
-    layers: "4,8,12,16,24,32,40,48,56,64"
-    probe_count: 4
+    # Optional confirmation scan around the selected late-layer region.
+    layers: "48,52,54,56,58,60,64"
+    probe_count: 8
     # Probe mode compares an on-target perturbation with an equal-size off-target control perturbation.
     perturbation_scale: 0.01
     device: auto
