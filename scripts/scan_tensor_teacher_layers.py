@@ -35,6 +35,7 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     serialize_patch_batch,
     serialize_tensor_value_batch,
     tokenize_contents_with_anchor,
+    transformer_block_hidden_states,
     validate_field_shapes,
     validate_teacher_tensor_source,
 )
@@ -46,7 +47,7 @@ from tensor_compression.utils.pipeline_config import (  # noqa: E402
 )
 
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "scripts/scan_tensor_teacher_layers.py requires transformers. "
@@ -138,14 +139,17 @@ def resolve_scan_args(args: argparse.Namespace, config: Mapping[str, Any]) -> Si
     root.representation_suffix = str(
         config_value(None, config, ["patch_alignment.representation_suffix"], "\nRepresentation:")
     )
-    root.probe_families = value_to_csv(
-        config_value(
-            None,
-            config,
-            ["patch_alignment.probe_families"],
-            "point_value,point_difference,point_mean,region_mean,region_range",
+    root.probe_families = [
+        family.lower()
+        for family in parse_csv(
+            config_value(
+                None,
+                config,
+                ["patch_alignment.probe_families"],
+                "point_value,point_difference,point_mean,region_mean,region_range",
+            )
         )
-    )
+    ]
     root.probe_region_size = int(
         config_value(None, config, ["patch_alignment.probe_region_size"], 4)
     )
@@ -536,13 +540,12 @@ def collect_anchor_hidden(
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             indices = indices.to(device)
-            outputs = llm_backbone(llm)(
+            hidden_states = transformer_block_hidden_states(
+                llm,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
+                layer_indices=layers,
             )
-            hidden_states = outputs.hidden_states
             expected_sequence = int(input_ids.shape[1])
             for layer in layers:
                 hidden = hidden_states[int(layer)]
@@ -693,13 +696,15 @@ def main() -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    llm = AutoModelForCausalLM.from_pretrained(
+    llm = AutoModel.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
         trust_remote_code=bool(args.trust_remote_code),
         dtype=dtype_from_name(str(args.torch_dtype)),
     )
-    llm.to(device).eval()
+    # Load only the base decoder; the scan never uses a causal LM head.
+    backbone = llm_backbone(llm)
+    backbone.to(device).eval()
     for parameter in llm.parameters():
         parameter.requires_grad_(False)
     num_hidden_layers = int(llm.config.num_hidden_layers)

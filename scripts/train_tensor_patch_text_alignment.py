@@ -47,7 +47,7 @@ from tensor_compression.utils.pipeline_config import (  # noqa: E402
 )
 
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "scripts/train_tensor_patch_text_alignment.py requires transformers. "
@@ -96,7 +96,14 @@ PROBE_FAMILIES = (
     "region_mean",
     "region_range",
 )
-PROBE_TEMPLATES_PER_FAMILY = 4
+PROBE_TEMPLATE_COUNTS = {
+    "point_value": 8,
+    "point_difference": 4,
+    "point_mean": 4,
+    "region_mean": 4,
+    "region_range": 4,
+}
+PROBE_READOUT_ENDINGS = (" is", " equals", " gives", " contains")
 PROBE_FORBIDDEN_INPUT_MARKERS = ("answer:", "a or b", "a/b", "choose from", "options:", "?")
 REMOVED_PATCH_ALIGNMENT_OPTIONS = (
     "center_embeddings",
@@ -1629,6 +1636,91 @@ def truncate_llm_backbone_to_layer(llm: nn.Module, teacher_layer: int) -> int | 
     return len(backbone.layers)
 
 
+def transformer_block_hidden_states(
+    llm: nn.Module,
+    *,
+    attention_mask: torch.Tensor,
+    layer_indices: Sequence[int],
+    input_ids: torch.Tensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> dict[int, torch.Tensor]:
+    """Capture only requested transformer-block outputs, before any final backbone norm."""
+    backbone = llm_backbone(llm)
+    layers = getattr(backbone, "layers", None)
+    requested = sorted({int(index) for index in layer_indices})
+    if not requested:
+        raise ValueError("At least one transformer layer must be requested.")
+    if isinstance(layers, nn.ModuleList):
+        invalid = [index for index in requested if index <= 0 or index > len(layers)]
+        if invalid:
+            raise ValueError(
+                f"Transformer block indices {invalid} are outside hidden_states[1..{len(layers)}]."
+            )
+        captured: dict[int, torch.Tensor] = {}
+
+        def capture(index: int):
+            def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+                hidden = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.is_tensor(hidden):
+                    raise TypeError(
+                        f"Transformer block {index} returned unsupported output type {type(output).__name__}."
+                    )
+                captured[index] = hidden
+
+            return hook
+
+        handles = [layers[index - 1].register_forward_hook(capture(index)) for index in requested]
+        try:
+            backbone(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        missing = [index for index in requested if index not in captured]
+        if missing:
+            raise RuntimeError(f"Transformer hooks did not capture requested blocks {missing}.")
+        return captured
+
+    outputs = backbone(
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    hidden_states = outputs.hidden_states
+    return {index: hidden_states[index] for index in requested}
+
+
+def forward_teacher_readout_hidden(
+    llm: nn.Module,
+    *,
+    attention_mask: torch.Tensor,
+    teacher_layer: int,
+    prefix_tokens: int = 0,
+    input_ids: torch.Tensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    hidden = transformer_block_hidden_states(
+        llm,
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        layer_indices=[int(teacher_layer)],
+    )[int(teacher_layer)]
+    return hidden_at_last_non_padding(
+        [hidden],
+        attention_mask[:, int(prefix_tokens) :],
+        0,
+        prefix_tokens=int(prefix_tokens),
+    )
+
+
 def masked_token_norm(embeddings: torch.Tensor, attention_mask: torch.Tensor) -> float:
     mask = attention_mask.to(device=embeddings.device, dtype=torch.bool)
     if not bool(mask.any()):
@@ -1727,11 +1819,15 @@ def build_static_alignment_anchor(
 def validate_probe_anchor_contract(anchor: AlignmentAnchor) -> None:
     if anchor.mode != "probe" or anchor.probe_family not in PROBE_FAMILIES:
         raise ValueError("Probe contract validation requires a supported probe anchor.")
-    if anchor.probe_template_index is None or not 0 <= int(anchor.probe_template_index) < PROBE_TEMPLATES_PER_FAMILY:
+    template_count = int(PROBE_TEMPLATE_COUNTS[str(anchor.probe_family)])
+    if anchor.probe_template_index is None or not 0 <= int(anchor.probe_template_index) < template_count:
         raise ValueError(f"Probe anchor has an invalid template index: {anchor.probe_template_index!r}.")
     text = str(anchor.text or "")
-    if not text.startswith("\n") or not text.endswith(" is"):
-        raise ValueError(f"Probe stem must start with a newline and end at a natural ' is' readout: {text!r}.")
+    if not text.startswith("\n") or not text.endswith(PROBE_READOUT_ENDINGS):
+        raise ValueError(
+            "Probe stem must start with a newline and end immediately before a numeric readout "
+            f"using one of {PROBE_READOUT_ENDINGS}: {text!r}."
+        )
     lowered = text.lower()
     leaked_markers = [marker for marker in PROBE_FORBIDDEN_INPUT_MARKERS if marker in lowered]
     if leaked_markers:
@@ -1766,19 +1862,20 @@ def build_numeric_probe_anchor(
     channel = rng.randrange(int(channel_count))
 
     def select_template(templates: Sequence[str]) -> tuple[int, str]:
-        if len(templates) != PROBE_TEMPLATES_PER_FAMILY:
+        expected_count = int(PROBE_TEMPLATE_COUNTS[family])
+        if len(templates) != expected_count:
             raise ValueError(
-                f"Every probe family must define exactly {PROBE_TEMPLATES_PER_FAMILY} templates, "
+                f"Probe family {family} must define exactly {expected_count} templates, "
                 f"but {family} defines {len(templates)}."
             )
         selected = (
             int(template_index)
             if template_index is not None
-            else (int(probe_index) // len(probe_families)) % PROBE_TEMPLATES_PER_FAMILY
+            else (int(probe_index) // len(probe_families)) % expected_count
         )
-        if not 0 <= selected < PROBE_TEMPLATES_PER_FAMILY:
+        if not 0 <= selected < expected_count:
             raise ValueError(
-                f"Probe template_index must be between 0 and {PROBE_TEMPLATES_PER_FAMILY - 1}, got {selected}."
+                f"Probe template_index must be between 0 and {expected_count - 1}, got {selected}."
             )
         return selected, str(templates[selected])
 
@@ -1800,9 +1897,13 @@ def build_numeric_probe_anchor(
         location = point_text(row, col)
         templates = (
             f"\nThe value at {location} is",
+            f"\nThe entry at {location} equals",
+            f"\nReading {location} gives",
+            f"\nAt {location}, this matrix contains",
             f"\nAt {location}, the value is",
-            f"\nThe numeric value at {location} is",
+            f"\nThe matrix entry at {location} is",
             f"\nFor {location}, the recorded value is",
+            f"\nThe number stored at {location} is",
         )
         selected_template_index, text = select_template(templates)
         parameters = (channel, row, col)
@@ -2231,13 +2332,13 @@ def text_teacher_hidden(
         )
     text_embeds = llm.get_input_embeddings()(input_ids)
     metrics["token_embedding_norm"] = masked_token_norm(text_embeds, attention_mask)
-    outputs = llm_backbone(llm)(
+    hidden = forward_teacher_readout_hidden(
+        llm,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        output_hidden_states=True,
-        use_cache=False,
+        teacher_layer=int(teacher_layer),
     )
-    hidden = hidden_at_last_non_padding(outputs.hidden_states, attention_mask, teacher_layer).detach()
+    hidden = hidden.detach()
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
     metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
     return HiddenBatch(hidden=hidden, metrics=metrics)
@@ -2316,16 +2417,11 @@ def tensor_student_hidden(
         device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
-    outputs = llm_backbone(llm)(
+    hidden = forward_teacher_readout_hidden(
+        llm,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        output_hidden_states=True,
-        use_cache=False,
-    )
-    hidden = hidden_at_last_non_padding(
-        outputs.hidden_states,
-        text_attention_mask,
-        teacher_layer,
+        teacher_layer=int(teacher_layer),
         prefix_tokens=int(soft_prompts.shape[1]),
     )
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
@@ -2457,12 +2553,6 @@ def alignment_anchors_from_args(
                 probe_index=index,
                 seed=int(args.seed) + (100_000 if evaluation else 0),
                 max_anchor_tokens=int(args.max_shared_suffix_tokens),
-                template_index=(
-                    (index // len(args.probe_families) + index % len(args.probe_families))
-                    % PROBE_TEMPLATES_PER_FAMILY
-                    if evaluation
-                    else None
-                ),
             )
             for index in range(probe_count)
         ]
@@ -2483,7 +2573,8 @@ def probe_contract_anchors(tokenizer: Any, args: argparse.Namespace) -> list[Ali
     channel_count = 1 if str(args.field_sampling_mode).lower() == "single" else len(parse_csv(args.fields))
     anchors: list[AlignmentAnchor] = []
     for family_index, family in enumerate(families):
-        for template_index in range(PROBE_TEMPLATES_PER_FAMILY):
+        template_count = int(PROBE_TEMPLATE_COUNTS[family])
+        for template_index in range(template_count):
             anchor = build_numeric_probe_anchor(
                 tokenizer=tokenizer,
                 patch_size=int(args.patch_size),
@@ -2497,7 +2588,7 @@ def probe_contract_anchors(tokenizer: Any, args: argparse.Namespace) -> list[Ali
                 template_index=template_index,
             )
             anchors.append(anchor)
-    expected_count = len(families) * PROBE_TEMPLATES_PER_FAMILY
+    expected_count = sum(int(PROBE_TEMPLATE_COUNTS[family]) for family in families)
     observed_pairs = {(anchor.probe_family, anchor.probe_template_index) for anchor in anchors}
     if len(anchors) != expected_count or len(observed_pairs) != expected_count:
         raise ValueError(
@@ -2506,10 +2597,11 @@ def probe_contract_anchors(tokenizer: Any, args: argparse.Namespace) -> list[Ali
         )
     for family in families:
         family_stems = {anchor.token_ids for anchor in anchors if anchor.probe_family == family}
-        if len(family_stems) != PROBE_TEMPLATES_PER_FAMILY:
+        expected_family_count = int(PROBE_TEMPLATE_COUNTS[family])
+        if len(family_stems) != expected_family_count:
             raise ValueError(
                 f"Probe templates for {family} collapsed to duplicate token sequences after tokenization: "
-                f"expected={PROBE_TEMPLATES_PER_FAMILY}, unique_token_sequences={len(family_stems)}."
+                f"expected={expected_family_count}, unique_token_sequences={len(family_stems)}."
             )
     return anchors
 
@@ -4121,7 +4213,7 @@ def preflight_teacher_text_tokenization(
         return {
             "probe_contract_anchor_count": float(len(contract_anchors)),
             "probe_contract_family_count": float(len(parse_csv(args.probe_families))),
-            "probe_contract_templates_per_family": float(PROBE_TEMPLATES_PER_FAMILY),
+            "probe_contract_template_count": float(len(contract_anchors)),
         } if contract_anchors else {}
     items = [dataset[index] for index in range(record_count)]
     batch = collate_patch_text(items)
@@ -4171,7 +4263,7 @@ def preflight_teacher_text_tokenization(
         if contract_anchors:
             summary["probe_contract_anchor_count"] = float(len(contract_anchors))
             summary["probe_contract_family_count"] = float(len(parse_csv(args.probe_families)))
-            summary["probe_contract_templates_per_family"] = float(PROBE_TEMPLATES_PER_FAMILY)
+            summary["probe_contract_template_count"] = float(len(contract_anchors))
         return summary
     encoded = tokenizer(
         texts,
@@ -4745,26 +4837,36 @@ def main() -> None:
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    llm = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=args.cache_dir,
-        trust_remote_code=bool(args.trust_remote_code),
-        dtype=dtype_from_name(str(args.torch_dtype)),
-    )
-    llm.to(device)
+    llm = None
+    llm_num_hidden_layers = -1
+    active_teacher_layers = None
+    # Serialize large-model construction across ranks. Each process moves its
+    # truncated backbone to its GPU before the next rank allocates host weights.
+    for load_rank in range(distributed_world_size()):
+        if distributed_rank() == load_rank:
+            llm = AutoModel.from_pretrained(
+                args.model_name_or_path,
+                cache_dir=args.cache_dir,
+                trust_remote_code=bool(args.trust_remote_code),
+                dtype=dtype_from_name(str(args.torch_dtype)),
+            )
+            llm_num_hidden_layers = int(getattr(llm.config, "num_hidden_layers", -1))
+            validate_teacher_hidden_state_index(int(args.teacher_layer), llm_num_hidden_layers)
+            active_teacher_layers = truncate_llm_backbone_to_layer(llm, int(args.teacher_layer))
+            llm.to(device)
+        distributed_barrier()
+    if llm is None:
+        raise RuntimeError("The local rank failed to construct the frozen teacher backbone.")
     llm.eval()
     for parameter in llm.parameters():
         parameter.requires_grad_(False)
     llm_hidden_size = int(llm.config.hidden_size)
-    llm_num_hidden_layers = int(getattr(llm.config, "num_hidden_layers", -1))
-    validate_teacher_hidden_state_index(int(args.teacher_layer), llm_num_hidden_layers)
     projection_dim = int(args.projection_dim or llm_hidden_size)
     if projection_dim != llm_hidden_size:
         raise ValueError(
             "patch_alignment.projection_dim must be null or equal to the LLM hidden size "
             f"({llm_hidden_size}) because the text teacher side is fixed and unprojected."
         )
-    active_teacher_layers = truncate_llm_backbone_to_layer(llm, int(args.teacher_layer))
     if active_teacher_layers is not None:
         distributed_barrier()
     elif is_main_process() and int(args.teacher_layer) < int(llm_num_hidden_layers):
@@ -4890,7 +4992,10 @@ def main() -> None:
             run_dir / "probe_contract.json",
             {
                 "family_count": len(parse_csv(args.probe_families)),
-                "templates_per_family": PROBE_TEMPLATES_PER_FAMILY,
+                "template_counts": {
+                    family: int(PROBE_TEMPLATE_COUNTS[family])
+                    for family in args.probe_families
+                },
                 "anchors": [
                     {
                         "name": anchor.name,
@@ -5165,7 +5270,7 @@ def main() -> None:
             for anchor in evaluation_anchors
         ],
         "anchor_aggregation": {
-            "training_schedule": "one shared probe per batch; families and four templates cycle uniformly",
+            "training_schedule": "one shared probe per batch; families and configured templates cycle uniformly",
             "primary_validation": "mean over fixed probes only when probe mode is selected",
             "global_retrieval": "separate_candidate_library_per_anchor",
             "probe_target_visibility": "internal_diagnostic_only_never_appended_to_llm_input",

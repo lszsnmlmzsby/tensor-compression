@@ -6,11 +6,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturbations
+from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturbations, resolve_scan_args
 from scripts.train_tensor_patch_text_alignment import (
     AlignmentAnchor,
     AlignmentProjectionPair,
     FixedTeacherWhitening,
+    PROBE_TEMPLATE_COUNTS,
+    alignment_anchors_from_args,
     apply_alignment_feature_transform,
     branch_mean_alignment_loss,
     build_numeric_probe_anchor,
@@ -32,6 +34,7 @@ from scripts.train_tensor_patch_text_alignment import (
     tokenize_contents_with_anchor,
     tokenize_contents_with_shared_suffix,
     teacher_probe_preflight_warnings,
+    transformer_block_hidden_states,
     validate_probe_anchor_contract,
     validate_teacher_hidden_state_index,
     validate_teacher_tensor_source,
@@ -80,6 +83,41 @@ class TinyBackboneModel(torch.nn.Module):
         self.model.layers = torch.nn.ModuleList(
             [torch.nn.Linear(2, 2, bias=False) for _ in range(block_count)]
         )
+
+
+class _AddBlock(torch.nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = float(value)
+
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor]:
+        return (hidden + self.value,)
+
+
+class _HookBackbone(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_AddBlock(1.0), _AddBlock(2.0)])
+
+    def forward(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        output_hidden_states=False,
+        use_cache=False,
+    ):
+        hidden = inputs_embeds
+        for layer in self.layers:
+            hidden = layer(hidden)[0]
+        return SimpleNamespace(last_hidden_state=hidden * 10.0)
+
+
+class _HookModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = _HookBackbone()
 
 
 def test_serialize_tensor_values_contains_only_values_and_shape_delimiters() -> None:
@@ -228,6 +266,21 @@ def test_shallow_teacher_truncation_keeps_requested_prefix_of_blocks() -> None:
 
     assert truncate_llm_backbone_to_layer(model, teacher_layer=2) == 2
     assert len(model.model.layers) == 2
+
+
+def test_transformer_block_capture_precedes_final_backbone_norm() -> None:
+    model = _HookModel()
+    inputs = torch.zeros(1, 3, 2)
+
+    captured = transformer_block_hidden_states(
+        model,
+        inputs_embeds=inputs,
+        attention_mask=torch.ones(1, 3, dtype=torch.long),
+        layer_indices=[1, 2],
+    )
+
+    assert torch.equal(captured[1], torch.ones_like(inputs))
+    assert torch.equal(captured[2], torch.full_like(inputs, 3.0))
 
 
 def test_teacher_hidden_state_index_rejects_non_contextual_embedding_output() -> None:
@@ -459,8 +512,9 @@ def test_probe_is_deterministic_and_contains_no_answer_or_choice_metadata() -> N
         "region_range",
     ],
 )
-def test_probe_uses_four_distinct_natural_stems_without_choice_format(family: str) -> None:
+def test_probe_uses_all_distinct_natural_stems_without_choice_format(family: str) -> None:
     tokenizer = CharacterTokenizer()
+    template_count = PROBE_TEMPLATE_COUNTS[family]
     anchors = [
         build_numeric_probe_anchor(
             tokenizer=tokenizer,
@@ -473,15 +527,15 @@ def test_probe_uses_four_distinct_natural_stems_without_choice_format(family: st
             max_anchor_tokens=256,
             template_index=template_index,
         )
-        for template_index in range(4)
+        for template_index in range(template_count)
     ]
 
-    assert {anchor.probe_template_index for anchor in anchors} == {0, 1, 2, 3}
-    assert len({anchor.token_ids for anchor in anchors}) == 4
+    assert {anchor.probe_template_index for anchor in anchors} == set(range(template_count))
+    assert len({anchor.token_ids for anchor in anchors}) == template_count
     for anchor in anchors:
         text = str(anchor.text)
         assert text.startswith("\n")
-        assert text.endswith(" is")
+        assert text.endswith((" is", " equals", " gives", " contains"))
         assert not any(marker in text for marker in ("Answer", "A or B", "A/B", "Choose", "?"))
 
 
@@ -524,13 +578,69 @@ def test_probe_contract_preflight_covers_every_family_and_template() -> None:
 
     anchors = probe_contract_anchors(tokenizer, args)
 
-    assert len(anchors) == 20
-    assert len({(anchor.probe_family, anchor.probe_template_index) for anchor in anchors}) == 20
+    expected_count = sum(PROBE_TEMPLATE_COUNTS[family] for family in args.probe_families)
+    assert len(anchors) == expected_count
+    assert len({(anchor.probe_family, anchor.probe_template_index) for anchor in anchors}) == expected_count
     for family in args.probe_families:
         family_anchors = [anchor for anchor in anchors if anchor.probe_family == family]
-        assert len(family_anchors) == 4
-        assert len({anchor.token_ids for anchor in family_anchors}) == 4
+        assert len(family_anchors) == PROBE_TEMPLATE_COUNTS[family]
+        assert len({anchor.token_ids for anchor in family_anchors}) == PROBE_TEMPLATE_COUNTS[family]
         assert len({anchor.probe_parameters for anchor in family_anchors}) == 1
+
+
+def test_point_value_evaluation_cycles_all_eight_short_stems() -> None:
+    tokenizer = CharacterTokenizer()
+    args = SimpleNamespace(
+        alignment_anchor_mode="probe",
+        evaluation_probe_count=8,
+        field_sampling_mode="single",
+        fields=["Vx"],
+        patch_size=16,
+        probe_families=["point_value"],
+        probe_region_size=4,
+        seed=42,
+        max_shared_suffix_tokens=256,
+        representation_suffix="\nRepresentation:",
+    )
+
+    anchors = alignment_anchors_from_args(tokenizer, args, evaluation=True)
+
+    assert len(anchors) == 8
+    assert {anchor.probe_template_index for anchor in anchors} == set(range(8))
+    assert len({anchor.token_ids for anchor in anchors}) == 8
+
+
+@pytest.mark.parametrize("configured", ["point_value", ["point_value"], "point_value,point_mean"])
+def test_layer_scan_parses_probe_family_scalars_and_lists(configured) -> None:
+    cli = SimpleNamespace(
+        anchor_mode=None,
+        split=None,
+        records=None,
+        batch_size=None,
+        layers=None,
+        probe_count=None,
+        perturbation_scale=None,
+        device=None,
+        output=None,
+    )
+    config = {
+        "model": {"name_or_path": "unused-test-model"},
+        "patch_alignment": {
+            "hdf5_path": "unused-test-data.h5",
+            "fields": ["Vx"],
+            "probe_families": configured,
+            "teacher_text_source": "raw",
+            "patch_encoder": {"normalization": {"mode": "none"}},
+        },
+    }
+
+    resolved = resolve_scan_args(cli, config)
+
+    assert resolved.probe_families == (
+        ["point_value", "point_mean"]
+        if configured == "point_value,point_mean"
+        else ["point_value"]
+    )
 
 
 def test_probe_channel_text_matches_parameter_channel() -> None:

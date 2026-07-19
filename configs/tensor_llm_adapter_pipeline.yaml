@@ -28,7 +28,8 @@ data:
 # Current stage-1 config encodes a per-patch z-score matrix; QA keeps raw mean/scale for reversible value queries.
 # Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
 patch_qa:
-  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
+  # Fill this with the completed Qwen2.5-32B Stage-1 alignment_best.pt before Stage 2.
+  alignment_checkpoint: null
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16
   latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16
@@ -72,7 +73,7 @@ compressor:
   checkpoint: /home/lpr/wyx/tensor-compression/outputs/runs/20260620_153406_compressor_2d_baseline/checkpoints/best.pt
 
 model:
-  name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  name_or_path: Qwen/Qwen2.5-32B-Instruct
   local_dir: null
   revision: main
   trust_remote_code: false
@@ -127,7 +128,7 @@ patch_alignment:
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_mean_matched_whitening_zscore
+  run_name: tensor_patch_text_alignment_qwen25_32b_point_value
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -140,9 +141,10 @@ patch_alignment:
   field_sampling_mode: single
   patch_size: 16
   # Number of random patch records created in-memory per split after applying split_mode.
-  train_records: 1048576
-  val_records: 8192
-  test_records: 8192
+  # First establish that the stronger teacher improves alignment before scaling record exposure.
+  train_records: 131072
+  val_records: 4096
+  test_records: 4096
   sample_indices: all
   time_indices: all
   # sample: train/val/test use disjoint sample_index values. This is the default credibility check.
@@ -158,9 +160,10 @@ patch_alignment:
   ensure_disjoint_records: true
   seed: 42
   device: auto
-  # Per-GPU batch. Four GPUs provide 128 in-batch contrastive candidates at the 2k-token teacher length.
-  batch_size: 32
-  eval_batch_size: 32
+  # Conservative per-GPU start for a truncated 32B teacher. Raise this after the smoke test;
+  # gradient accumulation does not add InfoNCE negatives.
+  batch_size: 4
+  eval_batch_size: 2
   epochs: 2
   lr: 1.0e-4
   weight_decay: 1.0e-4
@@ -168,7 +171,7 @@ patch_alignment:
   num_workers: 0
   # patch_ae_config: build a patch-sized AE from patch_encoder below.
   # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
-  encoder_source: patch_ae_config
+  encoder_source: checkpoint
   # true: train the AE when it is newly constructed. If freeze_patch_ae_after_pretrain is true,
   # this only affects the reconstruction warmup; the alignment phase trains only the Q-Former bridge.
   # false: freeze a loaded checkpoint encoder and train only the alignment adapter.
@@ -177,15 +180,15 @@ patch_alignment:
   #   compressor_checkpoint: /path/to/alignment_best.pt or patch_ae_pretrain_best.pt
   #   train_patch_ae: false
   #   patch_ae_pretrain_epochs: 0
-  train_patch_ae: true
-  # false matches the successful projection run: restore the best warmup AE, then jointly refine it.
-  freeze_patch_ae_after_pretrain: false
+  train_patch_ae: false
+  # Reuse only the four-field reconstruction AE from this checkpoint; loader ignores its old Q-Former.
+  freeze_patch_ae_after_pretrain: true
   # Jointly refine the AE without letting the contrastive objective erase reconstruction-relevant features.
   alignment_patch_ae_lr_scale: 0.1
   # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
-  patch_ae_pretrain_epochs: 1
+  patch_ae_pretrain_epochs: 0
   # Used only when encoder_source: checkpoint.
-  compressor_checkpoint: null
+  compressor_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
   compressor_config: null
   # With patch_ae_config this should be false. Set true only when loading a checkpoint whose input_size
   # differs from patch_size, for example the legacy 512x512 compressor.
@@ -224,7 +227,7 @@ patch_alignment:
     mode: whitening
     whitening:
       # Fit once on this many records from the training split before optimization.
-      records: 8192
+      records: 2048
       # Keep the highest-variance teacher directions and discard unstable low-variance directions.
       dim: 512
       # Covariance shrinkage bounds amplification in retained directions.
@@ -234,7 +237,7 @@ patch_alignment:
       max_condition_number: 1000.0
   # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
   # Used only when alignment_transform.mode is projection. The Q-Former soft tokens still enter
-  # Qwen at its native 1536-dimensional embedding width.
+  # Qwen at its native embedding width.
   alignment_projection:
     dim: 512
     hidden_dim: 1024
@@ -274,25 +277,24 @@ patch_alignment:
   # Select exactly one complete experiment: eos, representation, or probe. The formal run uses probe.
   alignment_anchor_mode: probe
   representation_suffix: "\nRepresentation:"
-  # Probe mode uses short, continuous-valued numerical operations instead of low-cardinality classes.
+  # Stage 1 teaches access to tensor values; arithmetic is left to the frozen LLM's later layers.
   # The scalar result is never appended to either LLM input. It is computed internally only to exclude
   # quantized-equal answers from the InfoNCE negative set and to diagnose teacher semantics.
   # There are no answer words, class labels, LM-head CE, or teacher-logit distillation.
   # Every sample and DDP rank in a batch receives the same stem/coordinates, so InfoNCE cannot use prompt identity.
   probe_families:
     - point_value
-    - point_difference
-    - point_mean
   probe_region_size: 4
-  # Validation/global retrieval uses one fixed stem from each enabled family in a separate complete pass.
-  evaluation_probe_count: 3
+  # One semantic family avoids supervising arithmetic that the teacher fails, while eight concise
+  # natural readout stems prevent Stage 1 from specializing to one fixed suffix wording.
+  evaluation_probe_count: 8
   # Teacher/probe correlation is a warning-only diagnostic, never a training gate. Aggregate the
-  # four wording templates within each numeric family over a larger independent sample.
+  # enabled family's wording templates over a larger independent sample.
   teacher_probe_warn_below_correlation: 0.1
   teacher_probe_diagnostic_records: 128
-  # Probe stems remain concise but need enough room for two coordinates or regions.
+  # The active point-value stems are short; this cap catches accidental prompt growth.
   # Representation does not append EOS; eos mode consists of the tokenizer's explicit EOS token alone.
-  max_shared_suffix_tokens: 96
+  max_shared_suffix_tokens: 32
   # Legacy prompt guard. In values_shared_suffix mode the suffix is tokenized separately and cannot be dropped.
   fail_on_text_anchor_missing: true
   # Fail if the numeric tensor body would be truncated before the separately preserved suffix.
@@ -308,17 +310,18 @@ patch_alignment:
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
-  # Hugging Face hidden_states[2] is the output after two transformer blocks.
+  # Provisional half-depth candidate. Replace it with the point-value layer-scan winner before a long run.
   # Index 0 is rejected because it is the non-contextual input embedding at the readout token.
-  teacher_layer: 2
+  teacher_layer: 32
   # Read-only frozen-Qwen scan used before choosing teacher_layer. It never trains or loads the AE/Q-Former/projector.
   # Run scripts/scan_tensor_teacher_layers.py; --anchor-mode can override probe with eos or representation.
   layer_scan:
     split: val
-    records: 128
-    batch_size: 8
-    layers: all
-    probe_count: 5
+    records: 32
+    batch_size: 1
+    # Sparse first pass; refine around the best layer before training.
+    layers: "4,8,12,16,24,32,40,48,56,64"
+    probe_count: 4
     # Probe mode compares an on-target perturbation with an equal-size off-target control perturbation.
     perturbation_scale: 0.01
     device: auto
@@ -327,7 +330,8 @@ patch_alignment:
 adapter:
   # Clone the stage-1 Q-Former into a question-conditioned residual branch; do not reuse downstream QA weights.
   architecture: residual_question_qformer
-  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260711_171257_tensor_patch_text_alignment/alignment_best.pt
+  # Fill this with the same Qwen2.5-32B Stage-1 checkpoint used by patch_qa.
+  init_checkpoint: null
   soft_prompt_tokens: 16
   adapter_dim: 512
   adapter_layers: 4
