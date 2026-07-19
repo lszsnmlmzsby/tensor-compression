@@ -50,6 +50,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 NUMERIC_ANSWER_PATTERN = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+THINKING_MODES = ("disabled", "auto")
 
 
 def parse_generated_numeric_answer(text: str) -> float | None:
@@ -114,6 +115,71 @@ def build_qwen_numeric_test_prompt(
     )
 
 
+def normalize_thinking_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode not in THINKING_MODES:
+        raise ValueError(
+            f"Unsupported thinking mode {value!r}; expected one of {THINKING_MODES}."
+        )
+    return mode
+
+
+def render_numeric_chat_prompt(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, str]],
+    thinking_mode: str,
+) -> tuple[str, bool, bool]:
+    """Render a chat prompt while remaining compatible with non-Qwen3 templates."""
+    mode = normalize_thinking_mode(thinking_mode)
+    uses_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template)
+    if not uses_chat_template:
+        rendered = (
+            f"System: {messages[0]['content']}\n"
+            f"User: {messages[1]['content']}\nAssistant:"
+        )
+        return rendered, False, False
+
+    if mode == "auto":
+        return (
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            ),
+            True,
+            False,
+        )
+
+    template_text = str(tokenizer.chat_template)
+    if "enable_thinking" not in template_text:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return rendered, True, False
+
+    # Qwen3 consumes this keyword in its template. Older/non-thinking templates may
+    # reject it, in which case the ordinary template is the compatible fallback.
+    try:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError as exc:
+        if "enable_thinking" not in str(exc):
+            raise
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return rendered, True, False
+    return rendered, True, True
+
+
 @torch.no_grad()
 def generate_qwen_numeric_answer(
     llm: torch.nn.Module,
@@ -122,7 +188,8 @@ def generate_qwen_numeric_answer(
     device: torch.device,
     max_input_tokens: int,
     max_new_tokens: int,
-) -> tuple[str, int]:
+    thinking_mode: str,
+) -> tuple[str, int, dict[str, Any]]:
     messages = [
         {
             "role": "system",
@@ -130,11 +197,11 @@ def generate_qwen_numeric_answer(
         },
         {"role": "user", "content": str(prompt)},
     ]
-    uses_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template)
-    if uses_chat_template:
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        rendered = f"System: {messages[0]['content']}\nUser: {prompt}\nAssistant:"
+    rendered, uses_chat_template, thinking_control_applied = render_numeric_chat_prompt(
+        tokenizer,
+        messages,
+        thinking_mode,
+    )
     encoded = tokenizer(
         rendered,
         return_tensors="pt",
@@ -157,7 +224,14 @@ def generate_qwen_numeric_answer(
         eos_token_id=int(tokenizer.eos_token_id),
     )
     generated_ids = output_ids[0, input_tokens:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip(), input_tokens
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    return generated_text, input_tokens, {
+        "thinking_mode": normalize_thinking_mode(thinking_mode),
+        "chat_template_used": bool(uses_chat_template),
+        "thinking_control_applied": bool(thinking_control_applied),
+        "generated_tokens": int(generated_ids.shape[0]),
+        "hit_max_new_tokens": int(generated_ids.shape[0]) >= int(max_new_tokens),
+    }
 
 
 def aggregate_qwen_numeric_test_cases(
@@ -307,6 +381,11 @@ def run_numeric_matrix_test(args: argparse.Namespace) -> dict[str, Any]:
     )
     trust_remote_code = bool(config_value(config, "model.trust_remote_code", False))
     torch_dtype = str(config_value(config, "model.torch_dtype", "bfloat16"))
+    thinking_mode = normalize_thinking_mode(
+        args.thinking_mode
+        if args.thinking_mode is not None
+        else config_value(config, "model.thinking_mode", "disabled")
+    )
     device = resolve_device(
         str(args.device if args.device is not None else config_value(config, "patch_alignment.device", "auto"))
     )
@@ -383,15 +462,21 @@ def run_numeric_matrix_test(args: argparse.Namespace) -> dict[str, Any]:
         )
         expected = float(expected_tensor[0].item())
         prompt = build_qwen_numeric_test_prompt(visible_patch, anchor, decimals)
-        generated_text, input_tokens = generate_qwen_numeric_answer(
+        generated_text, input_tokens, generation_control = generate_qwen_numeric_answer(
             llm,
             tokenizer,
             prompt,
             device,
             max_input_tokens,
             int(args.max_new_tokens),
+            thinking_mode,
         )
-        prediction = parse_generated_numeric_answer(generated_text)
+        if bool(generation_control["hit_max_new_tokens"]):
+            prediction = None
+            prediction_status = "generation_truncated"
+        else:
+            prediction = parse_generated_numeric_answer(generated_text)
+            prediction_status = "numeric" if prediction is not None else "no_numeric_answer"
         absolute_error = abs(float(prediction) - expected) if prediction is not None else None
         rounded_exact = (
             int(np.rint(float(prediction) * scale)) == int(target_ids[0].item())
@@ -408,7 +493,9 @@ def run_numeric_matrix_test(args: argparse.Namespace) -> dict[str, Any]:
                 "prompt": prompt,
                 "expected": expected,
                 "generated_text": generated_text,
+                "generation_control": generation_control,
                 "prediction": prediction,
+                "prediction_status": prediction_status,
                 "absolute_error": absolute_error,
                 "rounded_exact": bool(rounded_exact),
                 "within_tolerance": bool(
@@ -416,7 +503,25 @@ def run_numeric_matrix_test(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             }
         )
-    return aggregate_qwen_numeric_test_cases(cases, float(args.absolute_tolerance))
+    metrics = aggregate_qwen_numeric_test_cases(cases, float(args.absolute_tolerance))
+    controls = {
+        tuple(
+            sorted(
+                (str(key), value)
+                for key, value in case["generation_control"].items()
+                if key != "generated_tokens" and key != "hit_max_new_tokens"
+            )
+        )
+        for case in cases
+    }
+    metrics["generation_control"] = {
+        "requested_thinking_mode": thinking_mode,
+        "observed_variants": [dict(items) for items in sorted(controls)],
+        "truncated_records": int(
+            sum(bool(case["generation_control"]["hit_max_new_tokens"]) for case in cases)
+        ),
+    }
+    return metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -432,6 +537,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic-size", type=int, default=4)
     parser.add_argument("--max-input-tokens", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument(
+        "--thinking-mode",
+        choices=THINKING_MODES,
+        default=None,
+        help=(
+            "Chat-template mode. 'disabled' is the default and passes enable_thinking=False "
+            "when supported; 'auto' leaves the model/template default unchanged."
+        ),
+    )
     parser.add_argument("--absolute-tolerance", type=float, default=0.02)
     args = parser.parse_args()
     for name in ("dataset_records", "synthetic_records"):
@@ -477,7 +591,9 @@ def main() -> None:
         f"records={macro['records']:.0f} parsed={macro['parsed_fraction']:.3f} "
         f"exact={macro['rounded_exact_accuracy']:.3f} "
         f"within_tol={macro['within_tolerance_accuracy']:.3f} "
-        f"mae={parsed_mae_text} {source_text}"
+        f"mae={parsed_mae_text} {source_text} "
+        f"thinking={metrics['generation_control']['requested_thinking_mode']} "
+        f"truncated={metrics['generation_control']['truncated_records']}"
     )
     print(f"output={output_path}")
 

@@ -6,9 +6,29 @@ import torch
 from scripts.test_qwen_numeric_matrix_tasks import (
     aggregate_qwen_numeric_test_cases,
     build_qwen_numeric_test_prompt,
+    normalize_thinking_mode,
     parse_generated_numeric_answer,
+    render_numeric_chat_prompt,
 )
 from scripts.train_tensor_patch_text_alignment import AlignmentAnchor
+
+
+class _ThinkingChatTokenizer:
+    chat_template = "qwen3-like enable_thinking"
+
+    def __init__(self) -> None:
+        self.kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.kwargs = kwargs
+        return "rendered"
+
+
+class _LegacyChatTokenizer:
+    chat_template = "legacy"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+        return "legacy-rendered"
 
 
 def test_qwen_numeric_prompt_contains_matrix_and_task_but_not_expected_answer() -> None:
@@ -35,6 +55,33 @@ def test_generated_numeric_answer_uses_final_finite_number() -> None:
     assert parse_generated_numeric_answer("The calculation is 1.0 - 0.5 = 0.5") == pytest.approx(0.5)
     assert parse_generated_numeric_answer("Answer: -1.25e-2") == pytest.approx(-0.0125)
     assert parse_generated_numeric_answer("No numeric answer") is None
+
+
+def test_numeric_chat_prompt_disables_qwen3_thinking_when_supported() -> None:
+    tokenizer = _ThinkingChatTokenizer()
+    rendered, uses_chat_template, control_applied = render_numeric_chat_prompt(
+        tokenizer,
+        [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+        "disabled",
+    )
+
+    assert rendered == "rendered"
+    assert uses_chat_template is True
+    assert control_applied is True
+    assert tokenizer.kwargs["enable_thinking"] is False
+    assert normalize_thinking_mode("disabled") == "disabled"
+
+
+def test_numeric_chat_prompt_falls_back_for_templates_without_thinking_argument() -> None:
+    rendered, uses_chat_template, control_applied = render_numeric_chat_prompt(
+        _LegacyChatTokenizer(),
+        [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+        "disabled",
+    )
+
+    assert rendered == "legacy-rendered"
+    assert uses_chat_template is True
+    assert control_applied is False
 
 
 def test_qwen_numeric_case_aggregation_keeps_sources_separate() -> None:
