@@ -127,7 +127,7 @@ patch_alignment:
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_pca_whitening_zscore
+  run_name: tensor_patch_text_alignment_mean_matched_whitening_zscore
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -230,6 +230,8 @@ patch_alignment:
       # Covariance shrinkage bounds amplification in retained directions.
       shrinkage: 0.01
       epsilon: 1.0e-5
+      # Cap the regularized covariance condition number so low-variance numerical noise is not over-amplified.
+      max_condition_number: 1000.0
   # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
   # Used only when alignment_transform.mode is projection. The Q-Former soft tokens still enter
   # Qwen at its native 1536-dimensional embedding width.
@@ -246,12 +248,20 @@ patch_alignment:
   # 0 disables the bound; 0.05 keeps token norms near ordinary input embeddings.
   soft_prompt_scale: 0.05
   temperature: 0.07
-  # Symmetric hidden-state InfoNCE is the primary alignment objective.
-  contrastive_loss_weight: 1.0
-  # Small auxiliary centered InfoNCE matches the previous successful projection run.
-  centered_contrastive_loss_weight: 0.1
-  # Keep improvement in Qwen's native hidden space instead of only the disposable PCA retrieval space.
-  native_centered_contrastive_loss_weight: 0.1
+  # Uncentered retrieval remains an auxiliary absolute-space constraint, but no longer dominates the
+  # probe-conditioned common direction that caused t2i candidate hubs.
+  contrastive_loss_weight: 0.25
+  # Deployment is tensor -> text, so i2t is primary. Keep t2i as an auxiliary one-to-one/hubness
+  # regularizer; these values are normalized by the loss implementation.
+  contrastive_direction_weights:
+    i2t: 0.75
+    t2i: 0.25
+  # The primary residual objective uses one DDP-global mean over all 128 same-probe records.
+  centered_contrastive_loss_weight: 1.0
+  # Preserve the same discriminative residual geometry in Qwen's native hidden space for stage 2.
+  native_centered_contrastive_loss_weight: 0.25
+  # Match transformed and native branch means during training so centering is not required at inference.
+  mean_alignment_loss_weight: 0.1
   # Only contributes gradients while the AE is trainable; otherwise it is logged as a metric.
   reconstruction_loss_weight: 1.0
   # Serialize the same z-scored patch that enters the AE.
@@ -276,8 +286,10 @@ patch_alignment:
   probe_region_size: 4
   # Validation/global retrieval uses one fixed stem from each enabled family in a separate complete pass.
   evaluation_probe_count: 3
-  # Abort before AE warmup if the frozen teacher does not encode an enabled probe's numeric target.
-  teacher_probe_min_correlation: 0.1
+  # Teacher/probe correlation is a warning-only diagnostic, never a training gate. Aggregate the
+  # four wording templates within each numeric family over a larger independent sample.
+  teacher_probe_warn_below_correlation: 0.1
+  teacher_probe_diagnostic_records: 128
   # Probe stems remain concise but need enough room for two coordinates or regions.
   # Representation does not append EOS; eos mode consists of the tokenizer's explicit EOS token alone.
   max_shared_suffix_tokens: 96

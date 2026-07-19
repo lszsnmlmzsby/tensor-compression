@@ -1063,7 +1063,7 @@ CUDA_VISIBLE_DEVICES=5 python scripts/scan_tensor_teacher_layers.py \
 
 EOS 对照只需把最后一项改成 `--anchor-mode eos`。默认扫描 128 个验证 patch 和 `hidden_states[1..28]`；完整结果写入 `patch_alignment.output_root/teacher_layer_scan_*.json`。控制台的 `pair_cos` 越低表示跨样本角度坍缩越弱，`eff_rank` 越高表示变化占用的独立方向越多。probe 模式另外对被句子点名的数值施加扰动，并用数量和幅度相同、但位于 probe 支持域外的扰动作 control；`target/control > 1` 才说明该层对问题相关位置比无关位置更敏感。旧版 checkerboard `locality_margin` 不能证明局部读取能力，已经删除。不能只凭最低 `pair_cos` 选层。
 
-注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。
+注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。正式训练在只读取浅层 hidden 时，会在只读 Qwen generation baseline 完成后安全截断 backbone 到 `teacher_layer`；`run_summary.json` 同时记录原始层数和实际启用层数，无法确认安全结构时则保留完整 frozen LLM。
 
 Teacher branch 只包含配置后的 tensor 数值和形状分隔符：
 
@@ -1116,7 +1116,16 @@ The mean over rows 9-12 and columns 4-7 is
 
 AE warmup 前会穷举全部已启用的 `3 families x 4 templates`。tokenization preflight 检查上述结构、每个 family 的四种模板是否保持不同 token 序列、所有 suffix 长度和正文截断。任一结构或 tokenization 契约失败都会在训练前终止。
 
-`teacher_probe_min_correlation: 0.1` 还会检查每个启用 probe 的 frozen-teacher hidden 与数值目标几何是否至少具有弱正相关；低于阈值会在 AE warmup 前直接终止。这个阈值不是训练监督，也不筛选样本，只防止把 teacher 未表达的操作当作蒸馏目标。
+`teacher_probe_preflight.json` 会记录每个 probe 的 frozen-teacher hidden 与数值目标几何相关性。正式配置使用 128 条 train record，并把四个措辞模板按 numeric family 聚合，以 family 中位数作为稳定诊断。`teacher_probe_warn_below_correlation` 只产生 warning，不阻止长训练；tokenization、正文截断和 probe contract 失败仍会硬终止。旧的 `teacher_probe_min_correlation` 硬门槛已删除，因为它把小样本的观测相关性错误地当成了 teacher 可训练性的必要条件。
+
+Qwen 本身的数值矩阵能力使用独立脚本测试，不属于训练入口：
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python scripts/test_qwen_numeric_matrix_tasks.py \
+  --config configs/tensor_llm_adapter_pipeline.yaml
+```
+
+它分别向完整 Qwen 提供短合成矩阵和真实归一化 PDE patch，要求回答当前 probe family 的数值查找/运算，并将输入、生成文本、解析值和误差写入 `outputs/diagnostics/*_qwen_numeric_matrix_test.json`。该测试不使用 Q-Former，不向 prompt 泄露答案，也不参与 loss、样本筛选或 checkpoint 选择。训练脚本只保留 frozen teacher hidden 的 probe 预检。
 
 正式目标不减 probe-only baseline。`alignment_transform.mode` 可选三档：
 
@@ -1131,12 +1140,13 @@ AE warmup 前会穷举全部已启用的 `3 families x 4 templates`。tokenizati
 ```text
 Teacher = L2_normalize((teacher_hidden - mu) @ W)
 Student = L2_normalize((student_hidden - mu) @ W)
-loss = false-negative-masked symmetric_InfoNCE(Student, Teacher)
-     + 0.1 * centered_symmetric_InfoNCE(Student, Teacher)
-     + 0.1 * centered_symmetric_InfoNCE(native_student_hidden, native_teacher_hidden)
+loss = 0.25 * weighted_directional_InfoNCE(Student, Teacher; i2t=0.75, t2i=0.25)
+     + 1.00 * ddp_global_centered_symmetric_InfoNCE(Student, Teacher)
+     + 0.25 * ddp_global_centered_symmetric_InfoNCE(native_student_hidden, native_teacher_hidden)
+     + 0.10 * transformed_and_native_branch_mean_alignment
 ```
 
-两侧必须减同一个 teacher mean 并乘同一个矩阵；分别 whitening 会产生不同坐标系，代码不允许这种做法。该变换没有训练参数，统计量随 checkpoint 保存；截断 PCA 丢弃 teacher 的低方差噪声方向，但第二阶段无需携带它。为避免只在 512 维检索空间改善，训练另以小权重优化原生 1536 维 centered InfoNCE，并记录 raw centered/global retrieval。`projection` 档仍保留旧的一层独立 projection 以复现实验。训练不读取 Qwen 最终层 hidden，也不调用 LM head。
+两侧必须减同一个 teacher mean 并乘同一个矩阵；分别 whitening 会产生不同坐标系，代码不允许这种做法。PCA 特征值另受 `max_condition_number: 1000` 约束，避免放大低方差噪声。centered loss 使用所有 DDP rank 的同一个 128-record probe batch 均值，而不是每卡各减 32-record 均值。centered retrieval 只负责学习实例残差；额外的 transformed/native branch-mean loss 约束绝对分支位置，因此第二阶段和单样本推理不依赖 candidate-library centering。`projection` 档仍保留旧的一层独立 projection 以复现实验。
 
 probe 模式的全局 retrieval 使用 `evaluation_probe_count` 个固定 sentence stem，每个 family 在整个验证 split 上单独编码和检索，再做平均；同一个候选库内绝不混入不同 probe。量化后标量结果相同的非配对候选会从 InfoNCE 分母排除，避免把相同语义硬当负样本；配对正样本不变。严格的一对一 i2t/t2i 仍在未屏蔽的完整候选集上报告，另增 `semantic_*` 指标，因此该修正不会把宽松检索冒充实例检索。EOS 和 representation 设置各自只运行自己的全局检索。数值正文和 suffix 分开 tokenization；正文超出 `max_text_tokens - suffix_tokens` 会直接失败。
 
@@ -1211,9 +1221,10 @@ torchrun --standalone --nproc_per_node=2 \
 主要 loss：
 
 ```text
-loss = contrastive_loss_weight * false_negative_masked_symmetric_InfoNCE(tensor_embedding, text_teacher_embedding)
+loss = contrastive_loss_weight * weighted_directional_InfoNCE(tensor_embedding, text_teacher_embedding; i2t=0.75, t2i=0.25)
      + centered_contrastive_loss_weight * false_negative_masked_centered_symmetric_InfoNCE(...)
      + native_centered_contrastive_loss_weight * false_negative_masked_centered_symmetric_InfoNCE(native_hidden...)
+     + mean_alignment_loss_weight * transformed_and_native_branch_mean_alignment(...)
      + reconstruction_loss_weight * MSE(patch_AE_reconstruction, normalized_patch)
 ```
 
@@ -1223,7 +1234,7 @@ loss = contrastive_loss_weight * false_negative_masked_symmetric_InfoNCE(tensor_
 
 脚本同样会在长训练前拒绝无效边界：`epochs <= 0`、空 DataLoader、0 层 Q-Former、单卡 batch 1 导致 InfoNCE 没有负样本、新建随机 AE 却被冻结，以及可训练 AE 却关闭 reconstruction loss。
 
-`alignment_best.pt` 按整个验证 split 的严格一对一 `global_strict + centered_weight * global_centered_strict + native_weight * global_hidden_centered_strict` 选择；全局评估缺失时回退到对应 batch 指标。语义同值负样本屏蔽只影响训练 loss，不用于美化 checkpoint 选择。AE warmup 另按验证 reconstruction loss 保存 `patch_ae_pretrain_best.pt`，并在 alignment 前自动恢复 best；`last` 只保留作诊断。
+`alignment_best.pt` 使用整个验证 split 的方向加权严格 CE：`contrastive_weight * (0.75 * global_i2t_CE + 0.25 * global_t2i_CE)`，再加 batch-level centered、native-centered 和 branch-mean 项；全局 candidate-library centered retrieval 和全局 branch mean 只作诊断，不参与 checkpoint 选择，因为单样本部署没有验证集均值。全局评估缺失时回退到对应 batch 指标。i2t 是实际 tensor→text 部署方向，t2i 保留为较小的 one-to-one/hubness 辅助约束，而不是被删除或与 i2t 等权。语义同值负样本屏蔽只影响训练 loss，不用于美化 checkpoint 选择。
 
 `freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；设为 `true` 时只训练 Q-Former bridge。Q-Former 的必要输出线性层直接生成与 Qwen input embedding 同维的连续 prefix embeddings。
 
@@ -1236,7 +1247,8 @@ loss = contrastive_loss_weight * false_negative_masked_symmetric_InfoNCE(tensor_
 | `run_summary.json` | 真实开始/结束时间与耗时，以及 patch 大小、字段、split plan、record overlap、encoder 来源、latent grid、LLM hidden size、teacher layer、adapter 参数量。 |
 | `probe_contract.json` | 启动时穷举的已启用 stem、family/template、坐标和实际 token IDs；当前为 12 个。 |
 | `probe_tokenization_preflight.json` | 已启用 stem 的长度、token 序列和数值正文截断检查。 |
-| `teacher_probe_preflight.json` | AE warmup 前对最多 32 条 train record 和全部已启用 family/template 做 frozen-teacher 只读诊断，记录 hidden-目标相关性、最近邻目标误差与 target collision。 |
+| `teacher_probe_preflight.json` | AE warmup 前对最多 128 条 train record 和全部已启用 family/template 做 frozen-teacher 只读诊断，按 family 聚合记录 hidden-目标相关性、最近邻目标误差与 target collision。 |
+| `*_qwen_numeric_matrix_test.json` | 独立脚本产生的完整 frozen Qwen 数值 generation baseline，含逐例输入输出与分 source/family 指标。 |
 | `alignment_whitening.json` | whitening 档的 train record 数、均值范数、协方差谱和正则后 condition number。其他两档不生成。 |
 | `metrics_latest.json` | patch AE warmup、每轮 train/val loss、reconstruction loss、i2t/t2i retrieval accuracy。 |
 | `test_metrics.json` | 使用 `alignment_best.pt` 的最终 test 指标。 |
@@ -1263,7 +1275,7 @@ W&B 曲线：
 | `train/teacher_probe_hidden_similarity_vs_negative_target_distance_pearson` | Teacher hidden 相似度与 probe 数值接近程度的相关性；越高越支持 frozen teacher 确实编码了所问数值。 |
 | `train/alignment_soft_prompt_gradient_norm` | loss 对 Q-Former soft prompts 的平均梯度范数；接近 0 表示所选 teacher layer 对前缀难以控制。 |
 | `train/candidate_count` | 训练 InfoNCE 的候选数；单卡等于 batch size，多卡等于每卡 batch size 乘 GPU 数。 |
-| `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | 所选 transform 空间的 batch-centered retrieval；当前以 0.1 权重参与辅助 InfoNCE，不作为 checkpoint 指标。 |
+| `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | 所选 transform 空间的 batch-centered retrieval；当前以配置中的 centered loss 权重参与主要残差目标，不作为单独 checkpoint 指标。 |
 | `val/global_i2t_accuracy`、`val/global_t2i_accuracy` | 整个验证 split 内的未居中 retrieval accuracy，是主要全局指标。 |
 | `val/global_centered_i2t_accuracy`、`val/global_centered_t2i_accuracy` | 整个验证 split 内的 centered retrieval，仅用于诊断 hidden 各向异性。 |
 | `val/global_hidden_uncentered_i2t_accuracy`、`val/global_hidden_uncentered_t2i_accuracy` | 不经过任何 alignment transform 的 raw Qwen hidden 全局 retrieval；用于判断 transform 前后的差距。 |
@@ -1327,7 +1339,7 @@ patch_alignment:
 | `--representation-suffix` | `representation` 模式的极短文本后缀。 | 字符串 | 当前为换行后接 `Representation:`；末尾不追加 EOS。 |
 | `--probe-families` | hidden readout probe 的通用连续数值语义。 | `point_value,point_difference,point_mean,region_mean,region_range` 的子集 | 每个 batch 生成共享 sentence stem/坐标；结果不进入模型，只排除等价 false negatives。 |
 | `--probe-region-size` | 区域 probe 的正方形边长。 | 小于 patch size 的正整数 | 当前 4。 |
-| `--evaluation-probe-count` | 验证和 global retrieval 使用的固定 probe 数。 | 正整数 | 当前 5，每个 family 一个独立 pass。 |
+| `--evaluation-probe-count` | 验证和 global retrieval 使用的固定 probe 数。 | 正整数 | 当前 3，每个已启用 family 一个独立 pass。 |
 | `--max-shared-suffix-tokens` | 单个非 EOS suffix 的 token 数硬上限。 | 正整数 | 当前 96；实际 token 数由 preflight 记录，超限直接失败。 |
 | `--fail-on-text-anchor-missing` / `--no-fail-on-text-anchor-missing` | tokenization 后 anchor 缺失时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录缺失比例。 |
 | `--fail-on-text-max-length-hit` / `--no-fail-on-text-max-length-hit` | tokenized 文本打满 `max_text_tokens` 时是否直接报错。 | 布尔开关 | 默认开启；关闭后只记录 `*_max_length_hit_fraction`。 |
@@ -1335,26 +1347,30 @@ patch_alignment:
 | `--global-retrieval-max-records` | 允许全局 retrieval 的最大 split 条数。 | 正整数 | 默认 8192；超过则跳过，避免相似度矩阵过大。 |
 | `--global-retrieval-chunk-size` | 全局 retrieval 矩阵分块大小。 | 正整数 | 默认 1024；显存/内存紧张时调小。 |
 | `--text-prompt-template` | 旧 Teacher prompt 模板。 | `compact`、`compact_with_metadata`、`plain` | 仅 `alignment_text_layout: legacy_prompt` 生效；新布局固定使用无字段的数值序列化。 |
-| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | raw-value 配置使用 4，避免小幅 density/pressure 变化在两位小数时消失。 |
+| `--text-decimal-places` | 文本化 tensor 数值保留小数位。 | 非负整数 | 当前归一化 patch 使用 3。 |
 | `--max-text-tokens` | LLM 文本路径最大 token 数。 | 正整数 | 当前配置为 3072；严格 preflight 会报告真实长度并拒绝截断。 |
 | `--text-preflight-records` | AE warmup 前先检查多少条 teacher text 的 tokenization。 | 非负整数 | 默认 32；设 0 跳过预检查。 |
 | `--teacher-layer` | 取 LLM 哪一层 hidden state。 | `1..num_hidden_layers` | 当前为 2，即前两个 Transformer block 后的输出；0/负数和超过模型深度的索引会在 AE warmup 前终止。 |
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
-| `--contrastive-loss-weight` | symmetric InfoNCE 权重。 | 非负数 | 当前主要优化项，默认 1.0。 |
+| `--contrastive-loss-weight` | 未中心化 symmetric InfoNCE 权重。 | 非负数 | 当前 0.25，保留绝对空间约束但不让公共 probe 方向主导训练。 |
+| `--contrastive-i2t-weight` / `--contrastive-t2i-weight` | 两个 retrieval 方向在每个 InfoNCE 中的相对权重，会自动归一化。 | 非负数，和为正 | 当前 i2t=0.75、t2i=0.25；i2t 对应最终 tensor→text 部署，t2i 保留为防 hubness 的辅助约束。 |
 | `--projection-dim` | Q-Former 输出到 LLM 的 soft prompt 维度。 | `null` 或 LLM hidden size | 默认 `null` 自动匹配 LLM hidden size；这是输入桥接层，不是 post-hidden 对齐投影。 |
 | `--alignment-transform-mode` | hidden readout 后的对比空间。 | `none`、`projection`、`whitening` | 当前 `whitening`；三档互斥。 |
 | `--alignment-whitening-records` | 拟合固定 teacher whitening 的 train 记录数。 | `>=2` | 当前 8192；只在训练开始前读取一次。 |
 | `--alignment-whitening-dim` | 保留的 teacher PCA 主方向数。 | `1..hidden_size` | 当前 512；丢弃不稳定低方差方向。 |
 | `--alignment-whitening-shrinkage` | teacher covariance 向各向同性协方差收缩的比例。 | `[0,1]` | 当前 0.01，用于限制低方差方向的噪声放大。 |
 | `--alignment-whitening-epsilon` | whitening 特征值相对下限。 | 正数 | 当前 `1e-5`。 |
-| `--native-centered-contrastive-loss-weight` | 原生 LLM hidden 的 centered InfoNCE 权重。 | `>=0` | 当前 0.1；约束可迁移的 1536 维空间。 |
+| `--alignment-whitening-max-condition-number` | whitening 正则后协方差最大条件数。 | `>=1` | 当前 1000，限制低方差方向增益。 |
+| `--centered-contrastive-loss-weight` | DDP 全局 batch centered InfoNCE 权重。 | `>=0` | 当前 1.0，作为主要实例残差目标。 |
+| `--native-centered-contrastive-loss-weight` | 原生 LLM hidden 的 centered InfoNCE 权重。 | `>=0` | 当前 0.25；约束可迁移的 1536 维空间。 |
+| `--mean-alignment-loss-weight` | transformed/native 分支均值方向与范数匹配权重。 | `>=0` | 当前 0.1；避免推理时依赖中心化。 |
 | `--alignment-patch-ae-lr-scale` | alignment 阶段 AE 相对 Q-Former 的学习率倍率。 | `(0,1]` | 当前 0.1；限制 encoder 漂移。 |
-| `--teacher-probe-min-correlation` | 启用 probe 的 frozen-teacher 预检下限。 | `null` 或 `[-1,1]` | 当前 0.1；低于阈值则训练前终止。 |
+| `--teacher-probe-warn-below-correlation` | probe family 中位相关性低于此值时打印 warning。 | `null` 或 `[-1,1]` | 当前 0.1；只告警，不阻断训练。 |
+| `--teacher-probe-diagnostic-records` | 每个 probe 模板用于 frozen-teacher 语义诊断的 train record 数。 | `>=2` | 当前 128；四个措辞模板在 family 内聚合。 |
 | `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 旧配置兼容开关。 | 布尔开关 | 新实验改用 `--alignment-transform-mode`；冲突设置会直接报错。 |
 | `--alignment-projection-dim` | post-hidden 对齐空间宽度。 | 正整数 | 当前 512。 |
 | `--alignment-projection-layers` | 每侧 projection head 层数。 | 正整数 | 仅 projection 档生效；当前 1，即 `LayerNorm + Linear`。 |
 | `--alignment-projection-shared` / `--no-alignment-projection-shared` | student/teacher 是否共享 projection 参数。 | 布尔开关 | 仅 projection 档生效；默认 false。 |
-| `--centered-contrastive-loss-weight` | centered InfoNCE 辅助权重。 | 非负数 | 当前 0.1；主指标仍是所选 transform 的未居中 retrieval。 |
 | `--wandb-enabled` / `--no-wandb-enabled` | 是否启用 W&B。 | 布尔开关 | 默认读取 `wandb.enabled`。 |
 | `--wandb-mode` | W&B 运行模式。 | `online`、`offline`、`disabled` | `online`：上传到云端；`offline`：本地缓存；`disabled`：禁用。 |
 | `--wandb-log-model` / `--no-wandb-log-model` | 是否上传 patch AE/alignment checkpoint artifact。 | 布尔开关 | 默认读取 `wandb.log_model`。 |

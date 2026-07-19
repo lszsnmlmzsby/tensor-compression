@@ -12,6 +12,7 @@ from scripts.train_tensor_patch_text_alignment import (
     AlignmentProjectionPair,
     FixedTeacherWhitening,
     apply_alignment_feature_transform,
+    branch_mean_alignment_loss,
     build_numeric_probe_anchor,
     build_static_alignment_anchor,
     build_teacher_texts_for_batch,
@@ -26,10 +27,12 @@ from scripts.train_tensor_patch_text_alignment import (
     serialize_tensor_values,
     shared_suffix_token_ids,
     symmetric_contrastive_loss,
+    top1_candidate_usage_metrics,
+    truncate_llm_backbone_to_layer,
     tokenize_contents_with_anchor,
     tokenize_contents_with_shared_suffix,
+    teacher_probe_preflight_warnings,
     validate_probe_anchor_contract,
-    validate_teacher_probe_preflight,
     validate_teacher_hidden_state_index,
     validate_teacher_tensor_source,
 )
@@ -68,6 +71,15 @@ class WordTokenizer:
         if isinstance(text, str):
             return {"input_ids": self._encode(text)}
         return {"input_ids": [self._encode(item) for item in text]}
+
+
+class TinyBackboneModel(torch.nn.Module):
+    def __init__(self, block_count: int = 4) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(2, 2, bias=False) for _ in range(block_count)]
+        )
 
 
 def test_serialize_tensor_values_contains_only_values_and_shape_delimiters() -> None:
@@ -211,6 +223,13 @@ def test_hidden_readout_tracks_last_text_token_after_soft_prefix() -> None:
     assert readout[:, 0].tolist() == [3.0, 9.0]
 
 
+def test_shallow_teacher_truncation_keeps_requested_prefix_of_blocks() -> None:
+    model = TinyBackboneModel(block_count=4)
+
+    assert truncate_llm_backbone_to_layer(model, teacher_layer=2) == 2
+    assert len(model.model.layers) == 2
+
+
 def test_teacher_hidden_state_index_rejects_non_contextual_embedding_output() -> None:
     with pytest.raises(ValueError, match="input embedding"):
         validate_teacher_hidden_state_index(0, 28)
@@ -325,6 +344,24 @@ def test_teacher_pca_whitening_can_fit_within_anchor_covariance() -> None:
     assert metrics["output_dim"] == 2.0
 
 
+def test_teacher_whitening_caps_regularized_condition_number() -> None:
+    generator = torch.Generator().manual_seed(25)
+    teacher = torch.randn(1024, 6, generator=generator)
+    teacher[:, 1:] *= 1.0e-4
+    whitener = FixedTeacherWhitening(
+        hidden_dim=6,
+        output_dim=6,
+        shrinkage=0.0,
+        epsilon=1.0e-8,
+        max_condition_number=100.0,
+    )
+
+    metrics = whitener.fit(teacher)
+
+    assert metrics["configured_max_condition_number"] == 100.0
+    assert metrics["regularized_condition_number"] <= 100.0 + 1.0e-3
+
+
 def test_teacher_whitening_state_dict_restores_fitted_statistics() -> None:
     teacher = torch.randn(64, 3, generator=torch.Generator().manual_seed(11))
     fitted = FixedTeacherWhitening(hidden_dim=3, shrinkage=0.01, epsilon=1.0e-5)
@@ -346,6 +383,26 @@ def test_single_process_embedding_gather_preserves_gradients() -> None:
     assert torch.equal(embeddings.grad, torch.tensor([[2.0, 4.0]]))
 
 
+def test_branch_mean_alignment_matches_direction_and_norm_without_collapsing_rows() -> None:
+    teacher = torch.tensor([[1.0, 0.0], [3.0, 2.0]])
+    student = teacher + torch.tensor([[-1.0, 1.0], [-1.0, 1.0]])
+
+    loss, metrics = branch_mean_alignment_loss(student, teacher)
+
+    assert float(loss.item()) > 0.0
+    assert metrics["cosine"] < 1.0
+    assert metrics["l2_distance"] > 0.0
+    assert torch.equal(student[1] - student[0], teacher[1] - teacher[0])
+
+
+def test_top1_candidate_usage_exposes_candidate_hubness() -> None:
+    metrics = top1_candidate_usage_metrics(torch.tensor([0, 0, 0, 1]), candidate_count=4)
+
+    assert metrics["candidate_coverage"] == pytest.approx(0.5)
+    assert metrics["max_candidate_hit_fraction"] == pytest.approx(0.75)
+    assert 0.0 < metrics["candidate_hit_entropy"] < 1.0
+
+
 @pytest.mark.parametrize(
     "option",
     [
@@ -355,11 +412,16 @@ def test_single_process_embedding_gather_preserves_gradients() -> None:
         "probe_teacher_kl_weight",
         "probe_kl_temperature",
         "probe_teacher_preflight_records",
+        "teacher_probe_min_correlation",
     ],
 )
 def test_removed_alignment_options_fail_before_training(option: str) -> None:
     with pytest.raises(ValueError, match=option):
         reject_removed_alignment_options({"patch_alignment": {option: False}})
+
+
+def test_old_null_probe_gate_is_ignored_for_config_migration() -> None:
+    reject_removed_alignment_options({"patch_alignment": {"teacher_probe_min_correlation": None}})
 
 
 def test_probe_is_deterministic_and_contains_no_answer_or_choice_metadata() -> None:
@@ -564,36 +626,87 @@ def test_semantic_collisions_are_excluded_from_loss_but_strict_retrieval_is_pres
     assert metrics["semantic_t2i_accuracy"] > metrics["t2i_accuracy"]
 
 
-def test_checkpoint_selection_uses_strict_transformed_and_native_losses() -> None:
+def test_checkpoint_selection_is_deployment_directional_and_uses_nontransductive_auxiliaries() -> None:
     args = SimpleNamespace(
-        centered_contrastive_loss_weight=0.1,
-        native_centered_contrastive_loss_weight=0.1,
+        contrastive_loss_weight=0.25,
+        contrastive_i2t_weight=0.75,
+        contrastive_t2i_weight=0.25,
+        centered_contrastive_loss_weight=1.0,
+        native_centered_contrastive_loss_weight=0.25,
+        mean_alignment_loss_weight=0.1,
     )
     metrics = {
-        "global_strict_contrastive_loss": 2.0,
-        "global_centered_strict_contrastive_loss": 3.0,
-        "global_hidden_centered_strict_contrastive_loss": 5.0,
+        "global_strict_i2t_loss": 2.0,
+        "global_strict_t2i_loss": 4.0,
+        "centered_strict_contrastive_loss": 3.0,
+        "native_centered_strict_contrastive_loss": 5.0,
+        "mean_alignment_loss": 0.5,
     }
 
     name, value = checkpoint_selection_value(metrics, args)
 
     assert name == (
-        "global_strict_contrastive_loss+0.1*global_centered_strict_contrastive_loss"
-        "+0.1*global_hidden_centered_strict_contrastive_loss"
+        "0.25*(0.75*global_strict_i2t_loss+0.25*global_strict_t2i_loss)"
+        "+1*centered_strict_contrastive_loss"
+        "+0.25*native_centered_strict_contrastive_loss"
+        "+0.1*mean_alignment_loss"
     )
-    assert value == pytest.approx(2.8)
+    assert value == pytest.approx(4.925)
 
 
-def test_teacher_probe_preflight_rejects_unsupported_enabled_probe() -> None:
+def test_teacher_probe_preflight_warning_uses_family_median_without_aborting() -> None:
     preflight = {
-        "anchors": {
-            "point_value": {"hidden_similarity_vs_negative_target_distance_pearson": 0.4},
-            "region_range": {"hidden_similarity_vs_negative_target_distance_pearson": 0.02},
+        "families": {
+            "point_value": {
+                "hidden_similarity_vs_negative_target_distance_pearson_median": 0.4,
+            },
+            "region_range": {
+                "hidden_similarity_vs_negative_target_distance_pearson_median": 0.02,
+            },
         }
     }
 
-    with pytest.raises(ValueError, match="region_range=0.0200"):
-        validate_teacher_probe_preflight(preflight, minimum_correlation=0.1)
+    assert teacher_probe_preflight_warnings(preflight, warn_below_correlation=0.1) == [
+        "region_range=0.0200"
+    ]
+
+
+def test_teacher_probe_preflight_warning_can_be_disabled() -> None:
+    preflight = {
+        "families": {
+            "point_value": {
+                "hidden_similarity_vs_negative_target_distance_pearson_median": 0.0,
+            },
+        }
+    }
+
+    assert teacher_probe_preflight_warnings(preflight, warn_below_correlation=None) == []
+
+
+def test_contrastive_direction_weights_are_normalized_and_affect_loss() -> None:
+    tensor_embedding = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    text_embedding = tensor_embedding.clone()
+
+    primary, primary_metrics = symmetric_contrastive_loss(
+        tensor_embedding,
+        text_embedding,
+        temperature=1.0,
+        i2t_weight=3.0,
+        t2i_weight=1.0,
+    )
+    equal, equal_metrics = symmetric_contrastive_loss(
+        tensor_embedding,
+        text_embedding,
+        temperature=1.0,
+    )
+
+    assert primary_metrics["i2t_weight"] == pytest.approx(0.75)
+    assert primary_metrics["t2i_weight"] == pytest.approx(0.25)
+    assert primary_metrics["strict_contrastive_loss"] == pytest.approx(
+        0.75 * primary_metrics["strict_i2t_loss"] + 0.25 * primary_metrics["strict_t2i_loss"]
+    )
+    assert float(primary.item()) == pytest.approx(float(equal.item()))
+    assert equal_metrics["i2t_weight"] == pytest.approx(0.5)
 
 
 def test_layer_scan_control_changes_equal_number_of_off_target_values() -> None:
