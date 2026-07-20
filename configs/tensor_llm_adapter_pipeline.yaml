@@ -31,8 +31,8 @@ patch_qa:
   # Fill this with the completed Qwen2.5-32B Stage-1 alignment_best.pt before Stage 2.
   alignment_checkpoint: null
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
-  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16
-  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16
+  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256
+  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256
   fields:
     - density
     - pressure
@@ -124,11 +124,11 @@ latent_export:
 
 patch_alignment:
   # Tensor-as-text alignment pretraining. The same PDEBench patch goes through:
-  #   tensor path: patch -> patch AE encoder -> Q-Former soft prompt -> frozen LLM
+  #   tensor path: patch -> value-preserving 16x16 latent -> spatial soft tokens -> frozen LLM
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_qwen25_32b_layer56_point_value
+  run_name: tensor_patch_text_alignment_qwen25_32b_spatial256
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -175,24 +175,24 @@ patch_alignment:
   llm_gradient_checkpointing: true
   # patch_ae_config: build a patch-sized AE from patch_encoder below.
   # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
-  encoder_source: checkpoint
+  encoder_source: patch_ae_config
   # true: train the AE when it is newly constructed. If freeze_patch_ae_after_pretrain is true,
-  # this only affects the reconstruction warmup; the alignment phase trains only the Q-Former bridge.
+  # this only affects the reconstruction warmup; the alignment phase trains only the configured adapter.
   # false: freeze a loaded checkpoint encoder and train only the alignment adapter.
   # To reuse a trained patch AE, set:
   #   encoder_source: checkpoint
   #   compressor_checkpoint: /path/to/alignment_best.pt or patch_ae_pretrain_best.pt
   #   train_patch_ae: false
   #   patch_ae_pretrain_epochs: 0
-  train_patch_ae: false
-  # Reuse only the reconstruction AE from the successful 32B Layer-2 warmup; loader ignores its old Q-Former.
+  train_patch_ae: true
+  # Freeze after reconstruction warmup so alignment cannot destroy the exact spatial value channel.
   freeze_patch_ae_after_pretrain: true
   # Jointly refine the AE without letting the contrastive objective erase reconstruction-relevant features.
   alignment_patch_ae_lr_scale: 0.1
   # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
-  patch_ae_pretrain_epochs: 0
+  patch_ae_pretrain_epochs: 3
   # Used only when encoder_source: checkpoint.
-  compressor_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260719_225204_tensor_patch_text_alignment_qwen25_32b_point_value/patch_ae_pretrain_best.pt
+  compressor_checkpoint: null
   compressor_config: null
   # With patch_ae_config this should be false. Set true only when loading a checkpoint whose input_size
   # differs from patch_size, for example the legacy 512x512 compressor.
@@ -210,20 +210,25 @@ patch_alignment:
       name: conv_token_autoencoder_2d
       input_size: [16, 16]
       base_channels: 32
-      channel_multipliers: [1, 2]
+      # No downsampling: latent position (r,c) remains tied to input position (r,c).
+      channel_multipliers: []
       num_res_blocks: 1
-      latent_dim: 128
-      latent_grid: [4, 4]
+      # 16*16*8 equals the old 4*4*128 latent scalar count, isolating topology from capacity.
+      # Channel 0 is the exact normalized input value; channels 1..7 are learned local features.
+      latent_dim: 8
+      latent_grid: [16, 16]
+      preserve_input_channels: true
       dropout: 0.0
       norm: group
       activation: gelu
       output_activation: identity
-  adapter_type: qformer
+  # One data-dependent token per row-major latent position; there are no free learned queries.
+  adapter_type: spatial_transformer
   adapter_dim: 512
-  query_tokens: 16
-  adapter_layers: 4
+  query_tokens: 256
+  adapter_layers: 2
   adapter_heads: 8
-  # null maps Q-Former outputs directly to the LLM input embedding width.
+  # null maps spatial-adapter outputs directly to the LLM input embedding width.
   projection_dim: null
   # none: raw LLM hidden; projection: trainable CLIP-style heads; whitening: one fixed teacher-fitted
   # PCA transform shared by both branches. Whitening has no learned parameters and is not used by stage 2.
@@ -240,7 +245,7 @@ patch_alignment:
       # Cap the regularized covariance condition number so low-variance numerical noise is not over-amplified.
       max_condition_number: 1000.0
   # CLIP-style readout space used only by the stage-1 contrastive objective and retrieval metrics.
-  # Used only when alignment_transform.mode is projection. The Q-Former soft tokens still enter
+  # Used only when alignment_transform.mode is projection. The spatial soft tokens still enter
   # Qwen at its native embedding width.
   alignment_projection:
     dim: 512
@@ -275,7 +280,7 @@ patch_alignment:
   teacher_text_source: normalized
   # Symmetric layout:
   #   teacher = configured raw/normalized tensor values + one batch-shared setting-specific suffix
-  #   student = 16 continuous Q-Former embeddings + the exact same suffix token IDs
+  #   student = 256 continuous row-major spatial embeddings + the exact same suffix token IDs
   # No field names, task instructions, sample/time metadata, or patch-size text enter either branch.
   alignment_text_layout: values_shared_suffix
   # Select exactly one complete experiment: eos, representation, or probe. The formal run uses probe.
@@ -333,13 +338,13 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Clone the stage-1 Q-Former into a question-conditioned residual branch; do not reuse downstream QA weights.
-  architecture: residual_question_qformer
+  # Clone the stage-1 spatial adapter into a question-conditioned residual branch.
+  architecture: residual_question_adapter
   # Fill this with the same Qwen2.5-32B Stage-1 checkpoint used by patch_qa.
   init_checkpoint: null
-  soft_prompt_tokens: 16
+  soft_prompt_tokens: 256
   adapter_dim: 512
-  adapter_layers: 4
+  adapter_layers: 2
   adapter_heads: 8
   dropout: 0.0
   latent_pos_encoding: grid
@@ -347,15 +352,15 @@ adapter:
   question_condition_gate_init: 0.0
   # Formal runs must let the model read coordinates/tasks/statistics from text instead of regex-parsed features.
   structured_query_conditioning: false
-  # Residual mode keeps the same 16 token positions and inherited four Q-Former layers as stage 1.
-  local_soft_prompt_tokens: 16
-  local_adapter_layers: 4
+  # Residual mode keeps all 256 positions and the inherited spatial blocks from stage 1.
+  local_soft_prompt_tokens: 256
+  local_adapter_layers: 2
   # Frozen Qwen contextual tokens remain the only question input; no parsed coordinates or task IDs are used.
   local_question_input_mode: contextual_tokens
   local_context_layer: 6
   # Fuse full token sequences from a shallow lexical layer and a middle contextual layer.
   local_context_layers: [2, 6]
-  local_fusion_mode: residual_qformer
+  local_fusion_mode: residual_spatial_transformer
   local_text_encoder_layers: 0
   # Keep both new text conditioning and the final residual small at initialization.
   local_text_gate_init: 0.05
@@ -370,7 +375,7 @@ adapter:
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_residual_question_qformer
+  run_name: tensor_patch_qa_residual_spatial_transformer
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -388,13 +393,14 @@ llm_training:
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # 245,760 records x 2 epochs is 1.5x the previous two-epoch exposure and targets about 10 hours on one A800.
+  # The 256-token prefix is substantially longer than the former 16-token path.
   epochs: 2
-  # Five same-tensor groups of three fit exactly; 245,760 / 15 = 16,384 optimizer steps per epoch.
-  batch_size: 15
-  eval_batch_size: 2
-  eval_choice_batch_size: 16
-  gradient_accumulation_steps: 1
+  # Keep one complete same-tensor group per forward; choice CE expands it to roughly 12 sequences.
+  batch_size: 3
+  eval_batch_size: 1
+  eval_choice_batch_size: 4
+  # Preserve an effective optimizer batch of 15 without retaining five groups in GPU memory at once.
+  gradient_accumulation_steps: 5
   lr: 1.0e-4
   lr_scheduler: cosine
   warmup_ratio: 0.03
@@ -409,8 +415,8 @@ llm_training:
   # For the same tensor/task, its own question-conditioned prompt must beat another question's prompt.
   swapped_question_loss_weight: 0.1
   swapped_question_loss_margin: 0.1
-  # Bound the extra frozen-LLM scoring graph so batch_size 15 remains practical on one 80GB GPU.
-  swapped_question_max_records: 8
+  # Bound the extra frozen-LLM scoring graph to the current same-tensor group.
+  swapped_question_max_records: 3
   prompt_template: task_specific
   max_prompt_tokens: 512
   max_target_tokens: 8

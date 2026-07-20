@@ -12,14 +12,22 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from train_tensor_llm_adapter import (  # noqa: E402
+    HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
+    adapter_from_checkpoint,
     build_local_conditioning_prompt,
     parse_generated_choice,
     same_state_question_swap_indices,
     structured_query_features_for_record,
     task_specific_instruction,
 )
-from train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
+from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  # noqa: E402
+    ConvTokenAutoencoder2D,
+)
+from train_tensor_patch_text_alignment import (  # noqa: E402
+    TensorPatchAlignmentAdapter,
+    sinusoidal_2d_position_encoding,
+)
 
 
 def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
@@ -33,6 +41,84 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):
+    def test_spatial_position_encoding_is_deterministic_finite_and_row_major(self) -> None:
+        first = sinusoidal_2d_position_encoding(3, 4, 16)
+        second = sinusoidal_2d_position_encoding(3, 4, 16)
+
+        torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
+        self.assertEqual(tuple(first.shape), (1, 12, 16))
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertFalse(torch.equal(first[:, 0], first[:, 1]))
+        self.assertFalse(torch.equal(first[:, 0], first[:, 4]))
+
+    def test_spatial_adapter_has_one_row_major_token_per_latent_position(self) -> None:
+        torch.manual_seed(11)
+        adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 3),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=6,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.0,
+        ).eval()
+        latent = torch.zeros(1, 3, 2, 3)
+        changed = latent.clone()
+        changed[0, :, 1, 1] = torch.tensor([1.0, -2.0, 3.0])
+
+        base_states, base_local = adapter.spatial_input_states(latent)
+        changed_states, changed_local = adapter.spatial_input_states(changed)
+        state_changes = (changed_states - base_states).abs().sum(dim=-1).squeeze(0)
+        local_changes = (changed_local - base_local).abs().sum(dim=-1).squeeze(0)
+
+        self.assertEqual(torch.nonzero(state_changes > 0, as_tuple=False).flatten().tolist(), [4])
+        self.assertEqual(torch.nonzero(local_changes > 0, as_tuple=False).flatten().tolist(), [4])
+        self.assertEqual(tuple(adapter.forward_soft_prompts(latent).shape), (1, 6, 24))
+
+    def test_spatial_adapter_rejects_token_grid_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one output token per latent-grid position"):
+            TensorPatchAlignmentAdapter(
+                latent_channels=3,
+                latent_grid=(2, 3),
+                adapter_dim=16,
+                projection_dim=24,
+                dropout=0.0,
+                adapter_type="spatial_transformer",
+                query_tokens=5,
+                adapter_layers=1,
+                adapter_heads=4,
+                soft_prompt_scale=0.0,
+            )
+
+    def test_value_preserving_ae_keeps_exact_input_at_each_latent_position(self) -> None:
+        model = ConvTokenAutoencoder2D(
+            {
+                "model": {
+                    "input_size": [4, 4],
+                    "in_channels": 1,
+                    "out_channels": 1,
+                    "base_channels": 4,
+                    "channel_multipliers": [],
+                    "num_res_blocks": 0,
+                    "latent_dim": 3,
+                    "latent_grid": [4, 4],
+                    "dropout": 0.0,
+                    "norm": "identity",
+                    "activation": "gelu",
+                    "output_activation": "identity",
+                    "preserve_input_channels": True,
+                }
+            }
+        )
+        inputs = torch.randn(2, 1, 4, 4)
+        latent = model.encode(inputs)["latent_map"]
+
+        self.assertEqual(tuple(latent.shape), (2, 3, 4, 4))
+        torch.testing.assert_close(latent[:, :1], inputs, rtol=0.0, atol=0.0)
+
     def test_one_based_question_coordinates_map_to_zero_based_structured_features(self) -> None:
         one_based = {
             "task_type": "normalized_point_value",
@@ -137,6 +223,150 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         actual = conditioned(latent, question, mask, structured_query=None)
 
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_zero_text_gate_preserves_inherited_spatial_output(self) -> None:
+        torch.manual_seed(13)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        ).eval()
+        reloaded = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        ).eval()
+        reloaded.load_state_dict(aligned.state_dict(), strict=True)
+        conditioned = ResidualQuestionConditionedAdapter(
+            aligned_adapter=reloaded,
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_heads=4,
+            dropout=0.0,
+            text_gate_init=0.0,
+            residual_gate_init=0.1,
+        ).eval()
+        latent = torch.randn(3, 3, 2, 2)
+        question = torch.randn(3, 2, 6, 24)
+        mask = torch.ones(3, 6, dtype=torch.bool)
+
+        expected = aligned.forward_soft_prompts(latent)
+        actual = conditioned(latent, question, mask, structured_query=None)
+
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_spatial_stage1_checkpoint_rebuilds_strictly_for_downstream(self) -> None:
+        torch.manual_seed(17)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        ).eval()
+        checkpoint = {
+            "args": {
+                "adapter_type": "spatial_transformer",
+                "adapter_dim": 16,
+                "adapter_layers": 2,
+                "adapter_heads": 4,
+                "query_tokens": 4,
+                "projection_dim": 24,
+                "dropout": 0.0,
+                "soft_prompt_scale": 0.05,
+            },
+            "adapter_state_dict": aligned.state_dict(),
+        }
+        latent = torch.randn(2, 3, 2, 2)
+
+        rebuilt = adapter_from_checkpoint(checkpoint, latent_shape=(3, 2, 2), llm_hidden_size=24).eval()
+
+        self.assertIsInstance(rebuilt, TensorPatchAlignmentAdapter)
+        self.assertEqual(rebuilt.adapter_type, "spatial_transformer")
+        torch.testing.assert_close(
+            rebuilt.forward_soft_prompts(latent),
+            aligned.forward_soft_prompts(latent),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_spatial_residual_checkpoint_rebuilds_strictly(self) -> None:
+        torch.manual_seed(19)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = ResidualQuestionConditionedAdapter(
+            aligned_adapter=aligned,
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_heads=4,
+            dropout=0.0,
+            text_gate_init=0.05,
+            residual_gate_init=0.1,
+        )
+        original = HybridGlobalLocalAdapter(
+            global_adapter=aligned,
+            local_adapter=local,
+            freeze_global=True,
+            combine_mode="residual",
+        ).eval()
+        checkpoint = {
+            "args": {
+                "adapter_architecture": "residual_question_adapter",
+                "global_adapter_type": "spatial_transformer",
+                "adapter_dim": 16,
+                "adapter_layers": 2,
+                "adapter_heads": 4,
+                "projection_dim": 24,
+                "dropout": 0.0,
+                "soft_prompt_scale": 0.05,
+                "local_context_layers": "1,2",
+                "local_text_gate_init": 0.05,
+                "local_gate_init": 0.1,
+            },
+            "adapter_state_dict": original.state_dict(),
+        }
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 2, 5, 24)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+
+        rebuilt = adapter_from_checkpoint(checkpoint, latent_shape=(3, 2, 2), llm_hidden_size=24).eval()
+
+        self.assertIsInstance(rebuilt, HybridGlobalLocalAdapter)
+        torch.testing.assert_close(
+            rebuilt(latent, question, mask),
+            original(latent, question, mask),
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 if __name__ == "__main__":

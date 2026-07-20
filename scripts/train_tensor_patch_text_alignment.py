@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -1053,6 +1054,81 @@ class CrossAttentionBlock(nn.Module):
         return queries + self.ffn(self.ffn_norm(queries))
 
 
+def sinusoidal_position_encoding(length: int, dim: int) -> torch.Tensor:
+    """Return a deterministic [length, dim] sinusoidal position table."""
+    if int(length) <= 0 or int(dim) <= 0:
+        raise ValueError(f"Position encoding length and dim must be positive, got {length} and {dim}.")
+    positions = torch.arange(int(length), dtype=torch.float32).unsqueeze(1)
+    frequency_count = (int(dim) + 1) // 2
+    frequencies = torch.exp(
+        torch.arange(frequency_count, dtype=torch.float32)
+        * (-math.log(10000.0) / max(frequency_count - 1, 1))
+    )
+    angles = positions * frequencies.unsqueeze(0)
+    encoding = torch.empty(int(length), frequency_count * 2, dtype=torch.float32)
+    encoding[:, 0::2] = torch.sin(angles)
+    encoding[:, 1::2] = torch.cos(angles)
+    return encoding[:, : int(dim)]
+
+
+def sinusoidal_2d_position_encoding(height: int, width: int, dim: int) -> torch.Tensor:
+    """Encode row and column independently and flatten positions in row-major order."""
+    if int(height) <= 0 or int(width) <= 0:
+        raise ValueError(f"Spatial dimensions must be positive, got {(height, width)}.")
+    row_dim = int(dim) // 2
+    col_dim = int(dim) - row_dim
+    if row_dim <= 0 or col_dim <= 0:
+        raise ValueError(f"2D position encoding requires dim >= 2, got {dim}.")
+    rows = sinusoidal_position_encoding(int(height), row_dim)
+    cols = sinusoidal_position_encoding(int(width), col_dim)
+    row_grid = rows[:, None, :].expand(int(height), int(width), row_dim)
+    col_grid = cols[None, :, :].expand(int(height), int(width), col_dim)
+    return torch.cat([row_grid, col_grid], dim=-1).reshape(1, int(height) * int(width), int(dim))
+
+
+class SpatialTransformerBlock(nn.Module):
+    """Contextualize spatial tokens without replacing their position-specific states."""
+
+    def __init__(self, dim: int, heads: int, dropout: float) -> None:
+        super().__init__()
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=int(heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(float(dropout)),
+        )
+        self.capture_attention = False
+        self.last_self_attention_weights: torch.Tensor | None = None
+        self.last_attention_weights: torch.Tensor | None = None
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        normalized = self.self_norm(tokens)
+        attended, weights = self.self_attn(
+            normalized,
+            normalized,
+            normalized,
+            need_weights=bool(self.capture_attention),
+            average_attn_weights=False,
+        )
+        self.last_self_attention_weights = (
+            weights.detach().float().cpu()
+            if self.capture_attention and weights is not None
+            else None
+        )
+        self.last_attention_weights = self.last_self_attention_weights
+        tokens = tokens + attended
+        return tokens + self.ffn(self.ffn_norm(tokens))
+
+
 class TensorPatchAlignmentAdapter(nn.Module):
     def __init__(
         self,
@@ -1070,11 +1146,20 @@ class TensorPatchAlignmentAdapter(nn.Module):
         super().__init__()
         self.adapter_type = str(adapter_type).lower()
         self.latent_grid = tuple(int(dim) for dim in latent_grid)
+        if len(self.latent_grid) != 2 or any(dim <= 0 for dim in self.latent_grid):
+            raise ValueError(f"latent_grid must contain two positive dimensions, got {self.latent_grid}.")
         self.latent_token_count = int(self.latent_grid[0] * self.latent_grid[1])
-        self.soft_prompt_tokens = int(query_tokens) if self.adapter_type == "qformer" else 1
+        self.soft_prompt_tokens = (
+            self.latent_token_count
+            if self.adapter_type == "spatial_transformer"
+            else int(query_tokens)
+            if self.adapter_type == "qformer"
+            else 1
+        )
         self.structured_query_conditioning = False
         self.soft_prompt_scale = float(soft_prompt_scale)
-        adapter_dim = int(adapter_dim)
+        self.adapter_dim = int(adapter_dim)
+        adapter_dim = self.adapter_dim
         projection_dim = int(projection_dim)
         if adapter_dim % int(adapter_heads) != 0:
             raise ValueError(
@@ -1087,6 +1172,33 @@ class TensorPatchAlignmentAdapter(nn.Module):
                 nn.Linear(input_dim, adapter_dim),
                 nn.GELU(),
                 nn.Dropout(float(dropout)),
+                nn.Linear(adapter_dim, projection_dim),
+            )
+            return
+        if self.adapter_type == "spatial_transformer":
+            if int(query_tokens) != self.latent_token_count:
+                raise ValueError(
+                    "spatial_transformer requires one output token per latent-grid position: "
+                    f"query_tokens={int(query_tokens)}, latent_grid={self.latent_grid}, "
+                    f"expected={self.latent_token_count}."
+                )
+            self.latent_projection = nn.Linear(int(latent_channels), adapter_dim)
+            self.local_residual_projection = nn.Linear(int(latent_channels), adapter_dim)
+            self.register_buffer(
+                "spatial_pos_encoding",
+                sinusoidal_2d_position_encoding(*self.latent_grid, adapter_dim),
+                persistent=True,
+            )
+            self.spatial_pos_scale = nn.Parameter(torch.tensor(1.0))
+            self.local_residual_scale = nn.Parameter(torch.tensor(1.0))
+            self.blocks = nn.ModuleList(
+                [
+                    SpatialTransformerBlock(adapter_dim, int(adapter_heads), float(dropout))
+                    for _ in range(int(adapter_layers))
+                ]
+            )
+            self.output = nn.Sequential(
+                nn.LayerNorm(adapter_dim),
                 nn.Linear(adapter_dim, projection_dim),
             )
             return
@@ -1110,14 +1222,45 @@ class TensorPatchAlignmentAdapter(nn.Module):
         nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_pos_embed, mean=0.0, std=0.02)
 
+    def flatten_latent_tokens(self, latent_map: torch.Tensor) -> torch.Tensor:
+        if latent_map.ndim != 4:
+            raise ValueError(f"Expected latent_map [B,C,H,W], got {tuple(latent_map.shape)}.")
+        if tuple(int(dim) for dim in latent_map.shape[-2:]) != self.latent_grid:
+            raise ValueError(
+                f"Expected latent grid {self.latent_grid}, got {tuple(int(dim) for dim in latent_map.shape[-2:])}."
+            )
+        return latent_map.flatten(2).transpose(1, 2).contiguous()
+
+    def spatial_input_states(self, latent_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.adapter_type != "spatial_transformer":
+            raise ValueError("spatial_input_states is available only for spatial_transformer adapters.")
+        latent_tokens = self.flatten_latent_tokens(latent_map).to(dtype=self.latent_projection.weight.dtype)
+        local_residual = self.local_residual_projection(latent_tokens)
+        states = self.latent_projection(latent_tokens)
+        states = states + self.spatial_pos_scale.to(dtype=states.dtype) * self.spatial_pos_encoding.to(
+            device=states.device,
+            dtype=states.dtype,
+        )
+        return states, local_residual
+
+    def spatial_output_states(
+        self,
+        contextual_states: torch.Tensor,
+        local_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.adapter_type != "spatial_transformer":
+            raise ValueError("spatial_output_states is available only for spatial_transformer adapters.")
+        states = contextual_states + self.local_residual_scale.to(dtype=contextual_states.dtype) * local_residual
+        return self.scale_soft_prompts(self.output(states))
+
     def forward_soft_prompts(self, latent_map: torch.Tensor) -> torch.Tensor:
+        if self.adapter_type == "spatial_transformer":
+            states, local_residual = self.spatial_input_states(latent_map)
+            for block in self.blocks:
+                states = block(states)
+            return self.spatial_output_states(states, local_residual)
         if self.adapter_type == "qformer":
-            latent_tokens = latent_map.flatten(2).transpose(1, 2)
-            if int(latent_tokens.shape[1]) != self.latent_token_count:
-                raise ValueError(
-                    "Latent token count changed after adapter construction. "
-                    f"Expected {self.latent_token_count}, got {int(latent_tokens.shape[1])}."
-                )
+            latent_tokens = self.flatten_latent_tokens(latent_map)
             context = self.latent_projection(latent_tokens) + self.latent_pos_embed
             queries = self.query_tokens.expand(latent_map.shape[0], -1, -1)
             for block in self.blocks:
@@ -3018,11 +3161,32 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        soft_prompt_gradient_norm = (
-            float(soft_prompts.grad.detach().float().norm(dim=-1).mean().cpu().item())
-            if soft_prompts.grad is not None
-            else 0.0
-        )
+        if soft_prompts.grad is not None:
+            token_gradient_norms = soft_prompts.grad.detach().float().norm(dim=-1)
+            soft_prompt_gradient_norm = float(token_gradient_norms.mean().cpu().item())
+            relative_threshold = token_gradient_norms.amax(dim=1, keepdim=True) * 1.0e-3
+            soft_prompt_active_token_fraction = float(
+                token_gradient_norms.gt(relative_threshold).float().mean().cpu().item()
+            )
+            gradient_probabilities = token_gradient_norms / token_gradient_norms.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1.0e-20)
+            gradient_entropy = -(
+                gradient_probabilities * gradient_probabilities.clamp_min(1.0e-20).log()
+            ).sum(dim=1)
+            entropy_denominator = math.log(max(int(token_gradient_norms.shape[1]), 2))
+            soft_prompt_gradient_entropy = float(
+                (gradient_entropy / entropy_denominator).mean().cpu().item()
+            )
+            soft_prompt_gradient_min = float(token_gradient_norms.amin(dim=1).mean().cpu().item())
+            soft_prompt_gradient_max = float(token_gradient_norms.amax(dim=1).mean().cpu().item())
+        else:
+            soft_prompt_gradient_norm = 0.0
+            soft_prompt_active_token_fraction = 0.0
+            soft_prompt_gradient_entropy = 0.0
+            soft_prompt_gradient_min = 0.0
+            soft_prompt_gradient_max = 0.0
         synchronize_gradients([compressor if train_compressor else None, adapter, projector])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -3110,6 +3274,10 @@ def train_one_epoch(
                 "student_hidden_pairwise_cosine": off_diagonal_cosine_mean(student_hidden),
                 "teacher_hidden_pairwise_cosine": off_diagonal_cosine_mean(teacher_hidden),
                 "soft_prompt_gradient_norm": soft_prompt_gradient_norm,
+                "soft_prompt_active_token_fraction": soft_prompt_active_token_fraction,
+                "soft_prompt_gradient_entropy": soft_prompt_gradient_entropy,
+                "soft_prompt_gradient_min": soft_prompt_gradient_min,
+                "soft_prompt_gradient_max": soft_prompt_gradient_max,
             },
             batch_size,
             "alignment_",
@@ -3872,7 +4040,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", type=str, choices=("auto", "float32", "float16", "bfloat16"), default=None)
     parser.add_argument("--llm-gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
-    parser.add_argument("--adapter-type", type=str, choices=("qformer", "pooled_mlp"), default=None)
+    parser.add_argument(
+        "--adapter-type",
+        type=str,
+        choices=("qformer", "spatial_transformer", "pooled_mlp"),
+        default=None,
+    )
     parser.add_argument("--query-tokens", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
@@ -4293,6 +4466,8 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     for name in ("adapter_dim", "query_tokens", "adapter_layers", "adapter_heads"):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"patch_alignment.{name} must be positive.")
+    if str(args.adapter_type).lower() not in {"qformer", "spatial_transformer", "pooled_mlp"}:
+        raise ValueError(f"Unsupported patch_alignment.adapter_type: {args.adapter_type}")
     if int(args.max_text_tokens) <= 0:
         raise ValueError("patch_alignment.max_text_tokens must be positive.")
     if int(args.max_shared_suffix_tokens) <= 0:
@@ -4416,9 +4591,9 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             raise ValueError(
                 "values_shared_suffix requires patch_alignment.teacher_text_source to be raw or normalized."
             )
-        if str(args.adapter_type).lower() != "qformer":
+        if str(args.adapter_type).lower() not in {"qformer", "spatial_transformer"}:
             raise ValueError(
-                "values_shared_suffix requires patch_alignment.adapter_type=qformer for the formal soft-prefix path."
+                "values_shared_suffix requires a qformer or spatial_transformer soft-prefix adapter."
             )
     return args
 
@@ -4862,6 +5037,8 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"raw_centered_global_t2i={fmt_metric(metrics, 'global_hidden_centered_t2i_accuracy')} "
         f"collision={fmt_metric(metrics, 'semantic_collision_fraction')} "
         f"prompt_grad={fmt_metric(metrics, 'alignment_soft_prompt_gradient_norm')} "
+        f"prompt_active={fmt_metric(metrics, 'alignment_soft_prompt_active_token_fraction')} "
+        f"prompt_grad_entropy={fmt_metric(metrics, 'alignment_soft_prompt_gradient_entropy')} "
         f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
         f"recon_rel={fmt_metric(metrics, 'reconstruction_relative_rmse_to_target_std')}"
     )
@@ -5050,6 +5227,15 @@ def main() -> None:
     args.fields = value_to_csv(field_keys)
     validate_field_shapes(args.hdf5_path, field_keys)
     compressor_input_size = tuple(int(dim) for dim in compressor_config["model"]["input_size"])
+    configured_latent_grid = tuple(int(dim) for dim in compressor_config["model"]["latent_grid"])
+    if str(args.adapter_type).lower() == "spatial_transformer":
+        expected_spatial_tokens = int(configured_latent_grid[0] * configured_latent_grid[1])
+        if int(args.query_tokens) != expected_spatial_tokens:
+            raise ValueError(
+                "spatial_transformer token/grid mismatch before LLM loading: "
+                f"query_tokens={int(args.query_tokens)}, latent_grid={configured_latent_grid}, "
+                f"expected={expected_spatial_tokens}."
+            )
     normalization_cfg = dict(compressor_config.get("data", {}).get("dataset", {}).get("normalization", {}))
     validate_teacher_tensor_source(normalization_cfg, str(args.teacher_text_source))
     if not bool(args.resize_patch_to_compressor_input) and tuple(compressor_input_size) != (

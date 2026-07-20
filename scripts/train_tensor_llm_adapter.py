@@ -727,7 +727,7 @@ class QuestionConditionedLocalAdapter(nn.Module):
 
 
 class ResidualQuestionConditionedAdapter(nn.Module):
-    """Question-condition a stage-1 Q-Former while preserving its token layout and initialization."""
+    """Question-condition a stage-1 adapter while preserving its token layout and initialization."""
 
     def __init__(
         self,
@@ -740,15 +740,17 @@ class ResidualQuestionConditionedAdapter(nn.Module):
         residual_gate_init: float,
     ) -> None:
         super().__init__()
-        if str(aligned_adapter.adapter_type) != "qformer":
-            raise ValueError("residual_question_qformer requires a stage-1 qformer checkpoint.")
+        if str(aligned_adapter.adapter_type) not in {"qformer", "spatial_transformer"}:
+            raise ValueError(
+                "Residual question conditioning requires a stage-1 qformer or spatial_transformer checkpoint."
+            )
         self.backbone = copy.deepcopy(aligned_adapter)
         self.soft_prompt_tokens = int(aligned_adapter.soft_prompt_tokens)
         self.latent_grid = tuple(int(value) for value in aligned_adapter.latent_grid)
         self.context_layers = tuple(int(value) for value in context_layers)
         if not self.context_layers:
             raise ValueError("adapter.local_context_layers must contain at least one Qwen hidden-state index.")
-        adapter_dim = int(aligned_adapter.query_tokens.shape[-1])
+        adapter_dim = int(aligned_adapter.adapter_dim)
         self.text_projections = nn.ModuleList(
             [
                 nn.Sequential(
@@ -773,10 +775,16 @@ class ResidualQuestionConditionedAdapter(nn.Module):
         self.gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
         self.structured_query_conditioning = False
         self.question_input_mode = "contextual_tokens"
-        self.fusion_mode = "residual_qformer"
+        self.fusion_mode = (
+            "residual_spatial_transformer"
+            if str(aligned_adapter.adapter_type) == "spatial_transformer"
+            else "residual_qformer"
+        )
 
     @property
     def query_tokens(self) -> nn.Parameter:
+        if not hasattr(self.backbone, "query_tokens"):
+            raise AttributeError("A spatial_transformer adapter has no free query tokens.")
         return self.backbone.query_tokens
 
     def forward(
@@ -787,7 +795,7 @@ class ResidualQuestionConditionedAdapter(nn.Module):
         structured_query: torch.Tensor | None,
     ) -> torch.Tensor:
         if structured_query is not None:
-            raise ValueError("residual_question_qformer does not accept parsed structured query features.")
+            raise ValueError("Residual question conditioning does not accept parsed structured query features.")
         if question_embeds.ndim == 3:
             question_embeds = question_embeds.unsqueeze(1)
         if question_embeds.ndim != 4 or int(question_embeds.shape[1]) != len(self.context_layers):
@@ -810,11 +818,14 @@ class ResidualQuestionConditionedAdapter(nn.Module):
             else None
         )
 
-        latent_tokens = latent_map.flatten(2).transpose(1, 2)
-        if int(latent_tokens.shape[1]) != int(self.backbone.latent_token_count):
-            raise ValueError(
-                f"Expected {self.backbone.latent_token_count} latent tokens, got {int(latent_tokens.shape[1])}."
-            )
+        if str(self.backbone.adapter_type) == "spatial_transformer":
+            states, local_residual = self.backbone.spatial_input_states(latent_map)
+            for text_block, spatial_block in zip(self.text_blocks, self.backbone.blocks):
+                states = text_block(states, text_context, key_padding_mask=key_padding_mask)
+                states = spatial_block(states)
+            return self.backbone.spatial_output_states(states, local_residual)
+
+        latent_tokens = self.backbone.flatten_latent_tokens(latent_map)
         latent_context = (
             self.backbone.latent_projection(latent_tokens.to(dtype=self.backbone.latent_projection.weight.dtype))
             + self.backbone.latent_pos_embed
@@ -822,7 +833,6 @@ class ResidualQuestionConditionedAdapter(nn.Module):
         queries = self.backbone.query_tokens.expand(latent_map.shape[0], -1, -1)
         for text_block, latent_block in zip(self.text_blocks, self.backbone.blocks):
             queries = text_block(queries, text_context, key_padding_mask=key_padding_mask)
-            # The inherited block supplies query self-attention, latent cross-attention, and the FFN.
             queries = latent_block(queries, latent_context)
         return self.backbone.scale_soft_prompts(self.backbone.output(queries))
 
@@ -1347,7 +1357,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-architecture",
         type=str,
-        choices=("legacy", "alignment_qformer", "hybrid_local_qformer", "residual_question_qformer"),
+        choices=(
+            "legacy",
+            "alignment_qformer",
+            "alignment_adapter",
+            "hybrid_local_qformer",
+            "residual_question_qformer",
+            "residual_question_adapter",
+        ),
         default=None,
     )
     parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
@@ -1384,7 +1401,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-fusion-mode",
         type=str,
-        choices=("text_latent_pool", "anchor_queries", "residual_qformer"),
+        choices=(
+            "text_latent_pool",
+            "anchor_queries",
+            "residual_qformer",
+            "residual_spatial_transformer",
+        ),
         default=None,
     )
     parser.add_argument("--local-gate-init", type=float, default=None)
@@ -1697,6 +1719,31 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     for setting in positive_integer_settings:
         if int(getattr(args, setting)) <= 0:
             raise ValueError(f"llm_training.{setting} must be positive.")
+    supported_adapter_architectures = {
+        "legacy",
+        "alignment_qformer",
+        "alignment_adapter",
+        "hybrid_local_qformer",
+        "residual_question_qformer",
+        "residual_question_adapter",
+    }
+    if str(args.adapter_architecture) not in supported_adapter_architectures:
+        raise ValueError(f"Unsupported adapter.architecture: {args.adapter_architecture}")
+    if str(args.adapter_architecture) in {
+        "residual_question_qformer",
+        "residual_question_adapter",
+    } and str(args.adapter_init_checkpoint or "").strip().lower() in {"", "none", "null", "random"}:
+        raise ValueError(
+            f"adapter.architecture={args.adapter_architecture} requires adapter.init_checkpoint from stage 1."
+        )
+    supported_local_fusion_modes = {
+        "text_latent_pool",
+        "anchor_queries",
+        "residual_qformer",
+        "residual_spatial_transformer",
+    }
+    if str(args.local_fusion_mode) not in supported_local_fusion_modes:
+        raise ValueError(f"Unsupported adapter.local_fusion_mode: {args.local_fusion_mode}")
     if int(args.initial_eval_records) < 0:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
     for setting in (
@@ -3684,8 +3731,12 @@ def _adapter_forward_with_trace(
         return hook
 
     if isinstance(adapter, HybridGlobalLocalAdapter):
-        trace["local_query_tokens"] = adapter.local_adapter.query_tokens[0].detach().float().cpu()
-        trace["global_query_tokens"] = adapter.global_adapter.query_tokens[0].detach().float().cpu()
+        local_query_tokens = getattr(adapter.local_adapter, "query_tokens", None)
+        global_query_tokens = getattr(adapter.global_adapter, "query_tokens", None)
+        if isinstance(local_query_tokens, torch.Tensor):
+            trace["local_query_tokens"] = local_query_tokens[0].detach().float().cpu()
+        if isinstance(global_query_tokens, torch.Tensor):
+            trace["global_query_tokens"] = global_query_tokens[0].detach().float().cpu()
         anchor_projection = getattr(adapter.local_adapter, "anchor_projection", None)
         if anchor_projection is not None:
             anchor_indices = last_nonpadding_indices(prompt_mask.to(device=text_embeds.device))
@@ -3726,9 +3777,10 @@ def _adapter_forward_with_trace(
             handles.append(
                 anchor_projection.register_forward_hook(capture("local_anchor_condition"))
             )
-        handles.append(
-            adapter.global_adapter.latent_projection.register_forward_hook(capture("global_latent_projected"))
-        )
+        if hasattr(adapter.global_adapter, "latent_projection"):
+            handles.append(
+                adapter.global_adapter.latent_projection.register_forward_hook(capture("global_latent_projected"))
+            )
         for index, module in enumerate(adapter.global_adapter.blocks):
             handles.append(module.register_forward_hook(capture(f"global_after_latent_{index}")))
         handles.append(adapter.global_adapter.output.register_forward_hook(capture("global_output_pre_scale")))
@@ -4506,11 +4558,15 @@ def adapter_from_checkpoint(
         raise ValueError("Adapter checkpoint must contain args and adapter_state_dict mappings.")
     architecture = str(ckpt_args.get("adapter_architecture", ""))
     if not architecture:
-        architecture = (
-            "alignment_qformer"
-            if "query_tokens" in state_dict and "latent_pos_embed" in state_dict
-            else "legacy"
-        )
+        checkpoint_adapter_type = str(ckpt_args.get("adapter_type", ""))
+        if checkpoint_adapter_type == "spatial_transformer":
+            architecture = "alignment_adapter"
+        else:
+            architecture = (
+                "alignment_qformer"
+                if "query_tokens" in state_dict and "latent_pos_embed" in state_dict
+                else "legacy"
+            )
     latent_channels = int(latent_shape[0])
     if architecture == "legacy":
         adapter = TensorSoftPromptAdapter(
@@ -4534,14 +4590,24 @@ def adapter_from_checkpoint(
     adapter_heads = int(ckpt_args.get("adapter_heads", 8))
     global_prefix = (
         "global_adapter."
-        if architecture in {"hybrid_local_qformer", "residual_question_qformer"}
+        if architecture in {
+            "hybrid_local_qformer",
+            "residual_question_qformer",
+            "residual_question_adapter",
+        }
         else ""
     )
-    query_key = f"{global_prefix}query_tokens"
-    query_tensor = state_dict.get(query_key)
-    if not isinstance(query_tensor, torch.Tensor):
-        raise ValueError(f"Checkpoint is missing {query_key}.")
-    global_tokens = int(query_tensor.shape[1])
+    global_adapter_type = str(
+        ckpt_args.get("global_adapter_type", ckpt_args.get("adapter_type", "qformer"))
+    ).lower()
+    if global_adapter_type == "spatial_transformer":
+        global_tokens = int(latent_shape[-2]) * int(latent_shape[-1])
+    else:
+        query_key = f"{global_prefix}query_tokens"
+        query_tensor = state_dict.get(query_key)
+        if not isinstance(query_tensor, torch.Tensor):
+            raise ValueError(f"Checkpoint is missing {query_key}.")
+        global_tokens = int(query_tensor.shape[1])
     global_layers = max(
         [
             int(str(key).split(".")[2 if global_prefix else 1]) + 1
@@ -4556,7 +4622,7 @@ def adapter_from_checkpoint(
         adapter_dim=adapter_dim,
         projection_dim=llm_hidden_size,
         dropout=float(ckpt_args.get("global_dropout", ckpt_args.get("dropout", 0.0))),
-        adapter_type="qformer",
+        adapter_type=global_adapter_type,
         query_tokens=global_tokens,
         adapter_layers=global_layers,
         adapter_heads=adapter_heads,
@@ -4564,11 +4630,11 @@ def adapter_from_checkpoint(
             ckpt_args.get("global_soft_prompt_scale", ckpt_args.get("soft_prompt_scale", 0.05))
         ),
     )
-    if architecture == "alignment_qformer":
+    if architecture in {"alignment_qformer", "alignment_adapter"}:
         global_adapter.load_state_dict(state_dict, strict=True)
         return global_adapter
 
-    if architecture == "residual_question_qformer":
+    if architecture in {"residual_question_qformer", "residual_question_adapter"}:
         local_adapter = ResidualQuestionConditionedAdapter(
             aligned_adapter=global_adapter,
             llm_hidden_size=llm_hidden_size,
@@ -4587,6 +4653,12 @@ def adapter_from_checkpoint(
         )
         adapter.load_state_dict(state_dict, strict=True)
         return adapter
+
+    if global_adapter_type != "qformer":
+        raise ValueError(
+            f"{architecture} supports only qformer global adapters; use residual_question_adapter for "
+            f"stage-1 adapter_type={global_adapter_type}."
+        )
 
     local_query = state_dict.get("local_adapter.query_tokens")
     text_pos = state_dict.get("local_adapter.text_pos_embed")
@@ -4995,8 +5067,10 @@ def main() -> None:
     global_checkpoint_load_report: dict[str, Any] | None = None
     if str(args.adapter_architecture) in {
         "alignment_qformer",
+        "alignment_adapter",
         "hybrid_local_qformer",
         "residual_question_qformer",
+        "residual_question_adapter",
     }:
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_args: Mapping[str, Any] = {}
@@ -5014,16 +5088,33 @@ def main() -> None:
         hybrid_checkpoint = isinstance(raw_checkpoint_state, Mapping) and any(
             str(key).startswith("global_adapter.") for key in raw_checkpoint_state
         )
-        if str(args.adapter_architecture) == "residual_question_qformer" and hybrid_checkpoint:
+        if str(args.adapter_architecture) in {
+            "residual_question_qformer",
+            "residual_question_adapter",
+        } and hybrid_checkpoint:
             raise ValueError(
-                "residual_question_qformer must start from a stage-1 alignment checkpoint, not a downstream "
+                "Residual question conditioning must start from a stage-1 alignment checkpoint, not a downstream "
                 "hybrid checkpoint. Set adapter.init_checkpoint to alignment_best.pt."
             )
         if hybrid_checkpoint:
-            global_query = raw_checkpoint_state.get("global_adapter.query_tokens")
-            if not isinstance(global_query, torch.Tensor):
-                raise ValueError("Hybrid checkpoint is missing global_adapter.query_tokens.")
-            query_tokens = int(global_query.shape[1])
+            global_adapter_type = str(checkpoint_args.get("global_adapter_type", "")).lower()
+            if not global_adapter_type:
+                global_adapter_type = (
+                    "qformer"
+                    if isinstance(raw_checkpoint_state.get("global_adapter.query_tokens"), torch.Tensor)
+                    else "spatial_transformer"
+                    if "global_adapter.spatial_pos_encoding" in raw_checkpoint_state
+                    else ""
+                )
+            if global_adapter_type == "qformer":
+                global_query = raw_checkpoint_state.get("global_adapter.query_tokens")
+                if not isinstance(global_query, torch.Tensor):
+                    raise ValueError("Hybrid Q-Former checkpoint is missing global_adapter.query_tokens.")
+                query_tokens = int(global_query.shape[1])
+            elif global_adapter_type == "spatial_transformer":
+                query_tokens = int(latent_shape[-2]) * int(latent_shape[-1])
+            else:
+                raise ValueError("Could not infer the global adapter type from the hybrid checkpoint.")
             inferred_global_layers = [
                 int(str(key).split(".")[2]) + 1
                 for key in raw_checkpoint_state
@@ -5031,7 +5122,12 @@ def main() -> None:
             ]
             adapter_layers = max(inferred_global_layers or [int(args.adapter_layers)])
         else:
-            query_tokens = int(checkpoint_args.get("query_tokens", args.soft_prompt_tokens))
+            global_adapter_type = str(checkpoint_args.get("adapter_type", "qformer")).lower()
+            query_tokens = (
+                int(latent_shape[-2]) * int(latent_shape[-1])
+                if global_adapter_type == "spatial_transformer"
+                else int(checkpoint_args.get("query_tokens", args.soft_prompt_tokens))
+            )
             adapter_layers = int(checkpoint_args.get("adapter_layers", args.adapter_layers))
         adapter_heads = int(checkpoint_args.get("adapter_heads", args.adapter_heads))
         adapter_dim = int(checkpoint_args.get("adapter_dim", args.adapter_dim))
@@ -5055,7 +5151,7 @@ def main() -> None:
             adapter_dim=adapter_dim,
             projection_dim=checkpoint_projection_dim,
             dropout=global_dropout,
-            adapter_type=str(checkpoint_args.get("adapter_type", "qformer")),
+            adapter_type=global_adapter_type,
             query_tokens=query_tokens,
             adapter_layers=adapter_layers,
             adapter_heads=adapter_heads,
@@ -5100,9 +5196,10 @@ def main() -> None:
         args.adapter_layers = adapter_layers
         args.adapter_heads = adapter_heads
         args.adapter_dim = adapter_dim
+        args.global_adapter_type = global_adapter_type
         args.global_dropout = global_dropout
         args.global_soft_prompt_scale = global_soft_prompt_scale
-        if str(args.adapter_architecture) == "alignment_qformer":
+        if str(args.adapter_architecture) in {"alignment_qformer", "alignment_adapter"}:
             args.question_conditioning = False
             args.structured_query_conditioning = False
         if str(args.adapter_architecture) == "hybrid_local_qformer":
@@ -5174,9 +5271,12 @@ def main() -> None:
             args.freeze_global_adapter = freeze_global_adapter
             args.question_conditioning = True
             args.structured_query_conditioning = bool(adapter.structured_query_conditioning)
-        if str(args.adapter_architecture) == "residual_question_qformer":
+        if str(args.adapter_architecture) in {
+            "residual_question_qformer",
+            "residual_question_adapter",
+        }:
             if checkpoint is None:
-                raise ValueError("residual_question_qformer requires adapter.init_checkpoint from stage-1 alignment.")
+                raise ValueError("Residual question conditioning requires adapter.init_checkpoint from stage 1.")
             context_layers = [int(value) for value in parse_csv(args.local_context_layers)]
             global_adapter = adapter
             local_adapter = ResidualQuestionConditionedAdapter(
@@ -5195,17 +5295,17 @@ def main() -> None:
                 global_prompt_dropout=float(args.global_prompt_dropout),
                 combine_mode="residual",
             ).to(device)
-            checkpoint_load_report["mode"] = "stage1_cloned_residual_qformer"
+            checkpoint_load_report["mode"] = "stage1_cloned_residual_aligned_adapter"
             checkpoint_load_report["conditioned_backbone_initialized_parameters"] = sum(
                 int(parameter.numel()) for parameter in local_adapter.backbone.parameters()
             )
-            initialization = "stage1_residual_question_qformer"
+            initialization = "stage1_residual_question_adapter"
             args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
             args.local_soft_prompt_tokens = int(local_adapter.soft_prompt_tokens)
             args.local_adapter_layers = int(len(local_adapter.backbone.blocks))
             args.local_question_input_mode = "contextual_tokens"
             args.local_context_layer = int(max(context_layers))
-            args.local_fusion_mode = "residual_qformer"
+            args.local_fusion_mode = str(local_adapter.fusion_mode)
             args.freeze_global_adapter = True
             args.global_unfreeze_epoch = 0
             args.question_conditioning = True
@@ -5315,7 +5415,7 @@ def main() -> None:
         "structured_query_conditioning": bool(args.structured_query_conditioning),
         "question_input_mode": (
             "latent_only_global"
-            if str(args.adapter_architecture) == "alignment_qformer"
+            if str(args.adapter_architecture) in {"alignment_qformer", "alignment_adapter"}
             else (
                 "legacy_parsed_features"
                 if bool(args.structured_query_conditioning)
@@ -5327,6 +5427,7 @@ def main() -> None:
         "local_fusion_mode": str(args.local_fusion_mode),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "adapter_architecture": str(args.adapter_architecture),
+        "global_adapter_type": str(getattr(args, "global_adapter_type", "legacy")),
         "adapter_initialization": initialization,
         "adapter_init_checkpoint": str(args.adapter_init_checkpoint) if args.adapter_init_checkpoint else None,
         "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),

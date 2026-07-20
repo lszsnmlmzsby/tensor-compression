@@ -70,6 +70,7 @@ class ConvTokenAutoencoder2D(BaseCompressionModel):
         self.in_channels = int(model_cfg["in_channels"])
         self.out_channels = int(model_cfg["out_channels"])
         self.latent_dim = int(model_cfg["latent_dim"])
+        self.preserve_input_channels = bool(model_cfg.get("preserve_input_channels", False))
         base_channels = int(model_cfg["base_channels"])
         num_res_blocks = int(model_cfg["num_res_blocks"])
         dropout = float(model_cfg["dropout"])
@@ -101,7 +102,20 @@ class ConvTokenAutoencoder2D(BaseCompressionModel):
                 )
             current_channels = next_channels
         self.encoder = nn.Sequential(*encoder_layers)
-        self.to_latent = nn.Conv2d(current_channels, self.latent_dim, kernel_size=1)
+        learned_latent_dim = self.latent_dim
+        if self.preserve_input_channels:
+            if self.latent_grid != self.input_size:
+                raise ValueError(
+                    "preserve_input_channels requires latent_grid to equal input_size so values retain their "
+                    f"spatial positions. Got latent_grid={self.latent_grid}, input_size={self.input_size}."
+                )
+            if self.latent_dim <= self.in_channels:
+                raise ValueError(
+                    "preserve_input_channels requires latent_dim > in_channels so the latent contains both exact "
+                    f"input values and learned features. Got {self.latent_dim} and {self.in_channels}."
+                )
+            learned_latent_dim -= self.in_channels
+        self.to_latent = nn.Conv2d(current_channels, learned_latent_dim, kernel_size=1)
 
         decoder_layers: list[nn.Module] = [
             nn.Conv2d(self.latent_dim, current_channels, kernel_size=3, padding=1),
@@ -145,7 +159,12 @@ class ConvTokenAutoencoder2D(BaseCompressionModel):
 
     def encode(self, inputs: torch.Tensor) -> dict:
         features = self.encoder(inputs)
-        latent_map = self.to_latent(features)
+        learned_latent = self.to_latent(features)
+        latent_map = (
+            torch.cat([inputs.to(dtype=learned_latent.dtype), learned_latent], dim=1)
+            if self.preserve_input_channels
+            else learned_latent
+        )
         latent_tokens = latent_map.flatten(2).transpose(1, 2)
         return {
             "latent_map": latent_map,
@@ -156,4 +175,3 @@ class ConvTokenAutoencoder2D(BaseCompressionModel):
         latent_map = latent["latent_map"]
         reconstruction = self.decoder(latent_map)
         return self.output_activation(reconstruction)
-

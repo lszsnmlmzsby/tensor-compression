@@ -685,12 +685,12 @@ python scripts/prepare_tensor_llm_assets.py \
 | `structured_query_conditioning` | 旧版结构化 query 旁路。正式实验必须关闭，使 adapter 自己读取自然语言。 | `true`、`false` | `false`：推荐，使用自然语言 token；`true`：regex 解析坐标/任务，仅允许 sanity 调试。 |
 | `local_question_input_mode` | local branch 的自然语言输入。 | `contextual_tokens`、`input_embeddings` | `contextual_tokens`：使用 frozen Qwen 浅层逐 token hidden state；`input_embeddings`：旧版静态 embedding 路径。 |
 | `local_context_layer` | contextual local 使用的 Qwen hidden-state 层。 | 非负整数 | 当前 `6`：运行前六个 decoder block 后提前停止。 |
-| `local_context_layers` | residual Q-Former 融合的 Qwen hidden-state 层。 | 非负整数列表 | 当前 `[2,6]`，一次前向截取浅层词法细节与中层上下文。 |
-| `local_fusion_mode` | 问题 token 与 latent 的融合方式。 | `residual_qformer`、`anchor_queries`、`text_latent_pool` | 正式路径使用 `residual_qformer`：完整多层问题 token 条件化由 stage-1 初始化的 Q-Former；其余值用于旧 checkpoint 兼容。 |
+| `local_context_layers` | residual adapter 融合的 Qwen hidden-state 层。 | 非负整数列表 | 当前 `[2,6]`，一次前向截取浅层词法细节与中层上下文。 |
+| `local_fusion_mode` | 问题 token 与 latent 的融合方式。 | `residual_spatial_transformer`、`residual_qformer`、`anchor_queries`、`text_latent_pool` | 当前使用第一项；其余值用于旧 checkpoint 兼容。 |
 | `local_text_encoder_layers` | 旧 `input_embeddings` 路径的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置设为 `0`。 |
 | `soft_prompt_scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`，使 soft prompt token 范数接近普通 token embedding；`0`：关闭尺度限制，保留线性输出。 |
 
-当前正式 adapter 的信息流是单向的：自然语言题干会去掉 `Options:` 后的候选列表，再追加通用 anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual Q-Former。每层 inherited query 先 cross-attend 完整问题 token，再做 query self-attention 和 latent cross-attention。完整 QA prompt（包括候选列表）仍直接进入 frozen LLM，因此 adapter 专注“应从 tensor 读取什么证据”，不负责学习 A/B/C/D 格式。梯度不会更新 LLM。`structured_query_conditioning: false` 时，代码不会通过 regex 提前提取任务、坐标、区域或 mean/scale。
+当前正式 adapter 的信息流是单向的：自然语言题干会去掉 `Options:` 后的候选列表，再追加通用 anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual spatial adapter。每个固定空间位置先 cross-attend 完整问题 token，再做空间 self-attention。完整 QA prompt（包括候选列表）仍直接进入 frozen LLM，因此 adapter 专注“应从 tensor 读取什么证据”。梯度不会更新 LLM；代码也不会通过 regex 提前提取任务、坐标、区域或 mean/scale。
 
 #### `llm_training`
 
@@ -1041,7 +1041,7 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_direct_probe.py \
 
 ```text
 tensor path:
-  patch -> patch AE encoder -> latent tokens -> Q-Former adapter -> soft prompt tokens
+  patch -> value-preserving patch AE -> 16x16 latent grid -> spatial Transformer -> 256 soft prompt tokens
         -> frozen LLM -> middle-layer student hidden
 
 text path:
@@ -1051,7 +1051,7 @@ text path:
 
 当前正式路径使用 `alignment_text_layout: values_shared_suffix`。两条分支都先放置各自的 tensor 内容，再追加完全相同的设置相关 suffix；对齐位置是 suffix 最后一个 token 的 hidden state。当前候选 backbone 是 Qwen2.5-32B-Instruct；稀疏扫描中 Layer 2-40 的 target/control 约为 1，Layer 56 达到 1.81，因此正式配置使用 `teacher_layer: 56`，并建议长训练前用八个 point-value 模板在 48-64 层做一次局部确认。`hidden_states[0]` 只是上下文化前的输入 embedding，共享 readout token 在该位置看不到前面的 tensor，因此程序会拒绝 `teacher_layer <= 0`。
 
-Transformer block 不会删除或重排序列位置。以 16 个 Q-Former soft embeddings 加 1 个 EOS 为例，每一层的零基下标 16（第 17 个位置）仍对应同一个 EOS readout；变化的是该位置经过更多 block 后的 hidden vector。只有 EOS 模式固定为 17 个 student 位置；probe/representation 模式的最后位置是一基 `16 + suffix_token_count`。该位置同样在所有层保持不变。padding 只用于对齐 batch 长度，不会作为 readout。
+Transformer block 不会删除或重排序列位置。当前 256 个 soft embeddings 按 row-major 对应 `16x16` 网格；suffix 的最后位置是一基 `256 + suffix_token_count`。该位置在所有 LLM 层保持不变，变化的是 hidden vector。padding 只用于对齐 batch 长度，不会作为 readout。
 
 在正式训练前可用只读扫描脚本比较 frozen teacher 的所有层。它沿用 config 中的数据切分、归一化、数值精度和 suffix，既不训练也不加载 AE、Q-Former 或 alignment projector：
 
@@ -1063,7 +1063,7 @@ CUDA_VISIBLE_DEVICES=5 python scripts/scan_tensor_teacher_layers.py \
 
 EOS 对照只需把最后一项改成 `--anchor-mode eos`。当前 32B 配置先扫描 `4,8,12,16,24,32,40,48,56,64`，再围绕最佳候选做密集扫描；完整结果写入 `patch_alignment.output_root/teacher_layer_scan_*.json`。控制台的 `pair_cos` 越低表示跨样本角度坍缩越弱，`eff_rank` 越高表示变化占用的独立方向越多。probe 模式另外对被句子点名的数值施加扰动，并用数量和幅度相同、但位于 probe 支持域外的扰动作 control；`target/control > 1` 才说明该层对问题相关位置比无关位置更敏感。不能只凭最低 `pair_cos` 选层。
 
-注意：Q-Former 不再直接预测某一层 hidden vector。它输出 soft prompt tokens，并把这些 tokens 放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。正式训练在只读取浅层 hidden 时，会在只读 Qwen generation baseline 完成后安全截断 backbone 到 `teacher_layer`；`run_summary.json` 同时记录原始层数和实际启用层数，无法确认安全结构时则保留完整 frozen LLM。
+注意：空间适配器不直接预测某一层 hidden vector。它输出 native-width soft prompt embeddings，并把它们放到 frozen LLM 输入 embedding 前面；然后从同一个 frozen LLM 的 `teacher_layer` 取 student hidden state，与 text teacher hidden state 对齐。这样后续迁移到 soft prompt QA 时不会出现“训练时对齐中层、推理时却塞到输入层”的层级错配。旧 Q-Former 路径仍可由 `adapter_type: qformer` 复现。
 
 Teacher branch 只包含配置后的 tensor 数值和形状分隔符：
 
@@ -1077,7 +1077,7 @@ Teacher branch 只包含配置后的 tensor 数值和形状分隔符：
 Student branch 不再使用旧的说明 prompt：
 
 ```text
-[16 continuous Q-Former prefix embeddings]
+[256 row-major spatial prefix embeddings]
 <同一个共同 suffix>
 ```
 
@@ -1148,11 +1148,13 @@ probe 模式的全局 retrieval 使用 `evaluation_probe_count` 个固定 senten
 
 旧版“说明 + 字段 + 数值 + anchor / soft embeddings + 说明 + anchor”仍可通过 `alignment_text_layout: legacy_prompt` 复现，届时 `text_prompt_template` 才生效。
 
-默认 tensor path 不再把 `16x16` patch resize 到 `512x512`。当前 32B 实验加载并冻结已训练的 patch-sized reconstruction AE，只重新训练新的 Q-Former：
+默认 tensor path 不把 `16x16` patch resize 到 `512x512`。当前空间实验新建 value-preserving patch AE：
 
 ```text
-16x16 patch -> patch AE -> 4x4 latent tokens
+16x16x1 patch -> 16x16x8 latent -> 256 row-major spatial tokens
 ```
+
+latent 的第一个通道逐元素保留归一化输入，另外 7 个通道学习局部特征；`16*16*8` 与旧 `4*4*128` 的 latent 标量数相同，因此实验主要比较空间拓扑而不是容量。固定二维正弦编码标记 row/column，空间 self-attention 提供上下文，独立的局部残差路径避免上下文化抹掉对应位置的数值。
 
 如果 `encoder_source: checkpoint`，则加载 `compressor_checkpoint`；这适合调用已经训练好的 patch AE，或者临时复用旧的 512x512 compressor。只有后一种情况才应设 `resize_patch_to_compressor_input: true`。
 
@@ -1249,11 +1251,11 @@ loss = contrastive_loss_weight * weighted_directional_InfoNCE(tensor_embedding, 
 
 旧配置中的 `center_embeddings`、cosine loss 和 probe answer/KL 字段不会被静默忽略；脚本会在加载模型前列出残留字段并终止。`alignment_transform`、`alignment_projection` 的结构参数和 `centered_contrastive_loss_weight` 是当前受支持设置。
 
-脚本同样会在长训练前拒绝无效边界：`epochs <= 0`、空 DataLoader、0 层 Q-Former、单卡 batch 1 导致 InfoNCE 没有负样本、新建随机 AE 却被冻结，以及可训练 AE 却关闭 reconstruction loss。
+脚本同样会在长训练前拒绝无效边界：`epochs <= 0`、空 DataLoader、0 层 adapter、空间 token 数与网格不一致、单卡 batch 1 导致 InfoNCE 没有负样本、新建随机 AE 却被冻结，以及可训练 AE 却关闭 reconstruction loss。
 
 `alignment_best.pt` 使用整个验证 split 的方向加权严格 CE：`contrastive_weight * (0.75 * global_i2t_CE + 0.25 * global_t2i_CE)`，再加 batch-level centered、native-centered 和 branch-mean 项；全局 candidate-library centered retrieval 和全局 branch mean 只作诊断，不参与 checkpoint 选择，因为单样本部署没有验证集均值。全局评估缺失时回退到对应 batch 指标。i2t 是实际 tensor→text 部署方向，t2i 保留为较小的 one-to-one/hubness 辅助约束，而不是被删除或与 i2t 等权。语义同值负样本屏蔽只影响训练 loss，不用于美化 checkpoint 选择。
 
-`freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；设为 `true` 时只训练 Q-Former bridge。Q-Former 的必要输出线性层直接生成与 Qwen input embedding 同维的连续 prefix embeddings。
+`freeze_patch_ae_after_pretrain: false` 时，AE 在 reconstruction warmup 后继续随 alignment loss 更新；设为 `true` 时只训练 adapter。空间 adapter 的输出线性层直接生成与 Qwen input embedding 同维的连续 prefix embeddings。
 
 新布局会在 AE warmup 前逐 anchor 检查 tokenization，并输出最坏情况下的 `content_token_max`、`suffix_tokens` 和 `content_truncated`。anchor 单独编码，因此不会被截断；默认 `fail_on_text_max_length_hit: true` 会在任意数值正文超出预算时直接报错。`fail_on_text_anchor_missing` 只用于 `legacy_prompt` 兼容路径。
 
@@ -1290,7 +1292,9 @@ W&B 曲线：
 | `train/semantic_i2t_accuracy`、`val/semantic_t2i_accuracy` | top-1 候选的 probe 数值结果是否等价；只作语义诊断，不能替代严格 i2t/t2i。 |
 | `train/semantic_collision_fraction` | 原候选中量化后结果相同、因而从 InfoNCE 负样本分母排除的比例。 |
 | `train/teacher_probe_hidden_similarity_vs_negative_target_distance_pearson` | Teacher hidden 相似度与 probe 数值接近程度的相关性；越高越支持 frozen teacher 确实编码了所问数值。 |
-| `train/alignment_soft_prompt_gradient_norm` | loss 对 Q-Former soft prompts 的平均梯度范数；接近 0 表示所选 teacher layer 对前缀难以控制。 |
+| `train/alignment_soft_prompt_gradient_norm` | loss 对 soft prompts 的平均梯度范数；接近 0 表示所选 teacher layer 对前缀难以控制。 |
+| `train/alignment_soft_prompt_active_token_fraction` | 梯度大于该样本最大 token 梯度 `1e-3` 的 token 比例；空间模式下用于发现只有少数位置收到更新。 |
+| `train/alignment_soft_prompt_gradient_entropy` | token 梯度分布的归一化熵，范围约为 0 到 1；越接近 1 表示更新覆盖越均匀。 |
 | `train/candidate_count` | 训练 InfoNCE 的候选数；单卡等于 batch size，多卡等于每卡 batch size 乘 GPU 数。 |
 | `train/centered_i2t_accuracy`、`val/centered_i2t_accuracy` | 所选 transform 空间的 batch-centered retrieval；当前以配置中的 centered loss 权重参与主要残差目标，不作为单独 checkpoint 指标。 |
 | `val/global_i2t_accuracy`、`val/global_t2i_accuracy` | 整个验证 split 内的未居中 retrieval accuracy，是主要全局指标。 |
@@ -1340,14 +1344,14 @@ patch_alignment:
 | `--ensure-disjoint-records` / `--no-ensure-disjoint-records` | 是否禁止 train/val/test 出现完全相同 record。 | 布尔开关 | 默认开启；触发说明 split 采样有泄漏。 |
 | `--encoder-source` | encoder 从哪里来。 | `patch_ae_config`、`checkpoint` | `patch_ae_config`：按 YAML 构建 patch AE；`checkpoint`：加载 `compressor_checkpoint`。 |
 | `--train-patch-ae` / `--no-train-patch-ae` | 是否更新 AE 参数。 | 布尔开关 | 新建 patch AE 建议 `true`；加载已训练 patch AE 做纯 adapter 对齐时可设 `false`。 |
-| `--freeze-patch-ae-after-pretrain` / `--no-freeze-patch-ae-after-pretrain` | AE warmup 后 alignment 阶段是否冻结 AE。 | 布尔开关 | 当前 32B 配置为 `true`，复用 reconstruction AE 并只训练新的 Q-Former。 |
+| `--freeze-patch-ae-after-pretrain` / `--no-freeze-patch-ae-after-pretrain` | AE warmup 后 alignment 阶段是否冻结 AE。 | 布尔开关 | 当前为 `true`，warmup 后只训练空间 adapter。 |
 | `--patch-ae-pretrain-epochs` | 对齐前 reconstruction-only warmup 轮数。 | 非负整数 | `0`：跳过；大于 0：先训练 patch AE 重建。 |
 | `--compressor-checkpoint` | 已训练 encoder checkpoint。 | 路径、`null` | 仅 `encoder_source: checkpoint` 必需。 |
 | `--resize-patch-to-compressor-input` / `--no-resize-patch-to-compressor-input` | 是否把 patch resize 到 encoder `input_size` 后再编码。 | 布尔开关 | patch AE 应设 `false`；旧 512x512 AE 才设 `true`。 |
-| `--adapter-type` | tensor path 的对齐 adapter。 | `qformer`、`pooled_mlp` | `qformer`：learnable queries cross-attend latent tokens 并输出 soft prompt tokens；`pooled_mlp`：mean/std pooling 旧实现，仅作 ablation。 |
-| `--query-tokens` | Q-Former learnable query 数。 | 正整数 | query 越多，tensor path 容量越大，显存也更高。 |
-| `--adapter-layers` | Q-Former cross-attention block 数。 | 正整数 | 当前正式配置为 4。 |
-| `--adapter-heads` | Q-Former attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
+| `--adapter-type` | tensor path 的对齐 adapter。 | `spatial_transformer`、`qformer`、`pooled_mlp` | 当前使用 `spatial_transformer`：每个 latent 位置产生一个同位置 token；其余值保留兼容。 |
+| `--query-tokens` | soft token 数。 | 正整数 | spatial 模式必须严格等于 `latent_height * latent_width`；Q-Former 模式表示 learnable query 数。 |
+| `--adapter-layers` | adapter block 数。 | 正整数 | 当前空间 adapter 为 2 层 self-attention。 |
+| `--adapter-heads` | adapter attention heads。 | 正整数 | 必须整除 `adapter_dim`。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`；`0`：关闭限制。 |
 | `--reconstruction-loss-weight` | patch AE 重建 MSE 权重。 | 非负数 | 只在 `train_patch_ae: true` 时影响训练。 |
 | `--teacher-text-source` | teacher branch 序列化哪一种 patch。 | `raw`、`normalized` | 当前为 `normalized`；只要 AE 启用 normalization/clipping，就必须使用该值。 |
@@ -1371,7 +1375,7 @@ patch_alignment:
 | `--temperature` | InfoNCE 温度。 | 正数 | 默认 0.07。 |
 | `--contrastive-loss-weight` | 未中心化 symmetric InfoNCE 权重。 | 非负数 | 当前 0.25，保留绝对空间约束但不让公共 probe 方向主导训练。 |
 | `--contrastive-i2t-weight` / `--contrastive-t2i-weight` | 两个 retrieval 方向在每个 InfoNCE 中的相对权重，会自动归一化。 | 非负数，和为正 | 当前 i2t=0.75、t2i=0.25；i2t 对应最终 tensor→text 部署，t2i 保留为防 hubness 的辅助约束。 |
-| `--projection-dim` | Q-Former 输出到 LLM 的 soft prompt 维度。 | `null` 或 LLM hidden size | 默认 `null` 自动匹配 LLM hidden size；这是输入桥接层，不是 post-hidden 对齐投影。 |
+| `--projection-dim` | adapter 输出到 LLM 的 soft prompt 维度。 | `null` 或 LLM hidden size | 默认 `null` 自动匹配 LLM hidden size；这是输入桥接层，不是 post-hidden 对齐投影。 |
 | `--alignment-transform-mode` | hidden readout 后的对比空间。 | `none`、`projection`、`whitening` | 当前 `whitening`；三档互斥。 |
 | `--alignment-whitening-records` | 拟合固定 teacher whitening 的 train 记录数。 | `>=2` | 当前 2048；只在训练开始前读取一次。 |
 | `--alignment-whitening-dim` | 保留的 teacher PCA 主方向数。 | `1..hidden_size` | 当前 512；丢弃不稳定低方差方向。 |
@@ -1381,7 +1385,7 @@ patch_alignment:
 | `--centered-contrastive-loss-weight` | DDP 全局 batch centered InfoNCE 权重。 | `>=0` | 当前 1.0，作为主要实例残差目标。 |
 | `--native-centered-contrastive-loss-weight` | 原生 LLM hidden 的 centered InfoNCE 权重。 | `>=0` | 当前 0.25；约束可迁移的 LLM 原生 hidden 空间。 |
 | `--mean-alignment-loss-weight` | transformed/native 分支均值方向与范数匹配权重。 | `>=0` | 当前 0.1；避免推理时依赖中心化。 |
-| `--alignment-patch-ae-lr-scale` | alignment 阶段 AE 相对 Q-Former 的学习率倍率。 | `(0,1]` | 当前 0.1；限制 encoder 漂移。 |
+| `--alignment-patch-ae-lr-scale` | alignment 阶段 AE 相对 adapter 的学习率倍率。 | `(0,1]` | 当前 AE 在 warmup 后冻结，此值不生效。 |
 | `--teacher-probe-warn-below-correlation` | probe family 中位相关性低于此值时打印 warning。 | `null` 或 `[-1,1]` | 当前 0.1；只告警，不阻断训练。 |
 | `--teacher-probe-diagnostic-records` | 每个 probe 模板用于 frozen-teacher 语义诊断的 train record 数。 | `>=2` | 当前 128；八个措辞模板在 family 内聚合。 |
 | `--alignment-projection-enabled` / `--no-alignment-projection-enabled` | 旧配置兼容开关。 | 布尔开关 | 新实验改用 `--alignment-transform-mode`；冲突设置会直接报错。 |
@@ -1398,18 +1402,19 @@ patch_alignment:
 patch_encoder:
   model:
     input_size: [16, 16]
-    channel_multipliers: [1, 2]
-    latent_dim: 128
-    latent_grid: [4, 4]
+    channel_multipliers: []
+    latent_dim: 8
+    latent_grid: [16, 16]
+    preserve_input_channels: true
 ```
 
-`channel_multipliers` 的长度决定下采样次数。默认长度为 2，因此下采样因子是 `2^2=4`，`16x16` 输入对应 `4x4` latent tokens。
+空 `channel_multipliers` 表示不下采样。`preserve_input_channels` 只允许在 latent grid 与输入网格相同时启用，并把原输入通道原样放在 latent 的最前面。
 
 这个脚本不是 QA 训练。它的目标是验证：tensor path 能否学到和“LLM 直接阅读文本形式 patch”一致的中间表示。若这里的 retrieval accuracy 训练不上去，说明 text teacher 表示或 tensor adapter 结构仍有问题；若训练有效，再把这个 adapter 初始化迁移到后续 readout QA。
 
 ### 3.10 16x16 Patch QA 迁移
 
-第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[128,4,4]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE 及其 normalization config，因此 latent 编码的是当前 per-patch z-score tensor，与第一阶段 encoder 输入一致。QA 仍从 raw patch 计算标准答案和可逆变换所需的 mean/scale；题面明确 soft tokens 编码 z-score 矩阵。alignment projector/whitening 不进入下游，Q-Former soft tokens保持 Qwen 的原生 embedding 维度。
+第一阶段 patch alignment 完成后，用 `scripts/build_tensor_patch_qa.py` 从同一 PDEBench HDF5 裁剪单字段 `16x16` patch，同时生成 QA JSONL 和 `[8,16,16]` latent cache。脚本直接加载 `alignment_best.pt` 中的 patch AE 及其 normalization config，因此 latent 编码的是当前 per-patch z-score tensor，与第一阶段 encoder 输入一致。QA 仍从 raw patch 计算标准答案和可逆变换所需的 mean/scale。alignment projector/whitening 不进入下游；空间 adapter 的 256 个 soft tokens 保持 Qwen 原生 embedding 维度。
 
 当前任务使用固定、清晰的自然语言问题：
 
@@ -1430,7 +1435,7 @@ patch_qa:
   allow_unseen_alignment_fields: false
 
 adapter:
-  architecture: residual_question_qformer
+  architecture: residual_question_adapter
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
 ```
 
@@ -1463,7 +1468,7 @@ python -m py_compile \
   scripts/diagnose_tensor_llm_adapter.py \
   scripts/inspect_tensor_llm_readout.py
 
-# 先生成多 query QA；不重新训练 AE/alignment，已有 latent 会复用。
+# 先生成多 query QA；使用独立 spatial256 目录，不能复用旧 4x4 latent。
 CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 
@@ -1472,30 +1477,30 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
 
-长时间训练前先检查启动摘要包含 `loss_weights=ce:0.05,choice:1,ranking:0.1,swap:0.1` 和 `checkpoint_load=stage1_cloned_residual_qformer`。这表示固定 reference 与可训练 conditioned backbone 都由第一阶段 Q-Former 初始化，而不是复用旧 downstream checkpoint。若配置文件缺少任一 loss 字段，脚本会打印一行 warning 并采用内置默认值，同时把最终生效值写入 `args.json`。
+长时间训练前先检查启动摘要包含配置中的 loss weights 和 `checkpoint_load=stage1_cloned_residual_aligned_adapter`。这表示固定 reference 与可训练 conditioned backbone 都由第一阶段空间 adapter 初始化，而不是复用旧 downstream checkpoint。
 
-`adapter.architecture: alignment_qformer` 会按 checkpoint 里的 query 数、层数和 hidden size 构建与第一阶段同构的 Q-Former，并以 `strict=True` 加载 `adapter_state_dict`。第一阶段和下游使用同一组 Q-Former soft prompt 参数；冻结 LLM，仅更新 Q-Former adapter。
+`adapter.architecture: alignment_adapter` 会按 checkpoint 的 adapter 类型、网格、层数和 hidden size 重建第一阶段结构，并以 `strict=True` 加载 `adapter_state_dict`。旧 `alignment_qformer` 名称仍用于旧 checkpoint。
 
-局部读取增强模式不重跑第一阶段，也不使用 AE decoder。正式配置从第一阶段 `alignment_best.pt` 严格载入 16-token Q-Former，并复制为两份：reference branch 永久冻结；conditioned branch 继承相同的 query、latent projection、位置 embedding、4 层 query self-attention/latent cross-attention/FFN。每层在继承 block 前新增一个小门控 text cross-attention。它读取完整自然语言 prompt，包括任务规则、问题、文本中的坐标或统计量、标签与数值选项的对应关系、choice semantics 和输出格式约束；不读取 task id、正则表达式坐标、oracle 或答案。
+局部读取增强模式不重跑第一阶段，也不使用 AE decoder。`residual_question_adapter` 从 `alignment_best.pt` 严格载入 256-token 空间 adapter，并复制为两份：reference branch 永久冻结；conditioned branch 继承相同的逐位置 latent projection、固定二维编码、空间 blocks、局部残差和输出映射。每个空间 block 前新增一个小门控 text cross-attention，使每个位置 token 根据完整自然语言问题选择证据；不读取 task id、正则表达式坐标、oracle 或答案。文本门为 0 时，conditioned branch 必须逐元素复现 Stage 1 输出。
 
-问题 token 由 frozen Qwen 同一次 early-exit 前向提取第 2 层和第 6 层完整序列。第 2 层偏重数字、坐标和词法细节，第 6 层提供上下文语义；两层经过各自 `LayerNorm + Linear` 后以 learned softmax 权重融合。固定末尾 anchor 不再单独压缩并广播到全部 query。最终输出保持第一阶段相同的 16 个 token 位置：
+问题 token 由 frozen Qwen 同一次 early-exit 前向提取第 2 层和第 6 层完整序列。第 2 层偏重数字、坐标和词法细节，第 6 层提供上下文语义；两层经过各自 `LayerNorm + Linear` 后以 learned softmax 权重融合。最终输出保持第一阶段相同的 256 个位置：
 
 ```text
-global = frozen_stage1_qformer(latent)
+global = frozen_stage1_spatial_adapter(latent)
 conditioned = trainable_stage1_clone(latent, full_question_tokens)
 soft_prompt = global + residual_gate * (conditioned - global)
 ```
 
 ```yaml
 adapter:
-  architecture: residual_question_qformer
+  architecture: residual_question_adapter
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/CHANGE_ME/alignment_best.pt
-  local_soft_prompt_tokens: 16
-  local_adapter_layers: 4
+  local_soft_prompt_tokens: 256
+  local_adapter_layers: 2
   local_question_input_mode: contextual_tokens
   local_context_layer: 6
   local_context_layers: [2, 6]
-  local_fusion_mode: residual_qformer
+  local_fusion_mode: residual_spatial_transformer
   local_text_encoder_layers: 0
   structured_query_conditioning: false
   local_text_gate_init: 0.05
@@ -1520,15 +1525,15 @@ llm_training:
   checkpoint_metric: macro_latent_gain
 ```
 
-最终前缀为 `[16 residual-conditioned tokens][完整QA prompt]`，不会扩成 24 个 token。同一问题的所有候选答案共享一次 soft prompt 计算。训练 batch 按 `state_ref + task_type + field` 把同一 tensor 的三个不同问题放在一起；swapped-question loss 互换 conditioned prompt，要求自己的问题 prompt 对正确答案的 NLL 至少比另一问题 prompt 低 `0.1`。这个约束不解析问题内容，适用于任意自然语言条件读取。`macro_latent_gain` 继续作为 best checkpoint 指标。QA 文件中的 `oracle` 在 dataset 载入时会被删除。
+最终前缀为 `[256 residual-conditioned spatial tokens][完整QA prompt]`，不会额外拼接第二组 256 token。同一问题的所有候选答案共享一次 soft prompt 计算。训练 batch 按 `state_ref + task_type + field` 组织同一 tensor 的不同问题；swapped-question loss 互换 conditioned prompt，约束自然语言条件敏感性。QA 文件中的 `oracle` 在 dataset 载入时会被删除。
 
 每道题的主 prompt 会按该题实际 choices 明确写出输出契约，例如 `Required output: exactly one of A, B, C, D`，并要求不输出解释、标点或其他文字。训练和正式准确率仍使用每个合法标签的候选 NLL，避免自由生成的格式噪声改变优化目标；自由生成只在内置诊断中运行，用于区分“语义上选对但格式不合规”和“答案本身错误”。
 
-当前正式实验不复用旧 downstream hybrid checkpoint，新架构会主动拒绝这样的路径。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layers=[2,6]`、`local_fusion_mode=residual_qformer` 和 `stage1_cloned_residual_qformer` load report。
+当前正式实验不复用旧 downstream hybrid checkpoint，新架构会主动拒绝这样的路径。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layers=[2,6]`、`local_fusion_mode=residual_spatial_transformer` 和 `stage1_cloned_residual_aligned_adapter` load report。
 
-`freeze_global_adapter: true` 表示 reference global branch 始终冻结。复制出的 conditioned Q-Former 属于 local 参数组，以 `1e-4` 更新；`global_unfreeze_epoch: 0` 禁止 reference 漂移。`global_prompt_dropout` 关闭，因为单独保留小 residual 会改变问题定义，问题敏感性改由 swapped-question loss 约束。
+`freeze_global_adapter: true` 表示 reference global branch 始终冻结。复制出的 conditioned spatial adapter 属于 local 参数组；`global_unfreeze_epoch: 0` 禁止 reference 漂移。`global_prompt_dropout` 关闭，问题敏感性由自然语言 cross-attention 与 swapped-question loss 约束。
 
-`residual_question_qformer` 必须提供第一阶段 checkpoint，不能传 `--adapter-init-checkpoint none`。当前目标是利用已经验证有效的对齐初始化，不要求再运行随机初始化对照。
+`residual_question_adapter` 必须提供第一阶段 checkpoint，不能传 `--adapter-init-checkpoint none`。
 
 训练器默认先在 512 条验证记录上运行训练前评估，再开始微调。每个 epoch 只评估 `correct` 和 `shuffled`；最终 best checkpoint 再完整评估 `zero_latent`、`no_latent` 和 `shuffled_stats`。patch QA 的 shuffled baseline 优先随机换成同字段、同任务、但不同 `sample_index` 的 patch，避免把同一 PDE 轨迹的相邻时间步误当成强负样本；只有 sanity 数据没有第二个 sample 时才退回不同 state。`shuffled_stats` 会同时替换自然语言和记录元数据中的 mean/scale。
 
