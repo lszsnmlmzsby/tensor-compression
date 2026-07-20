@@ -26,6 +26,8 @@ from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  #
 )
 from train_tensor_patch_text_alignment import (  # noqa: E402
     TensorPatchAlignmentAdapter,
+    alignment_adapter_path_metrics,
+    alignment_adapter_parameter_metrics,
     sinusoidal_2d_position_encoding,
 )
 
@@ -92,6 +94,60 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 adapter_heads=4,
                 soft_prompt_scale=0.0,
             )
+
+    def test_spatial_adapter_parameter_metrics_are_read_only_scalars(self) -> None:
+        adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+
+        metrics = alignment_adapter_parameter_metrics(adapter)
+        parameter_names = dict(adapter.named_parameters())
+        buffer_names = dict(adapter.named_buffers())
+
+        self.assertEqual(metrics, {"spatial_pos_scale": 1.0, "local_residual_scale": 1.0})
+        self.assertNotIn("spatial_pos_scale", parameter_names)
+        self.assertNotIn("local_residual_scale", parameter_names)
+        self.assertIn("spatial_pos_scale", buffer_names)
+        self.assertIn("local_residual_scale", buffer_names)
+
+        adapter.capture_spatial_path_metrics = True
+        adapter.forward_soft_prompts(torch.randn(2, 3, 2, 2))
+        path_metrics = alignment_adapter_path_metrics(adapter)
+        self.assertGreater(path_metrics["spatial_position_to_content_rms_ratio"], 0.0)
+        self.assertGreater(path_metrics["local_residual_to_context_rms_ratio"], 0.0)
+
+    def test_spatial_adapter_resets_legacy_trainable_scales_when_loading(self) -> None:
+        kwargs = {
+            "latent_channels": 3,
+            "latent_grid": (2, 2),
+            "adapter_dim": 16,
+            "projection_dim": 24,
+            "dropout": 0.0,
+            "adapter_type": "spatial_transformer",
+            "query_tokens": 4,
+            "adapter_layers": 1,
+            "adapter_heads": 4,
+            "soft_prompt_scale": 0.05,
+        }
+        source = TensorPatchAlignmentAdapter(**kwargs)
+        legacy_state = source.state_dict()
+        legacy_state["spatial_pos_scale"] = torch.tensor(0.2)
+        legacy_state["local_residual_scale"] = torch.tensor(0.3)
+        restored = TensorPatchAlignmentAdapter(**kwargs)
+
+        restored.load_state_dict(legacy_state, strict=True)
+
+        self.assertEqual(float(restored.spatial_pos_scale), 1.0)
+        self.assertEqual(float(restored.local_residual_scale), 1.0)
 
     def test_value_preserving_ae_keeps_exact_input_at_each_latent_position(self) -> None:
         model = ConvTokenAutoencoder2D(

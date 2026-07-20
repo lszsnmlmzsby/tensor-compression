@@ -1189,8 +1189,12 @@ class TensorPatchAlignmentAdapter(nn.Module):
                 sinusoidal_2d_position_encoding(*self.latent_grid, adapter_dim),
                 persistent=True,
             )
-            self.spatial_pos_scale = nn.Parameter(torch.tensor(1.0))
-            self.local_residual_scale = nn.Parameter(torch.tensor(1.0))
+            # These paths are architectural guarantees, not gates for the retrieval objective to disable.
+            # Persistent buffers preserve strict compatibility with older checkpoints that stored trainable scales.
+            self.register_buffer("spatial_pos_scale", torch.tensor(1.0), persistent=True)
+            self.register_buffer("local_residual_scale", torch.tensor(1.0), persistent=True)
+            self.capture_spatial_path_metrics = False
+            self.last_spatial_path_metrics: dict[str, float] = {}
             self.blocks = nn.ModuleList(
                 [
                     SpatialTransformerBlock(adapter_dim, int(adapter_heads), float(dropout))
@@ -1222,6 +1226,30 @@ class TensorPatchAlignmentAdapter(nn.Module):
         nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_pos_embed, mean=0.0, std=0.02)
 
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Mapping[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if self.adapter_type == "spatial_transformer":
+            # Discard legacy learned gate values so Stage 1 and Stage 2 always retain both paths.
+            self.spatial_pos_scale.fill_(1.0)
+            self.local_residual_scale.fill_(1.0)
+
     def flatten_latent_tokens(self, latent_map: torch.Tensor) -> torch.Tensor:
         if latent_map.ndim != 4:
             raise ValueError(f"Expected latent_map [B,C,H,W], got {tuple(latent_map.shape)}.")
@@ -1236,11 +1264,22 @@ class TensorPatchAlignmentAdapter(nn.Module):
             raise ValueError("spatial_input_states is available only for spatial_transformer adapters.")
         latent_tokens = self.flatten_latent_tokens(latent_map).to(dtype=self.latent_projection.weight.dtype)
         local_residual = self.local_residual_projection(latent_tokens)
-        states = self.latent_projection(latent_tokens)
-        states = states + self.spatial_pos_scale.to(dtype=states.dtype) * self.spatial_pos_encoding.to(
-            device=states.device,
-            dtype=states.dtype,
+        content_states = self.latent_projection(latent_tokens)
+        position_states = self.spatial_pos_scale.to(dtype=content_states.dtype) * self.spatial_pos_encoding.to(
+            device=content_states.device,
+            dtype=content_states.dtype,
         )
+        states = content_states + position_states
+        if self.capture_spatial_path_metrics:
+            self.last_spatial_path_metrics = {
+                "spatial_position_to_content_rms_ratio": float(
+                    position_states.detach().float().square().mean().sqrt().div(
+                        content_states.detach().float().square().mean().sqrt().clamp_min(1.0e-8)
+                    ).cpu().item()
+                )
+            }
+        else:
+            self.last_spatial_path_metrics = {}
         return states, local_residual
 
     def spatial_output_states(
@@ -1250,7 +1289,14 @@ class TensorPatchAlignmentAdapter(nn.Module):
     ) -> torch.Tensor:
         if self.adapter_type != "spatial_transformer":
             raise ValueError("spatial_output_states is available only for spatial_transformer adapters.")
-        states = contextual_states + self.local_residual_scale.to(dtype=contextual_states.dtype) * local_residual
+        local_path = self.local_residual_scale.to(dtype=contextual_states.dtype) * local_residual
+        states = contextual_states + local_path
+        if self.capture_spatial_path_metrics:
+            self.last_spatial_path_metrics["local_residual_to_context_rms_ratio"] = float(
+                local_path.detach().float().square().mean().sqrt().div(
+                    contextual_states.detach().float().square().mean().sqrt().clamp_min(1.0e-8)
+                ).cpu().item()
+            )
         return self.scale_soft_prompts(self.output(states))
 
     def forward_soft_prompts(self, latent_map: torch.Tensor) -> torch.Tensor:
@@ -1293,6 +1339,20 @@ class TensorPatchAlignmentAdapter(nn.Module):
     ) -> torch.Tensor:
         del question_embeds, question_mask, structured_query
         return self.forward_soft_prompts(latent_map)
+
+
+def alignment_adapter_parameter_metrics(adapter: TensorPatchAlignmentAdapter) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for name in ("spatial_pos_scale", "local_residual_scale"):
+        parameter = getattr(adapter, name, None)
+        if isinstance(parameter, torch.Tensor) and parameter.numel() == 1:
+            metrics[name] = float(parameter.detach().float().cpu().item())
+    return metrics
+
+
+def alignment_adapter_path_metrics(adapter: TensorPatchAlignmentAdapter) -> dict[str, float]:
+    metrics = getattr(adapter, "last_spatial_path_metrics", None)
+    return dict(metrics) if isinstance(metrics, Mapping) else {}
 
 
 def build_projection_head(
@@ -3298,6 +3358,7 @@ def train_one_epoch(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
+    metrics.update(alignment_adapter_parameter_metrics(adapter))
     for key in (
         "candidate_count",
         "i2t_loss",
@@ -3531,6 +3592,7 @@ def evaluate(
     llm.eval()
     if projector is not None:
         projector.eval()
+    adapter.capture_spatial_path_metrics = adapter.adapter_type == "spatial_transformer"
     total_loss = 0.0
     total_contrastive = 0.0
     total_reconstruction = 0.0
@@ -3584,6 +3646,12 @@ def evaluate(
         )
         latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
+        add_weighted_metrics(
+            metric_totals,
+            alignment_adapter_path_metrics(adapter),
+            int(patches.shape[0]),
+            "adapter_",
+        )
         student_output = tensor_student_hidden(
             llm,
             tokenizer,
@@ -3759,6 +3827,7 @@ def evaluate(
             collected_teacher_hidden.append(teacher_hidden.detach().float().cpu())
             if probe_target_ids is not None:
                 collected_probe_target_ids.append(probe_target_ids.detach().long().cpu())
+    adapter.capture_spatial_path_metrics = False
     metrics = {
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
@@ -3767,6 +3836,7 @@ def evaluate(
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
     metrics.update(averaged_metrics(metric_totals, total_records))
+    metrics.update(alignment_adapter_parameter_metrics(adapter))
     for key in (
         "candidate_count",
         "i2t_loss",
