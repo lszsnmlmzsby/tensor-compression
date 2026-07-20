@@ -166,7 +166,8 @@ patch_alignment:
   lr: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
-  num_workers: 0
+  # Two persistent readers per GPU overlap random HDF5 patch reads without overwhelming shared storage.
+  num_workers: 2
   # Fail with stage diagnostics if a rank stops participating; normal long I/O should not hit this.
   distributed_timeout_seconds: 1800
   # Retained for bounded activation memory through the frozen Layer-2 teacher path.
@@ -189,6 +190,9 @@ patch_alignment:
   alignment_patch_ae_lr_scale: 0.1
   # Reconstruction-only warmup saves both best and last; alignment always starts from validation best.
   patch_ae_pretrain_epochs: 2
+  # The 16x16 AE is much smaller than Qwen alignment. This keeps 2048 warmup updates per epoch
+  # at train_records=1048576 on four GPUs while leaving the contrastive batch size unchanged.
+  patch_ae_pretrain_batch_size: 128
   # Used only when encoder_source: checkpoint.
   compressor_checkpoint: null
   compressor_config: null

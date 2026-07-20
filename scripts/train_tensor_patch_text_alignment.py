@@ -31,7 +31,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from tensor_compression.config import load_config  # noqa: E402
-from tensor_compression.data.normalization import normalize_tensor  # noqa: E402
 from tensor_compression.downstream.pdebench import (  # noqa: E402
     resolve_checkpoint_field_keys,
     resolve_device,
@@ -912,6 +911,39 @@ class PDEBenchPatchTextDataset(Dataset):
         self.decimal_places = int(decimal_places)
         self.prompt_template = str(prompt_template)
         self.include_raw_text = bool(include_raw_text)
+        self._hdf5_handle: h5py.File | None = None
+        self._hdf5_pid: int | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        # h5py handles cannot be pickled or safely shared by spawned DataLoader workers.
+        state["_hdf5_handle"] = None
+        state["_hdf5_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        handle = getattr(self, "_hdf5_handle", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+        self._hdf5_handle = None
+        self._hdf5_pid = None
+
+    def _open_hdf5(self) -> h5py.File:
+        process_id = os.getpid()
+        handle = self._hdf5_handle
+        if handle is not None and self._hdf5_pid == process_id and bool(handle.id.valid):
+            return handle
+        # A forked worker may inherit the parent's Python object. Reopen lazily in the worker process.
+        self.close()
+        self._hdf5_handle = h5py.File(self.hdf5_path, "r")
+        self._hdf5_pid = process_id
+        return self._hdf5_handle
 
     def __len__(self) -> int:
         return len(self.records)
@@ -943,15 +975,15 @@ class PDEBenchPatchTextDataset(Dataset):
         arrays: list[np.ndarray] = []
         row_slice = slice(int(record.row), int(record.row) + self.patch_size)
         col_slice = slice(int(record.col), int(record.col) + self.patch_size)
-        with h5py.File(self.hdf5_path, "r") as handle:
-            for field in self._record_field_keys(record):
-                dataset = handle[field]
-                arrays.append(
-                    np.asarray(
-                        dataset[int(record.sample_index), int(record.time_index), row_slice, col_slice],
-                        dtype=np.float32,
-                    )
+        handle = self._open_hdf5()
+        for field in self._record_field_keys(record):
+            dataset = handle[field]
+            arrays.append(
+                np.asarray(
+                    dataset[int(record.sample_index), int(record.time_index), row_slice, col_slice],
+                    dtype=np.float32,
                 )
+            )
         stacked = np.stack(arrays, axis=0)
         return torch.as_tensor(stacked, dtype=torch.float32)
 
@@ -1940,17 +1972,26 @@ def reconstruction_loss_with_diagnostics(
     mean_baseline_mse_per_record = (target_flat - target_mean).square().mean(dim=1)
     zero_baseline_mse_per_record = target_flat.square().mean(dim=1)
     eps = torch.finfo(torch.float32).eps
-    relative_mse = mse_per_record / mean_baseline_mse_per_record.clamp_min(eps)
-    relative_rmse = mse_per_record.sqrt() / mean_baseline_mse_per_record.sqrt().clamp_min(eps)
+    mean_record_relative_mse = mse_per_record / mean_baseline_mse_per_record.clamp_min(eps)
+    mean_record_relative_rmse = mse_per_record.sqrt() / mean_baseline_mse_per_record.sqrt().clamp_min(eps)
     loss = mse_per_record.mean()
+    mean_baseline_mse = mean_baseline_mse_per_record.mean()
+    relative_mse = loss / mean_baseline_mse.clamp_min(eps)
+    relative_rmse = loss.sqrt() / mean_baseline_mse.sqrt().clamp_min(eps)
     diagnostics = {
         "rmse": float(loss.detach().sqrt().cpu().item()),
         "target_abs_mean": float(target_flat.abs().mean().detach().cpu().item()),
-        "target_std": float(mean_baseline_mse_per_record.mean().detach().sqrt().cpu().item()),
-        "mean_baseline_mse": float(mean_baseline_mse_per_record.mean().detach().cpu().item()),
+        "target_std": float(mean_baseline_mse.detach().sqrt().cpu().item()),
+        "mean_baseline_mse": float(mean_baseline_mse.detach().cpu().item()),
         "zero_baseline_mse": float(zero_baseline_mse_per_record.mean().detach().cpu().item()),
-        "relative_mse_to_mean_baseline": float(relative_mse.mean().detach().cpu().item()),
-        "relative_rmse_to_target_std": float(relative_rmse.mean().detach().cpu().item()),
+        "relative_mse_to_mean_baseline": float(relative_mse.detach().cpu().item()),
+        "relative_rmse_to_target_std": float(relative_rmse.detach().cpu().item()),
+        "mean_record_relative_mse_to_mean_baseline": float(
+            mean_record_relative_mse.mean().detach().cpu().item()
+        ),
+        "mean_record_relative_rmse_to_target_std": float(
+            mean_record_relative_rmse.mean().detach().cpu().item()
+        ),
     }
     return loss, diagnostics
 
@@ -2816,11 +2857,34 @@ def normalize_patch_batch(
     batch = patches.to(dtype=torch.float32)
     if bool(resize_to_input):
         batch = resize_chw_batch(batch, input_size)
-    normalized = []
-    for patch in batch:
-        normalized_patch, _state = normalize_tensor(patch.cpu(), dict(normalization_cfg or {}))
-        normalized.append(normalized_patch)
-    return torch.stack(normalized, dim=0)
+    config = dict(normalization_cfg or {})
+    clip_min = config.get("clip_min")
+    clip_max = config.get("clip_max")
+    if clip_min is not None or clip_max is not None:
+        batch = torch.clamp(batch, min=clip_min, max=clip_max)
+
+    mode = str(config.get("mode", "none")).lower()
+    if mode == "none":
+        return batch
+    if mode not in {"minmax", "zscore"}:
+        raise ValueError(f"Unsupported normalization mode: {mode}")
+    scope = str(config.get("scope", "global")).lower()
+    if scope == "global":
+        reduction_dims = tuple(range(1, batch.ndim))
+    elif scope == "channel":
+        reduction_dims = tuple(range(2, batch.ndim))
+    else:
+        raise ValueError(f"Unsupported normalization scope: {scope}")
+
+    if mode == "minmax":
+        minimum = batch.amin(dim=reduction_dims, keepdim=True)
+        maximum = batch.amax(dim=reduction_dims, keepdim=True)
+        return (batch - minimum) / (maximum - minimum + 1.0e-6)
+    if mode == "zscore":
+        mean = batch.mean(dim=reduction_dims, keepdim=True)
+        std = batch.std(dim=reduction_dims, keepdim=True, unbiased=False)
+        return (batch - mean) / (std + 1.0e-6)
+    raise AssertionError(f"Unhandled normalization mode: {mode}")
 
 
 def build_teacher_texts_for_batch(
@@ -4100,6 +4164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-patch-ae", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--freeze-patch-ae-after-pretrain", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--patch-ae-pretrain-epochs", type=int, default=None)
+    parser.add_argument("--patch-ae-pretrain-batch-size", type=int, default=None)
     parser.add_argument("--compressor-checkpoint", type=str, default=None)
     parser.add_argument("--compressor-config", type=str, default=None)
     parser.add_argument("--resize-patch-to-compressor-input", action=argparse.BooleanOptionalAction, default=None)
@@ -4280,6 +4345,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "train_patch_ae", first_nested(config, ["patch_alignment.train_patch_ae"]), args.encoder_source == "patch_ae_config")
     set_default(args, "freeze_patch_ae_after_pretrain", first_nested(config, ["patch_alignment.freeze_patch_ae_after_pretrain"]), True)
     set_default(args, "patch_ae_pretrain_epochs", first_nested(config, ["patch_alignment.patch_ae_pretrain_epochs"]), 0)
+    set_default(
+        args,
+        "patch_ae_pretrain_batch_size",
+        first_nested(config, ["patch_alignment.patch_ae_pretrain_batch_size"]),
+        args.batch_size,
+    )
     set_default(
         args,
         "resize_patch_to_compressor_input",
@@ -4525,6 +4596,7 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         "test_records",
         "batch_size",
         "eval_batch_size",
+        "patch_ae_pretrain_batch_size",
         "epochs",
     ):
         if int(getattr(args, name)) <= 0:
@@ -4676,15 +4748,20 @@ def make_loader(
     sampler: torch.utils.data.Sampler | None = None,
     drop_last: bool = False,
 ) -> DataLoader:
+    worker_count = int(num_workers)
+    loader_kwargs: dict[str, Any] = {}
+    if worker_count > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
     return DataLoader(
         dataset,
         batch_size=int(batch_size),
         shuffle=bool(shuffle) if sampler is None else False,
         sampler=sampler,
-        num_workers=int(num_workers),
+        num_workers=worker_count,
         pin_memory=torch.cuda.is_available(),
         drop_last=bool(drop_last),
         collate_fn=collate_patch_text,
+        **loader_kwargs,
     )
 
 
@@ -5145,6 +5222,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "freeze_patch_ae_after_pretrain": bool(args.freeze_patch_ae_after_pretrain),
             "alignment_train_patch_ae": bool(getattr(args, "alignment_train_patch_ae", args.train_patch_ae)),
             "patch_ae_pretrain_epochs": int(args.patch_ae_pretrain_epochs),
+            "patch_ae_pretrain_batch_size": int(args.patch_ae_pretrain_batch_size),
             "compressor_checkpoint": args.compressor_checkpoint,
             "resize_patch_to_compressor_input": bool(args.resize_patch_to_compressor_input),
             "adapter_type": str(args.adapter_type),
@@ -5472,10 +5550,27 @@ def main() -> None:
         sampler=train_sampler,
         drop_last=distributed_is_initialized(),
     )
+    pretrain_loader = (
+        make_loader(
+            train_dataset,
+            int(args.patch_ae_pretrain_batch_size),
+            True,
+            int(args.num_workers),
+            sampler=train_sampler,
+            drop_last=distributed_is_initialized(),
+        )
+        if bool(args.train_patch_ae) and int(args.patch_ae_pretrain_epochs) > 0
+        else None
+    )
     if len(train_loader) <= 0:
         raise ValueError(
             "The training DataLoader has zero batches. In distributed mode, train_records must provide at least "
             "one full global batch because drop_last=true."
+        )
+    if pretrain_loader is not None and len(pretrain_loader) <= 0:
+        raise ValueError(
+            "The patch-AE pretrain DataLoader has zero batches. Reduce "
+            "patch_alignment.patch_ae_pretrain_batch_size or increase train_records."
         )
     val_sampler = (
         DistributedEvalSampler(val_dataset, distributed_world_size(), distributed_rank())
@@ -5630,6 +5725,10 @@ def main() -> None:
         probe_latent_map = compressor.encode(probe_patch)["latent_map"]
         latent_channels = int(probe_latent_map.shape[1])
         latent_grid = tuple(int(dim) for dim in probe_latent_map.shape[-2:])
+    # Preflight reads happen in the rank process. Workers must open their own clean handles lazily.
+    train_dataset.close()
+    val_dataset.close()
+    test_dataset.close()
     adapter = TensorPatchAlignmentAdapter(
         latent_channels=latent_channels,
         latent_grid=latent_grid,
@@ -5680,6 +5779,8 @@ def main() -> None:
         )
         if is_main_process():
             dump_json(run_dir / "alignment_whitening.json", whitening_metrics)
+    # The whitening dataset is used once; do not retain its persistent workers during training.
+    whitening_loader = None
 
     args.alignment_train_patch_ae = bool(args.train_patch_ae) and not (
         bool(args.freeze_patch_ae_after_pretrain) and int(args.patch_ae_pretrain_epochs) > 0
@@ -5735,6 +5836,7 @@ def main() -> None:
         "freeze_patch_ae_after_pretrain": bool(args.freeze_patch_ae_after_pretrain),
         "alignment_train_patch_ae": bool(args.alignment_train_patch_ae),
         "patch_ae_pretrain_epochs": int(args.patch_ae_pretrain_epochs),
+        "patch_ae_pretrain_batch_size": int(args.patch_ae_pretrain_batch_size),
         "alignment_patch_ae_lr_scale": float(args.alignment_patch_ae_lr_scale),
         "reconstruction_loss_weight": float(args.reconstruction_loss_weight),
         "resize_patch_to_compressor_input": bool(args.resize_patch_to_compressor_input),
@@ -5959,6 +6061,8 @@ def main() -> None:
     best_patch_ae_val = float("inf")
     best_patch_ae_epoch = 0
     if bool(args.train_patch_ae) and int(args.patch_ae_pretrain_epochs) > 0:
+        if pretrain_loader is None:
+            raise RuntimeError("Patch-AE pretraining was enabled without a pretrain DataLoader.")
         compressor_optimizer = torch.optim.AdamW(
             [parameter for parameter in compressor.parameters() if parameter.requires_grad],
             lr=float(args.lr),
@@ -5967,7 +6071,7 @@ def main() -> None:
         for pretrain_epoch in range(1, int(args.patch_ae_pretrain_epochs) + 1):
             pretrain_metrics, global_step = pretrain_patch_encoder_one_epoch(
                 compressor=compressor,
-                loader=train_loader,
+                loader=pretrain_loader,
                 optimizer=compressor_optimizer,
                 device=device,
                 args=args,
@@ -6062,6 +6166,8 @@ def main() -> None:
                 f"val_recon={best_patch_ae_val:.6g}"
             )
         distributed_barrier("patch_ae_pretrain_best_restored")
+        # Release persistent pretrain workers and their HDF5 handles before alignment starts.
+        pretrain_loader = None
 
     if bool(args.alignment_train_patch_ae):
         for parameter in compressor.parameters():

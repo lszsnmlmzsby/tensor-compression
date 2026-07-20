@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pickle
 from dataclasses import replace
 from types import SimpleNamespace
 
+import h5py
+import numpy as np
 import pytest
 import torch
 
@@ -12,7 +15,9 @@ from scripts.train_tensor_patch_text_alignment import (
     AlignmentProjectionPair,
     DistributedEvalSampler,
     FixedTeacherWhitening,
+    PDEBenchPatchTextDataset,
     PROBE_TEMPLATE_COUNTS,
+    PatchRecord,
     alignment_anchors_from_args,
     apply_alignment_feature_transform,
     branch_mean_alignment_loss,
@@ -24,9 +29,11 @@ from scripts.train_tensor_patch_text_alignment import (
     gather_with_grad,
     gradient_parameter_entries,
     hidden_at_last_non_padding,
+    normalize_patch_batch,
     normalize_alignment_embeddings,
     probe_targets_from_patches,
     probe_contract_anchors,
+    reconstruction_loss_with_diagnostics,
     reject_removed_alignment_options,
     serialize_tensor_values,
     shared_suffix_token_ids,
@@ -42,6 +49,7 @@ from scripts.train_tensor_patch_text_alignment import (
     validate_teacher_hidden_state_index,
     validate_teacher_tensor_source,
 )
+from tensor_compression.data.normalization import normalize_tensor
 
 
 class CharacterTokenizer:
@@ -86,6 +94,101 @@ class TinyBackboneModel(torch.nn.Module):
         self.model.layers = torch.nn.ModuleList(
             [torch.nn.Linear(2, 2, bias=False) for _ in range(block_count)]
         )
+
+
+@pytest.mark.parametrize(
+    ("mode", "scope"),
+    [
+        ("none", "global"),
+        ("minmax", "global"),
+        ("minmax", "channel"),
+        ("zscore", "global"),
+        ("zscore", "channel"),
+    ],
+)
+def test_vectorized_patch_normalization_matches_per_record_reference(mode: str, scope: str) -> None:
+    generator = torch.Generator().manual_seed(17)
+    patches = torch.randn(4, 2, 3, 5, generator=generator)
+    patches[0, 0].fill_(0.25)
+    config = {
+        "mode": mode,
+        "scope": scope,
+        "clip_min": -1.5,
+        "clip_max": 1.5,
+    }
+    expected = torch.stack([normalize_tensor(patch, config)[0] for patch in patches], dim=0)
+
+    actual = normalize_patch_batch(
+        patches,
+        input_size=(3, 5),
+        normalization_cfg=config,
+        resize_to_input=False,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_patch_dataset_reuses_process_local_hdf5_handle_and_drops_it_when_pickled(tmp_path) -> None:
+    hdf5_path = tmp_path / "patches.hdf5"
+    vx = np.arange(2 * 2 * 4 * 4, dtype=np.float32).reshape(2, 2, 4, 4)
+    vy = vx + 1000.0
+    with h5py.File(hdf5_path, "w") as handle:
+        handle.create_dataset("Vx", data=vx)
+        handle.create_dataset("Vy", data=vy)
+
+    dataset = PDEBenchPatchTextDataset(
+        hdf5_path=hdf5_path,
+        field_keys=["Vx", "Vy"],
+        records=[
+            PatchRecord(sample_index=0, time_index=0, row=0, col=0, field_key="Vx"),
+            PatchRecord(sample_index=1, time_index=1, row=2, col=2, field_key="Vy"),
+        ],
+        patch_size=2,
+        decimal_places=3,
+        prompt_template="compact",
+        include_raw_text=False,
+    )
+
+    first = dataset[0]
+    first_handle = dataset._hdf5_handle
+    second = dataset[1]
+
+    assert first_handle is not None
+    assert dataset._hdf5_handle is first_handle
+    torch.testing.assert_close(first["patch"][0], torch.from_numpy(vx[0, 0, :2, :2]))
+    torch.testing.assert_close(second["patch"][0], torch.from_numpy(vy[1, 1, 2:4, 2:4]))
+
+    restored = pickle.loads(pickle.dumps(dataset))
+    assert restored._hdf5_handle is None
+    restored_item = restored[0]
+    assert restored._hdf5_handle is not None
+    torch.testing.assert_close(restored_item["patch"], first["patch"])
+
+    dataset.close()
+    restored.close()
+
+
+def test_reconstruction_relative_metric_uses_aggregate_variance() -> None:
+    class ZeroDecoder(torch.nn.Module):
+        def decode(self, payload):
+            return torch.zeros_like(payload["latent_map"])
+
+    varying = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+    target = torch.stack([torch.ones_like(varying), varying], dim=0)
+
+    _loss, metrics = reconstruction_loss_with_diagnostics(
+        ZeroDecoder(),
+        latent_map=target,
+        target=target,
+    )
+
+    assert metrics["relative_rmse_to_target_std"] == pytest.approx(
+        metrics["rmse"] / metrics["target_std"]
+    )
+    assert (
+        metrics["mean_record_relative_rmse_to_target_std"]
+        > metrics["relative_rmse_to_target_std"]
+    )
 
 
 class _AddBlock(torch.nn.Module):
