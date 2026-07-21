@@ -393,19 +393,25 @@ llm_training:
   prefer_record_latent_ref: false
   # Cache all current train latents in CPU memory after first access; each [8,16,16] item is only 8 KiB float32.
   latent_cache_size: 32768
-  # Keep zero for one process-level cache. Raise only when uncached storage latency is the bottleneck.
-  num_workers: 0
+  # Overlap latent-file reads with the frozen-LLM forward. Worker-local bounded caches preserve
+  # deterministic records/order; lower to 0 only if shared-storage contention is observed.
+  num_workers: 4
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
   # The 256-token prefix is substantially longer than the former 16-token path.
   epochs: 2
-  # Keep one complete same-tensor group per forward; choice CE expands it to roughly 12 sequences.
+  # Keep one complete same-tensor group per forward. The single-token choice path does not expand candidates.
   batch_size: 3
-  eval_batch_size: 1
+  # Evaluation is no-grad and uses one prompt-only forward for single-token choices; it can use the
+  # measured training-safe batch without changing any metric or training gradient.
+  eval_batch_size: 8
   eval_choice_batch_size: 4
-  # Keep the 32B training forward bounded: one question's four choices per frozen-LLM call.
-  train_choice_batch_size: 4
+  # Used only by the sequence-likelihood fallback; auto single-token scoring uses one forward directly.
+  train_choice_batch_size: 12
+  # Ranking and swapped-question losses are concatenated but chunked above the measured safe forward batch.
+  # This preserves every margin term when --batch-size 8 produces six grouped records (6 negatives + 3 swaps).
+  train_grounding_batch_size: 8
   # Non-reentrant checkpointing retains gradients to the tensor prefix without storing every Qwen activation.
   llm_gradient_checkpointing: true
   # Four torchrun ranks give an effective optimizer batch of 3 x 4 = 12, close to the former
@@ -445,6 +451,8 @@ llm_training:
     - shuffled
     - shuffled_stats
   choice_score: mean
+  # auto uses one-forward restricted-label scoring for the current A/B/C/D tasks; sequence preserves the old exact scorer.
+  choice_scoring_mode: auto
   # Group different natural-language questions for the same tensor and operation inside each batch.
   group_questions_by_state: true
   questions_per_state_group: 3

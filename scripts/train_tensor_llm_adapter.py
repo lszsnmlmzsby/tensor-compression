@@ -1275,7 +1275,14 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
         if self.rank < 0 or self.rank >= self.num_replicas:
             raise ValueError(f"rank must be in [0, {self.num_replicas}), got {self.rank}.")
         self.epoch = 0
-        self._length = math.ceil(len(self._global_batches(epoch=0)) / self.num_replicas)
+        initial_batches = self._global_batches(epoch=0)
+        self._length = math.ceil(len(initial_batches) / self.num_replicas)
+        initial_sizes = [len(batch) for batch in initial_batches]
+        self.initial_batch_size_min = min(initial_sizes, default=0)
+        self.initial_batch_size_max = max(initial_sizes, default=0)
+        self.initial_batch_size_mean = (
+            sum(initial_sizes) / len(initial_sizes) if initial_sizes else 0.0
+        )
 
     def __len__(self) -> int:
         return self._length
@@ -1559,6 +1566,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum candidate-answer sequences sent through the frozen LLM in one training forward.",
     )
+    parser.add_argument(
+        "--train-grounding-batch-size",
+        type=int,
+        default=None,
+        help="Maximum ranking/swap sequences sent through the frozen LLM in one training forward.",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument(
         "--llm-gradient-checkpointing",
@@ -1682,6 +1695,13 @@ def parse_args() -> argparse.Namespace:
         choices=("mean", "sum"),
         help="Normalize candidate NLL by target-token count or not.",
     )
+    parser.add_argument(
+        "--choice-scoring-mode",
+        type=str,
+        default=None,
+        choices=("auto", "label", "sequence"),
+        help="Use one-forward restricted-label scoring when possible, or retain the exact sequence scorer.",
+    )
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--console-progress", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save-step-metrics", action=argparse.BooleanOptionalAction, default=None)
@@ -1801,6 +1821,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "train_grounding_batch_size",
+        first_nested(config, ["llm_training.train_grounding_batch_size"]),
+        args.train_choice_batch_size,
+    )
+    set_default(
+        args,
         "gradient_accumulation_steps",
         first_nested(config, ["llm_training.gradient_accumulation_steps"]),
         1,
@@ -1908,6 +1934,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.eval_baselines,
     )
     set_default(args, "choice_score", first_nested(config, ["llm_training.choice_score"]), "mean")
+    set_default(args, "choice_scoring_mode", first_nested(config, ["llm_training.choice_scoring_mode"]), "auto")
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
     set_default(args, "console_progress", first_nested(config, ["llm_training.console_progress"]), False)
     set_default(args, "save_step_metrics", first_nested(config, ["llm_training.save_step_metrics"]), False)
@@ -1958,6 +1985,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "eval_batch_size",
         "eval_choice_batch_size",
         "train_choice_batch_size",
+        "train_grounding_batch_size",
         "gradient_accumulation_steps",
         "max_prompt_tokens",
         "max_target_tokens",
@@ -1976,6 +2004,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     }
     if str(args.adapter_architecture) not in supported_adapter_architectures:
         raise ValueError(f"Unsupported adapter.architecture: {args.adapter_architecture}")
+    if str(args.choice_scoring_mode) not in {"auto", "label", "sequence"}:
+        raise ValueError(f"Unsupported llm_training.choice_scoring_mode: {args.choice_scoring_mode}")
     if str(args.adapter_architecture) in {
         "residual_question_qformer",
         "residual_question_adapter",
@@ -2639,6 +2669,47 @@ def audit_prompt_tokenization(
     return summary
 
 
+def audit_choice_tokenization(
+    datasets: Mapping[str, TensorReadoutQADataset],
+    tokenizer,
+) -> dict[str, Any]:
+    labels = sorted(
+        {
+            str(choice)
+            for dataset in datasets.values()
+            for record in dataset.records
+            for choice in (
+                record.get("choices")
+                if isinstance(record.get("choices"), Sequence)
+                and not isinstance(record.get("choices"), str)
+                else [str(record.get("answer", ""))]
+            )
+        }
+    )
+    token_ids: dict[str, list[int]] = {
+        label: [
+            int(value)
+            for value in tokenizer(
+                " " + label,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+        ]
+        for label in labels
+    }
+    single_token_ids = [values[0] for values in token_ids.values() if len(values) == 1]
+    all_single_token = all(len(values) == 1 for values in token_ids.values()) and len(
+        set(single_token_ids)
+    ) == len(labels)
+    return {
+        "labels": labels,
+        "token_ids": token_ids,
+        "all_labels_single_token": bool(all_single_token),
+        "training_path": "single_forward_restricted_logits" if all_single_token else "sequence_likelihood_fallback",
+        "evaluation_path": "prompt_only_restricted_logits" if all_single_token else "sequence_likelihood_fallback",
+    }
+
+
 def encode_example(
     record: Mapping[str, Any],
     answer: str,
@@ -2836,18 +2907,16 @@ def build_local_question_tensors(
     return encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
 
 
-def contextual_adapter_soft_embeds(
+def contextual_adapter_question_context(
     llm,
     adapter: nn.Module,
     tokenizer,
     records: Sequence[Mapping[str, Any]],
-    latent_map: torch.Tensor,
     device: torch.device,
     max_prompt_tokens: int,
     layer_index: int,
-    mode: str,
     prompt_template: str,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not (
         isinstance(adapter, HybridGlobalLocalAdapter)
         and adapter.local_adapter.question_input_mode == "contextual_tokens"
@@ -2868,12 +2937,43 @@ def contextual_adapter_soft_embeds(
         prompt_mask=question_mask.bool(),
         fallback_layer=int(layer_index),
     )
+    return question_embeds, question_mask.bool()
+
+
+def contextual_adapter_soft_embeds(
+    llm,
+    adapter: nn.Module,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    max_prompt_tokens: int,
+    layer_index: int,
+    mode: str,
+    prompt_template: str,
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | None:
+    question_context = precomputed_question_context
+    if question_context is None:
+        question_context = contextual_adapter_question_context(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            device=device,
+            max_prompt_tokens=int(max_prompt_tokens),
+            layer_index=int(layer_index),
+            prompt_template=str(prompt_template),
+        )
+    if question_context is None:
+        return None
+    question_embeds, question_mask = question_context
     return adapter_soft_embeds(
         adapter=adapter,
-        latent_map=latent_map.to(device),
+        latent_map=latent_map.to(device, non_blocking=True),
         text_embeds=question_embeds,
         question_embeds=question_embeds,
-        question_mask=question_mask.bool(),
+        question_mask=question_mask,
         records=records,
         mode=mode,
     )
@@ -2940,6 +3040,7 @@ def forward_loss(
     prompt_template: str,
     soft_prompt_mode: str = "correct",
     local_context_layer: int = 2,
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -2953,7 +3054,7 @@ def forward_loss(
     input_ids = input_ids.to(device)
     text_attention_mask = text_attention_mask.to(device)
     text_labels = text_labels.to(device)
-    latent_map = latent_map.to(device)
+    latent_map = latent_map.to(device, non_blocking=True)
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
@@ -2968,6 +3069,7 @@ def forward_loss(
         layer_index=int(local_context_layer),
         mode=soft_prompt_mode,
         prompt_template=str(prompt_template),
+        precomputed_question_context=precomputed_question_context,
     )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -3002,12 +3104,13 @@ def forward_loss(
     return sequence_nll.sum() / target_counts.sum().clamp_min(1)
 
 
-def selective_answer_nll(
+def selective_answer_statistics(
     llm,
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_first_logits: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     decoder = None
     get_decoder = getattr(llm, "get_decoder", None)
     if callable(get_decoder):
@@ -3033,6 +3136,13 @@ def selective_answer_nll(
     if not bool(target_mask.any()):
         raise ValueError("Answer scoring received a batch without target tokens.")
 
+    first_logits: torch.Tensor | None = None
+    if return_first_logits:
+        first_positions = target_mask.long().argmax(dim=1)
+        batch_positions = torch.arange(labels.shape[0], device=labels.device)
+        first_hidden = shift_hidden[batch_positions, first_positions]
+        first_logits = output_embeddings(first_hidden).float()
+
     target_hidden = shift_hidden[target_mask]
     target_labels = shift_labels[target_mask]
     target_logits = output_embeddings(target_hidden).float()
@@ -3044,6 +3154,22 @@ def selective_answer_nll(
     )
     sequence_nll = token_nll.new_zeros(labels.shape[0]).scatter_add(0, sequence_indices, token_nll)
     target_counts = target_mask.sum(dim=1)
+    return sequence_nll, target_counts, first_logits
+
+
+def selective_answer_nll(
+    llm,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sequence_nll, target_counts, _first_logits = selective_answer_statistics(
+        llm=llm,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+        return_first_logits=False,
+    )
     return sequence_nll, target_counts
 
 
@@ -3064,6 +3190,7 @@ def forward_answer_nll(
     return_target_counts: bool = False,
     local_context_layer: int = 2,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -3077,7 +3204,7 @@ def forward_answer_nll(
     input_ids = input_ids.to(device)
     text_attention_mask = text_attention_mask.to(device)
     text_labels = text_labels.to(device)
-    latent_map = latent_map.to(device)
+    latent_map = latent_map.to(device, non_blocking=True)
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
@@ -3094,6 +3221,7 @@ def forward_answer_nll(
             layer_index=int(local_context_layer),
             mode=soft_prompt_mode,
             prompt_template=str(prompt_template),
+            precomputed_question_context=precomputed_question_context,
         )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -3136,7 +3264,38 @@ def forward_answer_nll(
     return nll
 
 
-def choice_ce_loss(
+def single_token_choice_ids(
+    records: Sequence[Mapping[str, Any]],
+    tokenizer,
+) -> tuple[list[list[int]], list[int]] | None:
+    token_ids_by_record: list[list[int]] = []
+    target_indices: list[int] = []
+    for record in records:
+        choices = record.get("choices")
+        if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+            choices = [str(record["answer"])]
+        string_choices = [str(choice) for choice in choices]
+        answer = str(record["answer"])
+        if answer not in string_choices:
+            string_choices = [answer] + string_choices
+        encoded_choices: list[int] = []
+        for choice in string_choices:
+            encoded = tokenizer(
+                " " + choice,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+            if len(encoded) != 1:
+                return None
+            encoded_choices.append(int(encoded[0]))
+        if len(set(encoded_choices)) != len(encoded_choices):
+            return None
+        token_ids_by_record.append(encoded_choices)
+        target_indices.append(string_choices.index(answer))
+    return token_ids_by_record, target_indices
+
+
+def single_token_choice_ce_loss(
     llm,
     adapter: TensorSoftPromptAdapter,
     tokenizer,
@@ -3145,6 +3304,114 @@ def choice_ce_loss(
     device: torch.device,
     args: argparse.Namespace,
     soft_prompt_mode: str = "correct",
+    choice_token_spec: tuple[list[list[int]], list[int]] | None = None,
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
+    answers = [str(record["answer"]) for record in records]
+    input_ids, text_attention_mask, text_labels = build_text_tensors(
+        records=records,
+        answers=answers,
+        tokenizer=tokenizer,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        max_target_tokens=int(args.max_target_tokens),
+        append_eos=bool(args.append_eos),
+        prompt_template=str(args.prompt_template),
+    )
+    input_ids = input_ids.to(device)
+    text_attention_mask = text_attention_mask.to(device)
+    text_labels = text_labels.to(device)
+    latent_map = latent_map.to(device, non_blocking=True)
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
+    soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        mode=soft_prompt_mode,
+        prompt_template=str(args.prompt_template),
+        precomputed_question_context=precomputed_question_context,
+    )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter=adapter,
+            latent_map=latent_map,
+            text_embeds=text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=records,
+            mode=soft_prompt_mode,
+        )
+    soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
+    inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
+    soft_attention = torch.ones(
+        (input_ids.shape[0], soft_embeds.shape[1]),
+        dtype=text_attention_mask.dtype,
+        device=device,
+    )
+    attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
+    soft_labels = torch.full(
+        (input_ids.shape[0], soft_embeds.shape[1]),
+        IGNORE_INDEX,
+        dtype=text_labels.dtype,
+        device=device,
+    )
+    labels = torch.cat([soft_labels, text_labels], dim=1)
+    sequence_nll, target_counts, first_logits = selective_answer_statistics(
+        llm=llm,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=labels,
+        return_first_logits=True,
+    )
+    if first_logits is None:
+        raise RuntimeError("Single-token choice scoring did not produce first-answer logits.")
+    if choice_token_spec is None:
+        choice_token_spec = single_token_choice_ids(records, tokenizer)
+    if choice_token_spec is None:
+        raise ValueError("Single-token choice scoring received a non-single-token choice set.")
+    token_ids_by_record, target_indices = choice_token_spec
+    losses: list[torch.Tensor] = []
+    correct_choice_nlls: list[torch.Tensor] = []
+    hard_correct = 0
+    for row, (candidate_ids, target_index) in enumerate(zip(token_ids_by_record, target_indices)):
+        candidate_logits = first_logits[row, torch.tensor(candidate_ids, device=device)]
+        losses.append(F.cross_entropy(candidate_logits.unsqueeze(0), torch.tensor([target_index], device=device)))
+        correct_choice_nlls.append(
+            sequence_nll[row] / target_counts[row].clamp_min(1)
+            if str(args.choice_score) == "mean"
+            else sequence_nll[row]
+        )
+        hard_correct += int(int(torch.argmax(candidate_logits.detach()).item()) == int(target_index))
+    if not losses:
+        raise ValueError("single_token_choice_ce_loss received an empty record batch.")
+    return (
+        torch.stack(losses).mean(),
+        sequence_nll.sum() / target_counts.sum().clamp_min(1),
+        torch.stack(correct_choice_nlls),
+        soft_embeds,
+        {
+            "choice_accuracy": hard_correct / max(1, len(losses)),
+            "choice_01_loss": 1.0 - hard_correct / max(1, len(losses)),
+            "choice_single_token_path": 1.0,
+        },
+    )
+
+
+def _sequence_choice_ce_loss(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    args: argparse.Namespace,
+    soft_prompt_mode: str = "correct",
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
@@ -3179,6 +3446,7 @@ def choice_ce_loss(
         layer_index=int(args.local_context_layer),
         mode=soft_prompt_mode,
         prompt_template=str(args.prompt_template),
+        precomputed_question_context=precomputed_question_context,
     )
     candidate_soft_embeds = (
         torch.stack([base_soft_embeds[index] for index in candidate_owners], dim=0)
@@ -3251,7 +3519,51 @@ def choice_ce_loss(
     return loss, correct_answer_ce, torch.stack(correct_choice_nlls), base_soft_embeds, {
         "choice_accuracy": float(accuracy),
         "choice_01_loss": float(1.0 - accuracy),
+        "choice_single_token_path": 0.0,
     }
+
+
+def choice_ce_loss(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    args: argparse.Namespace,
+    soft_prompt_mode: str = "correct",
+    precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
+    choice_token_spec = single_token_choice_ids(records, tokenizer)
+    scoring_mode = str(args.choice_scoring_mode)
+    if scoring_mode == "sequence":
+        choice_token_spec = None
+    elif choice_token_spec is not None:
+        return single_token_choice_ce_loss(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=latent_map,
+            device=device,
+            args=args,
+            soft_prompt_mode=soft_prompt_mode,
+            choice_token_spec=choice_token_spec,
+            precomputed_question_context=precomputed_question_context,
+        )
+    elif scoring_mode == "label":
+        raise ValueError("choice_scoring_mode=label requires every choice label to tokenize as one unique token.")
+    return _sequence_choice_ce_loss(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map,
+        device=device,
+        args=args,
+        soft_prompt_mode=soft_prompt_mode,
+        precomputed_question_context=precomputed_question_context,
+    )
 
 
 def same_state_question_swap_indices(records: Sequence[Mapping[str, Any]]) -> tuple[list[int], list[int]]:
@@ -3351,6 +3663,16 @@ def training_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     records = batch["records"]
     answers = [str(record["answer"]) for record in records]
+    question_context = contextual_adapter_question_context(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        prompt_template=str(args.prompt_template),
+    )
     ce_weight = float(args.ce_loss_weight)
     choice_ce_weight = float(args.choice_ce_loss_weight)
     ranking_weight = float(args.ranking_loss_weight)
@@ -3358,6 +3680,7 @@ def training_loss(
     choice_metrics = {
         "choice_accuracy": 0.0,
         "choice_01_loss": 0.0,
+        "choice_single_token_path": 0.0,
     }
     if choice_ce_weight > 0.0:
         choice_loss_value, ce_loss, positive_nll, positive_soft_embeds, choice_metrics = choice_ce_loss(
@@ -3369,6 +3692,7 @@ def training_loss(
             device=device,
             args=args,
             soft_prompt_mode="correct",
+            precomputed_question_context=question_context,
         )
     else:
         ce_loss = forward_loss(
@@ -3384,6 +3708,7 @@ def training_loss(
             append_eos=bool(args.append_eos),
             prompt_template=str(args.prompt_template),
             local_context_layer=int(args.local_context_layer),
+            precomputed_question_context=question_context,
         )
         choice_loss_value = ce_loss.new_zeros(())
         positive_nll = None
@@ -3405,11 +3730,19 @@ def training_loss(
             soft_prompt_mode="correct",
             reduction=str(args.choice_score),
             local_context_layer=int(args.local_context_layer),
+            precomputed_question_context=question_context,
         )
     ranking_loss = positive_nll.new_zeros(())
     ranking_margin_mean = 0.0
+    swapped_loss = positive_nll.new_zeros(())
+    swapped_metrics = {"swapped_question_pairs": 0.0, "swapped_question_margin_mean": 0.0}
+    combined_records: list[Mapping[str, Any]] = []
+    combined_answers: list[str] = []
+    combined_latents: list[torch.Tensor] = []
+    combined_soft_embeds: list[torch.Tensor] = []
+    ranking_count = 0
+    negative_mode = str(args.ranking_loss_negative)
     if ranking_weight > 0.0:
-        negative_mode = str(args.ranking_loss_negative)
         if negative_mode == "shuffled":
             negative_latents = baseline_latents("shuffled", batch, dataset)
         elif negative_mode == "random":
@@ -3420,39 +3753,114 @@ def training_loss(
             negative_latents = torch.zeros_like(batch["latent_map"])
         else:
             raise ValueError(f"Unsupported ranking_loss_negative: {negative_mode}")
-        negative_nll = forward_answer_nll(
+        negative_soft_embeds = contextual_adapter_soft_embeds(
             llm=llm,
             adapter=adapter,
             tokenizer=tokenizer,
             records=records,
-            answers=answers,
             latent_map=negative_latents,
             device=device,
             max_prompt_tokens=int(args.max_prompt_tokens),
-            max_target_tokens=int(args.max_target_tokens),
-            append_eos=bool(args.append_eos),
+            layer_index=int(args.local_context_layer),
+            mode=negative_mode,
             prompt_template=str(args.prompt_template),
-            soft_prompt_mode=negative_mode,
-            reduction=str(args.choice_score),
-            local_context_layer=int(args.local_context_layer),
+            precomputed_question_context=question_context,
         )
-        ranking_terms = F.relu(float(args.ranking_loss_margin) + positive_nll - negative_nll)
-        ranking_loss = ranking_terms.mean()
-        ranking_margin_mean = float((negative_nll.detach() - positive_nll.detach()).mean().cpu().item())
-    swapped_loss, swapped_metrics = swapped_question_grounding_loss(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        records=records,
-        latent_map=batch["latent_map"],
-        positive_nll=positive_nll,
-        soft_embeds=positive_soft_embeds,
-        device=device,
-        args=args,
-    ) if swapped_weight > 0.0 else (
-        positive_nll.new_zeros(()),
-        {"swapped_question_pairs": 0.0, "swapped_question_margin_mean": 0.0},
-    )
+        if negative_soft_embeds is None:
+            negative_nll = forward_answer_nll(
+                llm=llm,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                records=records,
+                answers=answers,
+                latent_map=negative_latents,
+                device=device,
+                max_prompt_tokens=int(args.max_prompt_tokens),
+                max_target_tokens=int(args.max_target_tokens),
+                append_eos=bool(args.append_eos),
+                prompt_template=str(args.prompt_template),
+                soft_prompt_mode=negative_mode,
+                reduction=str(args.choice_score),
+                local_context_layer=int(args.local_context_layer),
+                precomputed_question_context=question_context,
+            )
+            ranking_terms = F.relu(float(args.ranking_loss_margin) + positive_nll - negative_nll)
+            ranking_loss = ranking_terms.mean()
+            ranking_margin_mean = float(
+                (negative_nll.detach() - positive_nll.detach()).mean().cpu().item()
+            )
+        else:
+            ranking_count = len(records)
+            combined_records.extend(records)
+            combined_answers.extend(answers)
+            combined_latents.extend(negative_latents)
+            combined_soft_embeds.extend(negative_soft_embeds)
+
+    swap_owners: list[int] = []
+    if swapped_weight > 0.0 and positive_soft_embeds is not None:
+        swap_owners, swap_sources = same_state_question_swap_indices(records)
+        max_swap_records = int(args.swapped_question_max_records)
+        swap_owners = swap_owners[:max_swap_records]
+        swap_sources = swap_sources[:max_swap_records]
+        for owner, source in zip(swap_owners, swap_sources):
+            combined_records.append(records[owner])
+            combined_answers.append(str(records[owner]["answer"]))
+            combined_latents.append(batch["latent_map"][owner])
+            combined_soft_embeds.append(positive_soft_embeds[source])
+
+    if combined_records:
+        combined_nll_chunks: list[torch.Tensor] = []
+        grounding_batch_size = max(1, int(args.train_grounding_batch_size))
+        for start in range(0, len(combined_records), grounding_batch_size):
+            end = min(len(combined_records), start + grounding_batch_size)
+            combined_nll_chunks.append(
+                forward_answer_nll(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    records=combined_records[start:end],
+                    answers=combined_answers[start:end],
+                    latent_map=torch.stack(combined_latents[start:end], dim=0),
+                    device=device,
+                    max_prompt_tokens=int(args.max_prompt_tokens),
+                    max_target_tokens=int(args.max_target_tokens),
+                    append_eos=bool(args.append_eos),
+                    prompt_template=str(args.prompt_template),
+                    soft_prompt_mode="correct",
+                    reduction=str(args.choice_score),
+                    local_context_layer=int(args.local_context_layer),
+                    precomputed_soft_embeds=torch.stack(combined_soft_embeds[start:end], dim=0),
+                )
+            )
+        combined_nll = torch.cat(combined_nll_chunks, dim=0)
+        if ranking_count > 0:
+            negative_nll = combined_nll[:ranking_count]
+            ranking_terms = F.relu(float(args.ranking_loss_margin) + positive_nll - negative_nll)
+            ranking_loss = ranking_terms.mean()
+            ranking_margin_mean = float(
+                (negative_nll.detach() - positive_nll.detach()).mean().cpu().item()
+            )
+        if swap_owners:
+            swapped_nll = combined_nll[ranking_count : ranking_count + len(swap_owners)]
+            selected_positive = torch.stack([positive_nll[index] for index in swap_owners])
+            swap_margin = swapped_nll - selected_positive
+            swapped_loss = F.relu(float(args.swapped_question_loss_margin) - swap_margin).mean()
+            swapped_metrics = {
+                "swapped_question_pairs": float(len(swap_owners)),
+                "swapped_question_margin_mean": float(swap_margin.detach().mean().cpu().item()),
+            }
+    elif swapped_weight > 0.0:
+        swapped_loss, swapped_metrics = swapped_question_grounding_loss(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=batch["latent_map"],
+            positive_nll=positive_nll,
+            soft_embeds=positive_soft_embeds,
+            device=device,
+            args=args,
+        )
     weighted_ce_loss = ce_weight * ce_loss
     weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
     weighted_ranking_loss = ranking_weight * ranking_loss
@@ -3466,6 +3874,7 @@ def training_loss(
         "weighted_choice_ce_loss": float(weighted_choice_ce_loss.detach().cpu().item()),
         "choice_accuracy": float(choice_metrics["choice_accuracy"]),
         "choice_01_loss": float(choice_metrics["choice_01_loss"]),
+        "choice_single_token_path": float(choice_metrics.get("choice_single_token_path", 0.0)),
         "ranking_loss": float(ranking_loss.detach().cpu().item()),
         "weighted_ranking_loss": float(weighted_ranking_loss.detach().cpu().item()),
         "ranking_margin_mean": ranking_margin_mean,
@@ -3505,7 +3914,7 @@ def score_candidate_batch(
     input_ids = input_ids.to(device)
     text_attention_mask = text_attention_mask.to(device)
     text_labels = text_labels.to(device)
-    latent_map = latent_map.to(device)
+    latent_map = latent_map.to(device, non_blocking=True)
 
     text_embeds = llm.get_input_embeddings()(input_ids)
     prompt_mask = text_labels.eq(IGNORE_INDEX) & text_attention_mask.bool()
@@ -3641,6 +4050,80 @@ def generate_diagnostic_answer(
     return parsed
 
 
+@torch.no_grad()
+def prompt_choice_label_logits(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    records: Sequence[Mapping[str, Any]],
+    latent_map: torch.Tensor,
+    device: torch.device,
+    args: argparse.Namespace,
+    mode: str,
+) -> torch.Tensor:
+    prompts = [build_prompt(record, prompt_template=str(args.prompt_template)) for record in records]
+    encoded = tokenizer(
+        prompts,
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+        add_special_tokens=True,
+    )
+    if int(encoded["input_ids"].shape[1]) > int(args.max_prompt_tokens):
+        raise ValueError(
+            f"A choice prompt uses {int(encoded['input_ids'].shape[1])} tokens, exceeding "
+            f"max_prompt_tokens={int(args.max_prompt_tokens)}."
+        )
+    input_ids = encoded["input_ids"].to(device)
+    text_attention_mask = encoded["attention_mask"].to(device)
+    text_embeds = llm.get_input_embeddings()(input_ids)
+    prompt_mask = text_attention_mask.bool()
+    soft_embeds = contextual_adapter_soft_embeds(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map.to(device, non_blocking=True),
+        device=device,
+        max_prompt_tokens=int(args.max_prompt_tokens),
+        layer_index=int(args.local_context_layer),
+        mode=mode,
+        prompt_template=str(args.prompt_template),
+    )
+    if soft_embeds is None:
+        soft_embeds = adapter_soft_embeds(
+            adapter=adapter,
+            latent_map=latent_map.to(device, non_blocking=True),
+            text_embeds=text_embeds,
+            question_embeds=text_embeds,
+            question_mask=prompt_mask,
+            records=records,
+            mode=mode,
+        )
+    soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
+    inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
+    soft_attention = torch.ones(
+        (input_ids.shape[0], soft_embeds.shape[1]),
+        dtype=text_attention_mask.dtype,
+        device=device,
+    )
+    attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
+    decoder = _decoder_for_diagnostics(llm)
+    output_embeddings = llm.get_output_embeddings()
+    if output_embeddings is None:
+        raise ValueError("The causal LLM does not expose output embeddings for choice scoring.")
+    outputs = decoder(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    last_indices = last_nonpadding_indices(text_attention_mask) + int(soft_embeds.shape[1])
+    batch_indices = torch.arange(input_ids.shape[0], device=device)
+    next_hidden = outputs.last_hidden_state[batch_indices, last_indices]
+    return output_embeddings(next_hidden).float()
+
+
 def collect_candidate_scores(
     llm,
     adapter: TensorSoftPromptAdapter,
@@ -3651,6 +4134,36 @@ def collect_candidate_scores(
     args: argparse.Namespace,
     mode: str,
 ) -> list[str]:
+    single_token_spec = single_token_choice_ids(records, tokenizer)
+    if str(args.choice_scoring_mode) == "sequence":
+        single_token_spec = None
+    elif single_token_spec is None and str(args.choice_scoring_mode) == "label":
+        raise ValueError("choice_scoring_mode=label requires every choice label to tokenize as one unique token.")
+    if single_token_spec is not None:
+        token_ids_by_record, _target_indices = single_token_spec
+        logits = prompt_choice_label_logits(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=latent_map,
+            device=device,
+            args=args,
+            mode=mode,
+        )
+        predictions: list[str] = []
+        for row, record in enumerate(records):
+            choices = record.get("choices")
+            if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+                choices = [str(record["answer"])]
+            string_choices = [str(choice) for choice in choices]
+            answer = str(record["answer"])
+            if answer not in string_choices:
+                string_choices = [answer] + string_choices
+            candidate_logits = logits[row, torch.tensor(token_ids_by_record[row], device=device)]
+            predictions.append(string_choices[int(torch.argmax(candidate_logits).item())])
+        return predictions
+
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -5436,8 +5949,32 @@ def main() -> None:
         if is_main_process()
         else None
     )
+    choice_tokenization_audit = broadcast_object_from_rank_zero(
+        audit_choice_tokenization(datasets, tokenizer) if is_main_process() else None
+    )
+    choice_tokenization_audit = dict(choice_tokenization_audit)
+    configured_choice_mode = str(args.choice_scoring_mode)
+    choice_tokenization_audit["configured_mode"] = configured_choice_mode
+    choice_tokenization_audit["effective_training_path"] = (
+        "sequence_likelihood"
+        if configured_choice_mode == "sequence"
+        else str(choice_tokenization_audit["training_path"])
+    )
+    choice_tokenization_audit["effective_evaluation_path"] = (
+        "sequence_likelihood"
+        if configured_choice_mode == "sequence"
+        else str(choice_tokenization_audit["evaluation_path"])
+    )
     if is_main_process():
         dump_json(run_dir / "prompt_audit.json", prompt_audit)
+        dump_json(run_dir / "choice_tokenization_audit.json", choice_tokenization_audit)
+    if configured_choice_mode == "label" and not bool(
+        choice_tokenization_audit["all_labels_single_token"]
+    ):
+        raise ValueError(
+            "choice_scoring_mode=label requires all labels to tokenize as one unique token; "
+            "see choice_tokenization_audit.json."
+        )
     if bool(args.require_untruncated_prompts) and not bool(prompt_audit["all_prompts_fit"]):
         raise ValueError(
             "Prompt audit found main/local prompts longer than "
@@ -5876,6 +6413,7 @@ def main() -> None:
             "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
             "per_rank_batch_size": int(args.batch_size),
             "train_choice_batch_size": int(args.train_choice_batch_size),
+            "train_grounding_batch_size": int(args.train_grounding_batch_size),
             "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
             "effective_train_batch_size": (
                 int(args.batch_size)
@@ -5885,6 +6423,16 @@ def main() -> None:
             "gradient_sync": "manual_all_reduce_adapter_only",
             "evaluation_sharding": "exact_nonpadding",
         },
+        "grouped_batch_size_epoch_zero": (
+            {
+                "configured_max": int(args.batch_size),
+                "minimum": int(train_epoch_sampler.initial_batch_size_min),
+                "maximum": int(train_epoch_sampler.initial_batch_size_max),
+                "mean": float(train_epoch_sampler.initial_batch_size_mean),
+            }
+            if isinstance(train_epoch_sampler, StateTaskGroupedBatchSampler)
+            else None
+        ),
         "model_dtype": str(model_dtype).replace("torch.", ""),
         "llm_gradient_checkpointing": bool(args.llm_gradient_checkpointing),
         "llm_hidden_size": llm_hidden_size,
@@ -5952,6 +6500,8 @@ def main() -> None:
         "qa_metadata_audit": qa_metadata_audit,
         "data_audit": data_audit,
         "prompt_audit": prompt_audit,
+        "choice_tokenization_audit": choice_tokenization_audit,
+        "choice_scoring_mode": str(args.choice_scoring_mode),
         "diagnostic_layer_audit": diagnostic_layer_audit,
         "local_context_audit": local_context_audit,
         "adapter_parameters_total": sum(p.numel() for p in adapter.parameters()),
@@ -5981,12 +6531,16 @@ def main() -> None:
             f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
             f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
             f"effective_batch={summary['distributed']['effective_train_batch_size']} "
+            f"eval_batch={int(args.eval_batch_size)} "
+            f"grouped_batch_range={summary['grouped_batch_size_epoch_zero']} "
+            f"grounding_forward_batch={int(args.train_grounding_batch_size)} "
             f"global_dropout={summary['global_prompt_dropout']:.2f} "
             f"params={summary['trainable_adapter_parameters']:,} "
             f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
             f"local_prompt_max={max(item['local_max_tokens'] for item in prompt_audit['splits'].values())} "
             f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
             f"ranking:{float(args.ranking_loss_weight):g},swap:{float(args.swapped_question_loss_weight):g} "
+            f"choice_path={choice_tokenization_audit['effective_training_path']} "
             f"checkpoint_load={checkpoint_load_report.get('mode')} "
             f"global/local_tensors={int(checkpoint_load_report.get('global_loaded_parameter_tensors', 0))}/"
             f"{int(checkpoint_load_report.get('local_loaded_parameter_tensors', 0))}"

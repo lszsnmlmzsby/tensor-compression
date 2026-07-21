@@ -1485,11 +1485,22 @@ W&B 只由 rank 0 写入。单卡回退时使用原来的 Python 命令，并加
 `--gradient-accumulation-steps 5` 恢复 effective batch 15。
 
 Qwen2.5-32B 的参数虽然冻结，答案损失仍要穿过全部 decoder layers 回传到 tensor prefix。Stage 2
-因此默认启用 non-reentrant `llm_gradient_checkpointing`，并用 `train_choice_batch_size: 4` 将一个
-三问题 batch 展开的 12 个候选分成三次 frozen-LLM forward；loss 仍在全部候选上计算，任务和梯度
-目标不变。启动日志会在模型加载前报告可见卡及空闲显存，低于总容量 95% 时标记
+因此默认启用 non-reentrant `llm_gradient_checkpointing`。启动日志会在模型加载前报告可见卡及空闲
+显存，低于总容量 95% 时标记
 `warning=visible_gpu_not_empty`。训练数据的 shuffled-negative 索引按 sample bucket 线性构造，latent
 使用有界 CPU LRU cache，避免大数据集启动时的近二次扫描和同一 `.pt` 文件反复读取。
+
+当前正式任务的 choices（A/B/C/D 或 A/B）都是单 token。`llm_training.choice_scoring_mode: auto`
+会在正确答案 teacher-forcing 的同一次 Qwen forward 中，从 `Answer:` 位置的 restricted-label logits
+计算 choice CE；普通 answer CE 仍计算正确 label 和 EOS，因此没有移除格式监督。ranking 与
+swapped-question 负向序列会合并并复用同一 batch 的第 2/6 层问题上下文；超过
+`train_grounding_batch_size: 8` 时只对该合并 batch 分块，所有 margin 项仍会参与同一次 loss。
+若未来使用多 token choices，代码会自动回退到原始 sequence-likelihood scorer；也可显式设置
+`choice_scoring_mode: sequence` 做严格旧实现复现。`eval_batch_size: 8` 只影响无梯度评估，不改变指标。
+`batch_size: 8` 在当前完整三问题分组下会被 sampler
+装入两个完整 group，实际 batch 为 6；`summary.json` 的 `grouped_batch_size_epoch_zero` 会记录真实
+范围。主 batch 从 3 提至 8 会让每 epoch 的优化器更新数减半，因此它是训练日程变更，不作为默认
+速度优化；应先用短 smoke test 比较稳定的 `samples/s` 和梯度，再决定是否调整正式训练日程。
 
 #### Stage 2 空闲 GPU sweep 调度
 

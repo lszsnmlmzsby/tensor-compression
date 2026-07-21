@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,12 +23,15 @@ from train_tensor_llm_adapter import (  # noqa: E402
     ResidualQuestionConditionedAdapter,
     StateTaskGroupedBatchSampler,
     TensorReadoutQADataset,
+    _sequence_choice_ce_loss,
     adapter_from_checkpoint,
     build_local_conditioning_prompt,
     choice_ce_loss,
     parse_generated_choice,
     same_state_question_swap_indices,
+    selective_answer_statistics,
     set_frozen_llm_execution_mode,
+    single_token_choice_ids,
     structured_query_features_for_record,
     task_specific_instruction,
 )
@@ -176,6 +180,75 @@ class TestDistributedSampling(unittest.TestCase):
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):
+    def test_selective_answer_statistics_aligns_first_target_and_retains_gradient(self) -> None:
+        class IdentityDecoder(nn.Module):
+            def forward(self, inputs_embeds, **_kwargs):
+                return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+        class FakeCausalLM(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.decoder = IdentityDecoder()
+                self.output = nn.Linear(3, 5, bias=False)
+
+            def get_decoder(self):
+                return self.decoder
+
+            def get_output_embeddings(self):
+                return self.output
+
+        torch.manual_seed(9)
+        llm = FakeCausalLM()
+        inputs = torch.randn(2, 5, 3, requires_grad=True)
+        labels = torch.tensor(
+            [
+                [-100, -100, 1, 4, -100],
+                [-100, 2, 4, -100, -100],
+            ]
+        )
+        attention = torch.ones(2, 5, dtype=torch.long)
+
+        sequence_nll, counts, first_logits = selective_answer_statistics(
+            llm=llm,
+            inputs_embeds=inputs,
+            attention_mask=attention,
+            labels=labels,
+            return_first_logits=True,
+        )
+
+        self.assertIsNotNone(first_logits)
+        assert first_logits is not None
+        expected_first = torch.stack([llm.output(inputs[0, 1]), llm.output(inputs[1, 0])])
+        torch.testing.assert_close(first_logits, expected_first)
+        self.assertEqual(counts.tolist(), [2, 2])
+        expected_nll = torch.stack(
+            [
+                F.cross_entropy(llm.output(inputs[0, 1:3]), torch.tensor([1, 4]), reduction="sum"),
+                F.cross_entropy(llm.output(inputs[1, 0:2]), torch.tensor([2, 4]), reduction="sum"),
+            ]
+        )
+        torch.testing.assert_close(sequence_nll, expected_nll)
+
+        (sequence_nll.sum() + first_logits.sum() * 0.01).backward()
+        self.assertIsNotNone(inputs.grad)
+        self.assertGreater(float(inputs.grad.abs().sum().item()), 0.0)
+
+    def test_single_token_choice_ids_use_space_prefixed_answer_tokens(self) -> None:
+        class FakeTokenizer:
+            ids = {" A": 11, " B": 12, " C": 13, " D": 14}
+
+            def __call__(self, text, **_kwargs):
+                return {"input_ids": [self.ids[text]]}
+
+        records = [
+            {"answer": "C", "choices": ["A", "B", "C", "D"]},
+            {"answer": "B", "choices": ["A", "B"]},
+        ]
+
+        result = single_token_choice_ids(records, FakeTokenizer())
+
+        self.assertEqual(result, ([[11, 12, 13, 14], [11, 12]], [2, 1]))
+
     def test_frozen_llm_mode_keeps_checkpoint_training_deterministic(self) -> None:
         model = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.5))
         model.is_gradient_checkpointing = True
@@ -221,7 +294,7 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             ),
             mock.patch("train_tensor_llm_adapter.forward_answer_nll", side_effect=fake_answer_nll),
         ):
-            chunked = choice_ce_loss(
+            chunked = _sequence_choice_ce_loss(
                 llm=object(),
                 adapter=object(),
                 tokenizer=object(),
