@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -12,8 +13,10 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from train_tensor_llm_adapter import (  # noqa: E402
+    ExactDistributedEvalSampler,
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
+    StateTaskGroupedBatchSampler,
     adapter_from_checkpoint,
     build_local_conditioning_prompt,
     parse_generated_choice,
@@ -40,6 +43,53 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
         "query": question,
         "question": question,
     }
+
+
+class TestDistributedSampling(unittest.TestCase):
+    def test_grouped_sampler_preserves_groups_and_equalizes_rank_steps(self) -> None:
+        records = [
+            _record(f"state_{state}", "point", "Vx", f"question_{variant}")
+            for state in range(7)
+            for variant in range(3)
+        ]
+        dataset = SimpleNamespace(records=records)
+        rank_batches = [
+            list(
+                StateTaskGroupedBatchSampler(
+                    dataset=dataset,
+                    batch_size=3,
+                    questions_per_group=3,
+                    seed=17,
+                    rank=rank,
+                    num_replicas=4,
+                )
+            )
+            for rank in range(4)
+        ]
+
+        self.assertEqual([len(batches) for batches in rank_batches], [2, 2, 2, 2])
+        flattened = [index for batches in rank_batches for batch in batches for index in batch]
+        self.assertEqual(set(flattened), set(range(len(records))))
+        self.assertEqual(len(flattened) - len(records), 3)
+        for batches in rank_batches:
+            for batch in batches:
+                keys = {
+                    (records[index]["state_ref"], records[index]["task_type"])
+                    for index in batch
+                }
+                self.assertEqual(len(keys), 1)
+
+    def test_exact_eval_sampler_never_pads_or_repeats(self) -> None:
+        dataset = list(range(10))
+        shards = [
+            list(ExactDistributedEvalSampler(dataset, rank=rank, num_replicas=3))
+            for rank in range(3)
+        ]
+
+        flattened = [index for shard in shards for index in shard]
+        self.assertEqual(sorted(flattened), list(range(10)))
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual([len(shard) for shard in shards], [4, 3, 3])
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):

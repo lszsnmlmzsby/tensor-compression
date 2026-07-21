@@ -400,8 +400,10 @@ llm_training:
   batch_size: 3
   eval_batch_size: 1
   eval_choice_batch_size: 4
-  # Preserve an effective optimizer batch of 15 without retaining five groups in GPU memory at once.
-  gradient_accumulation_steps: 5
+  # Four torchrun ranks give an effective optimizer batch of 3 x 4 = 12, close to the former
+  # single-GPU 3 x 5 = 15 schedule without reducing optimizer updates by another factor of four.
+  # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
+  gradient_accumulation_steps: 1
   lr: 1.0e-4
   lr_scheduler: cosine
   warmup_ratio: 0.03

@@ -1472,10 +1472,17 @@ python -m py_compile \
 CUDA_VISIBLE_DEVICES=1 python scripts/build_tensor_patch_qa.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 
-# 正式训练。
-CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
+# 正式四卡训练。每个进程各持有一份 frozen Qwen，只同步 adapter 梯度。
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,3,4,5 \
+torchrun --standalone --nproc_per_node=4 scripts/train_tensor_llm_adapter.py \
   --config configs/tensor_llm_adapter_pipeline.yaml
 ```
+
+`llm_training.batch_size` 是每张卡的 batch。当前 `batch_size: 3`、
+`gradient_accumulation_steps: 1` 在四卡下得到 effective batch 12。分布式 sampler 保留完整的
+same-tensor/same-task 问题组；验证和测试精确分片且不补齐重复记录。checkpoint、诊断、终端输出和
+W&B 只由 rank 0 写入。单卡回退时使用原来的 Python 命令，并加
+`--gradient-accumulation-steps 5` 恢复 effective batch 15。
 
 长时间训练前先检查启动摘要包含配置中的 loss weights 和 `checkpoint_load=stage1_cloned_residual_aligned_adapter`。这表示固定 reference 与可训练 conditioned backbone 都由第一阶段空间 adapter 初始化，而不是复用旧 downstream checkpoint。
 

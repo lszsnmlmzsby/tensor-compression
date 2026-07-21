@@ -17,9 +17,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +31,10 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
+from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
+    TensorPatchAlignmentAdapter,
+    synchronize_gradients,
+)
 
 from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
 from tensor_compression.integrations import WandbLogger  # noqa: E402
@@ -69,6 +74,83 @@ SUPPORTED_BASELINE_MODES = {
 }
 LOCAL_QUESTION_ANCHOR_TEXT = "Tensor evidence requested:"
 _ACTIVE_RUN_LIFECYCLE: "RunLifecycle | None" = None
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def distributed_rank() -> int:
+    return int(dist.get_rank()) if distributed_is_initialized() else 0
+
+
+def distributed_world_size() -> int:
+    return int(dist.get_world_size()) if distributed_is_initialized() else 1
+
+
+def is_main_process() -> bool:
+    return distributed_rank() == 0
+
+
+def initialize_distributed_device(requested_device: str) -> torch.device:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return resolve_device(requested_device)
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed Stage-2 training requires CUDA and the NCCL backend.")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank < 0 or local_rank >= torch.cuda.device_count():
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is invalid for {torch.cuda.device_count()} visible CUDA devices."
+        )
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return torch.device("cuda", local_rank)
+
+
+def distributed_barrier() -> None:
+    if distributed_is_initialized():
+        dist.barrier()
+
+
+def build_distributed_run_dir(output_root: str | Path, run_name: str) -> Path:
+    if not distributed_is_initialized():
+        return build_run_dir(output_root, run_name)
+    payload: list[str | None] = [
+        str(build_run_dir(output_root, run_name)) if is_main_process() else None
+    ]
+    dist.broadcast_object_list(payload, src=0)
+    if payload[0] is None:
+        raise RuntimeError("Rank 0 did not broadcast the Stage-2 run directory.")
+    run_dir = Path(payload[0])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+@torch.no_grad()
+def synchronize_module_from_rank_zero(module: nn.Module) -> None:
+    if not distributed_is_initialized():
+        return
+    for parameter in module.parameters():
+        dist.broadcast(parameter.data, src=0)
+    for buffer in module.buffers():
+        dist.broadcast(buffer.data, src=0)
+
+
+def average_trainable_gradients(module: nn.Module) -> None:
+    synchronize_gradients([module])
+
+
+def distributed_sum_scalars(values: Mapping[str, float], device: torch.device) -> dict[str, float]:
+    names = list(values)
+    tensor = torch.tensor(
+        [float(values[name]) for name in names],
+        dtype=torch.float64,
+        device=device,
+    )
+    if distributed_is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return {name: float(value) for name, value in zip(names, tensor.cpu().tolist())}
 
 
 def local_timestamp() -> str:
@@ -1094,6 +1176,8 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
         batch_size: int,
         questions_per_group: int,
         seed: int,
+        rank: int = 0,
+        num_replicas: int = 1,
     ) -> None:
         self.dataset = dataset
         self.batch_size = max(1, int(batch_size))
@@ -1103,14 +1187,21 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
                 "llm_training.questions_per_state_group cannot exceed llm_training.batch_size."
             )
         self.seed = int(seed)
+        self.rank = int(rank)
+        self.num_replicas = max(1, int(num_replicas))
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(f"rank must be in [0, {self.num_replicas}), got {self.rank}.")
         self.epoch = 0
+        self._length = math.ceil(len(self._global_batches(epoch=0)) / self.num_replicas)
 
     def __len__(self) -> int:
-        return math.ceil(len(self.dataset) / self.batch_size)
+        return self._length
 
-    def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        self.epoch += 1
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _global_batches(self, epoch: int) -> list[list[int]]:
+        rng = random.Random(self.seed + int(epoch))
         grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
         for index, record in enumerate(self.dataset.records):
             key = (str(record.get("state_ref", "")), str(record.get("task_type", "")))
@@ -1124,18 +1215,60 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
                 for start in range(0, len(indices), self.questions_per_group)
             )
         rng.shuffle(units)
-
-        batch: list[int] = []
+        units.sort(key=len, reverse=True)
+        batches: list[list[int]] = []
+        available_by_capacity: dict[int, list[int]] = defaultdict(list)
         for unit in units:
-            if batch and len(batch) + len(unit) > self.batch_size:
-                yield batch
-                batch = []
-            batch.extend(unit)
-            if len(batch) == self.batch_size:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
+            selected_batch: int | None = None
+            for capacity in range(len(unit), self.batch_size + 1):
+                if available_by_capacity[capacity]:
+                    selected_batch = available_by_capacity[capacity].pop()
+                    break
+            if selected_batch is None:
+                batches.append(list(unit))
+                selected_batch = len(batches) - 1
+            else:
+                batches[selected_batch].extend(unit)
+            remaining = self.batch_size - len(batches[selected_batch])
+            if remaining > 0:
+                available_by_capacity[remaining].append(selected_batch)
+        rng.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        batches = self._global_batches(self.epoch)
+        if self.num_replicas > 1:
+            target_count = len(self) * self.num_replicas
+            if len(batches) < target_count:
+                if not batches:
+                    return
+                missing = target_count - len(batches)
+                padding_source = list(batches)
+                batches.extend(
+                    copy.deepcopy(padding_source[index % len(padding_source)])
+                    for index in range(missing)
+                )
+            batches = batches[self.rank:target_count:self.num_replicas]
+        yield from batches
+
+
+class ExactDistributedEvalSampler(Sampler[int]):
+    """Shard evaluation records without padding or repeating any example."""
+
+    def __init__(self, dataset: Dataset, rank: int, num_replicas: int) -> None:
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.num_replicas = max(1, int(num_replicas))
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(f"rank must be in [0, {self.num_replicas}), got {self.rank}.")
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        if self.rank >= len(self.dataset):
+            return 0
+        return ((len(self.dataset) - 1 - self.rank) // self.num_replicas) + 1
 
 
 def collate_tensor_readout(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -3494,6 +3627,76 @@ def records_for_baseline(
     return updated
 
 
+def aggregate_evaluation_counts(
+    *,
+    total: int,
+    correct: int,
+    task_total: Mapping[str, int],
+    task_correct: Mapping[str, int],
+    field_total: Mapping[str, int],
+    field_correct: Mapping[str, int],
+    task_field_total: Mapping[str, int],
+    task_field_correct: Mapping[str, int],
+) -> tuple[
+    int,
+    int,
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
+    local_payload = {
+        "total": int(total),
+        "correct": int(correct),
+        "task_total": dict(task_total),
+        "task_correct": dict(task_correct),
+        "field_total": dict(field_total),
+        "field_correct": dict(field_correct),
+        "task_field_total": dict(task_field_total),
+        "task_field_correct": dict(task_field_correct),
+    }
+    gathered: list[Mapping[str, Any] | None]
+    if distributed_is_initialized():
+        gathered = [None] * distributed_world_size()
+        dist.all_gather_object(gathered, local_payload)
+    else:
+        gathered = [local_payload]
+
+    merged_total = 0
+    merged_correct = 0
+    merged_maps = {
+        "task_total": defaultdict(int),
+        "task_correct": defaultdict(int),
+        "field_total": defaultdict(int),
+        "field_correct": defaultdict(int),
+        "task_field_total": defaultdict(int),
+        "task_field_correct": defaultdict(int),
+    }
+    for payload in gathered:
+        if payload is None:
+            continue
+        merged_total += int(payload["total"])
+        merged_correct += int(payload["correct"])
+        for name, target in merged_maps.items():
+            values = payload.get(name, {})
+            if not isinstance(values, Mapping):
+                continue
+            for key, value in values.items():
+                target[str(key)] += int(value)
+    return (
+        merged_total,
+        merged_correct,
+        dict(merged_maps["task_total"]),
+        dict(merged_maps["task_correct"]),
+        dict(merged_maps["field_total"]),
+        dict(merged_maps["field_correct"]),
+        dict(merged_maps["task_field_total"]),
+        dict(merged_maps["task_field_correct"]),
+    )
+
+
 @torch.no_grad()
 def evaluate_choice_accuracy(
     llm,
@@ -3504,10 +3707,20 @@ def evaluate_choice_accuracy(
     args: argparse.Namespace,
     baseline_modes: Sequence[str],
 ) -> dict[str, Any]:
+    eval_sampler = (
+        ExactDistributedEvalSampler(
+            dataset,
+            rank=distributed_rank(),
+            num_replicas=distributed_world_size(),
+        )
+        if distributed_is_initialized()
+        else None
+    )
     loader = DataLoader(
         dataset,
         batch_size=max(1, int(args.eval_batch_size)),
         shuffle=False,
+        sampler=eval_sampler,
         num_workers=0,
         collate_fn=collate_tensor_readout,
     )
@@ -3554,6 +3767,25 @@ def evaluate_choice_accuracy(
                 field_correct[field] += hit
                 task_field_total[task_field] += 1
                 task_field_correct[task_field] += hit
+        (
+            total,
+            correct,
+            task_total,
+            task_correct,
+            field_total,
+            field_correct,
+            task_field_total,
+            task_field_correct,
+        ) = aggregate_evaluation_counts(
+            total=total,
+            correct=correct,
+            task_total=task_total,
+            task_correct=task_correct,
+            field_total=field_total,
+            field_correct=field_correct,
+            task_field_total=task_field_total,
+            task_field_correct=task_field_correct,
+        )
         metrics[mode] = {
             "accuracy": correct / max(1, total),
             "correct": correct,
@@ -4824,6 +5056,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
         key: raw_summary[key]
         for key in (
             "device",
+            "distributed",
             "model_dtype",
             "train_records",
             "val_records",
@@ -4960,16 +5193,21 @@ def main() -> None:
             "regex-parsed task/coordinate features. Disable it so the adapter reads the natural-language question."
         )
     apply_runtime_environment(args)
+    device = initialize_distributed_device(str(args.device))
     seed_everything(int(args.seed))
-    device = resolve_device(args.device)
-    run_dir = build_run_dir(args.output_root, args.run_name)
-    lifecycle = RunLifecycle(run_dir)
+    run_dir = build_distributed_run_dir(args.output_root, args.run_name)
+    lifecycle = RunLifecycle(run_dir) if is_main_process() else None
     _ACTIVE_RUN_LIFECYCLE = lifecycle
-    dump_json(run_dir / "args_requested.json", redacted_args(args))
-    if args.config:
-        dump_json(run_dir / "config_snapshot.json", redacted_config_snapshot(load_yaml_mapping(args.config)))
+    if is_main_process():
+        dump_json(run_dir / "args_requested.json", redacted_args(args))
+        if args.config:
+            dump_json(
+                run_dir / "config_snapshot.json",
+                redacted_config_snapshot(load_yaml_mapping(args.config)),
+            )
     qa_metadata_audit = audit_qa_metadata(args)
-    dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit)
+    if is_main_process():
+        dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit)
 
     train_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.train_split),
@@ -5000,7 +5238,8 @@ def main() -> None:
         datasets,
         require_disjoint_splits=bool(args.require_disjoint_splits),
     )
-    dump_json(run_dir / "data_audit.json", data_audit)
+    if is_main_process():
+        dump_json(run_dir / "data_audit.json", data_audit)
 
     tokenizer = load_tokenizer(args)
     prompt_audit = audit_prompt_tokenization(
@@ -5009,7 +5248,8 @@ def main() -> None:
         max_prompt_tokens=int(args.max_prompt_tokens),
         prompt_template=str(args.prompt_template),
     )
-    dump_json(run_dir / "prompt_audit.json", prompt_audit)
+    if is_main_process():
+        dump_json(run_dir / "prompt_audit.json", prompt_audit)
     if bool(args.require_untruncated_prompts) and not bool(prompt_audit["all_prompts_fit"]):
         raise ValueError(
             "Prompt audit found main/local prompts longer than "
@@ -5326,23 +5566,39 @@ def main() -> None:
             soft_prompt_scale=float(args.soft_prompt_scale),
         ).to(device)
 
+    synchronize_module_from_rank_zero(adapter)
+    seed_everything(int(args.seed) + distributed_rank())
+    train_epoch_sampler: Any = None
     if bool(args.group_questions_by_state):
+        train_epoch_sampler = StateTaskGroupedBatchSampler(
+            dataset=train_dataset,
+            batch_size=int(args.batch_size),
+            questions_per_group=int(args.questions_per_state_group),
+            seed=int(args.shuffle_seed),
+            rank=distributed_rank(),
+            num_replicas=distributed_world_size(),
+        )
         train_loader = DataLoader(
             train_dataset,
-            batch_sampler=StateTaskGroupedBatchSampler(
-                dataset=train_dataset,
-                batch_size=int(args.batch_size),
-                questions_per_group=int(args.questions_per_state_group),
-                seed=int(args.shuffle_seed),
-            ),
+            batch_sampler=train_epoch_sampler,
             num_workers=0,
             collate_fn=collate_tensor_readout,
         )
     else:
+        if distributed_is_initialized():
+            train_epoch_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=distributed_world_size(),
+                rank=distributed_rank(),
+                shuffle=True,
+                seed=int(args.shuffle_seed),
+                drop_last=False,
+            )
         train_loader = DataLoader(
             train_dataset,
             batch_size=max(1, int(args.batch_size)),
-            shuffle=True,
+            shuffle=train_epoch_sampler is None,
+            sampler=train_epoch_sampler,
             num_workers=0,
             collate_fn=collate_tensor_readout,
         )
@@ -5391,6 +5647,22 @@ def main() -> None:
 
     summary = {
         "device": str(device),
+        "distributed": {
+            "enabled": distributed_is_initialized(),
+            "backend": dist.get_backend() if distributed_is_initialized() else None,
+            "world_size": distributed_world_size(),
+            "rank": distributed_rank(),
+            "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            "per_rank_batch_size": int(args.batch_size),
+            "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+            "effective_train_batch_size": (
+                int(args.batch_size)
+                * distributed_world_size()
+                * int(args.gradient_accumulation_steps)
+            ),
+            "gradient_sync": "manual_all_reduce_adapter_only",
+            "evaluation_sharding": "exact_nonpadding",
+        },
         "model_dtype": str(model_dtype).replace("torch.", ""),
         "llm_hidden_size": llm_hidden_size,
         "latent_shape_chw": list(latent_shape),
@@ -5471,25 +5743,33 @@ def main() -> None:
         ),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }
-    dump_json(run_dir / "args.json", redacted_args(args))
-    dump_json(run_dir / "run_summary.json", summary)
-    lifecycle._write("running")
-    print(
-        f"run={run_dir.name} started_at={lifecycle.started_at} device={device} train/val/test="
-        f"{len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} "
-        f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
-        f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
-        f"global_dropout={summary['global_prompt_dropout']:.2f} "
-        f"params={summary['trainable_adapter_parameters']:,} "
-        f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
-        f"local_prompt_max={max(item['local_max_tokens'] for item in prompt_audit['splits'].values())} "
-        f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
-        f"ranking:{float(args.ranking_loss_weight):g},swap:{float(args.swapped_question_loss_weight):g} "
-        f"checkpoint_load={checkpoint_load_report.get('mode')} "
-        f"global/local_tensors={int(checkpoint_load_report.get('global_loaded_parameter_tensors', 0))}/"
-        f"{int(checkpoint_load_report.get('local_loaded_parameter_tensors', 0))}"
-    )
-    wandb_logger = WandbLogger(config=build_wandb_config(args, summary), run_dir=run_dir)
+    if is_main_process():
+        dump_json(run_dir / "args.json", redacted_args(args))
+        dump_json(run_dir / "run_summary.json", summary)
+        if lifecycle is None:
+            raise RuntimeError("Rank 0 did not create a run lifecycle.")
+        lifecycle._write("running")
+        print(
+            f"run={run_dir.name} started_at={lifecycle.started_at} device={device} "
+            f"distributed={int(distributed_is_initialized())} world_size={distributed_world_size()} "
+            f"train/val/test={len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} "
+            f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
+            f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
+            f"effective_batch={summary['distributed']['effective_train_batch_size']} "
+            f"global_dropout={summary['global_prompt_dropout']:.2f} "
+            f"params={summary['trainable_adapter_parameters']:,} "
+            f"prompt_max={max(item['max_tokens'] for item in prompt_audit['splits'].values())} "
+            f"local_prompt_max={max(item['local_max_tokens'] for item in prompt_audit['splits'].values())} "
+            f"loss_weights=ce:{float(args.ce_loss_weight):g},choice:{float(args.choice_ce_loss_weight):g},"
+            f"ranking:{float(args.ranking_loss_weight):g},swap:{float(args.swapped_question_loss_weight):g} "
+            f"checkpoint_load={checkpoint_load_report.get('mode')} "
+            f"global/local_tensors={int(checkpoint_load_report.get('global_loaded_parameter_tensors', 0))}/"
+            f"{int(checkpoint_load_report.get('local_loaded_parameter_tensors', 0))}"
+        )
+    wandb_config = build_wandb_config(args, summary)
+    if not is_main_process():
+        wandb_config["wandb"]["enabled"] = False
+    wandb_logger = WandbLogger(config=wandb_config, run_dir=run_dir)
 
     best_val_score = -math.inf
     best_epoch = 0
@@ -5516,15 +5796,17 @@ def main() -> None:
             )
             history["initial_eval"] = initial_metrics
             metrics_path = run_dir / "metrics_latest.json"
-            dump_json(metrics_path, history)
+            if is_main_process():
+                dump_json(metrics_path, history)
             initial_payload = (
                 flatten_numeric_metrics("initial_eval", initial_metrics)
                 if bool(args.wandb_detailed_metrics)
                 else compact_accuracy_metrics("initial_eval", initial_metrics)
             )
             wandb_logger.log(initial_payload, step=0)
-            print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
-            if bool(args.diagnostics_enabled):
+            if is_main_process():
+                print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
+            if bool(args.diagnostics_enabled) and is_main_process():
                 pretrain_diagnostic = run_embedded_diagnostics(
                     stage="pretrain",
                     llm=llm,
@@ -5540,9 +5822,12 @@ def main() -> None:
                 wandb_logger.log(
                     compact_diagnostic_metrics(pretrain_diagnostic["aggregate"]), step=0
                 )
+            distributed_barrier()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         for epoch in range(1, int(args.epochs) + 1):
+            if train_epoch_sampler is not None and hasattr(train_epoch_sampler, "set_epoch"):
+                train_epoch_sampler.set_epoch(epoch - 1)
             if (
                 isinstance(adapter, HybridGlobalLocalAdapter)
                 and adapter.freeze_global
@@ -5551,10 +5836,11 @@ def main() -> None:
                 and epoch >= int(args.global_unfreeze_epoch)
             ):
                 adapter.set_global_trainable(True)
-                print(
-                    f"unfroze global adapter at epoch {epoch}: "
-                    f"global_lr={float(args.global_lr):.3g}, local_lr={float(args.lr):.3g}"
-                )
+                if is_main_process():
+                    print(
+                        f"unfroze global adapter at epoch {epoch}: "
+                        f"global_lr={float(args.global_lr):.3g}, local_lr={float(args.lr):.3g}"
+                    )
             adapter.train()
             running_loss = 0.0
             running_ce_loss = 0.0
@@ -5579,7 +5865,7 @@ def main() -> None:
             progress = tqdm(
                 train_loader,
                 desc=f"Epoch {epoch:03d} [train]",
-                disable=not bool(args.console_progress),
+                disable=not bool(args.console_progress) or not is_main_process(),
             )
             final_accumulation_steps = len(train_loader) % accumulation_steps
             for step, batch in enumerate(progress, start=1):
@@ -5627,6 +5913,7 @@ def main() -> None:
                 running_swapped_question_pairs += float(loss_parts["swapped_question_pairs"])
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
+                    average_trainable_gradients(adapter)
                     if isinstance(adapter, HybridGlobalLocalAdapter):
                         local_grad_norm = gradient_l2_norm(adapter.local_adapter.parameters())
                         global_grad_norm = gradient_l2_norm(adapter.global_adapter.parameters())
@@ -5682,14 +5969,14 @@ def main() -> None:
                         "train_choice_01_loss": average_choice_01_loss,
                         "train_ranking_loss": average_ranking_loss,
                         "train_weighted_ranking_loss": average_weighted_ranking_loss,
-                            "train_ranking_margin": average_ranking_margin,
-                            "train_swapped_question_loss": average_swapped_question_loss,
-                            "train_swapped_question_margin": average_swapped_question_margin,
+                        "train_ranking_margin": average_ranking_margin,
+                        "train_swapped_question_loss": average_swapped_question_loss,
+                        "train_swapped_question_margin": average_swapped_question_margin,
                         "train_total_grad_norm": average_total_grad_norm,
                         "train_local_grad_norm": average_local_grad_norm,
                         "train_global_grad_norm": average_global_grad_norm,
                     }
-                    if bool(args.save_step_metrics):
+                    if bool(args.save_step_metrics) and is_main_process():
                         history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
                         dump_json(run_dir / "metrics_latest.json", history)
                     wandb_logger.log(
@@ -5706,24 +5993,65 @@ def main() -> None:
                         step=global_step,
                     )
 
-            train_loss = running_loss / max(1, len(train_loader))
-            train_ce_loss = running_ce_loss / max(1, len(train_loader))
-            train_weighted_ce_loss = running_weighted_ce_loss / max(1, len(train_loader))
-            train_choice_ce_loss = running_choice_ce_loss / max(1, len(train_loader))
-            train_weighted_choice_ce_loss = running_weighted_choice_ce_loss / max(1, len(train_loader))
-            train_choice_accuracy = running_choice_accuracy / max(1, len(train_loader))
-            train_choice_01_loss = running_choice_01_loss / max(1, len(train_loader))
-            train_ranking_loss = running_ranking_loss / max(1, len(train_loader))
-            train_weighted_ranking_loss = running_weighted_ranking_loss / max(1, len(train_loader))
-            train_ranking_margin = running_ranking_margin / max(1, len(train_loader))
-            train_swapped_question_loss = running_swapped_question_loss / max(1, len(train_loader))
-            train_weighted_swapped_question_loss = running_weighted_swapped_question_loss / max(1, len(train_loader))
-            train_swapped_question_margin = running_swapped_question_margin / max(1, len(train_loader))
-            train_swapped_question_pairs = running_swapped_question_pairs / max(1, len(train_loader))
-            train_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
-            train_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
-            train_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
-            train_global_dropout_rate = running_global_dropout_batches / max(1, len(train_loader))
+            train_totals = distributed_sum_scalars(
+                {
+                    "loss": running_loss,
+                    "ce_loss": running_ce_loss,
+                    "weighted_ce_loss": running_weighted_ce_loss,
+                    "choice_ce_loss": running_choice_ce_loss,
+                    "weighted_choice_ce_loss": running_weighted_choice_ce_loss,
+                    "choice_accuracy": running_choice_accuracy,
+                    "choice_01_loss": running_choice_01_loss,
+                    "ranking_loss": running_ranking_loss,
+                    "weighted_ranking_loss": running_weighted_ranking_loss,
+                    "ranking_margin": running_ranking_margin,
+                    "swapped_question_loss": running_swapped_question_loss,
+                    "weighted_swapped_question_loss": running_weighted_swapped_question_loss,
+                    "swapped_question_margin": running_swapped_question_margin,
+                    "swapped_question_pairs": running_swapped_question_pairs,
+                    "total_grad_norm": running_total_grad_norm,
+                    "local_grad_norm": running_local_grad_norm,
+                    "global_grad_norm": running_global_grad_norm,
+                    "global_dropout_batches": float(running_global_dropout_batches),
+                    "batch_count": float(len(train_loader)),
+                    "optimizer_update_count": float(optimizer_update_count),
+                },
+                device=device,
+            )
+            global_batch_count = max(1.0, train_totals["batch_count"])
+            global_update_count = max(1.0, train_totals["optimizer_update_count"])
+            train_loss = train_totals["loss"] / global_batch_count
+            train_ce_loss = train_totals["ce_loss"] / global_batch_count
+            train_weighted_ce_loss = train_totals["weighted_ce_loss"] / global_batch_count
+            train_choice_ce_loss = train_totals["choice_ce_loss"] / global_batch_count
+            train_weighted_choice_ce_loss = (
+                train_totals["weighted_choice_ce_loss"] / global_batch_count
+            )
+            train_choice_accuracy = train_totals["choice_accuracy"] / global_batch_count
+            train_choice_01_loss = train_totals["choice_01_loss"] / global_batch_count
+            train_ranking_loss = train_totals["ranking_loss"] / global_batch_count
+            train_weighted_ranking_loss = (
+                train_totals["weighted_ranking_loss"] / global_batch_count
+            )
+            train_ranking_margin = train_totals["ranking_margin"] / global_batch_count
+            train_swapped_question_loss = (
+                train_totals["swapped_question_loss"] / global_batch_count
+            )
+            train_weighted_swapped_question_loss = (
+                train_totals["weighted_swapped_question_loss"] / global_batch_count
+            )
+            train_swapped_question_margin = (
+                train_totals["swapped_question_margin"] / global_batch_count
+            )
+            train_swapped_question_pairs = (
+                train_totals["swapped_question_pairs"] / global_batch_count
+            )
+            train_total_grad_norm = train_totals["total_grad_norm"] / global_update_count
+            train_local_grad_norm = train_totals["local_grad_norm"] / global_update_count
+            train_global_grad_norm = train_totals["global_grad_norm"] / global_update_count
+            train_global_dropout_rate = (
+                train_totals["global_dropout_batches"] / global_batch_count
+            )
             val_metrics = evaluate_choice_accuracy(
                 llm=llm,
                 adapter=adapter,
@@ -5756,15 +6084,16 @@ def main() -> None:
                 "val": val_metrics,
             }
             history[f"epoch_{epoch:04d}"] = epoch_payload
-            dump_json(run_dir / "metrics_latest.json", history)
-            save_adapter_checkpoint(
-                run_dir / "adapter_last.pt",
-                adapter=adapter,
-                args=args,
-                latent_shape=latent_shape,
-                llm_hidden_size=llm_hidden_size,
-                metrics=epoch_payload,
-            )
+            if is_main_process():
+                dump_json(run_dir / "metrics_latest.json", history)
+                save_adapter_checkpoint(
+                    run_dir / "adapter_last.pt",
+                    adapter=adapter,
+                    args=args,
+                    latent_shape=latent_shape,
+                    llm_hidden_size=llm_hidden_size,
+                    metrics=epoch_payload,
+                )
             val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
             val_macro_latent_gain = macro_latent_gain(val_metrics)
             val_score = checkpoint_score(val_metrics, str(args.checkpoint_metric))
@@ -5815,19 +6144,21 @@ def main() -> None:
             if val_score > best_val_score:
                 best_val_score = val_score
                 best_epoch = epoch
-                save_adapter_checkpoint(
-                    run_dir / "adapter_best.pt",
-                    adapter=adapter,
-                    args=args,
-                    latent_shape=latent_shape,
-                    llm_hidden_size=llm_hidden_size,
-                    metrics=epoch_payload,
-                )
+                if is_main_process():
+                    save_adapter_checkpoint(
+                        run_dir / "adapter_best.pt",
+                        adapter=adapter,
+                        args=args,
+                        latent_shape=latent_shape,
+                        llm_hidden_size=llm_hidden_size,
+                        metrics=epoch_payload,
+                    )
             diagnostic_suffix = ""
             if (
                 bool(args.diagnostics_enabled)
                 and int(args.diagnostics_every_epochs) > 0
                 and epoch % int(args.diagnostics_every_epochs) == 0
+                and is_main_process()
             ):
                 diagnostic_summary = run_embedded_diagnostics(
                     stage=f"epoch_{epoch:04d}",
@@ -5852,15 +6183,19 @@ def main() -> None:
                     f" diag_local_l2={float(diagnostic_aggregate['local_prompt_relative_l2_mean']):.4f}"
                     f" diag_margin_gain={float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
                 )
+            distributed_barrier()
             wandb_logger.log(wandb_payload, step=global_step)
-            print(
-                f"epoch={epoch:03d}/{int(args.epochs):03d} "
-                f"loss={train_loss:.4f} train_acc={train_choice_accuracy:.4f} "
-                f"val={val_accuracy:.4f} shuffled={float(val_metrics.get('shuffled', {}).get('accuracy', 0.0)):.4f} "
-                f"macro_gain={val_macro_latent_gain:.4f} best_epoch={best_epoch}"
-                f"{diagnostic_suffix}"
-            )
+            if is_main_process():
+                print(
+                    f"epoch={epoch:03d}/{int(args.epochs):03d} "
+                    f"loss={train_loss:.4f} train_acc={train_choice_accuracy:.4f} "
+                    f"val={val_accuracy:.4f} "
+                    f"shuffled={float(val_metrics.get('shuffled', {}).get('accuracy', 0.0)):.4f} "
+                    f"macro_gain={val_macro_latent_gain:.4f} best_epoch={best_epoch}"
+                    f"{diagnostic_suffix}"
+                )
 
+        distributed_barrier()
         best_checkpoint_path = run_dir / "adapter_best.pt"
         if not best_checkpoint_path.exists():
             raise FileNotFoundError("Training completed without producing adapter_best.pt.")
@@ -5870,10 +6205,11 @@ def main() -> None:
             raise ValueError("adapter_best.pt does not contain adapter_state_dict.")
         adapter.load_state_dict(best_state_dict, strict=True)
         adapter.to(device)
-        print(
-            f"testing best checkpoint: epoch={best_epoch} "
-            f"{args.checkpoint_metric}={best_val_score:.6f}"
-        )
+        if is_main_process():
+            print(
+                f"testing best checkpoint: epoch={best_epoch} "
+                f"{args.checkpoint_metric}={best_val_score:.6f}"
+            )
         test_metrics = evaluate_choice_accuracy(
             llm=llm,
             adapter=adapter,
@@ -5883,34 +6219,54 @@ def main() -> None:
             args=args,
             baseline_modes=final_baseline_modes,
         )
-        dump_json(run_dir / "test_metrics.json", test_metrics)
+        if is_main_process():
+            dump_json(run_dir / "test_metrics.json", test_metrics)
         test_payload = (
             flatten_numeric_metrics("test", test_metrics)
             if bool(args.wandb_detailed_metrics)
             else compact_accuracy_metrics("test", test_metrics)
         )
         wandb_logger.log(test_payload, step=global_step + 1)
-        summary["result"] = {
-            "best_epoch": int(best_epoch),
-            "best_val_score": float(best_val_score),
-            "checkpoint_metric": str(args.checkpoint_metric),
-            "test_correct_accuracy": float(test_metrics.get("correct", {}).get("accuracy", 0.0)),
-            "test_shuffled_accuracy": float(test_metrics.get("shuffled", {}).get("accuracy", 0.0)),
-            "test_correct_by_task": dict(test_metrics.get("correct", {}).get("by_task", {})),
-        }
-        dump_json(run_dir / "run_summary.json", summary)
-        if bool(args.wandb_log_model):
-            log_adapter_artifact(wandb_logger, run_dir / "adapter_best.pt", f"{args.run_name}-best")
-            log_adapter_artifact(wandb_logger, run_dir / "adapter_last.pt", f"{args.run_name}-last")
-        print(f"run_dir: {run_dir}")
-        print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
+        if is_main_process():
+            summary["result"] = {
+                "best_epoch": int(best_epoch),
+                "best_val_score": float(best_val_score),
+                "checkpoint_metric": str(args.checkpoint_metric),
+                "test_correct_accuracy": float(
+                    test_metrics.get("correct", {}).get("accuracy", 0.0)
+                ),
+                "test_shuffled_accuracy": float(
+                    test_metrics.get("shuffled", {}).get("accuracy", 0.0)
+                ),
+                "test_correct_by_task": dict(
+                    test_metrics.get("correct", {}).get("by_task", {})
+                ),
+            }
+            dump_json(run_dir / "run_summary.json", summary)
+            if bool(args.wandb_log_model):
+                log_adapter_artifact(
+                    wandb_logger,
+                    run_dir / "adapter_best.pt",
+                    f"{args.run_name}-best",
+                )
+                log_adapter_artifact(
+                    wandb_logger,
+                    run_dir / "adapter_last.pt",
+                    f"{args.run_name}-last",
+                )
+            print(f"run_dir: {run_dir}")
+            print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
     finally:
         wandb_logger.finish()
-    timing = lifecycle.finish("completed")
-    print(
-        f"completed_at={timing['ended_at']} duration_seconds={timing['duration_seconds']} "
-        f"timing_file={run_dir / 'run_timing.json'}"
-    )
+    distributed_barrier()
+    if is_main_process():
+        if lifecycle is None:
+            raise RuntimeError("Rank 0 lost its run lifecycle before completion.")
+        timing = lifecycle.finish("completed")
+        print(
+            f"completed_at={timing['ended_at']} duration_seconds={timing['duration_seconds']} "
+            f"timing_file={run_dir / 'run_timing.json'}"
+        )
 
 
 if __name__ == "__main__":
@@ -5924,3 +6280,6 @@ if __name__ == "__main__":
         if _ACTIVE_RUN_LIFECYCLE is not None:
             _ACTIVE_RUN_LIFECYCLE.finish("failed", exc)
         raise
+    finally:
+        if distributed_is_initialized():
+            dist.destroy_process_group()
