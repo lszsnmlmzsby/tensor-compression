@@ -10,7 +10,7 @@ import random
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -113,6 +113,14 @@ def distributed_barrier() -> None:
         dist.barrier()
 
 
+def broadcast_object_from_rank_zero(value: Any) -> Any:
+    if not distributed_is_initialized():
+        return value
+    payload = [value if is_main_process() else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
 def build_distributed_run_dir(output_root: str | Path, run_name: str) -> Path:
     if not distributed_is_initialized():
         return build_run_dir(output_root, run_name)
@@ -151,6 +159,31 @@ def distributed_sum_scalars(values: Mapping[str, float], device: torch.device) -
     if distributed_is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return {name: float(value) for name, value in zip(names, tensor.cpu().tolist())}
+
+
+def gather_cuda_memory(device: torch.device) -> list[dict[str, float]]:
+    if device.type != "cuda":
+        return []
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    local = torch.tensor(
+        [free_bytes, total_bytes, torch.cuda.memory_allocated(device)],
+        dtype=torch.int64,
+        device=device,
+    )
+    if distributed_is_initialized():
+        gathered = [torch.empty_like(local) for _ in range(distributed_world_size())]
+        dist.all_gather(gathered, local)
+    else:
+        gathered = [local]
+    return [
+        {
+            "rank": float(rank),
+            "free_gib": float(values[0].item()) / 1024**3,
+            "total_gib": float(values[1].item()) / 1024**3,
+            "allocated_gib": float(values[2].item()) / 1024**3,
+        }
+        for rank, values in enumerate(gathered)
+    ]
 
 
 def local_timestamp() -> str:
@@ -1024,6 +1057,7 @@ class TensorReadoutQADataset(Dataset):
         max_records: int | None = None,
         prefer_record_latent_ref: bool = False,
         shuffle_seed: int = 42,
+        latent_cache_size: int = 0,
     ) -> None:
         self.jsonl_path = Path(jsonl_path)
         self.latent_dir = Path(latent_dir)
@@ -1033,6 +1067,9 @@ class TensorReadoutQADataset(Dataset):
             self.records = self.records[: max(0, int(max_records))]
         if not self.records:
             raise RuntimeError(f"No QA records found in {self.jsonl_path}.")
+        self.latent_cache_size = max(0, int(latent_cache_size))
+        self._latent_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._latent_path_cache: dict[str, Path] = {}
         self._random_different_indices = self._build_random_different_indices(int(shuffle_seed))
 
     @staticmethod
@@ -1052,15 +1089,22 @@ class TensorReadoutQADataset(Dataset):
         return records
 
     def _build_random_different_indices(self, seed: int) -> list[int]:
-        total = len(self.records)
         unique_states = {str(record.get("state_ref", "")) for record in self.records}
         if len(unique_states) < 2:
             raise RuntimeError(
                 "Cannot build shuffled latent baseline: every record belongs to the same state_ref."
             )
         rng = random.Random(seed)
-        indices_by_field_task: dict[tuple[str, str], list[int]] = defaultdict(list)
-        indices_by_field: dict[str, list[int]] = defaultdict(list)
+        by_field_task_sample: dict[tuple[str, str], dict[int, list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        by_field_task_state: dict[tuple[str, str], dict[str, list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        by_field_sample: dict[str, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+        by_field_state: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        by_sample: dict[int, list[int]] = defaultdict(list)
+        by_state: dict[str, list[int]] = defaultdict(list)
         for candidate_index, candidate_record in enumerate(self.records):
             field = str(
                 candidate_record.get("field")
@@ -1068,52 +1112,74 @@ class TensorReadoutQADataset(Dataset):
                 or ""
             )
             task = str(candidate_record.get("task_type", ""))
-            indices_by_field_task[(field, task)].append(candidate_index)
-            indices_by_field[field].append(candidate_index)
+            sample_index = int(candidate_record.get("sample_index", -1))
+            state_ref = str(candidate_record.get("state_ref", ""))
+            by_field_task_sample[(field, task)][sample_index].append(candidate_index)
+            by_field_task_state[(field, task)][state_ref].append(candidate_index)
+            by_field_sample[field][sample_index].append(candidate_index)
+            by_field_state[field][state_ref].append(candidate_index)
+            by_sample[sample_index].append(candidate_index)
+            by_state[state_ref].append(candidate_index)
+
+        def index_buckets(
+            buckets: Mapping[Any, Sequence[int]],
+        ) -> tuple[tuple[Any, ...], dict[Any, int], Mapping[Any, Sequence[int]]]:
+            keys = tuple(buckets)
+            return keys, {key: index for index, key in enumerate(keys)}, buckets
+
+        field_task_sources = {
+            key: index_buckets(buckets) for key, buckets in by_field_task_sample.items()
+        }
+        field_task_state_sources = {
+            key: index_buckets(buckets) for key, buckets in by_field_task_state.items()
+        }
+        field_sources = {key: index_buckets(buckets) for key, buckets in by_field_sample.items()}
+        field_state_sources = {key: index_buckets(buckets) for key, buckets in by_field_state.items()}
+        sample_source = index_buckets(by_sample)
+        state_source = index_buckets(by_state)
+
+        def choose_from_other_bucket(
+            source: tuple[tuple[Any, ...], Mapping[Any, int], Mapping[Any, Sequence[int]]],
+            excluded_key: Any,
+        ) -> int | None:
+            keys, positions, buckets = source
+            if not keys:
+                return None
+            excluded_position = positions.get(excluded_key)
+            if excluded_position is None:
+                selected_key = keys[rng.randrange(len(keys))]
+            elif len(keys) <= 1:
+                return None
+            else:
+                selected_position = rng.randrange(len(keys) - 1)
+                if selected_position >= excluded_position:
+                    selected_position += 1
+                selected_key = keys[selected_position]
+            return int(rng.choice(buckets[selected_key]))
+
         indices: list[int] = []
-        for index, record in enumerate(self.records):
+        for record in self.records:
             state_ref = str(record.get("state_ref", ""))
             sample_index = int(record.get("sample_index", -1))
             field = str(record.get("field") or record.get("metadata", {}).get("field") or "")
             task = str(record.get("task_type", ""))
-            candidates = [
-                candidate
-                for candidate in indices_by_field_task.get((field, task), [])
-                if int(self.records[candidate].get("sample_index", -1)) != sample_index
-            ]
-            if not candidates:
-                candidates = [
-                    candidate
-                    for candidate in indices_by_field.get(field, [])
-                    if int(self.records[candidate].get("sample_index", -1)) != sample_index
-                ]
-            if not candidates:
-                candidates = [
-                    candidate
-                    for candidate in range(total)
-                    if int(self.records[candidate].get("sample_index", -1)) != sample_index
-                ]
-            if not candidates:
-                candidates = [
-                    candidate
-                    for candidate in indices_by_field_task.get((field, task), [])
-                    if str(self.records[candidate].get("state_ref", "")) != state_ref
-                ]
-            if not candidates:
-                candidates = [
-                    candidate
-                    for candidate in indices_by_field.get(field, [])
-                    if str(self.records[candidate].get("state_ref", "")) != state_ref
-                ]
-            if not candidates:
-                candidates = [
-                    candidate
-                    for candidate in range(total)
-                    if str(self.records[candidate].get("state_ref", "")) != state_ref
-                ]
-            if not candidates:
+            candidate = choose_from_other_bucket(
+                field_task_sources.get((field, task), ((), {}, {})), sample_index
+            )
+            if candidate is None:
+                candidate = choose_from_other_bucket(field_sources.get(field, ((), {}, {})), sample_index)
+            if candidate is None:
+                candidate = choose_from_other_bucket(sample_source, sample_index)
+            if candidate is None:
+                candidate = choose_from_other_bucket(
+                    field_task_state_sources.get((field, task), ((), {}, {})), state_ref
+                )
+            if candidate is None:
+                candidate = choose_from_other_bucket(field_state_sources.get(field, ((), {}, {})), state_ref)
+            if candidate is None:
+                candidate = choose_from_other_bucket(state_source, state_ref)
+            if candidate is None:
                 raise RuntimeError("Failed to sample a different-state shuffled latent.")
-            candidate = int(rng.choice(candidates))
             indices.append(int(candidate))
         return indices
 
@@ -1134,20 +1200,31 @@ class TensorReadoutQADataset(Dataset):
             sample_index = int(record["sample_index"])
             time_index = int(record["time_index"])
             state_ref = f"sample{sample_index:06d}_t{time_index:04d}"
+        cached = self._latent_path_cache.get(state_ref)
+        if cached is not None:
+            return cached
         latent_from_dir = self.latent_dir / f"{state_ref}.pt"
         record_ref = record.get("latent_ref")
         if self.prefer_record_latent_ref and record_ref:
-            return Path(str(record_ref))
-        if latent_from_dir.exists():
-            return latent_from_dir
-        if record_ref:
-            return Path(str(record_ref))
-        return latent_from_dir
+            selected = Path(str(record_ref))
+        elif latent_from_dir.exists():
+            selected = latent_from_dir
+        elif record_ref:
+            selected = Path(str(record_ref))
+        else:
+            selected = latent_from_dir
+        self._latent_path_cache[state_ref] = selected
+        return selected
 
     def load_latent_for_record(self, record: Mapping[str, Any]) -> torch.Tensor:
         path = self.latent_path_for_record(record)
         if not path.exists():
             raise FileNotFoundError(f"Latent cache file not found: {path}")
+        cache_key = str(path)
+        cached = self._latent_cache.get(cache_key)
+        if cached is not None:
+            self._latent_cache.move_to_end(cache_key)
+            return cached
         payload = torch.load(path, map_location="cpu")
         latent = payload.get("latent_map") if isinstance(payload, Mapping) else payload
         if not isinstance(latent, torch.Tensor):
@@ -1156,7 +1233,13 @@ class TensorReadoutQADataset(Dataset):
             latent = latent.squeeze(0)
         if latent.ndim != 3:
             raise ValueError(f"Expected latent_map [C,H,W], got {tuple(latent.shape)} from {path}")
-        return latent.to(dtype=torch.float32)
+        latent = latent.to(dtype=torch.float32)
+        if self.latent_cache_size > 0:
+            self._latent_cache[cache_key] = latent
+            self._latent_cache.move_to_end(cache_key)
+            while len(self._latent_cache) > self.latent_cache_size:
+                self._latent_cache.popitem(last=False)
+        return latent
 
     def load_shuffled_latent(self, index: int) -> torch.Tensor:
         other_index = self._random_different_indices[int(index)]
@@ -1325,9 +1408,11 @@ def audit_qa_datasets(
                 raise ValueError(f"QA audit found invalid choices/answer: {qa_id}")
             choice_labels[task].update(str(choice) for choice in choices)
             latent_path = dataset.latent_path_for_record(record)
-            if not latent_path.exists():
-                raise FileNotFoundError(f"QA audit found a missing latent cache file: {latent_path}")
-            latent_paths.add(str(latent_path.resolve()))
+            resolved_latent_path = str(latent_path.resolve())
+            if resolved_latent_path not in latent_paths:
+                if not latent_path.exists():
+                    raise FileNotFoundError(f"QA audit found a missing latent cache file: {latent_path}")
+                latent_paths.add(resolved_latent_path)
             if task in {"normalized_point_value", "raw_point_value_with_stats"}:
                 displayed = _DISPLAYED_OPTION_PATTERN.findall(str(record.get("query") or record.get("question") or ""))
                 displayed_values = [float(value) for _label, value in displayed]
@@ -1451,6 +1536,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-disjoint-splits", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--require-untruncated-prompts", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--prefer-record-latent-ref", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--latent-cache-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--torch-dtype",
@@ -1466,7 +1553,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--eval-choice-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--train-choice-batch-size",
+        type=int,
+        default=None,
+        help="Maximum candidate-answer sequences sent through the frozen LLM in one training forward.",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument(
+        "--llm-gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Checkpoint frozen-LLM decoder layers while retaining gradients to tensor soft prompts.",
+    )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default=None)
     parser.add_argument("--warmup-ratio", type=float, default=None)
@@ -1683,6 +1782,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         first_nested(config, ["llm_training.prefer_record_latent_ref"]),
         False,
     )
+    set_default(args, "latent_cache_size", first_nested(config, ["llm_training.latent_cache_size"]), 32768)
+    set_default(args, "num_workers", first_nested(config, ["llm_training.num_workers"]), 0)
     set_default(args, "device", first_nested(config, ["llm_training.device", "runtime.device"]), "auto")
     set_default(args, "torch_dtype", first_nested(config, ["llm_training.torch_dtype", "model.torch_dtype"]), "auto")
     set_default(args, "trust_remote_code", first_nested(config, ["model.trust_remote_code"]), False)
@@ -1694,9 +1795,21 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "eval_choice_batch_size", first_nested(config, ["llm_training.eval_choice_batch_size"]), 16)
     set_default(
         args,
+        "train_choice_batch_size",
+        first_nested(config, ["llm_training.train_choice_batch_size"]),
+        4,
+    )
+    set_default(
+        args,
         "gradient_accumulation_steps",
         first_nested(config, ["llm_training.gradient_accumulation_steps"]),
         1,
+    )
+    set_default(
+        args,
+        "llm_gradient_checkpointing",
+        first_nested(config, ["llm_training.llm_gradient_checkpointing"]),
+        True,
     )
     set_default(args, "lr", first_nested(config, ["llm_training.lr"]), 1.0e-4)
     set_default(args, "lr_scheduler", first_nested(config, ["llm_training.lr_scheduler"]), "constant")
@@ -1844,6 +1957,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "batch_size",
         "eval_batch_size",
         "eval_choice_batch_size",
+        "train_choice_batch_size",
         "gradient_accumulation_steps",
         "max_prompt_tokens",
         "max_target_tokens",
@@ -1879,6 +1993,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError(f"Unsupported adapter.local_fusion_mode: {args.local_fusion_mode}")
     if int(args.initial_eval_records) < 0:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
+    if int(args.latent_cache_size) < 0 or int(args.num_workers) < 0:
+        raise ValueError("llm_training.latent_cache_size and num_workers must be non-negative.")
     for setting in (
         "ce_loss_weight",
         "choice_ce_loss_weight",
@@ -2106,6 +2222,17 @@ def resolve_model_dtype(raw: str, device: torch.device) -> torch.dtype:
     return mapping[raw]
 
 
+def set_frozen_llm_execution_mode(model: nn.Module, checkpoint_training: bool) -> None:
+    checkpointing_active = bool(getattr(model, "is_gradient_checkpointing", False))
+    if checkpoint_training and checkpointing_active:
+        model.train()
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                module.eval()
+    else:
+        model.eval()
+
+
 def load_tokenizer(args: argparse.Namespace):
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
@@ -2131,10 +2258,24 @@ def load_llm(args: argparse.Namespace, device: torch.device):
         trust_remote_code=bool(args.trust_remote_code),
     )
     model.to(device)
-    model.eval()
     model.config.use_cache = False
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    if bool(args.llm_gradient_checkpointing):
+        enable_checkpointing = getattr(model, "gradient_checkpointing_enable", None)
+        if not callable(enable_checkpointing):
+            raise ValueError("The selected causal LLM does not support gradient checkpointing.")
+        try:
+            enable_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            enable_checkpointing()
+        if not bool(getattr(model, "is_gradient_checkpointing", False)):
+            raise RuntimeError("The causal LLM did not report active gradient checkpointing.")
+        # Transformers activates decoder checkpointing only in training mode. Qwen2.5 uses zero
+        # dropout, but keep every Dropout module deterministic in case another compatible LLM does not.
+        set_frozen_llm_execution_mode(model, checkpoint_training=True)
+    else:
+        set_frozen_llm_execution_mode(model, checkpoint_training=False)
     return model, model_dtype
 
 
@@ -3045,24 +3186,37 @@ def choice_ce_loss(
         else None
     )
 
-    flat_nll_sum, flat_target_counts = forward_answer_nll(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        records=candidate_records,
-        answers=candidate_answers,
-        latent_map=torch.stack(candidate_latents, dim=0),
-        device=device,
-        max_prompt_tokens=int(args.max_prompt_tokens),
-        max_target_tokens=int(args.max_target_tokens),
-        append_eos=bool(args.append_eos),
-        prompt_template=str(args.prompt_template),
-        soft_prompt_mode=soft_prompt_mode,
-        reduction="sum",
-        return_target_counts=True,
-        local_context_layer=int(args.local_context_layer),
-        precomputed_soft_embeds=candidate_soft_embeds,
-    )
+    nll_chunks: list[torch.Tensor] = []
+    count_chunks: list[torch.Tensor] = []
+    candidate_batch_size = max(1, int(args.train_choice_batch_size))
+    for start in range(0, len(candidate_records), candidate_batch_size):
+        end = min(len(candidate_records), start + candidate_batch_size)
+        chunk_nll, chunk_counts = forward_answer_nll(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=candidate_records[start:end],
+            answers=candidate_answers[start:end],
+            latent_map=torch.stack(candidate_latents[start:end], dim=0),
+            device=device,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            max_target_tokens=int(args.max_target_tokens),
+            append_eos=bool(args.append_eos),
+            prompt_template=str(args.prompt_template),
+            soft_prompt_mode=soft_prompt_mode,
+            reduction="sum",
+            return_target_counts=True,
+            local_context_layer=int(args.local_context_layer),
+            precomputed_soft_embeds=(
+                candidate_soft_embeds[start:end]
+                if candidate_soft_embeds is not None
+                else None
+            ),
+        )
+        nll_chunks.append(chunk_nll)
+        count_chunks.append(chunk_counts)
+    flat_nll_sum = torch.cat(nll_chunks, dim=0)
+    flat_target_counts = torch.cat(count_chunks, dim=0)
     if str(args.choice_score) == "mean":
         flat_nll = flat_nll_sum / flat_target_counts.clamp_min(1)
     elif str(args.choice_score) == "sum":
@@ -3707,6 +3861,8 @@ def evaluate_choice_accuracy(
     args: argparse.Namespace,
     baseline_modes: Sequence[str],
 ) -> dict[str, Any]:
+    llm_was_training = bool(llm.training)
+    llm.eval()
     eval_sampler = (
         ExactDistributedEvalSampler(
             dataset,
@@ -3721,7 +3877,9 @@ def evaluate_choice_accuracy(
         batch_size=max(1, int(args.eval_batch_size)),
         shuffle=False,
         sampler=eval_sampler,
-        num_workers=0,
+        num_workers=int(args.num_workers),
+        persistent_workers=int(args.num_workers) > 0,
+        pin_memory=device.type == "cuda",
         collate_fn=collate_tensor_readout,
     )
     adapter.eval()
@@ -3816,6 +3974,8 @@ def evaluate_choice_accuracy(
             },
         }
     adapter.train()
+    if llm_was_training:
+        set_frozen_llm_execution_mode(llm, checkpoint_training=True)
     return metrics
 
 
@@ -4090,7 +4250,9 @@ def run_embedded_diagnostics(
     tensor_payload: dict[str, Any] = {"stage": stage, "records": {}}
     summaries: list[dict[str, Any]] = []
     was_training = adapter.training
+    llm_was_training = bool(llm.training)
     adapter.eval()
+    llm.eval()
     for index in selected:
         record = dataset.records[index]
         records = [record]
@@ -4711,6 +4873,8 @@ def run_embedded_diagnostics(
     atomic_torch_save(diagnostic_dir / f"{stage}_states.pt", tensor_payload)
     if was_training:
         adapter.train()
+    if llm_was_training:
+        set_frozen_llm_execution_mode(llm, checkpoint_training=True)
     return summary
 
 
@@ -5205,9 +5369,16 @@ def main() -> None:
                 run_dir / "config_snapshot.json",
                 redacted_config_snapshot(load_yaml_mapping(args.config)),
             )
-    qa_metadata_audit = audit_qa_metadata(args)
+        print(
+            f"run={run_dir.name} started_at={lifecycle.started_at if lifecycle is not None else local_timestamp()} "
+            "startup=metadata_audit"
+        )
+    qa_metadata_audit = broadcast_object_from_rank_zero(
+        audit_qa_metadata(args) if is_main_process() else None
+    )
     if is_main_process():
         dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit)
+        print("startup=dataset_index")
 
     train_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.train_split),
@@ -5215,6 +5386,7 @@ def main() -> None:
         max_records=args.max_train_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
+        latent_cache_size=int(args.latent_cache_size),
     )
     val_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.val_split),
@@ -5222,6 +5394,7 @@ def main() -> None:
         max_records=args.max_val_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
+        latent_cache_size=int(args.latent_cache_size),
     )
     test_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.test_split),
@@ -5229,24 +5402,39 @@ def main() -> None:
         max_records=args.max_test_records,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
+        latent_cache_size=int(args.latent_cache_size),
     )
     first_latent = train_dataset[0]["latent_map"]
     latent_shape = tuple(int(dim) for dim in first_latent.shape)
     latent_channels = int(latent_shape[0])
     datasets = {"train": train_dataset, "val": val_dataset, "test": test_dataset}
-    data_audit = audit_qa_datasets(
-        datasets,
-        require_disjoint_splits=bool(args.require_disjoint_splits),
+    if is_main_process():
+        print(
+            f"startup=data_audit train/val/test={len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)}"
+        )
+    data_audit = broadcast_object_from_rank_zero(
+        audit_qa_datasets(
+            datasets,
+            require_disjoint_splits=bool(args.require_disjoint_splits),
+        )
+        if is_main_process()
+        else None
     )
     if is_main_process():
         dump_json(run_dir / "data_audit.json", data_audit)
 
+    if is_main_process():
+        print("startup=tokenizer_and_prompt_audit")
     tokenizer = load_tokenizer(args)
-    prompt_audit = audit_prompt_tokenization(
-        datasets=datasets,
-        tokenizer=tokenizer,
-        max_prompt_tokens=int(args.max_prompt_tokens),
-        prompt_template=str(args.prompt_template),
+    prompt_audit = broadcast_object_from_rank_zero(
+        audit_prompt_tokenization(
+            datasets=datasets,
+            tokenizer=tokenizer,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            prompt_template=str(args.prompt_template),
+        )
+        if is_main_process()
+        else None
     )
     if is_main_process():
         dump_json(run_dir / "prompt_audit.json", prompt_audit)
@@ -5256,7 +5444,32 @@ def main() -> None:
             f"max_prompt_tokens={int(args.max_prompt_tokens)}. Increase the limit so formal runs do not "
             "silently remove natural-language instructions. See prompt_audit.json."
         )
+    pre_load_memory = gather_cuda_memory(device)
+    if is_main_process():
+        memory_suffix = ""
+        if pre_load_memory:
+            memory_suffix = " gpu_memory=" + ",".join(
+                f"r{int(item['rank'])}:{item['free_gib']:.2f}/{item['total_gib']:.2f}GiB"
+                for item in pre_load_memory
+            )
+            if any(item["free_gib"] < 0.95 * item["total_gib"] for item in pre_load_memory):
+                memory_suffix += " warning=visible_gpu_not_empty"
+        print(
+            f"startup=llm_load visible_cuda={os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}"
+            f"{memory_suffix}"
+        )
     llm, model_dtype = load_llm(args, device)
+    post_load_memory = gather_cuda_memory(device)
+    if is_main_process() and post_load_memory:
+        print(
+            "startup=llm_loaded gpu_memory="
+            + ",".join(
+                f"r{int(item['rank'])}:allocated={item['allocated_gib']:.2f}GiB,"
+                f"free={item['free_gib']:.2f}/{item['total_gib']:.2f}GiB"
+                for item in post_load_memory
+            )
+            + f" gradient_checkpointing={int(bool(args.llm_gradient_checkpointing))}"
+        )
     llm_hidden_size = int(llm.get_input_embeddings().embedding_dim)
     diagnostic_layer_audit = (
         validate_diagnostic_layers(llm, args.diagnostics_layers)
@@ -5276,6 +5489,8 @@ def main() -> None:
         else {"validated_before_training": False, "reason": "input_embeddings mode"}
     )
     if str(args.local_question_input_mode) == "contextual_tokens":
+        llm_was_training = bool(llm.training)
+        llm.eval()
         preflight_ids, preflight_mask = build_local_question_tensors(
             records=[train_dataset.records[0]],
             tokenizer=tokenizer,
@@ -5301,6 +5516,8 @@ def main() -> None:
             }
         )
         del preflight_context
+        if llm_was_training:
+            set_frozen_llm_execution_mode(llm, checkpoint_training=True)
 
     initialization = "random"
     checkpoint_load_report: dict[str, Any] = {"mode": "random"}
@@ -5581,7 +5798,9 @@ def main() -> None:
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_epoch_sampler,
-            num_workers=0,
+            num_workers=int(args.num_workers),
+            persistent_workers=int(args.num_workers) > 0,
+            pin_memory=device.type == "cuda",
             collate_fn=collate_tensor_readout,
         )
     else:
@@ -5599,7 +5818,9 @@ def main() -> None:
             batch_size=max(1, int(args.batch_size)),
             shuffle=train_epoch_sampler is None,
             sampler=train_epoch_sampler,
-            num_workers=0,
+            num_workers=int(args.num_workers),
+            persistent_workers=int(args.num_workers) > 0,
+            pin_memory=device.type == "cuda",
             collate_fn=collate_tensor_readout,
         )
     if isinstance(adapter, HybridGlobalLocalAdapter):
@@ -5654,6 +5875,7 @@ def main() -> None:
             "rank": distributed_rank(),
             "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
             "per_rank_batch_size": int(args.batch_size),
+            "train_choice_batch_size": int(args.train_choice_batch_size),
             "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
             "effective_train_batch_size": (
                 int(args.batch_size)
@@ -5664,11 +5886,14 @@ def main() -> None:
             "evaluation_sharding": "exact_nonpadding",
         },
         "model_dtype": str(model_dtype).replace("torch.", ""),
+        "llm_gradient_checkpointing": bool(args.llm_gradient_checkpointing),
         "llm_hidden_size": llm_hidden_size,
         "latent_shape_chw": list(latent_shape),
         "train_records": len(train_dataset),
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
+        "latent_cache_size": int(args.latent_cache_size),
+        "num_workers": int(args.num_workers),
         "shuffle_seed": int(args.shuffle_seed),
         "shuffled_negative_policy": "same_field_task_different_sample_then_fallback",
         "ce_loss_weight": float(args.ce_loss_weight),
@@ -5784,6 +6009,7 @@ def main() -> None:
                 max_records=initial_count,
                 prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
                 shuffle_seed=int(args.shuffle_seed),
+                latent_cache_size=int(args.latent_cache_size),
             )
             initial_metrics = evaluate_choice_accuracy(
                 llm=llm,

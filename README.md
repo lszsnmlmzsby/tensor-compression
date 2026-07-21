@@ -1484,6 +1484,54 @@ same-tensor/same-task 问题组；验证和测试精确分片且不补齐重复�
 W&B 只由 rank 0 写入。单卡回退时使用原来的 Python 命令，并加
 `--gradient-accumulation-steps 5` 恢复 effective batch 15。
 
+Qwen2.5-32B 的参数虽然冻结，答案损失仍要穿过全部 decoder layers 回传到 tensor prefix。Stage 2
+因此默认启用 non-reentrant `llm_gradient_checkpointing`，并用 `train_choice_batch_size: 4` 将一个
+三问题 batch 展开的 12 个候选分成三次 frozen-LLM forward；loss 仍在全部候选上计算，任务和梯度
+目标不变。启动日志会在模型加载前报告可见卡及空闲显存，低于总容量 95% 时标记
+`warning=visible_gpu_not_empty`。训练数据的 shuffled-negative 索引按 sample bucket 线性构造，latent
+使用有界 CPU LRU cache，避免大数据集启动时的近二次扫描和同一 `.pt` 文件反复读取。
+
+#### Stage 2 空闲 GPU sweep 调度
+
+`scripts/run_tensor_llm_adapter_sweep.py` 扫描 `nvidia-smi` 报告的全部 GPU。每当一张卡的
+空闲显存达到配置阈值，就在该卡启动下一个编号实验；调度器内部排除已经分配给其他 sweep 的卡。
+默认一张 A800 对应一个独立实验，并用梯度累积 5 保持 effective batch 15。这样比把一个实验拆到
+多卡更适合并行比较参数。
+
+默认清单位于 `configs/tensor_llm_adapter_stage2_sweep.yaml`，只做单因素修改：
+
+| 编号 | 相对 S001 的修改 | 目的 |
+|---|---|---|
+| `S001` | 无 | 当前配置基线。 |
+| `S002` | `lr: 5e-5` | 更保守地微调继承的空间 adapter。 |
+| `S003` | `swapped_question_loss_weight: 0.2` | 加强自然语言问题 grounding。 |
+| `S004` | `local_text_gate_init: 0.1` | 让问题 cross-attention 更早参与。 |
+| `S005` | `local_gate_init: 0.2` | 提高问题条件 residual 的初始幅度。 |
+
+在 `tmux` 中启动：
+
+```bash
+python scripts/run_tensor_llm_adapter_sweep.py \
+  --config configs/tensor_llm_adapter_stage2_sweep.yaml
+```
+
+交互终端只有一条动态等待状态，并在开始和结束时输出编号：
+
+```text
+waiting elapsed=02:13:45 pending=4 running=1
+S001 START time=... gpu=6 pid=...
+S001 END time=... duration=... exit=0 run_dir=/data/.../timestamp_..._S001
+```
+
+每次调度会创建独立 session 目录。`sweep_state.json` 记录所有编号的 PID、GPU、开始/结束时间、
+退出码和实际训练目录；`events.jsonl` 记录事件；`logs/S001.log` 等文件保存各训练进程的完整输出。
+重定向调度器输出时，waiting 默认每五分钟写一行，避免产生数千行日志。`Ctrl+C` 会终止本 session
+启动的所有训练进程并将其标记为 interrupted。
+
+显存扫描不是系统级原子预留；其他用户仍可能在检查和模型加载之间抢占同一张卡。正式共享集群应优先
+使用 Slurm。`gpus_per_run` 可改为多卡，但此时必须同时重新计算
+`gradient_accumulation_steps`，确保不同编号的 effective batch 可比。
+
 长时间训练前先检查启动摘要包含配置中的 loss weights 和 `checkpoint_load=stage1_cloned_residual_aligned_adapter`。这表示固定 reference 与可训练 conditioned backbone 都由第一阶段空间 adapter 初始化，而不是复用旧 downstream checkpoint。
 
 `adapter.architecture: alignment_adapter` 会按 checkpoint 的 adapter 类型、网格、层数和 hidden size 重建第一阶段结构，并以 `strict=True` 加载 `adapter_state_dict`。旧 `alignment_qformer` 名称仍用于旧 checkpoint。

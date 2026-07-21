@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
+from torch import nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
@@ -17,10 +21,13 @@ from train_tensor_llm_adapter import (  # noqa: E402
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
     StateTaskGroupedBatchSampler,
+    TensorReadoutQADataset,
     adapter_from_checkpoint,
     build_local_conditioning_prompt,
+    choice_ce_loss,
     parse_generated_choice,
     same_state_question_swap_indices,
+    set_frozen_llm_execution_mode,
     structured_query_features_for_record,
     task_specific_instruction,
 )
@@ -46,6 +53,82 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestDistributedSampling(unittest.TestCase):
+    def test_shuffled_indices_preserve_field_task_and_change_sample(self) -> None:
+        records = [
+            {
+                **_record(f"state_{sample}_{variant}", task, field, f"question_{variant}"),
+                "sample_index": sample,
+            }
+            for field in ("Vx", "Vy")
+            for task in ("point", "region")
+            for sample in range(3)
+            for variant in range(2)
+        ]
+        dataset = TensorReadoutQADataset.__new__(TensorReadoutQADataset)
+        dataset.records = records
+
+        first = dataset._build_random_different_indices(seed=17)
+        second = dataset._build_random_different_indices(seed=17)
+
+        self.assertEqual(first, second)
+        for source, candidate_index in zip(records, first):
+            candidate = records[candidate_index]
+            self.assertEqual(candidate["field"], source["field"])
+            self.assertEqual(candidate["task_type"], source["task_type"])
+            self.assertNotEqual(candidate["sample_index"], source["sample_index"])
+
+    def test_latent_lru_cache_avoids_repeated_torch_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {
+                    **_record(f"state_{sample}", "point", "Vx", f"question_{sample}"),
+                    "qa_id": f"qa_{sample}",
+                    "sample_index": sample,
+                }
+                for sample in range(2)
+            ]
+            jsonl = root / "train.jsonl"
+            with jsonl.open("w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+            for sample in range(2):
+                torch.save({"latent_map": torch.full((2, 2, 2), float(sample))}, root / f"state_{sample}.pt")
+            dataset = TensorReadoutQADataset(
+                jsonl_path=jsonl,
+                latent_dir=root,
+                latent_cache_size=1,
+            )
+
+            with mock.patch.object(torch, "load", wraps=torch.load) as wrapped_load:
+                first = dataset.load_latent_for_record(records[0])
+                repeated = dataset.load_latent_for_record(records[0])
+                dataset.load_latent_for_record(records[1])
+                reloaded = dataset.load_latent_for_record(records[0])
+
+            torch.testing.assert_close(first, repeated)
+            torch.testing.assert_close(first, reloaded)
+            self.assertEqual(wrapped_load.call_count, 3)
+
+    def test_shuffled_indices_fall_back_to_different_state_within_field_task(self) -> None:
+        records = [
+            {
+                **_record(f"state_{state}", "point", "Vx", f"question_{state}"),
+                "sample_index": 0,
+            }
+            for state in range(4)
+        ]
+        dataset = TensorReadoutQADataset.__new__(TensorReadoutQADataset)
+        dataset.records = records
+
+        selected = dataset._build_random_different_indices(seed=5)
+
+        for source, candidate_index in zip(records, selected):
+            candidate = records[candidate_index]
+            self.assertEqual(candidate["field"], source["field"])
+            self.assertEqual(candidate["task_type"], source["task_type"])
+            self.assertNotEqual(candidate["state_ref"], source["state_ref"])
+
     def test_grouped_sampler_preserves_groups_and_equalizes_rank_steps(self) -> None:
         records = [
             _record(f"state_{state}", "point", "Vx", f"question_{variant}")
@@ -93,6 +176,66 @@ class TestDistributedSampling(unittest.TestCase):
 
 
 class TestQuestionConditionedAdapter(unittest.TestCase):
+    def test_frozen_llm_mode_keeps_checkpoint_training_deterministic(self) -> None:
+        model = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.5))
+        model.is_gradient_checkpointing = True
+
+        set_frozen_llm_execution_mode(model, checkpoint_training=True)
+
+        self.assertTrue(model.training)
+        self.assertFalse(model[1].training)
+        set_frozen_llm_execution_mode(model, checkpoint_training=False)
+        self.assertFalse(model.training)
+
+    def test_choice_ce_candidate_chunking_preserves_scores_and_order(self) -> None:
+        records = [
+            {"answer": "B", "choices": ["A", "B", "C", "D"]},
+            {"answer": "D", "choices": ["A", "B", "C", "D"]},
+        ]
+        latent = torch.randn(2, 3, 2, 2)
+        args = SimpleNamespace(
+            train_choice_batch_size=3,
+            max_prompt_tokens=32,
+            max_target_tokens=4,
+            append_eos=True,
+            prompt_template="task_specific",
+            local_context_layer=2,
+            choice_score="mean",
+        )
+        observed_chunk_sizes: list[int] = []
+
+        def fake_answer_nll(**kwargs):
+            answers = list(kwargs["answers"])
+            observed_chunk_sizes.append(len(answers))
+            values = torch.tensor(
+                [float(ord(answer) - ord("A") + 1) for answer in answers],
+                requires_grad=True,
+            )
+            counts = torch.ones(len(answers), dtype=torch.long)
+            return values, counts
+
+        with (
+            mock.patch(
+                "train_tensor_llm_adapter.contextual_adapter_soft_embeds",
+                return_value=torch.zeros(2, 2, 4),
+            ),
+            mock.patch("train_tensor_llm_adapter.forward_answer_nll", side_effect=fake_answer_nll),
+        ):
+            chunked = choice_ce_loss(
+                llm=object(),
+                adapter=object(),
+                tokenizer=object(),
+                records=records,
+                latent_map=latent,
+                device=torch.device("cpu"),
+                args=args,
+            )
+
+        self.assertEqual(observed_chunk_sizes, [3, 3, 2])
+        expected_positive = torch.tensor([2.0, 4.0])
+        torch.testing.assert_close(chunked[2].detach(), expected_positive)
+        self.assertEqual(chunked[4]["choice_accuracy"], 0.0)
+
     def test_spatial_position_encoding_is_deterministic_finite_and_row_major(self) -> None:
         first = sinusoidal_2d_position_encoding(3, 4, 16)
         second = sinusoidal_2d_position_encoding(3, 4, 16)

@@ -391,6 +391,10 @@ llm_training:
   # Fail instead of silently truncating any natural-language instruction or query.
   require_untruncated_prompts: true
   prefer_record_latent_ref: false
+  # Cache all current train latents in CPU memory after first access; each [8,16,16] item is only 8 KiB float32.
+  latent_cache_size: 32768
+  # Keep zero for one process-level cache. Raise only when uncached storage latency is the bottleneck.
+  num_workers: 0
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
@@ -400,6 +404,10 @@ llm_training:
   batch_size: 3
   eval_batch_size: 1
   eval_choice_batch_size: 4
+  # Keep the 32B training forward bounded: one question's four choices per frozen-LLM call.
+  train_choice_batch_size: 4
+  # Non-reentrant checkpointing retains gradients to the tensor prefix without storing every Qwen activation.
+  llm_gradient_checkpointing: true
   # Four torchrun ranks give an effective optimizer batch of 3 x 4 = 12, close to the former
   # single-GPU 3 x 5 = 15 schedule without reducing optimizer updates by another factor of four.
   # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
