@@ -25,6 +25,7 @@ from train_tensor_llm_adapter import (  # noqa: E402
     TensorReadoutQADataset,
     _sequence_choice_ce_loss,
     adapter_from_checkpoint,
+    audit_qa_datasets,
     build_local_conditioning_prompt,
     choice_ce_loss,
     parse_generated_choice,
@@ -57,6 +58,45 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestDistributedSampling(unittest.TestCase):
+    def test_truncated_smoke_audit_does_not_require_all_choice_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            latent_dir = Path(directory)
+            torch.save({"latent_map": torch.zeros(1, 2, 2)}, latent_dir / "state.pt")
+
+            def dataset(records):
+                value = SimpleNamespace(records=records, latent_dir=latent_dir)
+                value.latent_path_for_record = lambda record: latent_dir / f"{record['state_ref']}.pt"
+                return value
+
+            train_records = [
+                {
+                    "qa_id": "state_task_0",
+                    "state_ref": "state",
+                    "sample_index": 0,
+                    "task_type": "raw_point_value_with_stats",
+                    "field": "Vx",
+                    "choices": ["A", "B", "C", "D"],
+                    "answer": "A",
+                    "question": "Options: A: 0; B: 1; C: 2; D: 3.",
+                }
+            ]
+            val_records = [dict(train_records[0], qa_id="other_task_0", state_ref="other", sample_index=1)]
+            torch.save({"latent_map": torch.zeros(1, 2, 2)}, latent_dir / "other.pt")
+            with self.assertRaisesRegex(ValueError, "answer labels absent"):
+                audit_qa_datasets(
+                    {"train": dataset(train_records), "val": dataset(val_records)},
+                    require_disjoint_splits=True,
+                    require_complete_split_coverage=True,
+                )
+
+            summary = audit_qa_datasets(
+                {"train": dataset(train_records), "val": dataset(val_records)},
+                require_disjoint_splits=True,
+                require_complete_split_coverage=False,
+            )
+            self.assertFalse(summary["_audit_scope"]["complete_split_coverage_checked"])
+            self.assertEqual(summary["val"]["missing_answer_labels"]["raw_point_value_with_stats"], ["B", "C", "D"])
+
     def test_shuffled_indices_preserve_field_task_and_change_sample(self) -> None:
         records = [
             {

@@ -1377,6 +1377,7 @@ _DISPLAYED_OPTION_PATTERN = re.compile(
 def audit_qa_datasets(
     datasets: Mapping[str, TensorReadoutQADataset],
     require_disjoint_splits: bool,
+    require_complete_split_coverage: bool = True,
 ) -> dict[str, Any]:
     split_states: dict[str, set[str]] = {}
     split_samples: dict[str, set[int]] = {}
@@ -1442,7 +1443,7 @@ def audit_qa_datasets(
             for task, labels in choice_labels.items()
             if labels - set(answer_counts[task])
         }
-        if missing_answer_labels and require_disjoint_splits:
+        if missing_answer_labels and require_disjoint_splits and require_complete_split_coverage:
             raise ValueError(
                 f"QA audit found answer labels absent from formal split {split}: {missing_answer_labels}"
             )
@@ -1466,21 +1467,23 @@ def audit_qa_datasets(
             "missing_answer_labels": missing_answer_labels,
             "numeric_option_records": numeric_option_records,
             "ascending_numeric_option_fraction": ascending_fraction,
+            "complete_coverage_checked": bool(require_complete_split_coverage),
         }
     reference_split = "train" if "train" in split_tasks else next(iter(split_tasks))
-    for split in split_tasks:
-        if not require_disjoint_splits or split == reference_split:
-            continue
-        if split_tasks[split] != split_tasks[reference_split]:
-            raise ValueError(
-                f"QA audit found task coverage mismatch between {reference_split} and {split}: "
-                f"{sorted(split_tasks[reference_split])} vs {sorted(split_tasks[split])}"
-            )
-        if split_fields[split] != split_fields[reference_split]:
-            raise ValueError(
-                f"QA audit found field coverage mismatch between {reference_split} and {split}: "
-                f"{sorted(split_fields[reference_split])} vs {sorted(split_fields[split])}"
-            )
+    if require_complete_split_coverage:
+        for split in split_tasks:
+            if not require_disjoint_splits or split == reference_split:
+                continue
+            if split_tasks[split] != split_tasks[reference_split]:
+                raise ValueError(
+                    f"QA audit found task coverage mismatch between {reference_split} and {split}: "
+                    f"{sorted(split_tasks[reference_split])} vs {sorted(split_tasks[split])}"
+                )
+            if split_fields[split] != split_fields[reference_split]:
+                raise ValueError(
+                    f"QA audit found field coverage mismatch between {reference_split} and {split}: "
+                    f"{sorted(split_fields[reference_split])} vs {sorted(split_fields[split])}"
+                )
     split_names = list(split_states)
     overlaps: dict[str, int] = {}
     sample_overlaps: dict[str, int] = {}
@@ -1512,6 +1515,15 @@ def audit_qa_datasets(
     summary["latent_file_overlap"] = latent_file_overlaps
     summary["require_disjoint_splits"] = bool(require_disjoint_splits)
     summary["evaluation_scope"] = "formal_generalization" if require_disjoint_splits else "sanity_only"
+    summary["_audit_scope"] = {
+        "disjoint_records_checked": bool(require_disjoint_splits),
+        "complete_split_coverage_checked": bool(require_complete_split_coverage),
+        "coverage_note": (
+            "Full task/field/answer coverage checks were applied."
+            if require_complete_split_coverage
+            else "Coverage checks were skipped because at least one split was explicitly truncated for a smoke test."
+        ),
+    }
     return summary
 
 
@@ -5929,6 +5941,14 @@ def main() -> None:
         audit_qa_datasets(
             datasets,
             require_disjoint_splits=bool(args.require_disjoint_splits),
+            require_complete_split_coverage=not any(
+                value is not None
+                for value in (
+                    args.max_train_records,
+                    args.max_val_records,
+                    args.max_test_records,
+                )
+            ),
         )
         if is_main_process()
         else None
