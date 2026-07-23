@@ -17,6 +17,7 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import train_tensor_llm_adapter as adapter_training  # noqa: E402
 from train_tensor_llm_adapter import (  # noqa: E402
     ExactDistributedEvalSampler,
     HybridGlobalLocalAdapter,
@@ -29,6 +30,7 @@ from train_tensor_llm_adapter import (  # noqa: E402
     build_local_conditioning_prompt,
     choice_ce_loss,
     parse_generated_choice,
+    read_host_memory_snapshot,
     same_state_question_swap_indices,
     selective_answer_statistics,
     set_frozen_llm_execution_mode,
@@ -58,6 +60,47 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
 
 
 class TestDistributedSampling(unittest.TestCase):
+    def test_record_limit_stops_jsonl_loading_early(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "records.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"state_ref": "first"}) + "\n")
+                handle.write("this line is intentionally invalid JSON\n")
+
+            records = TensorReadoutQADataset._load_records(path, max_records=1)
+
+            self.assertEqual(records, [{"state_ref": "first"}])
+
+    def test_worker_cache_capacity_divides_the_per_rank_budget(self) -> None:
+        dataset = TensorReadoutQADataset.__new__(TensorReadoutQADataset)
+        dataset.latent_cache_size = 10
+        with mock.patch.object(
+            adapter_training,
+            "get_worker_info",
+            return_value=SimpleNamespace(num_workers=4),
+        ):
+            self.assertEqual(dataset.effective_latent_cache_size(), 3)
+
+    def test_linux_host_memory_snapshot_uses_mem_available_and_process_rss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "self").mkdir()
+            (root / "meminfo").write_text(
+                "MemTotal:       134217728 kB\nMemFree:         1048576 kB\n"
+                "MemAvailable:   67108864 kB\n",
+                encoding="utf-8",
+            )
+            (root / "self" / "status").write_text(
+                "Name:\tpython\nVmRSS:\t2097152 kB\n",
+                encoding="utf-8",
+            )
+
+            snapshot = read_host_memory_snapshot(root)
+
+            self.assertEqual(snapshot["total_gib"], 128.0)
+            self.assertEqual(snapshot["available_gib"], 64.0)
+            self.assertEqual(snapshot["process_rss_gib"], 2.0)
+
     def test_truncated_smoke_audit_does_not_require_all_choice_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             latent_dir = Path(directory)
@@ -345,9 +388,86 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             )
 
         self.assertEqual(observed_chunk_sizes, [3, 3, 2])
-        expected_positive = torch.tensor([2.0, 4.0])
+        candidate_scores = torch.tensor([-1.0, -2.0, -3.0, -4.0])
+        expected_positive = torch.stack(
+            [
+                F.cross_entropy(candidate_scores.unsqueeze(0), torch.tensor([1])),
+                F.cross_entropy(candidate_scores.unsqueeze(0), torch.tensor([3])),
+            ]
+        )
         torch.testing.assert_close(chunked[2].detach(), expected_positive)
         self.assertEqual(chunked[4]["choice_accuracy"], 0.0)
+
+    def test_single_token_grounding_nll_excludes_eos_and_full_vocabulary(self) -> None:
+        class FakeTokenizer:
+            ids = {" A": 1, " B": 2, " C": 3, " D": 4}
+
+            def __call__(self, text, **_kwargs):
+                return {"input_ids": [self.ids[text]]}
+
+        class FakeLLM(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embeddings = nn.Embedding(8, 4)
+
+            def get_input_embeddings(self):
+                return self.embeddings
+
+        records = [
+            {"answer": "C", "choices": ["A", "B", "C", "D"]},
+            {"answer": "B", "choices": ["A", "B"]},
+        ]
+        args = SimpleNamespace(
+            max_prompt_tokens=8,
+            max_target_tokens=2,
+            append_eos=True,
+            prompt_template="task_specific",
+            local_context_layer=2,
+            choice_score="mean",
+        )
+        first_logits = torch.zeros(2, 8, requires_grad=True)
+        with torch.no_grad():
+            first_logits[0, 1:5] = torch.tensor([0.0, 1.0, 3.0, -1.0])
+            first_logits[1, 1:3] = torch.tensor([-2.0, 2.0])
+        input_ids = torch.zeros(2, 3, dtype=torch.long)
+        attention = torch.ones_like(input_ids)
+        labels = torch.tensor([[-100, -100, 1], [-100, -100, 2]])
+
+        with (
+            mock.patch(
+                "train_tensor_llm_adapter.build_text_tensors",
+                return_value=(input_ids, attention, labels),
+            ),
+            mock.patch(
+                "train_tensor_llm_adapter.contextual_adapter_soft_embeds",
+                return_value=torch.zeros(2, 2, 4),
+            ),
+            mock.patch(
+                "train_tensor_llm_adapter.selective_answer_statistics",
+                return_value=(torch.tensor([100.0, 200.0]), torch.tensor([2, 2]), first_logits),
+            ),
+        ):
+            loss, _answer_ce, per_record_nll, _soft, _metrics = (
+                adapter_training.single_token_choice_ce_loss(
+                    llm=FakeLLM(),
+                    adapter=object(),
+                    tokenizer=FakeTokenizer(),
+                    records=records,
+                    latent_map=torch.zeros(2, 1, 1, 1),
+                    device=torch.device("cpu"),
+                    args=args,
+                )
+            )
+
+        expected = torch.stack(
+            [
+                F.cross_entropy(first_logits[0, 1:5].unsqueeze(0), torch.tensor([2])),
+                F.cross_entropy(first_logits[1, 1:3].unsqueeze(0), torch.tensor([1])),
+            ]
+        )
+        torch.testing.assert_close(per_record_nll, expected)
+        torch.testing.assert_close(loss, expected.mean())
+        self.assertNotEqual(per_record_nll.tolist(), [50.0, 100.0])
 
     def test_spatial_position_encoding_is_deterministic_finite_and_row_major(self) -> None:
         first = sinusoidal_2d_position_encoding(3, 4, 16)
@@ -554,6 +674,27 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         self.assertEqual(owners, [0, 1])
         self.assertEqual(swapped, [1, 0])
 
+    def test_grounding_swaps_skip_same_answer_pairs(self) -> None:
+        records = [
+            {**_record("s1", "point", "Vx", "question one"), "answer": "A"},
+            {**_record("s1", "point", "Vx", "question two"), "answer": "A"},
+            {**_record("s1", "point", "Vx", "question three"), "answer": "B"},
+        ]
+
+        owners, swapped = same_state_question_swap_indices(
+            records,
+            require_different_answers=True,
+        )
+
+        self.assertEqual(owners, [0, 1, 2])
+        self.assertEqual(swapped, [2, 2, 0])
+        self.assertTrue(
+            all(
+                records[owner]["answer"] != records[source]["answer"]
+                for owner, source in zip(owners, swapped)
+            )
+        )
+
     def test_zero_text_gate_preserves_inherited_qformer_output(self) -> None:
         torch.manual_seed(7)
         aligned = TensorPatchAlignmentAdapter(
@@ -631,6 +772,120 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
+    def test_grounded_spatial_reader_has_no_trainable_unconditioned_path(self) -> None:
+        torch.manual_seed(23)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        ).eval()
+        conditioned = ResidualQuestionConditionedAdapter(
+            aligned_adapter=aligned,
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_heads=4,
+            dropout=0.0,
+            text_gate_init=1.0,
+            residual_gate_init=1.0,
+            freeze_backbone=True,
+            text_gate_trainable=False,
+            residual_gate_trainable=False,
+            zero_init_text_attention=True,
+        ).train()
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 2, 5, 24)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+
+        self.assertFalse(any(parameter.requires_grad for parameter in conditioned.backbone.parameters()))
+        self.assertFalse(conditioned.backbone.training)
+        self.assertFalse(conditioned.gate.requires_grad)
+        self.assertTrue(all(not block.gate.requires_grad for block in conditioned.text_blocks))
+        self.assertTrue(
+            all(
+                int(torch.count_nonzero(block.attention.out_proj.weight).item()) == 0
+                for block in conditioned.text_blocks
+            )
+        )
+        torch.testing.assert_close(
+            conditioned(latent, question, mask, structured_query=None),
+            aligned.forward_soft_prompts(latent),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        output = conditioned(latent, question, mask, structured_query=None)
+        output.sum().backward()
+        self.assertTrue(all(parameter.grad is None for parameter in conditioned.backbone.parameters()))
+        self.assertGreater(
+            float(conditioned.text_blocks[0].attention.out_proj.weight.grad.abs().sum().item()),
+            0.0,
+        )
+
+    def test_global_only_baseline_bypasses_question_conditioned_branch(self) -> None:
+        torch.manual_seed(29)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = ResidualQuestionConditionedAdapter(
+            aligned_adapter=aligned,
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_heads=4,
+            dropout=0.0,
+            text_gate_init=1.0,
+            residual_gate_init=1.0,
+            freeze_backbone=True,
+            text_gate_trainable=False,
+            residual_gate_trainable=False,
+            zero_init_text_attention=True,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=aligned,
+            local_adapter=local,
+            freeze_global=True,
+            combine_mode="residual",
+        )
+        latent = torch.randn(2, 3, 2, 2)
+        text_embeds = torch.randn(2, 5, 24)
+
+        with mock.patch.object(
+            local,
+            "forward",
+            side_effect=AssertionError("global_only must not execute the local branch"),
+        ):
+            actual = adapter_training.adapter_soft_embeds(
+                adapter=adapter,
+                latent_map=latent,
+                text_embeds=text_embeds,
+                question_embeds=None,
+                question_mask=None,
+                records=None,
+                mode="global_only",
+            )
+
+        torch.testing.assert_close(
+            actual,
+            aligned.forward_soft_prompts(latent).to(dtype=text_embeds.dtype),
+            rtol=0.0,
+            atol=0.0,
+        )
+
     def test_spatial_stage1_checkpoint_rebuilds_strictly_for_downstream(self) -> None:
         torch.manual_seed(17)
         aligned = TensorPatchAlignmentAdapter(
@@ -691,8 +946,12 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             context_layers=(1, 2),
             adapter_heads=4,
             dropout=0.0,
-            text_gate_init=0.05,
-            residual_gate_init=0.1,
+            text_gate_init=1.0,
+            residual_gate_init=1.0,
+            freeze_backbone=True,
+            text_gate_trainable=False,
+            residual_gate_trainable=False,
+            zero_init_text_attention=True,
         )
         original = HybridGlobalLocalAdapter(
             global_adapter=aligned,
@@ -711,8 +970,12 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 "dropout": 0.0,
                 "soft_prompt_scale": 0.05,
                 "local_context_layers": "1,2",
-                "local_text_gate_init": 0.05,
-                "local_gate_init": 0.1,
+                "local_text_gate_init": 1.0,
+                "local_gate_init": 1.0,
+                "freeze_conditioned_backbone": True,
+                "local_text_gate_trainable": False,
+                "local_residual_gate_trainable": False,
+                "zero_init_local_text_attention": True,
             },
             "adapter_state_dict": original.state_dict(),
         }
@@ -723,6 +986,8 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         rebuilt = adapter_from_checkpoint(checkpoint, latent_shape=(3, 2, 2), llm_hidden_size=24).eval()
 
         self.assertIsInstance(rebuilt, HybridGlobalLocalAdapter)
+        self.assertFalse(any(parameter.requires_grad for parameter in rebuilt.local_adapter.backbone.parameters()))
+        self.assertFalse(rebuilt.local_adapter.gate.requires_grad)
         torch.testing.assert_close(
             rebuilt(latent, question, mask),
             original(latent, question, mask),

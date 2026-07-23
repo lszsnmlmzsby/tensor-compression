@@ -688,9 +688,13 @@ python scripts/prepare_tensor_llm_assets.py \
 | `local_context_layers` | residual adapter 融合的 Qwen hidden-state 层。 | 非负整数列表 | 当前 `[2,6]`，一次前向截取浅层词法细节与中层上下文。 |
 | `local_fusion_mode` | 问题 token 与 latent 的融合方式。 | `residual_spatial_transformer`、`residual_qformer`、`anchor_queries`、`text_latent_pool` | 当前使用第一项；其余值用于旧 checkpoint 兼容。 |
 | `local_text_encoder_layers` | 旧 `input_embeddings` 路径的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置设为 `0`。 |
+| `freeze_conditioned_backbone` | 是否冻结 residual branch 继承的 Stage-1 空间 backbone。 | `true`、`false` | 正式配置为 `true`，防止 conditioned clone 绕过问题分支学成第二个无条件 encoder。 |
+| `local_text_gate_init` / `local_gate_init` | cross-attention 与 outer residual 的固定尺度。 | 浮点数 | 正式配置均为 `1.0`，避免两个小 gate 相乘压低问题梯度。 |
+| `local_text_gate_trainable` / `local_residual_gate_trainable` | 是否训练上述 gate。 | `true`、`false` | 正式配置均关闭；问题增量由 cross-attention 权重学习。 |
+| `zero_init_local_text_attention` | 是否把新增 cross-attention 的输出投影初始化为零。 | `true`、`false` | `true` 使 Stage 2 启动时逐元素复现 Stage 1，同时保留到输出投影的梯度。 |
 | `soft_prompt_scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：`tanh` 后限制每维约在 `[-0.05,0.05]`，使 soft prompt token 范数接近普通 token embedding；`0`：关闭尺度限制，保留线性输出。 |
 
-当前正式 adapter 的信息流是单向的：自然语言题干会去掉 `Options:` 后的候选列表，再追加通用 anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual spatial adapter。每个固定空间位置先 cross-attend 完整问题 token，再做空间 self-attention。完整 QA prompt（包括候选列表）仍直接进入 frozen LLM，因此 adapter 专注“应从 tensor 读取什么证据”。梯度不会更新 LLM；代码也不会通过 regex 提前提取任务、坐标、区域或 mean/scale。
+当前正式 adapter 的信息流是单向的：local reader 接收完整自然语言题干、候选项及输出约束，并把末尾 `Answer:` 换成中性的 `Tensor evidence requested:` anchor；frozen Qwen 一次运行到第 6 层，同时截取第 2/6 层逐 token contextual states，detach 后进入 residual spatial adapter。每个固定空间位置先 cross-attend 完整问题 token，再做空间 self-attention。完整 QA prompt 也直接进入 frozen LLM。梯度不会更新 LLM；代码不会通过 regex 提前提取任务、坐标、区域或 mean/scale。
 
 #### `llm_training`
 
@@ -719,11 +723,12 @@ python scripts/prepare_tensor_llm_assets.py \
 | `ce_loss_weight` | 普通答案 token-level CE loss 权重。 | 非负数 | 该项训练 LLM 在答案 token 位置生成真实答案；权重大时可能更多学习输出格式和标签先验。 |
 | `choice_ce_loss_weight` | 候选项分类 CE loss 权重。 | 非负数 | `0`：关闭；大于 0 时把所有候选答案的 `-NLL` 当作分类 logits，直接优化“选中正确候选项”。 |
 | `ranking_loss_weight` | ranking loss 权重。 | 非负数 | `0`：关闭；大于 0 时要求正确 latent 比错配 latent 更支持正确答案。 |
-| `ranking_loss_margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 希望 `NLL(shuffled)-NLL(correct)` 至少达到该值。 |
-| `ranking_loss_negative` | ranking loss 使用的负样本类型。 | `shuffled`、`random`、`no_latent`、`zero_latent` | `shuffled`：随机错配 latent；`random`：随机噪声；`no_latent`：零 soft prompt；`zero_latent`：latent 置零但仍经过 adapter 和 query 条件。 |
+| `ranking_loss_margin` | ranking loss 的最小 restricted-choice CE 间隔。 | 非负数 | 希望 `ChoiceCE(negative)-ChoiceCE(correct)` 至少达到该值，不包含 EOS。 |
+| `ranking_loss_negative` | ranking loss 使用的对照类型。 | `global_only`、`shuffled`、`random`、`no_latent`、`zero_latent` | 正式配置用 `global_only`，要求 question reader 优于同一 tensor 的冻结 Stage-1 前缀；其余保留兼容。 |
 | `swapped_question_loss_weight` | 同 tensor 问题交换 grounding loss 权重。 | 非负数 | 大于 0 时要求自己的 conditioned prompt 比同 tensor/任务的另一问题 prompt 更支持正确答案。 |
-| `swapped_question_loss_margin` | 问题交换目标的最小 NLL 间隔。 | 非负数 | 当前 `0.1`。 |
+| `swapped_question_loss_margin` | 问题交换目标的最小 restricted-choice CE 间隔。 | 非负数 | 当前 `0.1`。 |
 | `swapped_question_max_records` | 每个 batch 参与交换评分的最大记录数。 | 正整数 | 当前 `8`，限制额外 LLM 前向的显存和时间。 |
+| `swapped_question_require_different_answer` | 是否跳过答案标签相同的问题交换。 | `true`、`false` | 正式配置为 `true`，避免把可能等价的证据强制当负样本。 |
 | `prompt_template` | Adapter 训练用文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按 `task_type` 写明读数/比较/bin 规则；`generic`：旧版通用提示。 |
 | `max_prompt_tokens` | 文本 prompt 最大 token 数。 | 正整数 | 超出会左截断。 |
 | `max_target_tokens` | 答案最大 token 数。 | 正整数 | - |
@@ -876,11 +881,12 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--ce-loss-weight` | 普通答案 token-level CE loss 权重。 | 非负数 | 例如 `0.1`；该项不应长期占主导，否则可能主要学习答案格式。 |
 | `--choice-ce-loss-weight` | 候选项分类 CE loss 权重。 | 非负数 | 例如 `1.0`；该项更接近选择题正确率的可导 surrogate。 |
 | `--ranking-loss-weight` | ranking loss 权重。 | 非负数 | `0`：关闭；默认从 config 读取。 |
-| `--ranking-loss-margin` | ranking loss 的最小 NLL 间隔。 | 非负数 | 要求正确 latent 的正确答案 NLL 比负样本更低。 |
-| `--ranking-loss-negative` | ranking loss 负样本类型。 | `shuffled`、`random`、`no_latent`、`zero_latent` | `shuffled`：错配 tensor state；`zero_latent`：更严格地检查是否超过 query 条件先验。 |
+| `--ranking-loss-margin` | ranking loss 的最小 restricted-choice CE 间隔。 | 非负数 | 要求正确 latent 的合法选项分类损失比负样本更低。 |
+| `--ranking-loss-negative` | ranking loss 对照类型。 | `global_only`、`shuffled`、`random`、`no_latent`、`zero_latent` | 正式配置用不可训练的 `global_only`，避免随机 tensor 的同答案假负样本。 |
 | `--swapped-question-loss-weight` | 同 tensor 问题交换 loss 权重。 | 非负数 | 需要 grouped sampling 和正的 choice CE 权重。 |
-| `--swapped-question-loss-margin` | 问题交换最小 NLL margin。 | 非负数 | 当前 `0.1`。 |
+| `--swapped-question-loss-margin` | 问题交换最小 restricted-choice CE margin。 | 非负数 | 当前 `0.1`。 |
 | `--swapped-question-max-records` | 每 batch 最多交换评分多少条记录。 | 正整数 | 当前 `8`。 |
+| `--swapped-question-require-different-answer` / `--no-swapped-question-require-different-answer` | 是否只使用答案不同的问题交换。 | 布尔开关 | 正式训练开启。 |
 | `--soft-prompt-tokens` | soft prompt token 数。 | 正整数 | - |
 | `--adapter-dim` | adapter 内部维度。 | 正整数 | 必须能被 heads 整除。 |
 | `--adapter-layers` | adapter 层数。 | 正整数 | - |
@@ -893,8 +899,12 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 | `--local-question-input-mode` | local branch 的问题表示来源。 | `contextual_tokens`、`input_embeddings` | 正式配置使用 frozen Qwen contextual states。 |
 | `--local-context-layer` | contextual question 提前停止的 Qwen decoder 层数。 | 非负整数 | 当前配置为 `6`。 |
 | `--local-context-layers` | residual 模式融合的 Qwen hidden-state 层。 | 逗号分隔非负整数 | 当前 `2,6`。 |
-| `--local-fusion-mode` | local query 的文本/latent 融合路径。 | `residual_qformer`、`anchor_queries`、`text_latent_pool` | 正式配置使用 `residual_qformer`；其余保留旧 checkpoint 兼容。 |
+| `--local-fusion-mode` | local query 的文本/latent 融合路径。 | `residual_spatial_transformer`、`residual_qformer`、`anchor_queries`、`text_latent_pool` | 正式配置使用 `residual_spatial_transformer`；其余保留旧 checkpoint 兼容。 |
 | `--local-text-encoder-layers` | 旧 input-embedding local branch 的额外文本 Transformer 层数。 | 非负整数 | contextual 正式配置为 `0`。 |
+| `--freeze-conditioned-backbone` / `--no-freeze-conditioned-backbone` | 是否冻结 conditioned branch 继承的 Stage-1 backbone。 | 布尔开关 | 正式训练开启。 |
+| `--local-text-gate-trainable` / `--no-local-text-gate-trainable` | 是否训练 text gate。 | 布尔开关 | 正式训练关闭并固定为 `1`。 |
+| `--local-residual-gate-trainable` / `--no-local-residual-gate-trainable` | 是否训练 outer residual gate。 | 布尔开关 | 正式训练关闭并固定为 `1`。 |
+| `--zero-init-local-text-attention` / `--no-zero-init-local-text-attention` | 是否零初始化新增 attention 输出。 | 布尔开关 | 正式训练开启。 |
 | `--soft-prompt-scale` | soft prompt 输出尺度限制。 | 非负数 | `0.05`：推荐默认值；`0`：关闭限制。 |
 | `--prompt-template` | 文本 prompt 模板。 | `task_specific`、`generic` | `task_specific`：按任务写规则；`generic`：旧版通用提示。 |
 | `--max-prompt-tokens` | prompt 最大 token 数。 | 正整数 | 默认正式配置禁止截断；调试时关闭严格检查才会左截断。 |
@@ -923,14 +933,15 @@ CUDA_VISIBLE_DEVICES=1 python scripts/train_tensor_llm_adapter.py \
 训练目标默认包含普通 CE、候选项分类 CE 和 ranking 项：
 
 ```text
-loss = ce_loss_weight * token_CE(answer | correct_latent)
-     + choice_ce_loss_weight * CE(softmax(-NLL(candidate_i | correct_latent)), correct_candidate)
-     + ranking_loss_weight * max(0, margin + NLL(answer | correct_latent) - NLL(answer | negative_latent))
-     + swapped_question_loss_weight * max(0, margin + NLL(answer | own_question_prompt)
-                                                  - NLL(answer | swapped_question_prompt))
+loss = ce_loss_weight * token_CE(answer + EOS | correct_latent)
+     + choice_ce_loss_weight * ChoiceCE(correct_latent, own_question)
+     + ranking_loss_weight * max(0, margin + ChoiceCE(correct_latent, own_question)
+                                           - ChoiceCE(global_only, own_question))
+     + swapped_question_loss_weight * max(0, margin + ChoiceCE(correct_latent, own_question)
+                                                    - ChoiceCE(correct_latent, swapped_question))
 ```
 
-`choice_01_loss = 1 - choice_accuracy` 会被记录到日志中，但它是硬 argmax 后的不可导指标，不参与反向传播。`choice_ce_loss` 是它的可导替代项，更接近最终 choice accuracy；ranking 项用于惩罚“错配 latent 也同样支持正确答案”的情况。做消融时可以设置 `ranking_loss_weight: 0` 或命令行传 `--ranking-loss-weight 0`。
+`ChoiceCE` 只在该题合法的 A/B/C/D logits 内归一化，与正式 accuracy 使用同一评分空间；EOS 只留在低权重 token CE 中负责格式。`choice_01_loss = 1 - choice_accuracy` 是不可导日志指标，不参与反向传播。
 
 ### 3.7 Adapter 过拟合 Sanity Check
 
@@ -1493,7 +1504,8 @@ Qwen2.5-32B 的参数虽然冻结，答案损失仍要穿过全部 decoder layer
 当前正式任务的 choices（A/B/C/D 或 A/B）都是单 token。`llm_training.choice_scoring_mode: auto`
 会在正确答案 teacher-forcing 的同一次 Qwen forward 中，从 `Answer:` 位置的 restricted-label logits
 计算 choice CE；普通 answer CE 仍计算正确 label 和 EOS，因此没有移除格式监督。ranking 与
-swapped-question 负向序列会合并并复用同一 batch 的第 2/6 层问题上下文；超过
+swapped-question 也使用同一 restricted-choice CE，不把 EOS 或完整词表概率混入 grounding margin。
+负向序列会合并并复用同一 batch 的第 2/6 层问题上下文；超过
 `train_grounding_batch_size: 8` 时只对该合并 batch 分块，所有 margin 项仍会参与同一次 loss。
 若未来使用多 token choices，代码会自动回退到原始 sequence-likelihood scorer；也可显式设置
 `choice_scoring_mode: sequence` 做严格旧实现复现。`eval_batch_size: 8` 只影响无梯度评估，不改变指标。
@@ -1514,10 +1526,8 @@ swapped-question 负向序列会合并并复用同一 batch 的第 2/6 层问题
 | 编号 | 相对 S001 的修改 | 目的 |
 |---|---|---|
 | `S001` | 无 | 当前配置基线。 |
-| `S002` | `lr: 5e-5` | 更保守地微调继承的空间 adapter。 |
+| `S002` | `lr: 5e-5` | 更保守地训练自然语言读取器。 |
 | `S003` | `swapped_question_loss_weight: 0.2` | 加强自然语言问题 grounding。 |
-| `S004` | `local_text_gate_init: 0.1` | 让问题 cross-attention 更早参与。 |
-| `S005` | `local_gate_init: 0.2` | 提高问题条件 residual 的初始幅度。 |
 
 在 `tmux` 中启动：
 
@@ -1543,18 +1553,18 @@ S001 END time=... duration=... exit=0 run_dir=/data/.../timestamp_..._S001
 使用 Slurm。`gpus_per_run` 可改为多卡，但此时必须同时重新计算
 `gradient_accumulation_steps`，确保不同编号的 effective batch 可比。
 
-长时间训练前先检查启动摘要包含配置中的 loss weights 和 `checkpoint_load=stage1_cloned_residual_aligned_adapter`。这表示固定 reference 与可训练 conditioned backbone 都由第一阶段空间 adapter 初始化，而不是复用旧 downstream checkpoint。
+长时间训练前先检查启动摘要包含配置中的 loss weights 和 `checkpoint_load=stage1_frozen_backbone_question_residual`。这表示固定 reference 与冻结的 conditioned backbone 都由第一阶段空间 adapter 初始化，而不是复用旧 downstream checkpoint。
 
 `adapter.architecture: alignment_adapter` 会按 checkpoint 的 adapter 类型、网格、层数和 hidden size 重建第一阶段结构，并以 `strict=True` 加载 `adapter_state_dict`。旧 `alignment_qformer` 名称仍用于旧 checkpoint。
 
-局部读取增强模式不重跑第一阶段，也不使用 AE decoder。`residual_question_adapter` 从 `alignment_best.pt` 严格载入 256-token 空间 adapter，并复制为两份：reference branch 永久冻结；conditioned branch 继承相同的逐位置 latent projection、固定二维编码、空间 blocks、局部残差和输出映射。每个空间 block 前新增一个小门控 text cross-attention，使每个位置 token 根据完整自然语言问题选择证据；不读取 task id、正则表达式坐标、oracle 或答案。文本门为 0 时，conditioned branch 必须逐元素复现 Stage 1 输出。
+局部读取增强模式不重跑第一阶段，也不使用 AE decoder。`residual_question_adapter` 从 `alignment_best.pt` 严格载入 256-token 空间 adapter，并复制为两份：reference branch 永久冻结；conditioned branch 的逐位置 latent projection、固定二维编码、空间 blocks、局部残差和输出映射同样冻结。每个空间 block 前新增 trainable text cross-attention，使每个位置 token 根据完整自然语言问题选择证据；不读取 task id、正则表达式坐标、oracle 或答案。新增 attention 的输出投影为零初始化，因此 conditioned branch 在第一个优化器更新前逐元素复现 Stage 1。
 
 问题 token 由 frozen Qwen 同一次 early-exit 前向提取第 2 层和第 6 层完整序列。第 2 层偏重数字、坐标和词法细节，第 6 层提供上下文语义；两层经过各自 `LayerNorm + Linear` 后以 learned softmax 权重融合。最终输出保持第一阶段相同的 256 个位置：
 
 ```text
 global = frozen_stage1_spatial_adapter(latent)
-conditioned = trainable_stage1_clone(latent, full_question_tokens)
-soft_prompt = global + residual_gate * (conditioned - global)
+conditioned = frozen_stage1_backbone_with_trainable_text_attention(latent, full_question_tokens)
+soft_prompt = global + (conditioned - global)
 ```
 
 ```yaml
@@ -1569,8 +1579,12 @@ adapter:
   local_fusion_mode: residual_spatial_transformer
   local_text_encoder_layers: 0
   structured_query_conditioning: false
-  local_text_gate_init: 0.05
-  local_gate_init: 0.1
+  local_text_gate_init: 1.0
+  local_text_gate_trainable: false
+  local_gate_init: 1.0
+  local_residual_gate_trainable: false
+  zero_init_local_text_attention: true
+  freeze_conditioned_backbone: true
   freeze_global_adapter: true
   global_unfreeze_epoch: 0
   global_lr: 1.0e-5
@@ -1578,15 +1592,17 @@ adapter:
 
 llm_training:
   epochs: 2
-  batch_size: 15
+  batch_size: 3
   lr_scheduler: cosine
   warmup_ratio: 0.03
   group_questions_by_state: true
   questions_per_state_group: 3
   weight_decay: 1.0e-4
   ranking_loss_weight: 0.1
+  ranking_loss_negative: global_only
   swapped_question_loss_weight: 0.1
   swapped_question_loss_margin: 0.1
+  swapped_question_require_different_answer: true
   swapped_question_max_records: 8
   checkpoint_metric: macro_latent_gain
 ```
@@ -1595,9 +1611,9 @@ llm_training:
 
 每道题的主 prompt 会按该题实际 choices 明确写出输出契约，例如 `Required output: exactly one of A, B, C, D`，并要求不输出解释、标点或其他文字。训练和正式准确率仍使用每个合法标签的候选 NLL，避免自由生成的格式噪声改变优化目标；自由生成只在内置诊断中运行，用于区分“语义上选对但格式不合规”和“答案本身错误”。
 
-当前正式实验不复用旧 downstream hybrid checkpoint，新架构会主动拒绝这样的路径。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layers=[2,6]`、`local_fusion_mode=residual_spatial_transformer` 和 `stage1_cloned_residual_aligned_adapter` load report。
+当前正式实验不复用旧 downstream hybrid checkpoint，新架构会主动拒绝这样的路径。启动后可在 `run_summary.json` 核对 `question_input_mode=contextual_tokens`、`local_context_layers=[2,6]`、`local_fusion_mode=residual_spatial_transformer` 和 `stage1_frozen_backbone_question_residual` load report。程序还会对一条真实 latent 做训练前恒等检查；`stage1_identity_error` 应接近 `0`，超出数值容差会直接停止，不会进入长训练。
 
-`freeze_global_adapter: true` 表示 reference global branch 始终冻结。复制出的 conditioned spatial adapter 属于 local 参数组；`global_unfreeze_epoch: 0` 禁止 reference 漂移。`global_prompt_dropout` 关闭，问题敏感性由自然语言 cross-attention 与 swapped-question loss 约束。
+`freeze_global_adapter: true` 表示 reference global branch 始终冻结；`freeze_conditioned_backbone: true` 也禁止其副本形成无条件捷径。local 参数组只包含问题层融合、文本投影和 cross-attention。两个固定 gate 均为 1，问题路径不会被双重缩小；`global_prompt_dropout` 关闭，问题敏感性由自然语言 cross-attention 与 swapped-question loss 约束。
 
 `residual_question_adapter` 必须提供第一阶段 checkpoint，不能传 `--adapter-init-checkpoint none`。
 
@@ -1614,7 +1630,7 @@ llm_training:
 - `diagnostics/epoch_XXXX_summary.json`：主 prompt、local 完整条件 prompt、候选 NLL 预测、自由生成原文、解析标签、严格格式是否合法、正确答案 margin、soft prompt 差异，以及指定 LLM 层的 hidden-state cosine/relative L2；
 - `diagnostics/epoch_XXXX_states.pt`：latent、mask、global prompt、conditioned residual、combined prompt、文本/latent 投影、query self-attention/cross-attention 权重和各指定 LLM 层 hidden state 的原始张量快照。
 
-默认层为 `[0,2,8,14,-1]`。诊断同时记录跨任务 `question_sensitivity`、按任务拆分的 correct/shuffled accuracy 与 answer margin、same-tensor/same-task residual 敏感度与 swapped margin、residual/global RMS、实际 residual gate、四层 text cross-attention gate、layer 2/6 learned fusion 权重、16 个 query 输出的平均非对角余弦相似度，以及每一层 query 对问题 token 和 4x4 latent cell 的 top attention。它还把 conditioned prompt 换成另一个问题的结果重新评分；只有正确问题比 swapped question 获得更高答案 margin，才说明问题差异与任务输出相关。最终测试额外报告 `local_only`（仅 residual）和 `global_only`（固定 stage-1 prompt）。摘要 JSON 会先于较大的 states PT 写入；诊断与 checkpoint 都先写临时文件再原子替换正式文件名，避免下载到仍在写入的 0 字节或半截文件。
+默认层为 `[0,2,8,14,-1]`。诊断同时记录跨任务 `question_sensitivity`、按任务拆分的 correct/shuffled accuracy 与 answer margin、same-tensor/same-task residual 敏感度与 swapped margin、residual/global RMS、固定 residual/text gate、conditioned-backbone 与 question-reader 的 trainable parameter 数、layer 2/6 learned fusion 权重、256 个空间输出的平均非对角余弦相似度，以及各 block 对问题 token 和 `16x16` latent cell 的 top attention。它还把 conditioned prompt 换成另一个问题的结果重新评分；只有正确问题比 swapped question 获得更高答案 margin，才说明问题差异与任务输出相关。最终测试额外报告 `local_only`（仅 residual）和 `global_only`（固定 stage-1 prompt）。摘要 JSON 会先于较大的 states PT 写入；诊断与 checkpoint 都先写临时文件再原子替换正式文件名，避免下载到仍在写入的 0 字节或半截文件。
 
 W&B 和 `metrics_latest.json` 还会记录 `train_local_grad_norm`、`train_global_grad_norm`、`train_total_grad_norm` 与 local gate。若 hidden state 已有差异但 local gradient 长期接近 0，应先排查门控、mask 或 loss 路径，而不是继续增加 epoch。
 

@@ -363,10 +363,17 @@ adapter:
   local_context_layers: [2, 6]
   local_fusion_mode: residual_spatial_transformer
   local_text_encoder_layers: 0
-  # Keep both new text conditioning and the final residual small at initialization.
-  local_text_gate_init: 0.05
-  local_gate_init: 0.1
-  # The original stage-1 branch remains a fixed anchor; its cloned conditioned branch is trainable.
+  # Use one unsuppressed question path. Zero-initialized attention outputs make the initial
+  # conditioned branch exactly equal Stage 1 without multiplying two small trainable gates.
+  local_text_gate_init: 1.0
+  local_text_gate_trainable: false
+  local_gate_init: 1.0
+  local_residual_gate_trainable: false
+  zero_init_local_text_attention: true
+  # Preserve the Stage-1 spatial/value mapping. Only natural-language projections and
+  # cross-attention may create the residual during this training stage.
+  freeze_conditioned_backbone: true
+  # The original stage-1 branch remains a fixed reference anchor.
   freeze_global_adapter: true
   global_unfreeze_epoch: 0
   # Retained for old hybrid checkpoints; unused while the residual reference is frozen.
@@ -376,7 +383,7 @@ adapter:
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_residual_spatial_transformer
+  run_name: tensor_patch_qa_grounded_spatial_reader
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -391,11 +398,18 @@ llm_training:
   # Fail instead of silently truncating any natural-language instruction or query.
   require_untruncated_prompts: true
   prefer_record_latent_ref: false
-  # Cache all current train latents in CPU memory after first access; each [8,16,16] item is only 8 KiB float32.
-  latent_cache_size: 32768
-  # Overlap latent-file reads with the frozen-LLM forward. Worker-local bounded caches preserve
-  # deterministic records/order; lower to 0 only if shared-storage contention is observed.
-  num_workers: 4
+  # Per-rank latent-cache budget shared across loader workers. Each [8,16,16] item is 8 KiB float32;
+  # 8192 entries cap each rank near 64 MiB instead of multiplying the full budget by every worker.
+  latent_cache_size: 8192
+  # Two workers per rank overlap local-NVMe reads while avoiding 16 persistent dataset copies on four GPUs.
+  num_workers: 2
+  # DDP ranks load their full frozen-LLM replicas one at a time. This prevents four temporary CPU
+  # checkpoint copies from peaking together before the weights are moved to their GPUs.
+  serialize_llm_loading: true
+  low_cpu_mem_usage: true
+  # Linux MemAvailable includes reclaimable page cache. Abort coherently before host OOM makes SSH unresponsive.
+  # Set to 0 only on a deliberately memory-constrained smoke-test host.
+  min_host_memory_available_gib: 16
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
@@ -428,10 +442,13 @@ llm_training:
   choice_ce_loss_weight: 1.0
   ranking_loss_weight: 0.1
   ranking_loss_margin: 0.1
-  ranking_loss_negative: shuffled
+  # Require the question reader to improve over the frozen Stage-1 prompt for the same tensor.
+  ranking_loss_negative: global_only
   # For the same tensor/task, its own question-conditioned prompt must beat another question's prompt.
   swapped_question_loss_weight: 0.1
   swapped_question_loss_margin: 0.1
+  # Same-label swaps are semantically ambiguous, especially for balanced binary tasks.
+  swapped_question_require_different_answer: true
   # Bound the extra frozen-LLM scoring graph to the current same-tensor group.
   swapped_question_max_records: 3
   prompt_template: task_specific

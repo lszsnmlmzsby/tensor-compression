@@ -5434,6 +5434,7 @@ def main() -> None:
                 cache_dir=args.cache_dir,
                 trust_remote_code=bool(args.trust_remote_code),
                 dtype=dtype_from_name(str(args.torch_dtype)),
+                low_cpu_mem_usage=True,
             )
             llm_num_hidden_layers = int(getattr(llm.config, "num_hidden_layers", -1))
             validate_teacher_hidden_state_index(int(args.teacher_layer), llm_num_hidden_layers)

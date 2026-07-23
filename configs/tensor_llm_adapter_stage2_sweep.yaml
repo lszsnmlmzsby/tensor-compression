@@ -19,8 +19,6 @@ sweep:
   parameters:
     - lr
     - swapped_question_loss_weight
-    - local_text_gate_init
-    - local_gate_init
 
   common_overrides:
     epochs: 2
@@ -34,15 +32,13 @@ sweep:
     weight_decay: 1.0e-4
     ranking_loss_weight: 0.1
     swapped_question_loss_weight: 0.1
-    local_text_gate_init: 0.05
-    local_gate_init: 0.1
 
   runs:
     # Baseline from tensor_llm_adapter_pipeline.yaml.
     - id: S001
       overrides: {}
 
-    # More conservative optimization of the inherited spatial adapter.
+    # More conservative optimization of the natural-language reader.
     - id: S002
       overrides:
         lr: 5.0e-5
@@ -51,13 +47,3 @@ sweep:
     - id: S003
       overrides:
         swapped_question_loss_weight: 0.2
-
-    # Allow question cross-attention to affect the inherited blocks earlier.
-    - id: S004
-      overrides:
-        local_text_gate_init: 0.1
-
-    # Increase the initial magnitude of the question-conditioned residual.
-    - id: S005
-      overrides:
-        local_gate_init: 0.2
