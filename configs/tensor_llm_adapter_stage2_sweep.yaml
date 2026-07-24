@@ -1,10 +1,10 @@
 sweep:
   training_script: scripts/train_tensor_llm_adapter.py
   training_config: configs/tensor_llm_adapter_pipeline.yaml
-  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260721_023133_tensor_patch_text_alignment_qwen25_32b_spatial256_stage2_final/alignment_best.pt
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   output_root: /data/wyx/tensor_llm_outputs/runs
-  status_root: /data/wyx/tensor_llm_outputs/sweeps/tensor_patch_qa_residual_spatial
-  run_name_prefix: tensor_patch_qa_residual_spatial_sweep
+  status_root: /data/wyx/tensor_llm_outputs/sweeps/tensor_patch_qa_direct_spatial
+  run_name_prefix: tensor_patch_qa_direct_spatial_sweep
 
   # A single A800 runs one independent sweep point. This preserves more parallel experiments than DDP.
   gpus_per_run: 1
@@ -18,32 +18,32 @@ sweep:
   # These are the only parameters varied by this sweep. Each non-baseline run changes one at a time.
   parameters:
     - lr
-    - swapped_question_loss_weight
+    - ranking_loss_weight
 
   common_overrides:
     epochs: 2
     batch_size: 3
-    eval_batch_size: 1
+    eval_batch_size: 8
     eval_choice_batch_size: 4
     gradient_accumulation_steps: 5
     seed: 42
     shuffle_seed: 42
-    lr: 1.0e-4
+    lr: 2.0e-5
     weight_decay: 1.0e-4
     ranking_loss_weight: 0.1
-    swapped_question_loss_weight: 0.1
+    swapped_question_loss_weight: 0.0
 
   runs:
     # Baseline from tensor_llm_adapter_pipeline.yaml.
     - id: S001
       overrides: {}
 
-    # More conservative optimization of the natural-language reader.
+    # More conservative fine-tuning of the Stage-1 spatial adapter.
     - id: S002
       overrides:
-        lr: 5.0e-5
+        lr: 1.0e-5
 
-    # Stronger pressure to use the matching natural-language question.
+    # Stronger task-independent pressure to use tensor evidence instead of a zero-information prefix.
     - id: S003
       overrides:
-        swapped_question_loss_weight: 0.2
+        ranking_loss_weight: 0.2

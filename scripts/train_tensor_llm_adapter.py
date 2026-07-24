@@ -13,7 +13,7 @@ import sys
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,20 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     synchronize_gradients,
 )
 
+from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
+    PATCH_LATENT_AUDIT_FORMAT,
+    PATCH_LATENT_FORMAT,
+    PATCH_QA_BUILD_MARKER,
+    PATCH_QA_FORMAT,
+    PATCH_QA_PROMPT_CONTRACT,
+    canonical_normalization,
+    canonical_path,
+    latent_identity_from_record,
+    latent_qa_stats_from_record,
+    sha256_file,
+    validate_stage1_alignment_checkpoint_payload,
+    validate_patch_latent_payload,
+)
 from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
 from tensor_compression.integrations import WandbLogger  # noqa: E402
 from tensor_compression.utils import dump_json  # noqa: E402
@@ -61,8 +75,6 @@ except ImportError as exc:  # pragma: no cover - exercised only in missing-depen
 
 IGNORE_INDEX = -100
 STRUCTURED_QUERY_FEATURE_DIM = 32
-PATCH_QA_FORMAT = "tensor_patch_qa_v2"
-PATCH_QA_PROMPT_CONTRACT = "encoder_zscore_one_based_v2"
 SUPPORTED_BASELINE_MODES = {
     "correct",
     "global_only",
@@ -73,6 +85,255 @@ SUPPORTED_BASELINE_MODES = {
     "random",
     "shuffled_stats",
 }
+DIRECT_ALIGNMENT_ARCHITECTURES = frozenset({"alignment_qformer", "alignment_adapter"})
+CONTEXTUAL_LOCAL_ARCHITECTURES = frozenset(
+    {"hybrid_local_qformer", "residual_question_qformer", "residual_question_adapter"}
+)
+
+
+def is_direct_alignment_architecture(value: str) -> bool:
+    return str(value) in DIRECT_ALIGNMENT_ARCHITECTURES
+
+
+def uses_contextual_local_prompt(args: argparse.Namespace) -> bool:
+    return (
+        str(args.adapter_architecture) in CONTEXTUAL_LOCAL_ARCHITECTURES
+        and str(args.local_question_input_mode) == "contextual_tokens"
+    )
+
+
+def model_identifier_leaf(value: str | Path) -> str:
+    normalized = str(value).strip().replace("\\", "/").rstrip("/")
+    return normalized.rsplit("/", 1)[-1].casefold() if normalized else ""
+
+
+def validate_stage1_model_identity(
+    checkpoint_args: Mapping[str, Any],
+    current_model_name_or_path: str | Path,
+) -> None:
+    checkpoint_model = str(checkpoint_args.get("model_name_or_path", "")).strip()
+    current_model = str(current_model_name_or_path).strip()
+    if not checkpoint_model:
+        raise ValueError(
+            "The Stage-1 checkpoint does not record model_name_or_path, so its frozen-LLM identity "
+            "cannot be verified for direct Stage 2."
+        )
+    if not current_model:
+        raise ValueError("Stage 2 does not specify model_name_or_path.")
+    if model_identifier_leaf(checkpoint_model) != model_identifier_leaf(current_model):
+        raise ValueError(
+            "Stage-1 and Stage-2 must use the same frozen LLM. "
+            f"Checkpoint model={checkpoint_model!r}, current model={current_model!r}."
+        )
+
+
+def validate_stage1_teacher_supervision(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the Stage-1 hidden-trajectory contract without loading loss-only transforms."""
+    raw_version = checkpoint.get("checkpoint_version", 0)
+    try:
+        checkpoint_version = int(raw_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Stage-1 checkpoint_version must be an integer, got {raw_version!r}.") from exc
+    raw_metadata = checkpoint.get("teacher_supervision")
+    if raw_metadata is None:
+        if checkpoint_version >= 3:
+            raise ValueError(
+                "Stage-1 checkpoint version 3 or newer is missing teacher_supervision metadata."
+            )
+        return None
+    if not isinstance(raw_metadata, Mapping):
+        raise ValueError("Stage-1 teacher_supervision must be a mapping.")
+
+    raw_layers = raw_metadata.get("layers")
+    raw_auxiliary_layers = raw_metadata.get("auxiliary_layers")
+    if (
+        not isinstance(raw_layers, Sequence)
+        or isinstance(raw_layers, (str, bytes))
+        or not isinstance(raw_auxiliary_layers, Sequence)
+        or isinstance(raw_auxiliary_layers, (str, bytes))
+    ):
+        raise ValueError("Stage-1 teacher layers and auxiliary_layers must be numeric sequences.")
+    try:
+        primary_layer = int(raw_metadata["primary_layer"])
+        layers = [int(layer) for layer in raw_layers]
+        auxiliary_layers = [int(layer) for layer in raw_auxiliary_layers]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Stage-1 teacher_supervision must define integer primary_layer, layers, and auxiliary_layers."
+        ) from exc
+    if primary_layer <= 0 or not layers or any(layer <= 0 for layer in layers):
+        raise ValueError("Stage-1 teacher layers must use positive 1-based transformer block indices.")
+    if layers != sorted(set(layers)):
+        raise ValueError(f"Stage-1 teacher layers must be sorted and unique, got {layers}.")
+    if primary_layer not in layers:
+        raise ValueError(
+            f"Stage-1 primary teacher layer {primary_layer} is absent from layers={layers}."
+        )
+    expected_auxiliary = sorted(set(layers) - {primary_layer})
+    if auxiliary_layers != expected_auxiliary:
+        raise ValueError(
+            "Stage-1 auxiliary teacher layers disagree with the complete layer list: "
+            f"expected={expected_auxiliary}, observed={auxiliary_layers}."
+        )
+
+    raw_weights = raw_metadata.get("auxiliary_layer_weights")
+    if not isinstance(raw_weights, Mapping):
+        raise ValueError("Stage-1 teacher_supervision is missing auxiliary_layer_weights.")
+    try:
+        auxiliary_weight_pairs = [
+            (int(layer), float(weight)) for layer, weight in raw_weights.items()
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stage-1 auxiliary teacher weights must map layer indices to numbers.") from exc
+    auxiliary_weights = dict(auxiliary_weight_pairs)
+    if len(auxiliary_weights) != len(auxiliary_weight_pairs):
+        raise ValueError("Stage-1 auxiliary teacher weights contain duplicate numeric layer keys.")
+    if sorted(auxiliary_weights) != expected_auxiliary:
+        raise ValueError(
+            "Stage-1 auxiliary teacher weights do not cover exactly the auxiliary layers: "
+            f"layers={expected_auxiliary}, weights={sorted(auxiliary_weights)}."
+        )
+    if any(not math.isfinite(weight) or weight <= 0.0 for weight in auxiliary_weights.values()):
+        raise ValueError("Stage-1 auxiliary teacher weights must be finite and positive.")
+
+    primary_transform = str(raw_metadata.get("primary_feature_transform", ""))
+    if primary_transform not in {"none", "projection", "whitening"}:
+        raise ValueError(
+            "Stage-1 primary_feature_transform must be none, projection, or whitening; "
+            f"got {primary_transform!r}."
+        )
+    auxiliary_transform = str(raw_metadata.get("auxiliary_feature_transform", ""))
+    if auxiliary_transform != "native_centered_and_branch_mean":
+        raise ValueError(
+            "Stage-1 auxiliary_feature_transform has an unsupported contract: "
+            f"{auxiliary_transform!r}."
+        )
+    return {
+        "primary_layer": primary_layer,
+        "layers": layers,
+        "auxiliary_layers": auxiliary_layers,
+        "auxiliary_layer_weights": {
+            str(layer): auxiliary_weights[layer] for layer in expected_auxiliary
+        },
+        "primary_feature_transform": primary_transform,
+        "auxiliary_feature_transform": auxiliary_transform,
+    }
+
+
+def validate_stage1_alignment_checkpoint_phase(
+    checkpoint: Mapping[str, Any],
+    checkpoint_path: str | Path | None = None,
+) -> str:
+    """Validate a complete Stage-1 checkpoint before Stage-2 initialization.
+
+    The path is part of the validation for legacy checkpoints because old
+    files did not record their phase.  Requiring it prevents an old
+    patch-AE warmup file from being mistaken for an alignment checkpoint.
+    """
+    if checkpoint_path is None:
+        raise ValueError(
+            "Stage-1 checkpoint phase validation requires the checkpoint path so legacy files can be "
+            "distinguished from patch-AE warmup files."
+        )
+    validation = validate_stage1_alignment_checkpoint_payload(
+        checkpoint,
+        path=checkpoint_path,
+    )
+    return str(validation["checkpoint_phase"])
+
+
+def _configured_checkpoint_path(value: Any) -> Path | None:
+    raw = str(value or "").strip()
+    if raw.lower() in {"", "none", "null", "random"}:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
+def validate_direct_alignment_provenance(
+    *,
+    metadata_checkpoint: Any,
+    configured_checkpoint: Any,
+    adapter_checkpoint: Any,
+    require_metadata_checkpoint: bool,
+) -> dict[str, Any]:
+    paths = {
+        "qa_metadata": _configured_checkpoint_path(metadata_checkpoint),
+        "patch_qa_config": _configured_checkpoint_path(configured_checkpoint),
+        "adapter_init": _configured_checkpoint_path(adapter_checkpoint),
+    }
+    if require_metadata_checkpoint and paths["qa_metadata"] is None:
+        raise ValueError(
+            "Formal direct Stage 2 requires QA metadata to record the Stage-1 alignment checkpoint. "
+            "Regenerate the QA assets with the current build_tensor_patch_qa.py."
+        )
+    if paths["adapter_init"] is None:
+        raise ValueError("Direct Stage 2 requires adapter.init_checkpoint from Stage 1.")
+    reference_name = "qa_metadata" if paths["qa_metadata"] is not None else "patch_qa_config"
+    reference = paths[reference_name]
+    if reference is None:
+        raise ValueError(
+            "Direct Stage 2 cannot establish QA/adapter provenance: neither QA metadata nor "
+            "patch_qa.alignment_checkpoint identifies Stage 1."
+        )
+    mismatches = {
+        name: path
+        for name, path in paths.items()
+        if path is not None and path != reference
+    }
+    if mismatches:
+        rendered = ", ".join(f"{name}={path}" for name, path in paths.items() if path is not None)
+        raise ValueError(
+            "Direct Stage 2 must use exactly the Stage-1 checkpoint that generated the QA latent cache. "
+            + rendered
+        )
+    return {
+        "validated": True,
+        "reference": reference_name,
+        "checkpoint": str(reference),
+        "sources": {name: str(path) if path is not None else None for name, path in paths.items()},
+    }
+
+
+def validate_adapter_loss_contract(args: argparse.Namespace) -> None:
+    direct_alignment_architecture = is_direct_alignment_architecture(args.adapter_architecture)
+    if (
+        direct_alignment_architecture
+        and float(args.ranking_loss_weight) > 0.0
+        and str(args.ranking_loss_negative) == "global_only"
+    ):
+        raise ValueError(
+            "Direct alignment adapters have no separate global/local branch, so "
+            "ranking_loss_negative=global_only would compare identical soft prompts. Use no_latent or disable ranking."
+        )
+    if (
+        direct_alignment_architecture
+        and float(args.ranking_loss_weight) > 0.0
+        and str(args.ranking_loss_negative) in {"shuffled", "random"}
+    ):
+        raise ValueError(
+            "Direct alignment ranking cannot use shuffled/random tensors as supervised negatives. "
+            "A mismatched tensor can have the same valid answer, while random tensors create an "
+            "out-of-distribution shortcut. Use no_latent for task-independent modality grounding."
+        )
+    if direct_alignment_architecture and float(args.swapped_question_loss_weight) > 0.0:
+        raise ValueError(
+            "Direct alignment adapters intentionally produce a question-independent tensor prefix. "
+            "swapped_question_loss would compare identical same-tensor prefixes and must be disabled."
+        )
+    if direct_alignment_architecture:
+        for setting in ("eval_baselines", "final_eval_baselines"):
+            unsupported = sorted(
+                set(parse_csv(getattr(args, setting, ""))) & {"global_only", "local_only"}
+            )
+            if unsupported:
+                raise ValueError(
+                    f"Direct alignment adapters have no global/local split; {setting} contains "
+                    f"meaningless baselines {unsupported}."
+                )
+
+
 LOCAL_QUESTION_ANCHOR_TEXT = "Tensor evidence requested:"
 _ACTIVE_RUN_LIFECYCLE: "RunLifecycle | None" = None
 
@@ -93,7 +354,13 @@ def is_main_process() -> bool:
     return distributed_rank() == 0
 
 
-def initialize_distributed_device(requested_device: str) -> torch.device:
+def initialize_distributed_device(
+    requested_device: str,
+    distributed_timeout_seconds: float,
+) -> torch.device:
+    timeout_seconds = float(distributed_timeout_seconds)
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        raise ValueError("llm_training.distributed_timeout_seconds must be finite and positive.")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return resolve_device(requested_device)
@@ -103,9 +370,13 @@ def initialize_distributed_device(requested_device: str) -> torch.device:
     if local_rank < 0 or local_rank >= torch.cuda.device_count():
         raise ValueError(
             f"LOCAL_RANK={local_rank} is invalid for {torch.cuda.device_count()} visible CUDA devices."
-        )
+    )
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(seconds=timeout_seconds),
+    )
     return torch.device("cuda", local_rank)
 
 
@@ -114,26 +385,52 @@ def distributed_barrier() -> None:
         dist.barrier()
 
 
-def broadcast_object_from_rank_zero(value: Any) -> Any:
+def run_on_rank_zero_and_broadcast(operation, stage: str) -> Any:
+    """Execute rank-0-only work while making failures visible to every rank."""
     if not distributed_is_initialized():
-        return value
-    payload = [value if is_main_process() else None]
+        return operation()
+    original_error: BaseException | None = None
+    envelope: dict[str, Any] | None = None
+    if is_main_process():
+        try:
+            envelope = {"ok": True, "value": operation()}
+        except BaseException as exc:
+            original_error = exc
+            envelope = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:4000],
+            }
+    payload = [envelope]
     dist.broadcast_object_list(payload, src=0)
-    return payload[0]
+    received = payload[0]
+    if not isinstance(received, Mapping) or not bool(received.get("ok", False)):
+        error_type = (
+            str(received.get("error_type", "RuntimeError"))
+            if isinstance(received, Mapping)
+            else "RuntimeError"
+        )
+        error_message = (
+            str(received.get("error_message", "rank 0 returned an invalid status envelope"))
+            if isinstance(received, Mapping)
+            else "rank 0 returned an invalid status envelope"
+        )
+        if original_error is not None:
+            raise original_error
+        raise RuntimeError(f"Rank-0 {stage} failed with {error_type}: {error_message}")
+    return received.get("value")
 
 
 def build_distributed_run_dir(output_root: str | Path, run_name: str) -> Path:
     if not distributed_is_initialized():
         return build_run_dir(output_root, run_name)
-    payload: list[str | None] = [
-        str(build_run_dir(output_root, run_name)) if is_main_process() else None
-    ]
-    dist.broadcast_object_list(payload, src=0)
-    if payload[0] is None:
-        raise RuntimeError("Rank 0 did not broadcast the Stage-2 run directory.")
-    run_dir = Path(payload[0])
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+    path = run_on_rank_zero_and_broadcast(
+        lambda: str(build_run_dir(output_root, run_name)),
+        "run directory creation",
+    )
+    if not isinstance(path, str) or not path:
+        raise RuntimeError("Rank 0 broadcast an invalid Stage-2 run directory.")
+    return Path(path)
 
 
 @torch.no_grad()
@@ -148,6 +445,87 @@ def synchronize_module_from_rank_zero(module: nn.Module) -> None:
 
 def average_trainable_gradients(module: nn.Module) -> None:
     synchronize_gradients([module])
+
+
+def optimizer_parameter_audit(
+    optimizer: torch.optim.Optimizer,
+    module: nn.Module,
+    *,
+    allow_frozen_parameters: bool = False,
+) -> dict[str, int]:
+    """Verify that optimizer membership matches the intended adapter boundary."""
+    module_parameters = list(module.parameters())
+    module_ids = {id(parameter) for parameter in module_parameters}
+    trainable_ids = {
+        id(parameter) for parameter in module_parameters if parameter.requires_grad
+    }
+    optimizer_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group.get("params", [])
+    ]
+    optimizer_ids = [id(parameter) for parameter in optimizer_parameters]
+    duplicate_count = len(optimizer_ids) - len(set(optimizer_ids))
+    missing_count = len(trainable_ids - set(optimizer_ids))
+    outside_module_count = len(set(optimizer_ids) - module_ids)
+    frozen_count = len((set(optimizer_ids) & module_ids) - trainable_ids)
+    extra_count = outside_module_count + (0 if allow_frozen_parameters else frozen_count)
+    if duplicate_count or missing_count or extra_count:
+        raise RuntimeError(
+            "Stage-2 optimizer parameter audit failed: "
+            f"duplicates={duplicate_count}, missing_trainable={missing_count}, "
+            f"outside_module={outside_module_count}, frozen_in_optimizer={frozen_count}, "
+            f"extra={extra_count}."
+        )
+    return {
+        "trainable_parameters": sum(parameter.numel() for parameter in module_parameters if parameter.requires_grad),
+        "optimizer_parameters": sum(parameter.numel() for parameter in optimizer_parameters),
+        "optimizer_tensor_count": len(optimizer_parameters),
+        "optimizer_duplicate_tensor_count": duplicate_count,
+        "optimizer_missing_trainable_tensor_count": missing_count,
+        "optimizer_extra_tensor_count": extra_count,
+        "optimizer_outside_module_tensor_count": outside_module_count,
+        "optimizer_frozen_tensor_count": frozen_count,
+        "optimizer_allows_frozen_parameters": int(bool(allow_frozen_parameters)),
+    }
+
+
+def assert_finite_gradients(module: nn.Module, context: str) -> None:
+    """Fail at the first update containing a non-finite trainable gradient."""
+    invalid: list[str] = []
+    for name, parameter in module.named_parameters():
+        if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
+            invalid.append(str(name))
+    if invalid:
+        preview = ", ".join(invalid[:8])
+        raise FloatingPointError(
+            f"Non-finite gradients detected in {context}: {preview}"
+            f"{' ...' if len(invalid) > 8 else ''}."
+        )
+
+
+def average_trainable_gradients_by_record_count(
+    module: nn.Module,
+    local_record_count: int,
+    device: torch.device,
+) -> int:
+    """Synchronize accumulated record-sum gradients and convert them to a global record mean."""
+    local_count = int(local_record_count)
+    if local_count <= 0:
+        raise ValueError("Cannot normalize accumulated gradients with zero local records.")
+    average_trainable_gradients(module)
+    count_tensor = torch.tensor([float(local_count)], dtype=torch.float64, device=device)
+    if distributed_is_initialized():
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+    global_count = int(round(float(count_tensor.item())))
+    if global_count <= 0:
+        raise RuntimeError("Distributed gradient normalization received zero global records.")
+    scale = float(distributed_world_size()) / float(global_count)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+    return global_count
 
 
 def distributed_sum_scalars(values: Mapping[str, float], device: torch.device) -> dict[str, float]:
@@ -276,17 +654,37 @@ def local_timestamp() -> str:
 
 def atomic_dump_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.tmp")
-    dump_json(temporary, payload)
-    os.replace(temporary, target)
+    try:
+        dump_json(temporary, payload)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def atomic_torch_save(path: str | Path, payload: Mapping[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.tmp")
-    torch.save(payload, temporary)
-    os.replace(temporary, target)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def compact_diagnostic_tensors(value: Any) -> Any:
+    """Halve diagnostic snapshot size without changing model/checkpoint precision."""
+    if torch.is_tensor(value):
+        return value.to(dtype=torch.float16) if value.is_floating_point() else value
+    if isinstance(value, Mapping):
+        return {key: compact_diagnostic_tensors(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [compact_diagnostic_tensors(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(compact_diagnostic_tensors(item) for item in value)
+    return value
 
 
 class RunLifecycle:
@@ -314,15 +712,23 @@ class RunLifecycle:
 
     def _write(self, status: str, error: BaseException | None = None) -> dict[str, Any]:
         timing = self._payload(status, error)
-        self.last_payload = timing
-        dump_json(self.run_dir / "run_timing.json", timing)
         summary_path = self.run_dir / "run_summary.json"
         if summary_path.exists():
-            with summary_path.open("r", encoding="utf-8") as handle:
-                summary = json.load(handle)
-            if isinstance(summary, dict):
+            try:
+                with summary_path.open("r", encoding="utf-8") as handle:
+                    summary = json.load(handle)
+                if not isinstance(summary, dict):
+                    raise ValueError("run_summary.json must contain a JSON object")
                 summary["timing"] = timing
-                dump_json(summary_path, summary)
+                atomic_dump_json(summary_path, summary)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                # Timing is the authoritative lifecycle record. A truncated
+                # summary must never hide the exception that ended the run.
+                timing["run_summary_update_error"] = (
+                    f"{type(exc).__name__}: {str(exc)[:1000]}"
+                )
+        self.last_payload = timing
+        atomic_dump_json(self.run_dir / "run_timing.json", timing)
         return timing
 
     def finish(self, status: str, error: BaseException | None = None) -> dict[str, Any]:
@@ -1180,6 +1586,7 @@ class TensorReadoutQADataset(Dataset):
         prefer_record_latent_ref: bool = False,
         shuffle_seed: int = 42,
         latent_cache_size: int = 0,
+        latent_contract: Mapping[str, Any] | None = None,
     ) -> None:
         self.jsonl_path = Path(jsonl_path)
         self.latent_dir = Path(latent_dir)
@@ -1188,8 +1595,11 @@ class TensorReadoutQADataset(Dataset):
         if not self.records:
             raise RuntimeError(f"No QA records found in {self.jsonl_path}.")
         self.latent_cache_size = max(0, int(latent_cache_size))
+        self.latent_contract = dict(latent_contract) if isinstance(latent_contract, Mapping) else None
         self._latent_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._latent_path_cache: dict[str, Path] = {}
+        self._latent_identity_cache: dict[str, dict[str, Any]] = {}
+        self._latent_qa_stats_cache: dict[str, dict[str, float]] = {}
         self._random_different_indices = self._build_random_different_indices(int(shuffle_seed))
 
     @staticmethod
@@ -1354,18 +1764,16 @@ class TensorReadoutQADataset(Dataset):
         if not path.exists():
             raise FileNotFoundError(f"Latent cache file not found: {path}")
         cache_key = str(path)
+        if self.latent_contract is not None:
+            self._validate_record_identity_for_path(path, record)
+            self._validate_record_qa_stats_for_path(path, record)
         cached = self._latent_cache.get(cache_key)
         if cached is not None:
             self._latent_cache.move_to_end(cache_key)
             return cached
-        payload = torch.load(path, map_location="cpu")
-        latent = payload.get("latent_map") if isinstance(payload, Mapping) else payload
-        if not isinstance(latent, torch.Tensor):
-            raise ValueError(f"Latent cache file does not contain a tensor latent_map: {path}")
-        if latent.ndim == 4 and latent.shape[0] == 1:
-            latent = latent.squeeze(0)
-        if latent.ndim != 3:
-            raise ValueError(f"Expected latent_map [C,H,W], got {tuple(latent.shape)} from {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        latent = self._latent_from_payload(payload, path=path, record=record)
+        payload = None
         latent = latent.to(dtype=torch.float32)
         cache_capacity = self.effective_latent_cache_size()
         if cache_capacity > 0:
@@ -1374,6 +1782,94 @@ class TensorReadoutQADataset(Dataset):
             while len(self._latent_cache) > cache_capacity:
                 self._latent_cache.popitem(last=False)
         return latent
+
+    def _latent_from_payload(
+        self,
+        payload: Any,
+        *,
+        path: Path,
+        record: Mapping[str, Any],
+    ) -> torch.Tensor:
+        if self.latent_contract is not None:
+            expected_identity = self._validate_record_identity_for_path(path, record)
+            latent = validate_patch_latent_payload(
+                payload,
+                path=path,
+                expected_identity=expected_identity,
+                expected_alignment_checkpoint=self.latent_contract["alignment_checkpoint"],
+                expected_alignment_sha256=self.latent_contract["alignment_checkpoint_sha256"],
+                expected_normalization=self.latent_contract["encoder_input_normalization"],
+                expected_shape=self.latent_contract["latent_shape"],
+                expected_storage_dtype=self.latent_contract.get("storage_dtype"),
+                expected_qa_stats=self._validate_record_qa_stats_for_path(path, record),
+            )
+        else:
+            latent = payload.get("latent_map") if isinstance(payload, Mapping) else payload
+            if not isinstance(latent, torch.Tensor):
+                raise ValueError(f"Latent cache file does not contain a tensor latent_map: {path}")
+            if latent.ndim == 4 and latent.shape[0] == 1:
+                latent = latent.squeeze(0)
+            if latent.ndim != 3:
+                raise ValueError(f"Expected latent_map [C,H,W], got {tuple(latent.shape)} from {path}")
+            if not bool(torch.isfinite(latent).all()):
+                raise FloatingPointError(f"Latent cache contains NaN or infinity: {path}")
+        return latent
+
+    def _validate_record_identity_for_path(
+        self,
+        path: Path,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        expected = latent_identity_from_record(record)
+        key = str(path.resolve())
+        identity_cache = getattr(self, "_latent_identity_cache", None)
+        if identity_cache is None:
+            identity_cache = {}
+            self._latent_identity_cache = identity_cache
+        previous = identity_cache.get(key)
+        if previous is not None and previous != expected:
+            raise ValueError(
+                f"QA records map different patch identities to one latent cache file {path}: "
+                f"first={previous}, current={expected}."
+            )
+        identity_cache[key] = expected
+        return expected
+
+    def _validate_record_qa_stats_for_path(
+        self,
+        path: Path,
+        record: Mapping[str, Any],
+    ) -> dict[str, float]:
+        expected = latent_qa_stats_from_record(record)
+        key = str(path.resolve())
+        stats_cache = getattr(self, "_latent_qa_stats_cache", None)
+        if stats_cache is None:
+            stats_cache = {}
+            self._latent_qa_stats_cache = stats_cache
+        previous = stats_cache.get(key)
+        if previous is not None and previous != expected:
+            raise ValueError(
+                f"QA records map different normalization statistics to one latent cache file {path}: "
+                f"first={previous}, current={expected}."
+            )
+        stats_cache[key] = expected
+        return expected
+
+    def validate_latent_file_for_record(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate one unique cache payload without populating the runtime LRU."""
+        path = self.latent_path_for_record(record)
+        if not path.exists():
+            raise FileNotFoundError(f"Latent cache file not found: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        latent = self._latent_from_payload(payload, path=path, record=record)
+        result = {
+            "path": str(path.resolve()),
+            "shape": [int(value) for value in latent.shape],
+            "dtype": str(latent.dtype).replace("torch.", ""),
+        }
+        payload = None
+        latent = None
+        return result
 
     def load_shuffled_latent(self, index: int) -> torch.Tensor:
         other_index = self._random_different_indices[int(index)]
@@ -1519,6 +2015,11 @@ def audit_qa_datasets(
     split_tasks: dict[str, set[str]] = {}
     split_fields: dict[str, set[str]] = {}
     summary: dict[str, Any] = {}
+    globally_validated_latents: dict[str, dict[str, Any]] = {}
+    globally_validated_identities: dict[str, dict[str, Any]] = {}
+    globally_validated_qa_stats: dict[str, dict[str, float]] = {}
+    globally_seen_latent_paths: set[str] = set()
+    latent_audit_started = time.monotonic()
     for split, dataset in datasets.items():
         qa_ids: set[str] = set()
         states: set[str] = set()
@@ -1551,9 +2052,37 @@ def audit_qa_datasets(
             choice_labels[task].update(str(choice) for choice in choices)
             latent_path = dataset.latent_path_for_record(record)
             resolved_latent_path = str(latent_path.resolve())
+            strict_latent_contract = getattr(dataset, "latent_contract", None) is not None
+            if strict_latent_contract:
+                record_identity = latent_identity_from_record(record)
+                previous_identity = globally_validated_identities.get(resolved_latent_path)
+                if previous_identity is not None and previous_identity != record_identity:
+                    raise ValueError(
+                        "QA audit found different patch identities mapped to one latent file: "
+                        f"path={resolved_latent_path}, first={previous_identity}, current={record_identity}."
+                    )
+                globally_validated_identities[resolved_latent_path] = record_identity
+                record_stats = latent_qa_stats_from_record(record)
+                previous_stats = globally_validated_qa_stats.get(resolved_latent_path)
+                if previous_stats is not None and previous_stats != record_stats:
+                    raise ValueError(
+                        "QA audit found different normalization statistics mapped to one latent file: "
+                        f"path={resolved_latent_path}, first={previous_stats}, current={record_stats}."
+                    )
+                globally_validated_qa_stats[resolved_latent_path] = record_stats
             if resolved_latent_path not in latent_paths:
                 if not latent_path.exists():
                     raise FileNotFoundError(f"QA audit found a missing latent cache file: {latent_path}")
+                if strict_latent_contract and resolved_latent_path not in globally_seen_latent_paths:
+                    globally_validated_latents[resolved_latent_path] = dataset.validate_latent_file_for_record(record)
+                    globally_seen_latent_paths.add(resolved_latent_path)
+                    validated_count = len(globally_validated_latents)
+                    if validated_count % 1024 == 0:
+                        print(
+                            f"startup=latent_audit validated={validated_count} "
+                            f"elapsed={timedelta(seconds=int(time.monotonic() - latent_audit_started))}",
+                            flush=True,
+                        )
                 latent_paths.add(resolved_latent_path)
             if task in {"normalized_point_value", "raw_point_value_with_stats"}:
                 displayed = _DISPLAYED_OPTION_PATTERN.findall(str(record.get("query") or record.get("question") or ""))
@@ -1589,7 +2118,7 @@ def audit_qa_datasets(
                 "scripts/build_tensor_patch_qa.py."
             )
         summary[split] = {
-            "records": len(dataset),
+            "records": len(dataset.records),
             "states": len(states),
             "samples": len(samples),
             "latent_files": len(latent_paths),
@@ -1648,6 +2177,10 @@ def audit_qa_datasets(
     summary["sample_overlap"] = sample_overlaps
     summary["latent_file_overlap"] = latent_file_overlaps
     summary["require_disjoint_splits"] = bool(require_disjoint_splits)
+    summary["strict_latent_payloads_validated"] = len(globally_validated_latents)
+    summary["strict_latent_contract_enabled"] = all(
+        getattr(dataset, "latent_contract", None) is not None for dataset in datasets.values()
+    )
     summary["evaluation_scope"] = "formal_generalization" if require_disjoint_splits else "sanity_only"
     summary["_audit_scope"] = {
         "disjoint_records_checked": bool(require_disjoint_splits),
@@ -1691,6 +2224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefer-record-latent-ref", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--latent-cache-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--distributed-timeout-seconds",
+        type=float,
+        default=None,
+        help="Timeout for Stage-2 distributed collectives, including rank-0-only audits.",
+    )
     parser.add_argument(
         "--serialize-llm-loading",
         action=argparse.BooleanOptionalAction,
@@ -2000,6 +2539,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "num_workers", first_nested(config, ["llm_training.num_workers"]), 0)
     set_default(
         args,
+        "distributed_timeout_seconds",
+        first_nested(config, ["llm_training.distributed_timeout_seconds"]),
+        1800.0,
+    )
+    set_default(
+        args,
         "serialize_llm_loading",
         first_nested(config, ["llm_training.serialize_llm_loading"]),
         True,
@@ -2254,6 +2799,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if str(args.choice_scoring_mode) not in {"auto", "label", "sequence"}:
         raise ValueError(f"Unsupported llm_training.choice_scoring_mode: {args.choice_scoring_mode}")
     if str(args.adapter_architecture) in {
+        "alignment_qformer",
+        "alignment_adapter",
         "residual_question_qformer",
         "residual_question_adapter",
     } and str(args.adapter_init_checkpoint or "").strip().lower() in {"", "none", "null", "random"}:
@@ -2284,6 +2831,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
     if int(args.latent_cache_size) < 0 or int(args.num_workers) < 0:
         raise ValueError("llm_training.latent_cache_size and num_workers must be non-negative.")
+    if (
+        not math.isfinite(float(args.distributed_timeout_seconds))
+        or float(args.distributed_timeout_seconds) <= 0.0
+    ):
+        raise ValueError("llm_training.distributed_timeout_seconds must be finite and positive.")
     if float(args.min_host_memory_available_gib) < 0:
         raise ValueError("llm_training.min_host_memory_available_gib must be non-negative.")
     for setting in (
@@ -2306,6 +2858,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         )
     ):
         raise ValueError("At least one training loss weight must be positive.")
+    validate_adapter_loss_contract(args)
     if not 0.0 <= float(args.dropout) < 1.0:
         raise ValueError("adapter.dropout must be in [0, 1).")
     if int(args.local_text_encoder_layers) < 0:
@@ -2515,13 +3068,24 @@ def resolve_model_dtype(raw: str, device: torch.device) -> torch.dtype:
 
 def set_frozen_llm_execution_mode(model: nn.Module, checkpoint_training: bool) -> None:
     checkpointing_active = bool(getattr(model, "is_gradient_checkpointing", False))
+    # Disable stochastic behavior recursively first. This also covers modules
+    # that call functional dropout using their own ``training`` flag.
+    model.eval()
     if checkpoint_training and checkpointing_active:
-        model.train()
-        for module in model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
-    else:
-        model.eval()
+        # Decoder checkpointing is gated on the decoder backbone's training flag.
+        # Flip only that flag so all attention/MLP children remain deterministic.
+        decoder = getattr(model, "model", model)
+        if not isinstance(decoder, nn.Module):
+            raise TypeError("The frozen causal LLM exposes a non-module decoder backbone.")
+        decoder.training = True
+
+
+def frozen_llm_checkpoint_execution_active(model: nn.Module) -> bool:
+    """Return whether the frozen decoder is in its checkpoint-enabled execution mode."""
+    decoder = getattr(model, "model", model)
+    if not isinstance(decoder, nn.Module):
+        raise TypeError("The frozen causal LLM exposes a non-module decoder backbone.")
+    return bool(getattr(model, "is_gradient_checkpointing", False) and decoder.training)
 
 
 def load_tokenizer(args: argparse.Namespace):
@@ -2560,12 +3124,15 @@ def load_llm(args: argparse.Namespace, device: torch.device):
             raise ValueError("The selected causal LLM does not support gradient checkpointing.")
         try:
             enable_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            enable_checkpointing()
+        except TypeError as exc:
+            raise RuntimeError(
+                "Stage-2 soft-prefix training requires non-reentrant gradient checkpointing. "
+                "Upgrade transformers or explicitly disable llm_training.llm_gradient_checkpointing "
+                "for a memory-bounded smoke run."
+            ) from exc
         if not bool(getattr(model, "is_gradient_checkpointing", False)):
             raise RuntimeError("The causal LLM did not report active gradient checkpointing.")
-        # Transformers activates decoder checkpointing only in training mode. Qwen2.5 uses zero
-        # dropout, but keep every Dropout module deterministic in case another compatible LLM does not.
+        # Transformers activates decoder checkpointing only when its decoder backbone is in training mode.
         set_frozen_llm_execution_mode(model, checkpoint_training=True)
     else:
         set_frozen_llm_execution_mode(model, checkpoint_training=False)
@@ -2647,7 +3214,93 @@ def qa_path(qa_dir: str | Path, split: str) -> Path:
     return path
 
 
+def validate_qa_latent_contract(
+    metadata: Mapping[str, Any],
+    *,
+    configured_alignment_checkpoint: str | Path | None,
+    require_formal_contract: bool,
+) -> dict[str, Any] | None:
+    """Bind every formal latent payload to one immutable Stage-1 checkpoint."""
+    metadata_format = str(metadata.get("format", ""))
+    if metadata_format != PATCH_QA_FORMAT:
+        if require_formal_contract:
+            raise ValueError(
+                f"Formal patch QA requires metadata format {PATCH_QA_FORMAT!r}, got {metadata_format!r}. "
+                "Regenerate QA and latent caches with scripts/build_tensor_patch_qa.py."
+            )
+        return None
+    latent_format = str(metadata.get("latent_format", ""))
+    if latent_format != PATCH_LATENT_FORMAT:
+        raise ValueError(
+            f"Patch QA metadata requires latent_format={PATCH_LATENT_FORMAT!r}, got {latent_format!r}."
+        )
+    latent_audit_format = str(metadata.get("latent_audit_format", ""))
+    if latent_audit_format != PATCH_LATENT_AUDIT_FORMAT:
+        raise ValueError(
+            "Patch QA metadata has a missing or stale latent_audit_format; regenerate the QA JSONL "
+            "with scripts/build_tensor_patch_qa.py."
+        )
+    raw_shape = metadata.get("latent_shape")
+    if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, (str, bytes)):
+        raise ValueError("Patch QA metadata latent_shape must be a three-element integer sequence.")
+    latent_shape = [int(value) for value in raw_shape]
+    if len(latent_shape) != 3 or any(value <= 0 for value in latent_shape):
+        raise ValueError(f"Patch QA metadata has invalid latent_shape={latent_shape}.")
+    storage_dtype = str(metadata.get("storage_dtype", ""))
+    if storage_dtype not in {"float16", "float32"}:
+        raise ValueError(f"Patch QA metadata has unsupported storage_dtype={storage_dtype!r}.")
+    normalization = metadata.get("encoder_input_normalization")
+    if not isinstance(normalization, Mapping):
+        raise ValueError("Patch QA metadata is missing encoder_input_normalization.")
+    normalized_config = canonical_normalization(normalization)
+    mode = normalized_config["mode"]
+    scope = normalized_config["scope"]
+    if mode != "zscore" or scope != "channel" or any(
+        normalized_config[name] is not None for name in ("clip_min", "clip_max")
+    ):
+        raise ValueError(
+            "Formal Stage 2 expects unclipped per-patch channel z-score latents; "
+            f"metadata reports {normalized_config}."
+        )
+
+    metadata_checkpoint = str(metadata.get("alignment_checkpoint", "")).strip()
+    configured_checkpoint = str(configured_alignment_checkpoint or "").strip()
+    checkpoint = configured_checkpoint or metadata_checkpoint
+    if not checkpoint:
+        raise ValueError("Patch QA metadata/config does not identify the Stage-1 alignment checkpoint.")
+    if metadata_checkpoint and canonical_path(metadata_checkpoint) != canonical_path(checkpoint):
+        raise ValueError(
+            "Patch QA latent contract points to a different Stage-1 checkpoint: "
+            f"metadata={canonical_path(metadata_checkpoint)}, configured={canonical_path(checkpoint)}."
+        )
+    metadata_sha256 = str(metadata.get("alignment_checkpoint_sha256", "")).lower()
+    if len(metadata_sha256) != 64 or any(character not in "0123456789abcdef" for character in metadata_sha256):
+        raise ValueError("Patch QA metadata has a missing or invalid alignment_checkpoint_sha256.")
+    actual_sha256 = sha256_file(checkpoint)
+    if actual_sha256 != metadata_sha256:
+        raise ValueError(
+            "The Stage-1 checkpoint file changed after patch latents were generated: "
+            f"path={canonical_path(checkpoint)}, metadata_sha256={metadata_sha256}, "
+            f"actual_sha256={actual_sha256}. Regenerate the latent cache."
+        )
+    return {
+        "format": PATCH_LATENT_FORMAT,
+        "latent_audit_format": PATCH_LATENT_AUDIT_FORMAT,
+        "alignment_checkpoint": canonical_path(checkpoint),
+        "alignment_checkpoint_sha256": actual_sha256,
+        "encoder_input_normalization": normalized_config,
+        "latent_shape": latent_shape,
+        "storage_dtype": storage_dtype,
+    }
+
+
 def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    build_marker = Path(args.qa_dir) / PATCH_QA_BUILD_MARKER
+    if build_marker.exists():
+        raise RuntimeError(
+            "Patch QA assets are marked as an incomplete or active build: "
+            f"{build_marker}. Finish/rerun scripts/build_tensor_patch_qa.py before Stage 2."
+        )
     metadata_path = Path(args.qa_dir) / "metadata.json"
     if not metadata_path.exists():
         if bool(args.require_disjoint_splits):
@@ -2660,6 +3313,7 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         raise ValueError(f"Expected a JSON object in {metadata_path}.")
     metadata_format = str(metadata.get("format", ""))
+    legacy_metadata_format = "tensor_patch_qa_v2"
     prompt_contract = str(metadata.get("prompt_contract", ""))
     coordinate_origin = int(metadata.get("natural_language_coordinate_origin", -1))
     if bool(args.require_disjoint_splits) and (
@@ -2671,8 +3325,13 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "Formal patch QA training requires regenerated encoder-zscore, one-based natural-language prompts. "
             f"Observed format={metadata_format!r}, prompt_contract={prompt_contract!r}, "
             f"coordinate_origin={coordinate_origin}. Run scripts/build_tensor_patch_qa.py with the current code; "
-            "matching latent files will be reused."
+            "formal v3 caches must be regenerated or strictly revalidated."
         )
+    if not bool(args.require_disjoint_splits) and metadata_format not in {
+        PATCH_QA_FORMAT,
+        legacy_metadata_format,
+    }:
+        raise ValueError(f"Unsupported patch QA metadata format={metadata_format!r}.")
     qa_fields = [str(field) for field in metadata.get("fields", [])]
     alignment_fields = [str(field) for field in metadata.get("alignment_fields", [])]
     allow_unseen_alignment_fields = bool(metadata.get("allow_unseen_alignment_fields", False))
@@ -2688,21 +3347,28 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         )
     observed_alignment = metadata.get("alignment_checkpoint")
     configured_alignment = getattr(args, "qa_alignment_checkpoint", None)
-    if observed_alignment and configured_alignment:
-        observed_path = Path(str(observed_alignment)).expanduser().resolve()
-        configured_path = Path(str(configured_alignment)).expanduser().resolve()
+    adapter_init = str(args.adapter_init_checkpoint or "").strip()
+    direct_alignment_provenance: dict[str, Any] | None = None
+    if is_direct_alignment_architecture(args.adapter_architecture):
+        direct_alignment_provenance = validate_direct_alignment_provenance(
+            metadata_checkpoint=observed_alignment,
+            configured_checkpoint=configured_alignment,
+            adapter_checkpoint=adapter_init,
+            require_metadata_checkpoint=bool(args.require_disjoint_splits),
+        )
+    elif observed_alignment and configured_alignment:
+        observed_path = _configured_checkpoint_path(observed_alignment)
+        configured_path = _configured_checkpoint_path(configured_alignment)
         if observed_path != configured_path:
             raise ValueError(
                 "Patch QA metadata was generated with a different alignment checkpoint. "
                 f"metadata={observed_path}, config={configured_path}."
             )
-    adapter_init = str(args.adapter_init_checkpoint or "").strip()
-    if configured_alignment and adapter_init and Path(adapter_init).name == "alignment_best.pt":
-        if Path(adapter_init).expanduser().resolve() != Path(str(configured_alignment)).expanduser().resolve():
-            raise ValueError(
-                "adapter.init_checkpoint and patch_qa.alignment_checkpoint must match when initializing "
-                "directly from alignment_best.pt."
-            )
+    latent_contract = validate_qa_latent_contract(
+        metadata,
+        configured_alignment_checkpoint=configured_alignment,
+        require_formal_contract=bool(args.require_disjoint_splits),
+    )
     split_mode = str(metadata.get("split_mode", "unknown"))
     if bool(args.require_disjoint_splits) and split_mode != "sample":
         raise ValueError(
@@ -2731,6 +3397,9 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_contract": prompt_contract,
         "natural_language_coordinate_origin": coordinate_origin,
         "alignment_checkpoint": str(observed_alignment or ""),
+        "alignment_checkpoint_sha256": str(metadata.get("alignment_checkpoint_sha256", "")),
+        "latent_contract": latent_contract,
+        "direct_alignment_provenance": direct_alignment_provenance,
         "hdf5_path": str(metadata.get("hdf5_path", "")),
         "fields": qa_fields,
         "alignment_fields": alignment_fields,
@@ -2889,11 +3558,13 @@ def audit_prompt_tokenization(
     tokenizer,
     max_prompt_tokens: int,
     prompt_template: str,
+    audit_local_conditioning_prompt: bool = True,
 ) -> dict[str, Any]:
     limit = int(max_prompt_tokens)
     summary: dict[str, Any] = {
         "max_prompt_tokens": limit,
         "prompt_template": str(prompt_template),
+        "local_conditioning_prompt_audited": bool(audit_local_conditioning_prompt),
         "splits": {},
         "truncated_records": 0,
         "local_truncated_records": 0,
@@ -2927,14 +3598,21 @@ def audit_prompt_tokenization(
                     )
                 prompts.append(prompt)
             encoded = tokenizer(prompts, add_special_tokens=True, truncation=False)["input_ids"]
-            local_encoded = tokenizer(
-                [build_local_conditioning_prompt(record, prompt_template=prompt_template) for record in records],
-                add_special_tokens=True,
-                truncation=False,
-            )["input_ids"]
+            local_encoded: Sequence[Sequence[int] | None]
+            if audit_local_conditioning_prompt:
+                local_encoded = tokenizer(
+                    [
+                        build_local_conditioning_prompt(record, prompt_template=prompt_template)
+                        for record in records
+                    ],
+                    add_special_tokens=True,
+                    truncation=False,
+                )["input_ids"]
+            else:
+                local_encoded = [None] * len(records)
             for record, token_ids, local_token_ids in zip(records, encoded, local_encoded):
                 token_count = len(token_ids)
-                local_token_count = len(local_token_ids)
+                local_token_count = len(local_token_ids) if local_token_ids is not None else 0
                 task = str(record.get("task_type", "unknown"))
                 task_stat = task_stats[task]
                 task_stat["records"] += 1
@@ -2954,7 +3632,7 @@ def audit_prompt_tokenization(
                                 "tokens": token_count,
                             }
                         )
-                if local_token_count > limit:
+                if audit_local_conditioning_prompt and local_token_count > limit:
                     split_local_truncated += 1
                     if len(summary["truncated_examples"]) < 8:
                         summary["truncated_examples"].append(
@@ -2978,7 +3656,11 @@ def audit_prompt_tokenization(
         summary["truncated_records"] += split_truncated
         summary["local_truncated_records"] += split_local_truncated
     summary["all_prompts_fit"] = (
-        int(summary["truncated_records"]) == 0 and int(summary["local_truncated_records"]) == 0
+        int(summary["truncated_records"]) == 0
+        and (
+            not bool(audit_local_conditioning_prompt)
+            or int(summary["local_truncated_records"]) == 0
+        )
     )
     return summary
 
@@ -4726,7 +5408,8 @@ def evaluate_choice_accuracy(
     args: argparse.Namespace,
     baseline_modes: Sequence[str],
 ) -> dict[str, Any]:
-    llm_was_training = bool(llm.training)
+    adapter_was_training = bool(adapter.training)
+    llm_checkpoint_training = frozen_llm_checkpoint_execution_active(llm)
     llm.eval()
     eval_sampler = (
         ExactDistributedEvalSampler(
@@ -4841,9 +5524,8 @@ def evaluate_choice_accuracy(
                 for key, count in sorted(task_field_total.items())
             },
         }
-    adapter.train()
-    if llm_was_training:
-        set_frozen_llm_execution_mode(llm, checkpoint_training=True)
+    adapter.train(adapter_was_training)
+    set_frozen_llm_execution_mode(llm, checkpoint_training=llm_checkpoint_training)
     return metrics
 
 
@@ -4960,6 +5642,90 @@ def _decoder_for_diagnostics(llm) -> nn.Module:
     if decoder is None or decoder is llm:
         raise ValueError("The causal LLM does not expose decoder hidden states for diagnostics.")
     return decoder
+
+
+def _resolved_diagnostic_layers(
+    requested_layers: Sequence[int],
+    hidden_state_count: int,
+) -> list[int]:
+    if not requested_layers:
+        raise ValueError("At least one diagnostic hidden-state layer must be requested.")
+    invalid = [
+        int(value)
+        for value in requested_layers
+        if not -int(hidden_state_count) <= int(value) < int(hidden_state_count)
+    ]
+    if invalid:
+        raise ValueError(
+            f"Diagnostic hidden-state layers {invalid} are invalid for "
+            f"{int(hidden_state_count)} returned states."
+        )
+    return sorted(
+        {
+            int(value) if int(value) >= 0 else int(hidden_state_count) + int(value)
+            for value in requested_layers
+        }
+    )
+
+
+@torch.no_grad()
+def _decoder_question_last_hidden(
+    decoder: nn.Module,
+    soft_embeds: torch.Tensor,
+    text_embeds: torch.Tensor,
+    text_mask: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    requested_layers: Sequence[int],
+) -> dict[str, torch.Tensor]:
+    if soft_embeds.ndim != 3 or text_embeds.ndim != 3:
+        raise ValueError(
+            "Diagnostic decoder inputs must be [batch,tokens,hidden] tensors: "
+            f"soft={tuple(soft_embeds.shape)}, text={tuple(text_embeds.shape)}."
+        )
+    if int(soft_embeds.shape[0]) != 1 or int(text_embeds.shape[0]) != 1:
+        raise ValueError("Question-last diagnostics currently require a single record.")
+    if text_mask.ndim != 2 or prompt_mask.shape != text_mask.shape:
+        raise ValueError(
+            "Question-last diagnostics require matching [1,tokens] text and prompt masks: "
+            f"text_mask={tuple(text_mask.shape)}, prompt_mask={tuple(prompt_mask.shape)}."
+        )
+    prompt_positions = torch.nonzero(
+        prompt_mask[0].bool() & text_mask[0].bool(),
+        as_tuple=False,
+    ).flatten()
+    if prompt_positions.numel() == 0:
+        raise ValueError(
+            "Question-last diagnostics found no prompt token. The QA prompt must contain at least "
+            "one unmasked natural-language token before the answer target."
+        )
+    inputs = torch.cat([soft_embeds, text_embeds], dim=1)
+    attention = torch.cat(
+        [
+            torch.ones(
+                (1, int(soft_embeds.shape[1])),
+                dtype=text_mask.dtype,
+                device=text_mask.device,
+            ),
+            text_mask,
+        ],
+        dim=1,
+    )
+    outputs = decoder(
+        inputs_embeds=inputs,
+        attention_mask=attention,
+        use_cache=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("The diagnostic decoder did not return hidden states.")
+    resolved_layers = _resolved_diagnostic_layers(requested_layers, len(hidden_states))
+    question_last = int(soft_embeds.shape[1]) + int(prompt_positions[-1].item())
+    return {
+        str(layer): hidden_states[layer][0, question_last].detach().float().cpu()
+        for layer in resolved_layers
+    }
 
 
 def _adapter_forward_with_trace(
@@ -5102,7 +5868,7 @@ def _adapter_forward_with_trace(
 
 
 @torch.no_grad()
-def run_embedded_diagnostics(
+def _run_embedded_diagnostics_impl(
     stage: str,
     llm,
     adapter: nn.Module,
@@ -5117,8 +5883,6 @@ def run_embedded_diagnostics(
     requested_layers = [int(value) for value in parse_csv(args.diagnostics_layers)]
     tensor_payload: dict[str, Any] = {"stage": stage, "records": {}}
     summaries: list[dict[str, Any]] = []
-    was_training = adapter.training
-    llm_was_training = bool(llm.training)
     adapter.eval()
     llm.eval()
     for index in selected:
@@ -5197,18 +5961,15 @@ def run_embedded_diagnostics(
             hidden_states = outputs.hidden_states
             if hidden_states is None:
                 raise RuntimeError("LLM diagnostics requested hidden states but the decoder returned none.")
-            invalid_layers = [
-                value for value in requested_layers if not -len(hidden_states) <= value < len(hidden_states)
-            ]
-            if invalid_layers:
+            resolved_layers = _resolved_diagnostic_layers(requested_layers, len(hidden_states))
+            prompt_positions = torch.nonzero(
+                prompt_mask[0].bool() & text_mask[0].bool(),
+                as_tuple=False,
+            ).flatten()
+            if prompt_positions.numel() == 0:
                 raise ValueError(
-                    f"Diagnostic hidden-state layers {invalid_layers} are invalid for "
-                    f"{len(hidden_states)} returned states."
+                    "Embedded diagnostics found no natural-language prompt token before the answer target."
                 )
-            resolved_layers = sorted(
-                {value if value >= 0 else len(hidden_states) + value for value in requested_layers}
-            )
-            prompt_positions = torch.nonzero(prompt_mask[0], as_tuple=False).flatten()
             question_last = int(soft.shape[1] + prompt_positions[-1].item())
             local_count = (
                 0
@@ -5394,8 +6155,10 @@ def run_embedded_diagnostics(
             alt_ids = alt_ids.to(device)
             alt_mask = alt_mask.to(device)
             alt_labels = alt_labels.to(device)
-            alt_text_embeds = llm.get_input_embeddings()(alt_ids)
-            alt_prompt_mask = alt_labels.eq(IGNORE_INDEX) & alt_mask.bool()
+            alt_llm_text_embeds = llm.get_input_embeddings()(alt_ids)
+            alt_llm_prompt_mask = alt_labels.eq(IGNORE_INDEX) & alt_mask.bool()
+            alt_text_embeds = alt_llm_text_embeds
+            alt_prompt_mask = alt_llm_prompt_mask
             if (
                 isinstance(adapter, HybridGlobalLocalAdapter)
                 and adapter.local_adapter.question_input_mode == "contextual_tokens"
@@ -5428,11 +6191,29 @@ def run_embedded_diagnostics(
                 prompt_mask=alt_prompt_mask,
                 structured_query=alt_condition,
             )
-            alt_soft = alt_soft[0].detach().float().cpu()
+            alt_soft_model = alt_soft.to(dtype=alt_llm_text_embeds.dtype)
+            alt_soft = alt_soft_model[0].detach().float().cpu()
+            alt_question_last = _decoder_question_last_hidden(
+                decoder=decoder,
+                soft_embeds=alt_soft_model,
+                text_embeds=alt_llm_text_embeds,
+                text_mask=alt_mask,
+                prompt_mask=alt_llm_prompt_mask,
+                requested_layers=requested_layers,
+            )
+            same_latent_question_last = {
+                layer: _cosine_and_relative_l2(
+                    correct_state["layers"][layer]["question_last"],
+                    hidden,
+                )
+                for layer, hidden in alt_question_last.items()
+                if layer in correct_state["layers"]
+            }
             question_sensitivity = {
                 "alternate_qa_id": str(alternate_record.get("qa_id", "")),
                 "alternate_task_type": str(alternate_record.get("task_type", "unknown")),
                 "same_latent_soft_prompt": _cosine_and_relative_l2(correct_state["soft_prompt"], alt_soft),
+                "same_latent_question_last_by_layer": same_latent_question_last,
             }
             if isinstance(adapter, HybridGlobalLocalAdapter) and adapter.residual_mode:
                 question_sensitivity["same_latent_local_prompt"] = _cosine_and_relative_l2(
@@ -5561,6 +6342,12 @@ def run_embedded_diagnostics(
     same_task_sensitive_records = [
         item for item in summaries if item["same_task_question_sensitivity"] is not None
     ]
+    question_hidden_sensitive_records = [
+        item
+        for item in question_sensitive_records
+        if isinstance(item["question_sensitivity"].get("same_latent_question_last_by_layer"), Mapping)
+        and item["question_sensitivity"]["same_latent_question_last_by_layer"]
+    ]
     local_rms_values = [
         float(item["soft_prompt_correct_vs_shuffled"].get("local_rms", 0.0)) for item in summaries
     ]
@@ -5677,6 +6464,28 @@ def run_embedded_diagnostics(
             if "same_latent_local_prompt" in item["question_sensitivity"]
         )
         / max(1, len(question_sensitive_records)),
+        "same_latent_different_question_question_last_relative_l2_by_layer": {
+            layer: sum(
+                item["question_sensitivity"]["same_latent_question_last_by_layer"][layer]["relative_l2"]
+                for item in question_hidden_sensitive_records
+                if layer in item["question_sensitivity"]["same_latent_question_last_by_layer"]
+            )
+            / max(
+                1,
+                sum(
+                    layer in item["question_sensitivity"]["same_latent_question_last_by_layer"]
+                    for item in question_hidden_sensitive_records
+                ),
+            )
+            for layer in sorted(
+                {
+                    layer
+                    for item in question_hidden_sensitive_records
+                    for layer in item["question_sensitivity"]["same_latent_question_last_by_layer"]
+                },
+                key=int,
+            )
+        },
         "same_task_different_question_local_relative_l2_mean": sum(
             item["same_task_question_sensitivity"]["same_latent_local_prompt"]["relative_l2"]
             for item in same_task_sensitive_records
@@ -5745,20 +6554,59 @@ def run_embedded_diagnostics(
             for layer in layer_names
         },
     }
+    question_last_by_layer = aggregate[
+        "same_latent_different_question_question_last_relative_l2_by_layer"
+    ]
+    aggregate["same_latent_different_question_question_last_relative_l2_mean"] = (
+        sum(float(value) for value in question_last_by_layer.values())
+        / max(1, len(question_last_by_layer))
+    )
     summary = {
         "stage": stage,
         "aggregate": aggregate,
         "records": summaries,
         "state_file": str(diagnostic_dir / f"{stage}_states.pt"),
+        "state_float_dtype": "float16",
         "structured_query_conditioning": bool(getattr(adapter, "structured_query_conditioning", False)),
     }
     atomic_dump_json(diagnostic_dir / f"{stage}_summary.json", summary)
-    atomic_torch_save(diagnostic_dir / f"{stage}_states.pt", tensor_payload)
-    if was_training:
-        adapter.train()
-    if llm_was_training:
-        set_frozen_llm_execution_mode(llm, checkpoint_training=True)
+    atomic_torch_save(
+        diagnostic_dir / f"{stage}_states.pt",
+        compact_diagnostic_tensors(tensor_payload),
+    )
     return summary
+
+
+def run_embedded_diagnostics(
+    stage: str,
+    llm,
+    adapter: nn.Module,
+    tokenizer,
+    dataset: TensorReadoutQADataset,
+    device: torch.device,
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Run diagnostics without leaking eval mode into the training loop."""
+    adapter_was_training = bool(adapter.training)
+    llm_checkpoint_training = frozen_llm_checkpoint_execution_active(llm)
+    try:
+        return _run_embedded_diagnostics_impl(
+            stage=stage,
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            device=device,
+            args=args,
+            run_dir=run_dir,
+        )
+    finally:
+        adapter.train(adapter_was_training)
+        set_frozen_llm_execution_mode(
+            llm,
+            checkpoint_training=llm_checkpoint_training,
+        )
 
 
 def save_adapter_checkpoint(
@@ -5767,16 +6615,93 @@ def save_adapter_checkpoint(
     args: argparse.Namespace,
     latent_shape: Sequence[int],
     llm_hidden_size: int,
+    latent_contract: Mapping[str, Any],
     metrics: Mapping[str, Any] | None = None,
 ) -> None:
     payload = {
+        "checkpoint_type": "tensor_llm_adapter",
+        "checkpoint_version": 2,
         "adapter_state_dict": adapter.state_dict(),
         "args": redacted_args(args),
         "latent_shape_chw": list(int(dim) for dim in latent_shape),
         "llm_hidden_size": int(llm_hidden_size),
+        "latent_contract": dict(latent_contract),
         "metrics": dict(metrics or {}),
     }
     atomic_torch_save(path, payload)
+
+
+def validate_adapter_checkpoint_payload(
+    checkpoint: Any,
+    *,
+    expected_latent_shape: Sequence[int],
+    expected_llm_hidden_size: int,
+    expected_architecture: str,
+    expected_latent_contract: Mapping[str, Any],
+) -> Mapping[str, torch.Tensor]:
+    """Validate that a saved Stage-2 checkpoint is standalone and belongs to this run."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Stage-2 adapter checkpoint must contain a mapping payload.")
+    if str(checkpoint.get("checkpoint_type", "")) != "tensor_llm_adapter":
+        raise ValueError("Stage-2 adapter checkpoint has an invalid checkpoint_type.")
+    try:
+        checkpoint_version = int(checkpoint.get("checkpoint_version", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stage-2 adapter checkpoint_version must be an integer.") from exc
+    if checkpoint_version < 2:
+        raise ValueError(
+            "Stage-2 adapter checkpoint lacks the version-2 latent provenance envelope."
+        )
+    state_dict = checkpoint.get("adapter_state_dict")
+    checkpoint_args = checkpoint.get("args")
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("Stage-2 adapter checkpoint has no adapter_state_dict.")
+    if not isinstance(checkpoint_args, Mapping):
+        raise ValueError("Stage-2 adapter checkpoint has no args mapping.")
+    non_tensor_keys = [str(key) for key, value in state_dict.items() if not torch.is_tensor(value)]
+    if non_tensor_keys:
+        raise ValueError(
+            "Stage-2 adapter state_dict contains non-tensor values: "
+            f"{non_tensor_keys[:8]}."
+        )
+    non_finite_keys = [
+        str(key)
+        for key, value in state_dict.items()
+        if value.is_floating_point() and not bool(torch.isfinite(value).all())
+    ]
+    if non_finite_keys:
+        raise FloatingPointError(
+            "Stage-2 adapter checkpoint contains NaN or infinity: "
+            f"{non_finite_keys[:8]}."
+        )
+    observed_shape = checkpoint.get("latent_shape_chw")
+    if not isinstance(observed_shape, Sequence) or isinstance(observed_shape, (str, bytes)):
+        raise ValueError("Stage-2 adapter checkpoint has no valid latent_shape_chw.")
+    observed_shape_values = tuple(int(value) for value in observed_shape)
+    expected_shape_values = tuple(int(value) for value in expected_latent_shape)
+    if observed_shape_values != expected_shape_values:
+        raise ValueError(
+            "Stage-2 adapter checkpoint latent shape mismatch: "
+            f"observed={observed_shape_values}, expected={expected_shape_values}."
+        )
+    if int(checkpoint.get("llm_hidden_size", -1)) != int(expected_llm_hidden_size):
+        raise ValueError(
+            "Stage-2 adapter checkpoint LLM hidden width does not match the active model."
+        )
+    observed_architecture = str(checkpoint_args.get("adapter_architecture", ""))
+    if observed_architecture != str(expected_architecture):
+        raise ValueError(
+            "Stage-2 adapter checkpoint architecture mismatch: "
+            f"observed={observed_architecture!r}, expected={str(expected_architecture)!r}."
+        )
+    observed_contract = checkpoint.get("latent_contract")
+    if not isinstance(observed_contract, Mapping):
+        raise ValueError("Stage-2 adapter checkpoint is missing latent_contract provenance.")
+    if dict(observed_contract) != dict(expected_latent_contract):
+        raise ValueError(
+            "Stage-2 adapter checkpoint was trained against a different latent/Stage-1 contract."
+        )
+    return state_dict
 
 
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -6049,6 +6974,7 @@ def compact_diagnostic_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
         "local_prompt_relative_l2_mean",
         "answer_margin_correct_minus_shuffled",
         "same_task_different_question_local_relative_l2_mean",
+        "same_latent_different_question_question_last_relative_l2_mean",
         "same_task_swapped_question_answer_margin_mean",
         "local_to_global_prompt_rms_ratio",
     )
@@ -6060,6 +6986,11 @@ def compact_diagnostic_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
     for key in ("local_residual_gate",):
         if isinstance(metrics.get(key), (int, float)):
             payload[f"diagnostics/{key}"] = float(metrics[key])
+    tensor_sensitivity = metrics.get("question_last_relative_l2_by_layer")
+    if isinstance(tensor_sensitivity, Mapping):
+        for layer, value in tensor_sensitivity.items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                payload[f"diagnostics/tensor_question_last_relative_l2/layer_{layer}"] = float(value)
     generation = metrics.get("generation")
     if isinstance(generation, Mapping):
         for key in (
@@ -6253,27 +7184,50 @@ def main() -> None:
             "regex-parsed task/coordinate features. Disable it so the adapter reads the natural-language question."
         )
     apply_runtime_environment(args)
-    device = initialize_distributed_device(str(args.device))
+    device = initialize_distributed_device(
+        str(args.device),
+        float(args.distributed_timeout_seconds),
+    )
     seed_everything(int(args.seed))
     run_dir = build_distributed_run_dir(args.output_root, args.run_name)
-    lifecycle = RunLifecycle(run_dir) if is_main_process() else None
+    lifecycle: RunLifecycle | None = None
+
+    def initialize_lifecycle() -> dict[str, str]:
+        nonlocal lifecycle
+        lifecycle = RunLifecycle(run_dir)
+        return {"started_at": lifecycle.started_at}
+
+    lifecycle_metadata = run_on_rank_zero_and_broadcast(
+        initialize_lifecycle,
+        "run lifecycle initialization",
+    )
     _ACTIVE_RUN_LIFECYCLE = lifecycle
-    if is_main_process():
-        dump_json(run_dir / "args_requested.json", redacted_args(args))
+
+    def write_startup_snapshots() -> None:
+        atomic_dump_json(run_dir / "args_requested.json", redacted_args(args))
         if args.config:
-            dump_json(
+            atomic_dump_json(
                 run_dir / "config_snapshot.json",
                 redacted_config_snapshot(load_yaml_mapping(args.config)),
             )
+
+    run_on_rank_zero_and_broadcast(write_startup_snapshots, "startup snapshot write")
+    if is_main_process():
         print(
-            f"run={run_dir.name} started_at={lifecycle.started_at if lifecycle is not None else local_timestamp()} "
+            f"run={run_dir.name} started_at={lifecycle_metadata['started_at']} "
             "startup=metadata_audit"
         )
-    qa_metadata_audit = broadcast_object_from_rank_zero(
-        audit_qa_metadata(args) if is_main_process() else None
+    qa_metadata_audit = run_on_rank_zero_and_broadcast(
+        lambda: audit_qa_metadata(args),
+        "QA metadata audit",
+    )
+    raw_latent_contract = qa_metadata_audit.get("latent_contract")
+    latent_contract = dict(raw_latent_contract) if isinstance(raw_latent_contract, Mapping) else None
+    run_on_rank_zero_and_broadcast(
+        lambda: atomic_dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit),
+        "QA metadata audit write",
     )
     if is_main_process():
-        dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit)
         print("startup=dataset_index")
 
     train_dataset = TensorReadoutQADataset(
@@ -6283,6 +7237,7 @@ def main() -> None:
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
+        latent_contract=latent_contract,
     )
     val_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.val_split),
@@ -6291,6 +7246,7 @@ def main() -> None:
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
+        latent_contract=latent_contract,
     )
     test_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.test_split),
@@ -6299,6 +7255,7 @@ def main() -> None:
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
+        latent_contract=latent_contract,
     )
     first_latent = train_dataset[0]["latent_map"]
     latent_shape = tuple(int(dim) for dim in first_latent.shape)
@@ -6308,8 +7265,8 @@ def main() -> None:
         print(
             f"startup=data_audit train/val/test={len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)}"
         )
-    data_audit = broadcast_object_from_rank_zero(
-        audit_qa_datasets(
+    data_audit = run_on_rank_zero_and_broadcast(
+        lambda: audit_qa_datasets(
             datasets,
             require_disjoint_splits=bool(args.require_disjoint_splits),
             require_complete_split_coverage=not any(
@@ -6320,28 +7277,30 @@ def main() -> None:
                     args.max_test_records,
                 )
             ),
-        )
-        if is_main_process()
-        else None
+        ),
+        "QA dataset audit",
     )
-    if is_main_process():
-        dump_json(run_dir / "data_audit.json", data_audit)
+    run_on_rank_zero_and_broadcast(
+        lambda: atomic_dump_json(run_dir / "data_audit.json", data_audit),
+        "QA dataset audit write",
+    )
 
     if is_main_process():
         print("startup=tokenizer_and_prompt_audit")
     tokenizer = load_tokenizer(args)
-    prompt_audit = broadcast_object_from_rank_zero(
-        audit_prompt_tokenization(
+    prompt_audit = run_on_rank_zero_and_broadcast(
+        lambda: audit_prompt_tokenization(
             datasets=datasets,
             tokenizer=tokenizer,
             max_prompt_tokens=int(args.max_prompt_tokens),
             prompt_template=str(args.prompt_template),
-        )
-        if is_main_process()
-        else None
+            audit_local_conditioning_prompt=uses_contextual_local_prompt(args),
+        ),
+        "prompt tokenization audit",
     )
-    choice_tokenization_audit = broadcast_object_from_rank_zero(
-        audit_choice_tokenization(datasets, tokenizer) if is_main_process() else None
+    choice_tokenization_audit = run_on_rank_zero_and_broadcast(
+        lambda: audit_choice_tokenization(datasets, tokenizer),
+        "choice tokenization audit",
     )
     choice_tokenization_audit = dict(choice_tokenization_audit)
     configured_choice_mode = str(args.choice_scoring_mode)
@@ -6356,9 +7315,11 @@ def main() -> None:
         if configured_choice_mode == "sequence"
         else str(choice_tokenization_audit["evaluation_path"])
     )
-    if is_main_process():
-        dump_json(run_dir / "prompt_audit.json", prompt_audit)
-        dump_json(run_dir / "choice_tokenization_audit.json", choice_tokenization_audit)
+    def write_prompt_audits() -> None:
+        atomic_dump_json(run_dir / "prompt_audit.json", prompt_audit)
+        atomic_dump_json(run_dir / "choice_tokenization_audit.json", choice_tokenization_audit)
+
+    run_on_rank_zero_and_broadcast(write_prompt_audits, "prompt audit write")
     if configured_choice_mode == "label" and not bool(
         choice_tokenization_audit["all_labels_single_token"]
     ):
@@ -6368,7 +7329,7 @@ def main() -> None:
         )
     if bool(args.require_untruncated_prompts) and not bool(prompt_audit["all_prompts_fit"]):
         raise ValueError(
-            "Prompt audit found main/local prompts longer than "
+            "Prompt audit found an active prompt path longer than "
             f"max_prompt_tokens={int(args.max_prompt_tokens)}. Increase the limit so formal runs do not "
             "silently remove natural-language instructions. See prompt_audit.json."
         )
@@ -6427,6 +7388,7 @@ def main() -> None:
         else {"validated_before_training": False, "reason": "diagnostics disabled"}
     )
     context_layer_values = [int(value) for value in parse_csv(args.local_context_layers)]
+    uses_contextual_local_adapter = uses_contextual_local_prompt(args)
     local_context_audit = (
         {
             "validated_before_training": True,
@@ -6435,12 +7397,12 @@ def main() -> None:
                 for layer_index in context_layer_values
             ],
         }
-        if str(args.local_question_input_mode) == "contextual_tokens"
-        else {"validated_before_training": False, "reason": "input_embeddings mode"}
+        if uses_contextual_local_adapter
+        else {"validated_before_training": False, "reason": "architecture has no contextual local adapter"}
     )
     local_context_preflight: tuple[torch.Tensor, torch.Tensor] | None = None
-    if str(args.local_question_input_mode) == "contextual_tokens":
-        llm_was_training = bool(llm.training)
+    if uses_contextual_local_adapter:
+        llm_checkpoint_training = frozen_llm_checkpoint_execution_active(llm)
         llm.eval()
         preflight_ids, preflight_mask = build_local_question_tensors(
             records=[train_dataset.records[0]],
@@ -6467,12 +7429,15 @@ def main() -> None:
             }
         )
         local_context_preflight = (preflight_context, preflight_mask.bool())
-        if llm_was_training:
-            set_frozen_llm_execution_mode(llm, checkpoint_training=True)
+        set_frozen_llm_execution_mode(llm, checkpoint_training=llm_checkpoint_training)
 
     initialization = "random"
     checkpoint_load_report: dict[str, Any] = {"mode": "random"}
     global_checkpoint_load_report: dict[str, Any] | None = None
+    stage1_teacher_supervision: dict[str, Any] | None = None
+    stage1_checkpoint_version = 0
+    stage1_checkpoint_phase: str | None = None
+    stage1_checkpoint_validation_mode: str | None = None
     if str(args.adapter_architecture) in {
         "alignment_qformer",
         "alignment_adapter",
@@ -6487,11 +7452,30 @@ def main() -> None:
         if init_checkpoint.lower() in {"", "none", "null", "random"}:
             init_checkpoint = ""
         if init_checkpoint:
-            loaded = torch.load(Path(init_checkpoint).expanduser(), map_location="cpu")
+            loaded = torch.load(
+                Path(init_checkpoint).expanduser(),
+                map_location="cpu",
+                weights_only=True,
+            )
             if not isinstance(loaded, Mapping):
                 raise ValueError(f"Unsupported alignment checkpoint: {args.adapter_init_checkpoint}")
             checkpoint = loaded
             checkpoint_args = loaded.get("args", {}) if isinstance(loaded.get("args"), Mapping) else {}
+            if is_direct_alignment_architecture(args.adapter_architecture):
+                checkpoint_validation = validate_stage1_alignment_checkpoint_payload(
+                    loaded,
+                    path=init_checkpoint,
+                )
+                if "adapter_architecture" in checkpoint_args:
+                    raise ValueError(
+                        "Direct Stage 2 must start from a Stage-1 alignment checkpoint, not a previous "
+                        "downstream adapter checkpoint. Use alignment_best.pt from Stage 1."
+                    )
+                validate_stage1_model_identity(checkpoint_args, args.model_name_or_path)
+                stage1_checkpoint_phase = str(checkpoint_validation["checkpoint_phase"])
+                stage1_checkpoint_validation_mode = str(checkpoint_validation["validation_mode"])
+                stage1_teacher_supervision = validate_stage1_teacher_supervision(loaded)
+                stage1_checkpoint_version = int(checkpoint_validation["checkpoint_version"])
         raw_checkpoint_state = checkpoint.get("adapter_state_dict") if checkpoint is not None else None
         hybrid_checkpoint = isinstance(raw_checkpoint_state, Mapping) and any(
             str(key).startswith("global_adapter.") for key in raw_checkpoint_state
@@ -6594,6 +7578,11 @@ def main() -> None:
                 "mode": "strict_global_checkpoint",
                 "loaded_parameter_tensors": global_loaded_parameter_tensors,
                 "local_loaded_parameter_tensors": 0,
+                "stage1_checkpoint_version": int(stage1_checkpoint_version),
+                "stage1_checkpoint_phase": stage1_checkpoint_phase,
+                "stage1_checkpoint_validation_mode": stage1_checkpoint_validation_mode,
+                "stage1_teacher_supervision": stage1_teacher_supervision,
+                "stage1_loss_feature_transform_loaded": False,
                 **global_checkpoint_load_report,
             }
             initialization = "alignment_checkpoint"
@@ -6775,6 +7764,16 @@ def main() -> None:
             args.global_unfreeze_epoch = 0
             args.question_conditioning = True
             args.structured_query_conditioning = False
+        # Strict loading has copied every deployable adapter tensor. Do not keep
+        # the Stage-1 compressor and loss-only transform payload resident in host
+        # memory for the rest of a long Stage-2 run.
+        checkpoint = None
+        checkpoint_args = {}
+        hybrid_state_dict = None
+        raw_checkpoint_state = None
+        state_dict = None
+        if init_checkpoint:
+            loaded = None
     else:
         adapter = TensorSoftPromptAdapter(
             latent_channels=latent_channels,
@@ -6896,6 +7895,13 @@ def main() -> None:
                 name="adapter",
             ),
         )
+    optimizer_audit = optimizer_parameter_audit(
+        optimizer,
+        adapter,
+        allow_frozen_parameters=(
+            isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.residual_mode
+        ),
+    )
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
     total_optimizer_updates = max(1, updates_per_epoch * int(args.epochs))
@@ -6912,6 +7918,11 @@ def main() -> None:
     final_baseline_modes = parse_csv(args.final_eval_baselines)
     if not final_baseline_modes:
         final_baseline_modes = list(baseline_modes)
+    optimizer_lr_prefix = (
+        "adapter"
+        if is_direct_alignment_architecture(str(args.adapter_architecture))
+        else "local"
+    )
 
     summary = {
         "device": str(device),
@@ -6931,7 +7942,9 @@ def main() -> None:
                 * int(args.gradient_accumulation_steps)
             ),
             "gradient_sync": "manual_all_reduce_adapter_only",
+            "gradient_normalization": "record_weighted_manual_ddp",
             "evaluation_sharding": "exact_nonpadding",
+            "timeout_seconds": float(args.distributed_timeout_seconds),
         },
         "grouped_batch_size_epoch_zero": (
             {
@@ -6967,7 +7980,7 @@ def main() -> None:
             "latent_cache_budget_scope": "per_rank_shared_across_workers",
         },
         "shuffle_seed": int(args.shuffle_seed),
-        "shuffled_negative_policy": "same_field_task_different_sample_then_fallback",
+        "shuffled_baseline_policy": "same_field_task_different_sample_then_fallback",
         "ce_loss_weight": float(args.ce_loss_weight),
         "choice_ce_loss_weight": float(args.choice_ce_loss_weight),
         "ranking_loss_weight": float(args.ranking_loss_weight),
@@ -6987,7 +8000,7 @@ def main() -> None:
         "question_condition_gate_init": float(args.question_condition_gate_init),
         "structured_query_conditioning": bool(args.structured_query_conditioning),
         "question_input_mode": (
-            "latent_only_global"
+            "direct_tensor_prefix_then_natural_language_prompt"
             if str(args.adapter_architecture) in {"alignment_qformer", "alignment_adapter"}
             else (
                 "legacy_parsed_features"
@@ -7029,6 +8042,7 @@ def main() -> None:
         "checkpoint_metric": str(args.checkpoint_metric),
         "diagnostics_generation_max_new_tokens": int(args.diagnostics_generation_max_new_tokens),
         "checkpoint_load_report": checkpoint_load_report,
+        "optimizer_parameter_audit": optimizer_audit,
         "qa_metadata_audit": qa_metadata_audit,
         "data_audit": data_audit,
         "prompt_audit": prompt_audit,
@@ -7050,12 +8064,17 @@ def main() -> None:
         ),
         "frozen_llm_parameters": sum(p.numel() for p in llm.parameters()),
     }
-    if is_main_process():
-        dump_json(run_dir / "args.json", redacted_args(args))
-        dump_json(run_dir / "run_summary.json", summary)
+    def write_run_manifest() -> None:
         if lifecycle is None:
             raise RuntimeError("Rank 0 did not create a run lifecycle.")
+        atomic_dump_json(run_dir / "args.json", redacted_args(args))
+        atomic_dump_json(run_dir / "run_summary.json", summary)
         lifecycle._write("running")
+
+    run_on_rank_zero_and_broadcast(write_run_manifest, "run manifest write")
+    if is_main_process():
+        if lifecycle is None:
+            raise RuntimeError("Rank 0 did not create a run lifecycle.")
         print(
             f"run={run_dir.name} started_at={lifecycle.started_at} device={device} "
             f"distributed={int(distributed_is_initialized())} world_size={distributed_world_size()} "
@@ -7063,6 +8082,7 @@ def main() -> None:
             f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
             f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
             f"effective_batch={summary['distributed']['effective_train_batch_size']} "
+            f"ddp_timeout={float(args.distributed_timeout_seconds):g}s "
             f"eval_batch={int(args.eval_batch_size)} "
             f"grouped_batch_range={summary['grouped_batch_size_epoch_zero']} "
             f"grounding_forward_batch={int(args.train_grounding_batch_size)} "
@@ -7103,6 +8123,7 @@ def main() -> None:
                 prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
                 shuffle_seed=int(args.shuffle_seed),
                 latent_cache_size=int(args.latent_cache_size),
+                latent_contract=latent_contract,
             )
             initial_metrics = evaluate_choice_accuracy(
                 llm=llm,
@@ -7115,8 +8136,10 @@ def main() -> None:
             )
             history["initial_eval"] = initial_metrics
             metrics_path = run_dir / "metrics_latest.json"
-            if is_main_process():
-                dump_json(metrics_path, history)
+            run_on_rank_zero_and_broadcast(
+                lambda: atomic_dump_json(metrics_path, history),
+                "initial evaluation metrics write",
+            )
             initial_payload = (
                 flatten_numeric_metrics("initial_eval", initial_metrics)
                 if bool(args.wandb_detailed_metrics)
@@ -7125,22 +8148,29 @@ def main() -> None:
             wandb_logger.log(initial_payload, step=0)
             if is_main_process():
                 print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
-            if bool(args.diagnostics_enabled) and is_main_process():
-                pretrain_diagnostic = run_embedded_diagnostics(
-                    stage="pretrain",
-                    llm=llm,
-                    adapter=adapter,
-                    tokenizer=tokenizer,
-                    dataset=val_dataset,
-                    device=device,
-                    args=args,
-                    run_dir=run_dir,
+            if bool(args.diagnostics_enabled):
+                pretrain_diagnostic_aggregate = run_on_rank_zero_and_broadcast(
+                    lambda: run_embedded_diagnostics(
+                        stage="pretrain",
+                        llm=llm,
+                        adapter=adapter,
+                        tokenizer=tokenizer,
+                        dataset=val_dataset,
+                        device=device,
+                        args=args,
+                        run_dir=run_dir,
+                    )["aggregate"],
+                    "pretrain diagnostics",
                 )
-                history["pretrain_diagnostics"] = dict(pretrain_diagnostic["aggregate"])
-                dump_json(metrics_path, history)
-                wandb_logger.log(
-                    compact_diagnostic_metrics(pretrain_diagnostic["aggregate"]), step=0
+                history["pretrain_diagnostics"] = dict(pretrain_diagnostic_aggregate)
+                run_on_rank_zero_and_broadcast(
+                    lambda: atomic_dump_json(metrics_path, history),
+                    "pretrain diagnostic metrics write",
                 )
+                if is_main_process():
+                    wandb_logger.log(
+                        compact_diagnostic_metrics(pretrain_diagnostic_aggregate), step=0
+                    )
             distributed_barrier()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -7175,6 +8205,7 @@ def main() -> None:
             running_weighted_swapped_question_loss = 0.0
             running_swapped_question_margin = 0.0
             running_swapped_question_pairs = 0.0
+            running_record_count = 0
             running_total_grad_norm = 0.0
             running_local_grad_norm = 0.0
             running_global_grad_norm = 0.0
@@ -7186,7 +8217,7 @@ def main() -> None:
                 desc=f"Epoch {epoch:03d} [train]",
                 disable=not bool(args.console_progress) or not is_main_process(),
             )
-            final_accumulation_steps = len(train_loader) % accumulation_steps
+            accumulated_local_records = 0
             for step, batch in enumerate(progress, start=1):
                 drop_global_for_batch = bool(
                     isinstance(adapter, HybridGlobalLocalAdapter)
@@ -7209,30 +8240,38 @@ def main() -> None:
                     if isinstance(adapter, HybridGlobalLocalAdapter):
                         adapter.set_global_prompt_dropout_for_batch(False)
                 running_global_dropout_batches += int(drop_global_for_batch)
-                accumulation_divisor = (
-                    final_accumulation_steps
-                    if final_accumulation_steps > 0 and step > len(train_loader) - final_accumulation_steps
-                    else accumulation_steps
-                )
-                (loss / accumulation_divisor).backward()
+                batch_record_count = len(batch.get("records", ()))
+                if batch_record_count <= 0:
+                    raise RuntimeError(f"Training batch {step} contains no records.")
+                # training_loss is a per-record mean. Accumulate record sums so that
+                # variable grouped batches and a short final accumulation window do
+                # not change the effective gradient scale.
+                (loss * float(batch_record_count)).backward()
+                accumulated_local_records += int(batch_record_count)
                 current_loss = float(loss_parts["loss"])
-                running_loss += current_loss
-                running_ce_loss += float(loss_parts["ce_loss"])
-                running_weighted_ce_loss += float(loss_parts["weighted_ce_loss"])
-                running_choice_ce_loss += float(loss_parts["choice_ce_loss"])
-                running_weighted_choice_ce_loss += float(loss_parts["weighted_choice_ce_loss"])
-                running_choice_accuracy += float(loss_parts["choice_accuracy"])
-                running_choice_01_loss += float(loss_parts["choice_01_loss"])
-                running_ranking_loss += float(loss_parts["ranking_loss"])
-                running_weighted_ranking_loss += float(loss_parts["weighted_ranking_loss"])
-                running_ranking_margin += float(loss_parts["ranking_margin_mean"])
-                running_swapped_question_loss += float(loss_parts["swapped_question_loss"])
-                running_weighted_swapped_question_loss += float(loss_parts["weighted_swapped_question_loss"])
-                running_swapped_question_margin += float(loss_parts["swapped_question_margin_mean"])
-                running_swapped_question_pairs += float(loss_parts["swapped_question_pairs"])
+                running_loss += current_loss * batch_record_count
+                running_ce_loss += float(loss_parts["ce_loss"]) * batch_record_count
+                running_weighted_ce_loss += float(loss_parts["weighted_ce_loss"]) * batch_record_count
+                running_choice_ce_loss += float(loss_parts["choice_ce_loss"]) * batch_record_count
+                running_weighted_choice_ce_loss += float(loss_parts["weighted_choice_ce_loss"]) * batch_record_count
+                running_choice_accuracy += float(loss_parts["choice_accuracy"]) * batch_record_count
+                running_choice_01_loss += float(loss_parts["choice_01_loss"]) * batch_record_count
+                running_ranking_loss += float(loss_parts["ranking_loss"]) * batch_record_count
+                running_weighted_ranking_loss += float(loss_parts["weighted_ranking_loss"]) * batch_record_count
+                running_ranking_margin += float(loss_parts["ranking_margin_mean"]) * batch_record_count
+                running_swapped_question_loss += float(loss_parts["swapped_question_loss"]) * batch_record_count
+                running_weighted_swapped_question_loss += float(loss_parts["weighted_swapped_question_loss"]) * batch_record_count
+                running_swapped_question_margin += float(loss_parts["swapped_question_margin_mean"]) * batch_record_count
+                running_swapped_question_pairs += float(loss_parts["swapped_question_pairs"]) * batch_record_count
+                running_record_count += int(batch_record_count)
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
-                    average_trainable_gradients(adapter)
+                    average_trainable_gradients_by_record_count(
+                        adapter,
+                        accumulated_local_records,
+                        device,
+                    )
+                    assert_finite_gradients(adapter, f"epoch {epoch} step {step}")
                     if isinstance(adapter, HybridGlobalLocalAdapter):
                         local_grad_norm = gradient_l2_norm(adapter.local_adapter.parameters())
                         global_grad_norm = gradient_l2_norm(adapter.global_adapter.parameters())
@@ -7241,8 +8280,20 @@ def main() -> None:
                         total_grad_norm = gradient_l2_norm(adapter.parameters())
                         local_grad_norm = total_grad_norm
                         global_grad_norm = 0.0
+                    if not all(
+                        math.isfinite(value)
+                        for value in (total_grad_norm, local_grad_norm, global_grad_norm)
+                    ):
+                        raise FloatingPointError(
+                            f"Non-finite gradient norm at epoch {epoch} step {step}: "
+                            f"total={total_grad_norm}, local={local_grad_norm}, global={global_grad_norm}."
+                        )
                     if float(args.grad_clip_norm) > 0:
-                        torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(args.grad_clip_norm))
+                        torch.nn.utils.clip_grad_norm_(
+                            adapter.parameters(),
+                            float(args.grad_clip_norm),
+                            error_if_nonfinite=True,
+                        )
                     running_total_grad_norm += total_grad_norm
                     running_local_grad_norm += local_grad_norm
                     running_global_grad_norm += global_grad_norm
@@ -7250,20 +8301,21 @@ def main() -> None:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    accumulated_local_records = 0
                     global_step += 1
 
-                average_loss = running_loss / step
-                average_ce_loss = running_ce_loss / step
-                average_weighted_ce_loss = running_weighted_ce_loss / step
-                average_choice_ce_loss = running_choice_ce_loss / step
-                average_weighted_choice_ce_loss = running_weighted_choice_ce_loss / step
-                average_choice_accuracy = running_choice_accuracy / step
-                average_choice_01_loss = running_choice_01_loss / step
-                average_ranking_loss = running_ranking_loss / step
-                average_weighted_ranking_loss = running_weighted_ranking_loss / step
-                average_ranking_margin = running_ranking_margin / step
-                average_swapped_question_loss = running_swapped_question_loss / step
-                average_swapped_question_margin = running_swapped_question_margin / step
+                average_loss = running_loss / max(1, running_record_count)
+                average_ce_loss = running_ce_loss / max(1, running_record_count)
+                average_weighted_ce_loss = running_weighted_ce_loss / max(1, running_record_count)
+                average_choice_ce_loss = running_choice_ce_loss / max(1, running_record_count)
+                average_weighted_choice_ce_loss = running_weighted_choice_ce_loss / max(1, running_record_count)
+                average_choice_accuracy = running_choice_accuracy / max(1, running_record_count)
+                average_choice_01_loss = running_choice_01_loss / max(1, running_record_count)
+                average_ranking_loss = running_ranking_loss / max(1, running_record_count)
+                average_weighted_ranking_loss = running_weighted_ranking_loss / max(1, running_record_count)
+                average_ranking_margin = running_ranking_margin / max(1, running_record_count)
+                average_swapped_question_loss = running_swapped_question_loss / max(1, running_record_count)
+                average_swapped_question_margin = running_swapped_question_margin / max(1, running_record_count)
                 average_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
                 average_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
                 average_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
@@ -7311,9 +8363,15 @@ def main() -> None:
                             else None
                         ),
                     }
-                    if bool(args.save_step_metrics) and is_main_process():
-                        history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
-                        dump_json(run_dir / "metrics_latest.json", history)
+                    if bool(args.save_step_metrics):
+                        def write_step_metrics() -> None:
+                            history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
+                            atomic_dump_json(run_dir / "metrics_latest.json", history)
+
+                        run_on_rank_zero_and_broadcast(
+                            write_step_metrics,
+                            f"epoch {epoch} step {step} metrics write",
+                        )
                     wandb_logger.log(
                         {
                             "train_step/loss": average_loss,
@@ -7323,7 +8381,11 @@ def main() -> None:
                             "train_step/ranking_margin": average_ranking_margin,
                             "train_step/swapped_question_loss": average_swapped_question_loss,
                             "train_step/swapped_question_margin": average_swapped_question_margin,
-                            "train_step/lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
+                            "train_step/lr": optimizer_group_lr(
+                                optimizer,
+                                optimizer_lr_prefix,
+                                float(args.lr),
+                            ),
                             **(
                                 {"system/host_memory_available_gib": float(host_available_gib)}
                                 if host_available_gib is not None
@@ -7354,37 +8416,39 @@ def main() -> None:
                     "global_grad_norm": running_global_grad_norm,
                     "global_dropout_batches": float(running_global_dropout_batches),
                     "batch_count": float(len(train_loader)),
+                    "record_count": float(running_record_count),
                     "optimizer_update_count": float(optimizer_update_count),
                 },
                 device=device,
             )
             global_batch_count = max(1.0, train_totals["batch_count"])
+            global_record_count = max(1.0, train_totals["record_count"])
             global_update_count = max(1.0, train_totals["optimizer_update_count"])
-            train_loss = train_totals["loss"] / global_batch_count
-            train_ce_loss = train_totals["ce_loss"] / global_batch_count
-            train_weighted_ce_loss = train_totals["weighted_ce_loss"] / global_batch_count
-            train_choice_ce_loss = train_totals["choice_ce_loss"] / global_batch_count
+            train_loss = train_totals["loss"] / global_record_count
+            train_ce_loss = train_totals["ce_loss"] / global_record_count
+            train_weighted_ce_loss = train_totals["weighted_ce_loss"] / global_record_count
+            train_choice_ce_loss = train_totals["choice_ce_loss"] / global_record_count
             train_weighted_choice_ce_loss = (
-                train_totals["weighted_choice_ce_loss"] / global_batch_count
+                train_totals["weighted_choice_ce_loss"] / global_record_count
             )
-            train_choice_accuracy = train_totals["choice_accuracy"] / global_batch_count
-            train_choice_01_loss = train_totals["choice_01_loss"] / global_batch_count
-            train_ranking_loss = train_totals["ranking_loss"] / global_batch_count
+            train_choice_accuracy = train_totals["choice_accuracy"] / global_record_count
+            train_choice_01_loss = train_totals["choice_01_loss"] / global_record_count
+            train_ranking_loss = train_totals["ranking_loss"] / global_record_count
             train_weighted_ranking_loss = (
-                train_totals["weighted_ranking_loss"] / global_batch_count
+                train_totals["weighted_ranking_loss"] / global_record_count
             )
-            train_ranking_margin = train_totals["ranking_margin"] / global_batch_count
+            train_ranking_margin = train_totals["ranking_margin"] / global_record_count
             train_swapped_question_loss = (
-                train_totals["swapped_question_loss"] / global_batch_count
+                train_totals["swapped_question_loss"] / global_record_count
             )
             train_weighted_swapped_question_loss = (
-                train_totals["weighted_swapped_question_loss"] / global_batch_count
+                train_totals["weighted_swapped_question_loss"] / global_record_count
             )
             train_swapped_question_margin = (
-                train_totals["swapped_question_margin"] / global_batch_count
+                train_totals["swapped_question_margin"] / global_record_count
             )
             train_swapped_question_pairs = (
-                train_totals["swapped_question_pairs"] / global_batch_count
+                train_totals["swapped_question_pairs"] / global_record_count
             )
             train_total_grad_norm = train_totals["total_grad_norm"] / global_update_count
             train_local_grad_norm = train_totals["local_grad_norm"] / global_update_count
@@ -7424,16 +8488,23 @@ def main() -> None:
                 "val": val_metrics,
             }
             history[f"epoch_{epoch:04d}"] = epoch_payload
-            if is_main_process():
-                dump_json(run_dir / "metrics_latest.json", history)
+
+            def write_epoch_outputs() -> None:
+                atomic_dump_json(run_dir / "metrics_latest.json", history)
                 save_adapter_checkpoint(
                     run_dir / "adapter_last.pt",
                     adapter=adapter,
                     args=args,
                     latent_shape=latent_shape,
                     llm_hidden_size=llm_hidden_size,
+                    latent_contract=latent_contract or {},
                     metrics=epoch_payload,
                 )
+
+            run_on_rank_zero_and_broadcast(
+                write_epoch_outputs,
+                f"epoch {epoch} metrics and last-checkpoint write",
+            )
             val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
             val_macro_latent_gain = macro_latent_gain(val_metrics)
             val_score = checkpoint_score(val_metrics, str(args.checkpoint_metric))
@@ -7467,9 +8538,17 @@ def main() -> None:
                     and getattr(adapter.local_adapter, "anchor_gate", None) is not None
                     else 0.0
                 ),
-                "lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
-                "local_lr": optimizer_group_lr(optimizer, "local", float(args.lr)),
-                "global_lr": optimizer_group_lr(optimizer, "global", 0.0),
+                "lr": optimizer_group_lr(optimizer, optimizer_lr_prefix, float(args.lr)),
+                "local_lr": optimizer_group_lr(
+                    optimizer,
+                    optimizer_lr_prefix,
+                    float(args.lr),
+                ),
+                "global_lr": (
+                    optimizer_group_lr(optimizer, "global", 0.0)
+                    if isinstance(adapter, HybridGlobalLocalAdapter)
+                    else 0.0
+                ),
                 "global_trainable": float(
                     isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                 ),
@@ -7484,45 +8563,78 @@ def main() -> None:
             if val_score > best_val_score:
                 best_val_score = val_score
                 best_epoch = epoch
-                if is_main_process():
-                    save_adapter_checkpoint(
+                run_on_rank_zero_and_broadcast(
+                    lambda: save_adapter_checkpoint(
                         run_dir / "adapter_best.pt",
                         adapter=adapter,
                         args=args,
                         latent_shape=latent_shape,
                         llm_hidden_size=llm_hidden_size,
+                        latent_contract=latent_contract or {},
                         metrics=epoch_payload,
-                    )
+                    ),
+                    f"epoch {epoch} best-checkpoint write",
+                )
             diagnostic_suffix = ""
             if (
                 bool(args.diagnostics_enabled)
                 and int(args.diagnostics_every_epochs) > 0
                 and epoch % int(args.diagnostics_every_epochs) == 0
-                and is_main_process()
             ):
-                diagnostic_summary = run_embedded_diagnostics(
-                    stage=f"epoch_{epoch:04d}",
-                    llm=llm,
-                    adapter=adapter,
-                    tokenizer=tokenizer,
-                    dataset=val_dataset,
-                    device=device,
-                    args=args,
-                    run_dir=run_dir,
+                diagnostic_aggregate = dict(
+                    run_on_rank_zero_and_broadcast(
+                        lambda: run_embedded_diagnostics(
+                            stage=f"epoch_{epoch:04d}",
+                            llm=llm,
+                            adapter=adapter,
+                            tokenizer=tokenizer,
+                            dataset=val_dataset,
+                            device=device,
+                            args=args,
+                            run_dir=run_dir,
+                        )["aggregate"],
+                        f"epoch {epoch} diagnostics",
+                    )
                 )
-                diagnostic_aggregate = dict(diagnostic_summary["aggregate"])
                 epoch_payload["diagnostics"] = diagnostic_aggregate
                 history[f"epoch_{epoch:04d}"] = epoch_payload
-                dump_json(run_dir / "metrics_latest.json", history)
+                run_on_rank_zero_and_broadcast(
+                    lambda: atomic_dump_json(run_dir / "metrics_latest.json", history),
+                    f"epoch {epoch} diagnostic metrics write",
+                )
                 wandb_payload.update(
                     flatten_numeric_metrics("diagnostics", diagnostic_aggregate)
                     if bool(args.wandb_detailed_metrics)
                     else compact_diagnostic_metrics(diagnostic_aggregate)
                 )
-                diagnostic_suffix = (
-                    f" diag_local_l2={float(diagnostic_aggregate['local_prompt_relative_l2_mean']):.4f}"
-                    f" diag_margin_gain={float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
-                )
+                if is_direct_alignment_architecture(str(args.adapter_architecture)):
+                    tensor_l2_by_layer = diagnostic_aggregate.get(
+                        "question_last_relative_l2_by_layer",
+                        {},
+                    )
+                    tensor_l2_by_layer = (
+                        tensor_l2_by_layer if isinstance(tensor_l2_by_layer, Mapping) else {}
+                    )
+                    final_layer_key = (
+                        max(tensor_l2_by_layer, key=lambda value: int(value))
+                        if tensor_l2_by_layer
+                        else None
+                    )
+                    diagnostic_suffix = (
+                        " diag_q_last_l2="
+                        f"{float(diagnostic_aggregate.get('same_latent_different_question_question_last_relative_l2_mean', 0.0)):.4f}"
+                        " diag_tensor_l2@2="
+                        f"{float(tensor_l2_by_layer.get('2', 0.0)):.4f}"
+                        " diag_tensor_l2@last="
+                        f"{float(tensor_l2_by_layer.get(final_layer_key, 0.0)):.4f}"
+                        " diag_margin_gain="
+                        f"{float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
+                    )
+                else:
+                    diagnostic_suffix = (
+                        f" diag_local_l2={float(diagnostic_aggregate['local_prompt_relative_l2_mean']):.4f}"
+                        f" diag_margin_gain={float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
+                    )
             distributed_barrier()
             wandb_logger.log(wandb_payload, step=global_step)
             if is_main_process():
@@ -7539,12 +8651,28 @@ def main() -> None:
         best_checkpoint_path = run_dir / "adapter_best.pt"
         if not best_checkpoint_path.exists():
             raise FileNotFoundError("Training completed without producing adapter_best.pt.")
-        best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu")
-        best_state_dict = best_checkpoint.get("adapter_state_dict")
-        if not isinstance(best_state_dict, Mapping):
-            raise ValueError("adapter_best.pt does not contain adapter_state_dict.")
-        adapter.load_state_dict(best_state_dict, strict=True)
-        adapter.to(device)
+        best_checkpoint = torch.load(
+            best_checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        validate_adapter_checkpoint_payload(
+            best_checkpoint,
+            expected_latent_shape=latent_shape,
+            expected_llm_hidden_size=llm_hidden_size,
+            expected_architecture=str(args.adapter_architecture),
+            expected_latent_contract=latent_contract or {},
+        )
+        # Reconstruct from metadata instead of loading back into the existing
+        # object. This proves adapter_best.pt is independently usable by later
+        # evaluation/inference code and catches omitted constructor fields.
+        reloaded_adapter = adapter_from_checkpoint(
+            best_checkpoint,
+            latent_shape=latent_shape,
+            llm_hidden_size=llm_hidden_size,
+        )
+        del adapter, best_checkpoint
+        adapter = reloaded_adapter.to(device)
         if is_main_process():
             print(
                 f"testing best checkpoint: epoch={best_epoch} "
@@ -7559,15 +8687,18 @@ def main() -> None:
             args=args,
             baseline_modes=final_baseline_modes,
         )
-        if is_main_process():
-            dump_json(run_dir / "test_metrics.json", test_metrics)
+        run_on_rank_zero_and_broadcast(
+            lambda: atomic_dump_json(run_dir / "test_metrics.json", test_metrics),
+            "test metrics write",
+        )
         test_payload = (
             flatten_numeric_metrics("test", test_metrics)
             if bool(args.wandb_detailed_metrics)
             else compact_accuracy_metrics("test", test_metrics)
         )
         wandb_logger.log(test_payload, step=global_step + 1)
-        if is_main_process():
+
+        def write_final_outputs() -> None:
             summary["result"] = {
                 "best_epoch": int(best_epoch),
                 "best_val_score": float(best_val_score),
@@ -7582,7 +8713,7 @@ def main() -> None:
                     test_metrics.get("correct", {}).get("by_task", {})
                 ),
             }
-            dump_json(run_dir / "run_summary.json", summary)
+            atomic_dump_json(run_dir / "run_summary.json", summary)
             if bool(args.wandb_log_model):
                 log_adapter_artifact(
                     wandb_logger,
@@ -7594,15 +8725,22 @@ def main() -> None:
                     run_dir / "adapter_last.pt",
                     f"{args.run_name}-last",
                 )
+
+        run_on_rank_zero_and_broadcast(write_final_outputs, "final run outputs write")
+        if is_main_process():
             print(f"run_dir: {run_dir}")
             print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
     finally:
         wandb_logger.finish()
     distributed_barrier()
-    if is_main_process():
+
+    def finish_lifecycle() -> dict[str, Any]:
         if lifecycle is None:
             raise RuntimeError("Rank 0 lost its run lifecycle before completion.")
-        timing = lifecycle.finish("completed")
+        return lifecycle.finish("completed")
+
+    timing = run_on_rank_zero_and_broadcast(finish_lifecycle, "run lifecycle completion")
+    if is_main_process():
         print(
             f"completed_at={timing['ended_at']} duration_seconds={timing['duration_seconds']} "
             f"timing_file={run_dir / 'run_timing.json'}"

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,24 +24,48 @@ from train_tensor_llm_adapter import (  # noqa: E402
     ExactDistributedEvalSampler,
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
+    RunLifecycle,
     StateTaskGroupedBatchSampler,
     TensorReadoutQADataset,
+    _decoder_question_last_hidden,
+    _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
+    average_trainable_gradients_by_record_count,
     adapter_from_checkpoint,
     audit_qa_datasets,
+    build_distributed_run_dir,
     build_local_conditioning_prompt,
     choice_ce_loss,
+    frozen_llm_checkpoint_execution_active,
+    initialize_distributed_device,
     parse_generated_choice,
     read_host_memory_snapshot,
+    run_embedded_diagnostics,
+    run_on_rank_zero_and_broadcast,
+    optimizer_parameter_audit,
     same_state_question_swap_indices,
     selective_answer_statistics,
     set_frozen_llm_execution_mode,
     single_token_choice_ids,
     structured_query_features_for_record,
     task_specific_instruction,
+    validate_adapter_loss_contract,
+    validate_adapter_checkpoint_payload,
+    validate_qa_latent_contract,
+    validate_stage1_alignment_checkpoint_phase,
+    validate_stage1_model_identity,
+    validate_stage1_teacher_supervision,
 )
 from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  # noqa: E402
     ConvTokenAutoencoder2D,
+)
+from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
+    PATCH_LATENT_AUDIT_FORMAT,
+    PATCH_LATENT_FORMAT,
+    PATCH_QA_BUILD_MARKER,
+    PATCH_QA_FORMAT,
+    sha256_file,
+    validate_stage1_alignment_checkpoint_payload,
 )
 from train_tensor_patch_text_alignment import (  # noqa: E402
     TensorPatchAlignmentAdapter,
@@ -59,7 +85,444 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
     }
 
 
+def _stage1_checkpoint_payload(
+    *,
+    version: int = 3,
+    phase: str | None = "alignment",
+    include_type: bool = True,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "checkpoint_version": version,
+        "adapter_state_dict": {"adapter.weight": torch.zeros(1)},
+        "compressor_config": {"model": {"name": "test"}},
+        "compressor_state_dict": {"encoder.weight": torch.zeros(1)},
+        "args": {"model_name_or_path": "Qwen/Qwen2.5-14B-Instruct"},
+    }
+    if include_type:
+        payload["checkpoint_type"] = "tensor_patch_text_alignment"
+    if phase is not None:
+        payload["checkpoint_phase"] = phase
+    return payload
+
+
+class TestAdapterLossContracts(unittest.TestCase):
+    def test_stage1_model_identity_accepts_hf_and_local_paths_for_the_same_model(self) -> None:
+        validate_stage1_model_identity(
+            {"model_name_or_path": "Qwen/Qwen2.5-14B-Instruct"},
+            "/data/models/Qwen2.5-14B-Instruct",
+        )
+
+    def test_stage1_model_identity_rejects_same_width_different_models(self) -> None:
+        with self.assertRaisesRegex(ValueError, "same frozen LLM"):
+            validate_stage1_model_identity(
+                {"model_name_or_path": "/data/models/Qwen2.5-32B-Instruct"},
+                "/data/models/Qwen2.5-14B-Instruct",
+            )
+
+    def test_stage1_multilayer_supervision_metadata_is_strict_but_loss_transform_is_descriptive(self) -> None:
+        checkpoint = {
+            "checkpoint_version": 3,
+            "teacher_supervision": {
+                "primary_layer": 2,
+                "layers": [2, 4, 6],
+                "auxiliary_layers": [4, 6],
+                "auxiliary_layer_weights": {"4": 0.25, "6": 0.25},
+                "primary_feature_transform": "whitening",
+                "auxiliary_feature_transform": "native_centered_and_branch_mean",
+            },
+        }
+
+        metadata = validate_stage1_teacher_supervision(checkpoint)
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["layers"], [2, 4, 6])
+        self.assertEqual(metadata["primary_feature_transform"], "whitening")
+        self.assertIsNone(validate_stage1_teacher_supervision({"checkpoint_version": 1}))
+        self.assertIsNone(validate_stage1_teacher_supervision({"checkpoint_version": 2}))
+
+    def test_stage1_multilayer_supervision_metadata_rejects_missing_or_inconsistent_layers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "missing teacher_supervision"):
+            validate_stage1_teacher_supervision({"checkpoint_version": 3})
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            validate_stage1_teacher_supervision(
+                {
+                    "checkpoint_version": 3,
+                    "teacher_supervision": {
+                        "primary_layer": 2,
+                        "layers": [2, 4, 6],
+                        "auxiliary_layers": [4],
+                        "auxiliary_layer_weights": {"4": 0.25},
+                        "primary_feature_transform": "whitening",
+                        "auxiliary_feature_transform": "native_centered_and_branch_mean",
+                    },
+                }
+            )
+
+    def test_direct_stage2_rejects_patch_ae_warmup_checkpoint(self) -> None:
+        self.assertEqual(
+            validate_stage1_alignment_checkpoint_phase(
+                _stage1_checkpoint_payload(),
+                "/data/runs/alignment_best.pt",
+            ),
+            "alignment",
+        )
+        with self.assertRaisesRegex(ValueError, "patch-AE warmup checkpoint"):
+            validate_stage1_alignment_checkpoint_phase(
+                _stage1_checkpoint_payload(phase="patch_ae_pretrain"),
+                "/data/runs/patch_ae_pretrain_best.pt",
+        )
+        with self.assertRaisesRegex(ValueError, "missing checkpoint_phase"):
+            validate_stage1_alignment_checkpoint_phase(
+                _stage1_checkpoint_payload(phase=None),
+                "/data/runs/alignment_best.pt",
+            )
+        self.assertEqual(
+            validate_stage1_alignment_checkpoint_phase(
+                _stage1_checkpoint_payload(version=2, phase=None, include_type=False),
+                "/data/runs/alignment_best.pt",
+            ),
+            "alignment",
+        )
+        with self.assertRaisesRegex(ValueError, "accepted only when its filename"):
+            validate_stage1_alignment_checkpoint_phase(
+                _stage1_checkpoint_payload(version=2, phase=None, include_type=False),
+                "/data/runs/patch_ae_pretrain_best.pt",
+            )
+
+    def test_stage1_checkpoint_envelope_rejects_incomplete_legacy_payload(self) -> None:
+        incomplete = _stage1_checkpoint_payload(version=2, phase=None, include_type=False)
+        del incomplete["compressor_state_dict"]
+        with self.assertRaisesRegex(ValueError, "complete Stage-1 alignment checkpoint"):
+            validate_stage1_alignment_checkpoint_payload(
+                incomplete,
+                path="/data/runs/alignment_best.pt",
+            )
+
+    def test_direct_alignment_rejects_identical_global_only_ranking(self) -> None:
+        args = SimpleNamespace(
+            adapter_architecture="alignment_adapter",
+            ranking_loss_weight=0.1,
+            ranking_loss_negative="global_only",
+            swapped_question_loss_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "identical soft prompts"):
+            validate_adapter_loss_contract(args)
+
+    def test_direct_alignment_rejects_ambiguous_shuffled_tensor_ranking(self) -> None:
+        args = SimpleNamespace(
+            adapter_architecture="alignment_adapter",
+            ranking_loss_weight=0.1,
+            ranking_loss_negative="shuffled",
+            swapped_question_loss_weight=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "same valid answer"):
+            validate_adapter_loss_contract(args)
+
+    def test_direct_alignment_accepts_no_latent_ranking(self) -> None:
+        args = SimpleNamespace(
+            adapter_architecture="alignment_adapter",
+            ranking_loss_weight=0.1,
+            ranking_loss_negative="no_latent",
+            swapped_question_loss_weight=0.0,
+        )
+
+        validate_adapter_loss_contract(args)
+
+    def test_direct_alignment_rejects_identity_swapped_question_loss(self) -> None:
+        args = SimpleNamespace(
+            adapter_architecture="alignment_adapter",
+            ranking_loss_weight=0.0,
+            ranking_loss_negative="shuffled",
+            swapped_question_loss_weight=0.1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "question-independent tensor prefix"):
+            validate_adapter_loss_contract(args)
+
+    def test_direct_alignment_rejects_branch_only_baselines(self) -> None:
+        args = SimpleNamespace(
+            adapter_architecture="alignment_adapter",
+            ranking_loss_weight=0.0,
+            ranking_loss_negative="shuffled",
+            swapped_question_loss_weight=0.0,
+            eval_baselines="correct,global_only",
+            final_eval_baselines="correct,shuffled",
+        )
+
+        with self.assertRaisesRegex(ValueError, "no global/local split"):
+            validate_adapter_loss_contract(args)
+
+
+class TestTrainingAudits(unittest.TestCase):
+    def test_atomic_writers_remove_partial_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            json_target = root / "metrics.json"
+            checkpoint_target = root / "adapter.pt"
+
+            def fail_json(path, _payload):
+                Path(path).write_text("partial", encoding="utf-8")
+                raise OSError("json disk full")
+
+            def fail_checkpoint(_payload, path):
+                Path(path).write_bytes(b"partial")
+                raise OSError("checkpoint disk full")
+
+            with (
+                mock.patch.object(adapter_training, "dump_json", side_effect=fail_json),
+                self.assertRaisesRegex(OSError, "json disk full"),
+            ):
+                adapter_training.atomic_dump_json(json_target, {"epoch": 1})
+            with (
+                mock.patch.object(adapter_training.torch, "save", side_effect=fail_checkpoint),
+                self.assertRaisesRegex(OSError, "checkpoint disk full"),
+            ):
+                adapter_training.atomic_torch_save(checkpoint_target, {"weight": torch.ones(1)})
+
+            self.assertFalse(json_target.exists())
+            self.assertFalse(checkpoint_target.exists())
+            self.assertFalse((root / ".metrics.json.tmp").exists())
+            self.assertFalse((root / ".adapter.pt.tmp").exists())
+
+    def test_stage2_rejects_an_incomplete_qa_directory_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / PATCH_QA_BUILD_MARKER
+            marker.write_text('{"status":"building"}', encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "incomplete or active build"):
+                adapter_training.audit_qa_metadata(SimpleNamespace(qa_dir=directory))
+
+    def test_run_lifecycle_preserves_original_failure_when_summary_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            lifecycle = RunLifecycle(run_dir)
+            (run_dir / "run_summary.json").write_text("{truncated", encoding="utf-8")
+
+            timing = lifecycle.finish("failed", RuntimeError("original training failure"))
+
+            persisted = json.loads((run_dir / "run_timing.json").read_text(encoding="utf-8"))
+            self.assertEqual(timing["status"], "failed")
+            self.assertEqual(timing["error_message"], "original training failure")
+            self.assertIn("run_summary_update_error", timing)
+            self.assertEqual(persisted, timing)
+
+    def test_diagnostics_restore_training_and_checkpoint_execution_after_failure(self) -> None:
+        adapter = nn.Linear(2, 2).train()
+        llm = nn.Module()
+        llm.model = nn.Sequential(nn.Linear(2, 2), nn.Dropout(0.5))
+        llm.is_gradient_checkpointing = True
+        set_frozen_llm_execution_mode(llm, checkpoint_training=True)
+
+        with (
+            mock.patch.object(
+                adapter_training,
+                "_run_embedded_diagnostics_impl",
+                side_effect=RuntimeError("diagnostic failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "diagnostic failed"),
+        ):
+            run_embedded_diagnostics(
+                stage="test",
+                llm=llm,
+                adapter=adapter,
+                tokenizer=None,
+                dataset=None,
+                device=torch.device("cpu"),
+                args=SimpleNamespace(),
+                run_dir=Path("unused"),
+            )
+
+        self.assertTrue(adapter.training)
+        self.assertTrue(frozen_llm_checkpoint_execution_active(llm))
+        self.assertFalse(llm.model[0].training)
+        self.assertFalse(llm.model[1].training)
+
+    def test_stage2_checkpoint_envelope_binds_latent_and_stage1_provenance(self) -> None:
+        contract = {
+            "format": PATCH_LATENT_FORMAT,
+            "alignment_checkpoint": "/data/run/alignment_best.pt",
+            "alignment_checkpoint_sha256": "a" * 64,
+            "latent_shape": [3, 2, 2],
+        }
+        checkpoint = {
+            "checkpoint_type": "tensor_llm_adapter",
+            "checkpoint_version": 2,
+            "adapter_state_dict": {"weight": torch.ones(2, 2)},
+            "args": {"adapter_architecture": "alignment_adapter"},
+            "latent_shape_chw": [3, 2, 2],
+            "llm_hidden_size": 24,
+            "latent_contract": dict(contract),
+        }
+
+        state = validate_adapter_checkpoint_payload(
+            checkpoint,
+            expected_latent_shape=(3, 2, 2),
+            expected_llm_hidden_size=24,
+            expected_architecture="alignment_adapter",
+            expected_latent_contract=contract,
+        )
+        self.assertTrue(torch.equal(state["weight"], torch.ones(2, 2)))
+
+        changed_contract = dict(contract, alignment_checkpoint_sha256="b" * 64)
+        with self.assertRaisesRegex(ValueError, "different latent/Stage-1 contract"):
+            validate_adapter_checkpoint_payload(
+                checkpoint,
+                expected_latent_shape=(3, 2, 2),
+                expected_llm_hidden_size=24,
+                expected_architecture="alignment_adapter",
+                expected_latent_contract=changed_contract,
+            )
+
+    def test_optimizer_parameter_audit_requires_exact_membership(self) -> None:
+        module = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 2))
+        optimizer = torch.optim.AdamW(module.parameters(), lr=1.0e-3)
+
+        metrics = optimizer_parameter_audit(optimizer, module)
+
+        self.assertEqual(metrics["optimizer_missing_trainable_tensor_count"], 0)
+        self.assertEqual(metrics["optimizer_extra_tensor_count"], 0)
+        incomplete = torch.optim.AdamW(module[0].parameters(), lr=1.0e-3)
+        with self.assertRaisesRegex(RuntimeError, "missing_trainable"):
+            optimizer_parameter_audit(incomplete, module)
+        outside = nn.Parameter(torch.zeros(1))
+        with self.assertRaisesRegex(RuntimeError, "outside_module"):
+            optimizer_parameter_audit(
+                torch.optim.AdamW([*module.parameters(), outside], lr=1.0e-3),
+                module,
+            )
+
+    def test_record_weighted_gradient_normalization_in_single_process(self) -> None:
+        module = nn.Linear(2, 1, bias=False)
+        module.weight.grad = torch.full_like(module.weight, 6.0)
+
+        global_records = average_trainable_gradients_by_record_count(
+            module,
+            local_record_count=3,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(global_records, 3)
+        self.assertTrue(torch.equal(module.weight.grad, torch.full_like(module.weight, 2.0)))
+
+    def test_frozen_llm_checkpoint_state_uses_decoder_not_outer_training_flag(self) -> None:
+        model = nn.Module()
+        model.model = nn.Sequential(nn.Linear(2, 2), nn.Dropout(0.5))
+        model.is_gradient_checkpointing = True
+
+        set_frozen_llm_execution_mode(model, checkpoint_training=True)
+
+        self.assertFalse(model.training)
+        self.assertTrue(model.model.training)
+        self.assertFalse(model.model[0].training)
+        self.assertFalse(model.model[1].training)
+        self.assertTrue(frozen_llm_checkpoint_execution_active(model))
+        model.eval()
+        self.assertFalse(frozen_llm_checkpoint_execution_active(model))
+
+
+class _DiagnosticDecoder(nn.Module):
+    def forward(self, *, inputs_embeds, attention_mask, **_kwargs):
+        assert tuple(attention_mask.shape[:2]) == tuple(inputs_embeds.shape[:2])
+        return SimpleNamespace(
+            hidden_states=tuple(inputs_embeds + float(layer) for layer in range(3))
+        )
+
+
+class TestQuestionLastDiagnostics(unittest.TestCase):
+    def test_diagnostic_layer_indices_are_resolved_and_deduplicated(self) -> None:
+        self.assertEqual(_resolved_diagnostic_layers([0, 2, -1, 2], 3), [0, 2])
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            _resolved_diagnostic_layers([3], 3)
+
+    def test_question_last_hidden_uses_last_unmasked_prompt_token(self) -> None:
+        soft = torch.zeros(1, 2, 3)
+        text = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+        text_mask = torch.tensor([[1, 1, 1, 0]])
+        prompt_mask = torch.tensor([[1, 1, 0, 0]])
+
+        hidden = _decoder_question_last_hidden(
+            decoder=_DiagnosticDecoder(),
+            soft_embeds=soft,
+            text_embeds=text,
+            text_mask=text_mask,
+            prompt_mask=prompt_mask,
+            requested_layers=[0, -1],
+        )
+
+        self.assertTrue(torch.equal(hidden["0"], text[0, 1]))
+        self.assertTrue(torch.equal(hidden["2"], text[0, 1] + 2.0))
+
+
 class TestDistributedSampling(unittest.TestCase):
+    def test_distributed_run_directory_creation_broadcasts_rank_zero_failure(self) -> None:
+        broadcast_calls: list[dict[str, object]] = []
+
+        def capture(payload, src):
+            self.assertEqual(src, 0)
+            broadcast_calls.append(dict(payload[0]))
+
+        with (
+            mock.patch.object(adapter_training, "distributed_is_initialized", return_value=True),
+            mock.patch.object(adapter_training, "is_main_process", return_value=True),
+            mock.patch.object(
+                adapter_training,
+                "build_run_dir",
+                side_effect=OSError("shared storage unavailable"),
+            ),
+            mock.patch.object(adapter_training.dist, "broadcast_object_list", side_effect=capture),
+            self.assertRaisesRegex(OSError, "shared storage unavailable"),
+        ):
+            build_distributed_run_dir("/shared/runs", "formal")
+
+        self.assertEqual(len(broadcast_calls), 1)
+        self.assertFalse(bool(broadcast_calls[0]["ok"]))
+
+    def test_rank_zero_failure_is_broadcast_before_it_is_reraised(self) -> None:
+        broadcast_calls: list[dict[str, object]] = []
+
+        def capture(payload, src):
+            self.assertEqual(src, 0)
+            broadcast_calls.append(dict(payload[0]))
+
+        with (
+            mock.patch.object(adapter_training, "distributed_is_initialized", return_value=True),
+            mock.patch.object(adapter_training, "is_main_process", return_value=True),
+            mock.patch.object(adapter_training.dist, "broadcast_object_list", side_effect=capture),
+            self.assertRaisesRegex(ValueError, "bad metadata"),
+        ):
+            run_on_rank_zero_and_broadcast(
+                lambda: (_ for _ in ()).throw(ValueError("bad metadata")),
+                "metadata audit",
+            )
+
+        self.assertEqual(len(broadcast_calls), 1)
+        self.assertFalse(bool(broadcast_calls[0]["ok"]))
+        self.assertEqual(broadcast_calls[0]["error_type"], "ValueError")
+
+    def test_distributed_initialization_uses_configured_timeout(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"WORLD_SIZE": "2", "LOCAL_RANK": "1"}, clear=False),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "device_count", return_value=2),
+            mock.patch.object(torch.cuda, "set_device") as set_device,
+            mock.patch.object(adapter_training.dist, "init_process_group") as init_process_group,
+        ):
+            device = initialize_distributed_device("auto", distributed_timeout_seconds=7200)
+
+        self.assertEqual(device, torch.device("cuda", 1))
+        set_device.assert_called_once_with(1)
+        init_process_group.assert_called_once_with(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(seconds=7200),
+        )
+
+    def test_distributed_initialization_rejects_invalid_timeout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            initialize_distributed_device("cpu", distributed_timeout_seconds=float("nan"))
+
     def test_record_limit_stops_jsonl_loading_early(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "records.jsonl"
@@ -100,6 +563,120 @@ class TestDistributedSampling(unittest.TestCase):
             self.assertEqual(snapshot["total_gib"], 128.0)
             self.assertEqual(snapshot["available_gib"], 64.0)
             self.assertEqual(snapshot["process_rss_gib"], 2.0)
+
+    def test_formal_latent_contract_rejects_v2_and_changed_checkpoint_contents(self) -> None:
+        self.assertIsNone(
+            validate_qa_latent_contract(
+                {"format": "tensor_patch_qa_v2"},
+                configured_alignment_checkpoint=None,
+                require_formal_contract=False,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "Formal patch QA requires metadata format"):
+            validate_qa_latent_contract(
+                {"format": "tensor_patch_qa_v2"},
+                configured_alignment_checkpoint=None,
+                require_formal_contract=True,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "alignment_best.pt"
+            checkpoint.write_bytes(b"first checkpoint contents")
+            metadata = {
+                "format": PATCH_QA_FORMAT,
+                "latent_format": PATCH_LATENT_FORMAT,
+                "latent_audit_format": PATCH_LATENT_AUDIT_FORMAT,
+                "latent_shape": [8, 16, 16],
+                "storage_dtype": "float16",
+                "encoder_input_normalization": {
+                    "mode": "zscore",
+                    "scope": "channel",
+                    "stats_path": None,
+                    "clip_min": None,
+                    "clip_max": None,
+                },
+                "alignment_checkpoint": str(checkpoint),
+                "alignment_checkpoint_sha256": sha256_file(checkpoint),
+            }
+            validated = validate_qa_latent_contract(
+                metadata,
+                configured_alignment_checkpoint=checkpoint,
+                require_formal_contract=True,
+            )
+            self.assertEqual(validated["alignment_checkpoint_sha256"], metadata["alignment_checkpoint_sha256"])
+
+            checkpoint.write_bytes(b"changed checkpoint contents")
+            with self.assertRaisesRegex(ValueError, "changed after patch latents were generated"):
+                validate_qa_latent_contract(
+                    metadata,
+                    configured_alignment_checkpoint=checkpoint,
+                    require_formal_contract=True,
+                )
+
+    def test_formal_audit_rejects_one_latent_path_with_different_identities_or_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            latent_path = Path(directory) / "shared.pt"
+            latent_path.write_bytes(b"validated by test stub")
+
+            def record(qa_id: str) -> dict[str, object]:
+                return {
+                    "qa_id": qa_id,
+                    "patch_id": "patch_a",
+                    "state_ref": "patch_a",
+                    "sample_index": 0,
+                    "time_index": 1,
+                    "top_left": [2, 3],
+                    "task_type": "point_compare",
+                    "field": "Vx",
+                    "metadata": {"field": "Vx"},
+                    "choices": ["A", "B"],
+                    "answer": "A",
+                    "question": "Compare two points.",
+                    "latent_audit": {
+                        "format": PATCH_LATENT_AUDIT_FORMAT,
+                        "mean": 1.0,
+                        "std": 2.0,
+                        "scale": 2.000001,
+                    },
+                }
+
+            class AuditDataset:
+                latent_contract = {"enabled": True}
+
+                def __init__(self, records):
+                    self.records = records
+
+                def latent_path_for_record(self, _record):
+                    return latent_path
+
+                def validate_latent_file_for_record(self, _record):
+                    return {"path": str(latent_path)}
+
+                def __len__(self):
+                    return len(self.records)
+
+            first = record("qa_1")
+            different_identity = record("qa_2")
+            different_identity["patch_id"] = "patch_b"
+            different_identity["state_ref"] = "patch_b"
+            with self.assertRaisesRegex(ValueError, "different patch identities"):
+                audit_qa_datasets(
+                    {"train": AuditDataset([first, different_identity])},
+                    require_disjoint_splits=False,
+                    require_complete_split_coverage=False,
+                )
+
+            different_stats = record("qa_2")
+            different_stats["latent_audit"] = {
+                **different_stats["latent_audit"],
+                "scale": 3.0,
+            }
+            with self.assertRaisesRegex(ValueError, "different normalization statistics"):
+                audit_qa_datasets(
+                    {"train": AuditDataset([first, different_stats])},
+                    require_disjoint_splits=False,
+                    require_complete_split_coverage=False,
+                )
 
     def test_truncated_smoke_audit_does_not_require_all_choice_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -878,6 +1455,41 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 records=None,
                 mode="global_only",
             )
+
+        torch.testing.assert_close(
+            actual,
+            aligned.forward_soft_prompts(latent).to(dtype=text_embeds.dtype),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_direct_spatial_stage2_is_exactly_the_stage1_soft_prompt_path(self) -> None:
+        torch.manual_seed(31)
+        aligned = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=2,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        latent = torch.randn(2, 3, 2, 2)
+        text_embeds = torch.randn(2, 7, 24)
+        question_mask = torch.ones(2, 7, dtype=torch.bool)
+
+        actual = adapter_training.adapter_soft_embeds(
+            adapter=aligned,
+            latent_map=latent,
+            text_embeds=text_embeds,
+            question_embeds=text_embeds,
+            question_mask=question_mask,
+            records=[{"question": "first"}, {"question": "second"}],
+            mode="correct",
+        )
 
         torch.testing.assert_close(
             actual,

@@ -233,10 +233,11 @@ def parse_layer_indices(raw: str, num_hidden_layers: int) -> list[int]:
     layers = sorted({int(value) for value in parse_csv(raw)})
     if not layers:
         raise ValueError("--layers must be 'all' or contain at least one hidden-state index.")
-    invalid = [layer for layer in layers if layer < 0 or layer > int(num_hidden_layers)]
+    invalid = [layer for layer in layers if layer <= 0 or layer > int(num_hidden_layers)]
     if invalid:
         raise ValueError(
-            f"Layer indices {invalid} are outside hidden_states[0..{int(num_hidden_layers)}]."
+            f"Layer indices {invalid} are outside transformer blocks 1..{int(num_hidden_layers)}. "
+            "Index 0 is the non-contextual input embedding and is not a valid teacher readout."
         )
     return layers
 
@@ -776,8 +777,9 @@ def main() -> None:
         "model_name_or_path": args.model_name_or_path,
         "num_transformer_layers": num_hidden_layers,
         "hidden_state_index_contract": (
-            "hidden_states[0] is the input embedding; hidden_states[k] is the output after k transformer blocks. "
-            "Sequence positions are unchanged across all layers."
+            "Scanned index k is the output after transformer block k, for k in 1..num_transformer_layers. "
+            "Index 0 is excluded because it is the non-contextual input embedding. Sequence positions are "
+            "unchanged across all transformer blocks."
         ),
         "scan": {
             "split": args.split,

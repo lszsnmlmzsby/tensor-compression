@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import h5py
 import numpy as np
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturbations, resolve_scan_args
 from scripts.train_tensor_patch_text_alignment import (
@@ -18,7 +20,11 @@ from scripts.train_tensor_patch_text_alignment import (
     PDEBenchPatchTextDataset,
     PROBE_TEMPLATE_COUNTS,
     PatchRecord,
+    TensorPatchAlignmentAdapter,
     alignment_anchors_from_args,
+    apply_config_defaults,
+    audit_optimizer_parameter_coverage,
+    auxiliary_teacher_alignment_loss,
     apply_alignment_feature_transform,
     branch_mean_alignment_loss,
     build_numeric_probe_anchor,
@@ -26,19 +32,26 @@ from scripts.train_tensor_patch_text_alignment import (
     build_teacher_texts_for_batch,
     checkpoint_selection_value,
     duplicate_text_fraction,
+    forward_teacher_readout_hidden,
+    forward_teacher_readout_hiddens,
     gather_with_grad,
     gradient_parameter_entries,
     hidden_at_last_non_padding,
     normalize_patch_batch,
     normalize_alignment_embeddings,
+    normalize_teacher_layer_indices,
+    parse_args,
     probe_targets_from_patches,
     probe_contract_anchors,
     reconstruction_loss_with_diagnostics,
     reject_removed_alignment_options,
+    resolve_teacher_layer_supervision,
     serialize_tensor_values,
+    set_frozen_llm_student_mode,
     shared_suffix_token_ids,
     stable_name_fingerprint,
     symmetric_contrastive_loss,
+    teacher_supervision_metadata,
     top1_candidate_usage_metrics,
     truncate_llm_backbone_to_layer,
     tokenize_contents_with_anchor,
@@ -46,6 +59,7 @@ from scripts.train_tensor_patch_text_alignment import (
     teacher_probe_preflight_warnings,
     transformer_block_hidden_states,
     validate_probe_anchor_contract,
+    validate_finite_float,
     validate_teacher_hidden_state_index,
     validate_teacher_tensor_source,
 )
@@ -226,6 +240,36 @@ class _HookModel(torch.nn.Module):
         self.model = _HookBackbone()
 
 
+class _CheckpointHookBackbone(_HookBackbone):
+    def __init__(self, use_reentrant: bool) -> None:
+        super().__init__()
+        self.use_reentrant = bool(use_reentrant)
+
+    def forward(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        output_hidden_states=False,
+        use_cache=False,
+    ):
+        hidden = inputs_embeds
+        for layer in self.layers:
+            hidden = checkpoint(
+                lambda value, current_layer=layer: current_layer(value)[0],
+                hidden,
+                use_reentrant=self.use_reentrant,
+            )
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
+class _CheckpointHookModel(torch.nn.Module):
+    def __init__(self, use_reentrant: bool) -> None:
+        super().__init__()
+        self.model = _CheckpointHookBackbone(use_reentrant=use_reentrant)
+
+
 def test_serialize_tensor_values_contains_only_values_and_shape_delimiters() -> None:
     patch = torch.tensor([[[1.25, -2.0], [3.126, 4.0]]])
 
@@ -389,6 +433,308 @@ def test_transformer_block_capture_precedes_final_backbone_norm() -> None:
     assert torch.equal(captured[2], torch.full_like(inputs, 3.0))
 
 
+def test_multi_layer_readout_uses_each_rows_final_nonpadding_token_and_keeps_gradients() -> None:
+    model = _HookModel()
+    inputs = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2).requires_grad_()
+    attention_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]])
+
+    captured = forward_teacher_readout_hiddens(
+        model,
+        inputs_embeds=inputs,
+        attention_mask=attention_mask,
+        teacher_layers=[1, 2],
+    )
+    (captured[1].sum() + captured[2].sum()).backward()
+
+    assert torch.equal(
+        captured[1],
+        torch.stack([inputs.detach()[0, 1] + 1.0, inputs.detach()[1, 2] + 1.0]),
+    )
+    assert torch.equal(
+        captured[2],
+        torch.stack([inputs.detach()[0, 1] + 3.0, inputs.detach()[1, 2] + 3.0]),
+    )
+    assert inputs.grad is not None
+    assert torch.equal(inputs.grad[0, 1], torch.full((2,), 2.0))
+    assert torch.equal(inputs.grad[1, 2], torch.full((2,), 2.0))
+
+
+def test_single_layer_readout_prefix_argument_validates_full_mask_without_double_offset() -> None:
+    model = _HookModel()
+    inputs = torch.arange(2 * 5 * 2, dtype=torch.float32).reshape(2, 5, 2)
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]])
+
+    captured = forward_teacher_readout_hidden(
+        model,
+        inputs_embeds=inputs,
+        attention_mask=attention_mask,
+        teacher_layer=1,
+        prefix_tokens=2,
+    )
+
+    assert torch.equal(
+        captured,
+        torch.stack([inputs[0, 3] + 1.0, inputs[1, 4] + 1.0]),
+    )
+    with pytest.raises(ValueError, match="soft-prefix position"):
+        forward_teacher_readout_hidden(
+            model,
+            inputs_embeds=inputs,
+            attention_mask=torch.tensor([[1, 0, 1, 1, 0], [1, 1, 1, 1, 1]]),
+            teacher_layer=1,
+            prefix_tokens=2,
+        )
+
+
+def test_non_reentrant_checkpointed_readout_keeps_student_gradient_graph() -> None:
+    model = _CheckpointHookModel(use_reentrant=False)
+    inputs = torch.randn(2, 3, 2, requires_grad=True)
+
+    captured = forward_teacher_readout_hiddens(
+        model,
+        inputs_embeds=inputs,
+        attention_mask=torch.ones(2, 3, dtype=torch.long),
+        teacher_layers=[1, 2],
+    )
+    for hidden in captured.values():
+        hidden.retain_grad()
+    (captured[1].sum() + captured[2].sum()).backward()
+
+    assert inputs.grad is not None
+    assert torch.count_nonzero(inputs.grad) > 0
+    assert all(hidden.grad is not None for hidden in captured.values())
+    assert all(torch.count_nonzero(hidden.grad) > 0 for hidden in captured.values())
+
+
+def test_multi_layer_readout_rejects_non_finite_hidden_before_loss() -> None:
+    model = _HookModel()
+    inputs = torch.zeros(2, 3, 2)
+    inputs[0, 2, 0] = float("nan")
+
+    with pytest.raises(FloatingPointError, match=r"layers \[1, 2\]"):
+        forward_teacher_readout_hiddens(
+            model,
+            inputs_embeds=inputs,
+            attention_mask=torch.ones(2, 3, dtype=torch.long),
+            teacher_layers=[1, 2],
+        )
+
+
+def test_reentrant_checkpointed_readout_is_rejected_before_training() -> None:
+    model = _CheckpointHookModel(use_reentrant=True)
+    inputs = torch.randn(2, 3, 2, requires_grad=True)
+
+    with pytest.raises(RuntimeError, match="lost the student gradient graph"):
+        forward_teacher_readout_hiddens(
+            model,
+            inputs_embeds=inputs,
+            attention_mask=torch.ones(2, 3, dtype=torch.long),
+            teacher_layers=[1, 2],
+        )
+
+
+def test_auxiliary_teacher_layer_spec_is_explicit_and_rejects_ambiguous_inputs() -> None:
+    layers, weights = resolve_teacher_layer_supervision(2, [4, 6], [0.25, 0.5])
+
+    assert layers == (2, 4, 6)
+    assert weights == {4: 0.25, 6: 0.5}
+    with pytest.raises(ValueError, match="must not repeat"):
+        resolve_teacher_layer_supervision(2, [2], [0.25])
+    with pytest.raises(ValueError, match="exactly one weight"):
+        resolve_teacher_layer_supervision(2, [4, 6], [0.25])
+    assert resolve_teacher_layer_supervision(4, [6, 2], [0.25, 0.5]) == (
+        (4, 2, 6),
+        {2: 0.5, 6: 0.25},
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        resolve_teacher_layer_supervision(2, [4], [float("nan")])
+
+
+def test_config_defaults_keep_primary_out_of_lower_auxiliary_layers(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["train_tensor_patch_text_alignment.py", "--config", "unused.yaml"])
+    args = parse_args()
+    resolved = apply_config_defaults(
+        args,
+        {
+            "data": {"hdf5_path": "input.h5"},
+            "model": {"name_or_path": "test-model"},
+            "patch_alignment": {
+                "output_root": "outputs",
+                "teacher_layer": 4,
+                "auxiliary_teacher_layers": [6, 2],
+                "auxiliary_teacher_layer_weights": [0.25, 0.5],
+            },
+        },
+    )
+
+    assert resolved.teacher_layers == (4, 2, 6)
+    assert resolved.auxiliary_teacher_layers == [2, 6]
+    assert resolved.auxiliary_teacher_layer_weights == [0.5, 0.25]
+    assert resolved.auxiliary_teacher_layer_weights_by_layer == {2: 0.5, 6: 0.25}
+
+
+def test_teacher_layer_indices_reject_embedding_layer_and_duplicates() -> None:
+    assert normalize_teacher_layer_indices([6, 2, 4]) == (2, 4, 6)
+    with pytest.raises(ValueError, match="Index 0"):
+        normalize_teacher_layer_indices([0, 2])
+    with pytest.raises(ValueError, match="duplicate"):
+        normalize_teacher_layer_indices([2, 2])
+
+
+def test_frozen_llm_checkpoint_mode_keeps_stochastic_children_in_eval_mode() -> None:
+    model = _HookModel().train()
+
+    set_frozen_llm_student_mode(model, gradient_checkpointing=True)
+
+    assert model.training is False
+    assert model.model.training is True
+    assert all(layer.training is False for layer in model.model.layers)
+    model.eval()
+    assert model.model.training is False
+    set_frozen_llm_student_mode(model, gradient_checkpointing=True)
+    assert model.model.training is True
+    assert all(layer.training is False for layer in model.model.layers)
+    set_frozen_llm_student_mode(model, gradient_checkpointing=False)
+    assert model.training is False
+    assert model.model.training is False
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_finite_configuration_scalar_rejects_non_finite_values(invalid: float) -> None:
+    with pytest.raises(ValueError, match="must be finite"):
+        validate_finite_float("setting", invalid, minimum=0.0)
+
+
+def test_spatial_adapter_rejects_invalid_numeric_construction_before_torch_modules() -> None:
+    valid = {
+        "latent_channels": 2,
+        "latent_grid": (2, 2),
+        "adapter_dim": 8,
+        "projection_dim": 12,
+        "dropout": 0.0,
+        "adapter_type": "spatial_transformer",
+        "query_tokens": 4,
+        "adapter_layers": 1,
+        "adapter_heads": 2,
+        "soft_prompt_scale": 0.05,
+    }
+
+    with pytest.raises(ValueError, match="dropout"):
+        TensorPatchAlignmentAdapter(**{**valid, "dropout": float("nan")})
+    with pytest.raises(ValueError, match="soft_prompt_scale"):
+        TensorPatchAlignmentAdapter(**{**valid, "soft_prompt_scale": float("inf")})
+    with pytest.raises(ValueError, match="adapter_layers and adapter_heads"):
+        TensorPatchAlignmentAdapter(**{**valid, "adapter_heads": 0})
+
+
+def test_teacher_supervision_metadata_is_complete_and_canonical() -> None:
+    args = SimpleNamespace(
+        teacher_layer=4,
+        teacher_layers=(4, 2, 6),
+        auxiliary_teacher_layer_weights_by_layer={6: 0.25, 2: 0.5},
+        alignment_transform_mode="whitening",
+    )
+
+    metadata = teacher_supervision_metadata(args)
+
+    assert metadata == {
+        "primary_layer": 4,
+        "layers": [2, 4, 6],
+        "auxiliary_layers": [2, 6],
+        "auxiliary_layer_weights": {"2": 0.5, "6": 0.25},
+        "primary_feature_transform": "whitening",
+        "auxiliary_feature_transform": "native_centered_and_branch_mean",
+    }
+    with pytest.raises(ValueError, match="metadata is inconsistent"):
+        teacher_supervision_metadata(
+            SimpleNamespace(
+                teacher_layer=2,
+                teacher_layers=(2, 4),
+                auxiliary_teacher_layer_weights_by_layer={},
+                alignment_transform_mode="none",
+            )
+        )
+
+
+def test_auxiliary_teacher_loss_backpropagates_from_every_configured_layer() -> None:
+    generator = torch.Generator().manual_seed(33)
+    student = {
+        2: torch.randn(4, 8, generator=generator, requires_grad=True),
+        4: torch.randn(4, 8, generator=generator, requires_grad=True),
+        6: torch.randn(4, 8, generator=generator, requires_grad=True),
+    }
+    teacher = {layer: torch.randn(4, 8, generator=generator) for layer in student}
+
+    loss, metrics = auxiliary_teacher_alignment_loss(
+        student,
+        teacher,
+        {4: 0.25, 6: 0.5},
+        semantic_target_ids=None,
+        temperature=0.07,
+        i2t_weight=0.6,
+        t2i_weight=0.4,
+        native_centered_weight=0.5,
+        mean_alignment_weight=0.5,
+        distributed_batch=False,
+    )
+    loss.backward()
+
+    assert float(loss.item()) > 0.0
+    assert metrics["layer_count"] == 2.0
+    assert student[2].grad is None
+    assert student[4].grad is not None and torch.count_nonzero(student[4].grad) > 0
+    assert student[6].grad is not None and torch.count_nonzero(student[6].grad) > 0
+
+
+def test_auxiliary_teacher_loss_rejects_shape_and_target_mismatches() -> None:
+    student = {4: torch.randn(3, 8, requires_grad=True)}
+    teacher = {4: torch.randn(3, 7)}
+    kwargs = {
+        "temperature": 0.07,
+        "i2t_weight": 0.6,
+        "t2i_weight": 0.4,
+        "native_centered_weight": 0.5,
+        "mean_alignment_weight": 0.5,
+        "distributed_batch": False,
+    }
+
+    with pytest.raises(ValueError, match="shapes differ"):
+        auxiliary_teacher_alignment_loss(
+            student,
+            teacher,
+            {4: 0.25},
+            semantic_target_ids=None,
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="one value per local record"):
+        auxiliary_teacher_alignment_loss(
+            student,
+            {4: torch.randn(3, 8)},
+            {4: 0.25},
+            semantic_target_ids=torch.tensor([1, 2]),
+            **kwargs,
+        )
+
+
+def test_stage1_optimizer_audit_requires_exact_trainable_parameter_coverage() -> None:
+    module = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2))
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1.0e-3)
+
+    metrics = audit_optimizer_parameter_coverage(optimizer, [module])
+
+    assert metrics["missing_trainable_parameter_tensors"] == 0
+    assert metrics["unexpected_parameter_tensors"] == 0
+    incomplete = torch.optim.AdamW(module[0].parameters(), lr=1.0e-3)
+    with pytest.raises(RuntimeError, match="missing_trainable"):
+        audit_optimizer_parameter_coverage(incomplete, [module])
+    outside = torch.nn.Parameter(torch.zeros(1))
+    with pytest.raises(RuntimeError, match="unexpected"):
+        audit_optimizer_parameter_coverage(
+            torch.optim.AdamW([*module.parameters(), outside], lr=1.0e-3),
+            [module],
+        )
+
+
 def test_distributed_eval_sampler_partitions_without_padding_duplicates() -> None:
     dataset = list(range(10))
     shards = [list(DistributedEvalSampler(dataset, num_replicas=3, rank=rank)) for rank in range(3)]
@@ -481,6 +827,16 @@ def test_teacher_whitening_uses_one_fixed_transform_for_both_branches() -> None:
         atol=1.0e-5,
     )
     assert not any(parameter.requires_grad for parameter in whitener.parameters())
+
+
+def test_teacher_whitening_rejects_non_finite_hyperparameters_and_samples() -> None:
+    with pytest.raises(ValueError, match="epsilon.*finite"):
+        FixedTeacherWhitening(hidden_dim=4, shrinkage=0.01, epsilon=float("nan"))
+    whitener = FixedTeacherWhitening(hidden_dim=4, shrinkage=0.01, epsilon=1.0e-5)
+    samples = torch.randn(8, 4)
+    samples[0, 0] = float("inf")
+    with pytest.raises(ValueError, match="contain NaN or infinity"):
+        whitener.fit(samples)
 
 
 def test_teacher_pca_whitening_discards_low_variance_directions() -> None:
@@ -891,6 +1247,28 @@ def test_checkpoint_selection_is_deployment_directional_and_uses_nontransductive
     assert value == pytest.approx(4.925)
 
 
+def test_checkpoint_selection_includes_configured_auxiliary_teacher_layers() -> None:
+    args = SimpleNamespace(
+        contrastive_loss_weight=1.0,
+        contrastive_i2t_weight=0.6,
+        contrastive_t2i_weight=0.4,
+        centered_contrastive_loss_weight=0.0,
+        native_centered_contrastive_loss_weight=0.0,
+        mean_alignment_loss_weight=0.0,
+        auxiliary_teacher_layers=[4, 6],
+    )
+    metrics = {
+        "global_strict_i2t_loss": 2.0,
+        "global_strict_t2i_loss": 4.0,
+        "auxiliary_teacher_loss": 0.75,
+    }
+
+    name, value = checkpoint_selection_value(metrics, args)
+
+    assert name.endswith("+auxiliary_teacher_loss")
+    assert value == pytest.approx(0.6 * 2.0 + 0.4 * 4.0 + 0.75)
+
+
 def test_teacher_probe_preflight_warning_uses_family_median_without_aborting() -> None:
     preflight = {
         "families": {
@@ -920,6 +1298,31 @@ def test_teacher_probe_preflight_warning_can_be_disabled() -> None:
     assert teacher_probe_preflight_warnings(preflight, warn_below_correlation=None) == []
 
 
+def test_teacher_probe_preflight_warnings_identify_weak_auxiliary_layer() -> None:
+    preflight = {
+        "layers": {
+            "2": {
+                "families": {
+                    "point_value": {
+                        "hidden_similarity_vs_negative_target_distance_pearson_median": 0.2
+                    }
+                }
+            },
+            "6": {
+                "families": {
+                    "point_value": {
+                        "hidden_similarity_vs_negative_target_distance_pearson_median": 0.03
+                    }
+                }
+            },
+        }
+    }
+
+    assert teacher_probe_preflight_warnings(preflight, warn_below_correlation=0.1) == [
+        "layer_6/point_value=0.0300"
+    ]
+
+
 def test_contrastive_direction_weights_are_normalized_and_affect_loss() -> None:
     tensor_embedding = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     text_embedding = tensor_embedding.clone()
@@ -944,6 +1347,18 @@ def test_contrastive_direction_weights_are_normalized_and_affect_loss() -> None:
     )
     assert float(primary.item()) == pytest.approx(float(equal.item()))
     assert equal_metrics["i2t_weight"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_contrastive_direction_weights_reject_non_finite_values(invalid: float) -> None:
+    with pytest.raises(ValueError, match="must be finite"):
+        symmetric_contrastive_loss(
+            torch.eye(2),
+            torch.eye(2),
+            temperature=0.07,
+            i2t_weight=invalid,
+            t2i_weight=1.0,
+        )
 
 
 def test_layer_scan_control_changes_equal_number_of_off_target_values() -> None:

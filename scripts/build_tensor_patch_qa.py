@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
+import os
 import random
 import sys
 from collections import Counter
@@ -32,6 +34,21 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     validate_field_shapes,
 )
 from tensor_compression.data.normalization import normalize_tensor  # noqa: E402
+from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
+    PATCH_LATENT_FORMAT,
+    PATCH_LATENT_AUDIT_FORMAT,
+    PATCH_QA_BUILD_MARKER,
+    PATCH_QA_FORMAT,
+    PATCH_QA_PROMPT_CONTRACT,
+    atomic_json_dump,
+    atomic_torch_save,
+    canonical_normalization,
+    canonical_path,
+    latent_identity_from_record,
+    sha256_file,
+    validate_stage1_alignment_checkpoint_payload,
+    validate_patch_latent_payload,
+)
 from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
 from tensor_compression.models import build_model  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
@@ -51,8 +68,6 @@ TASKS = (
     "extreme_quadrant",
 )
 LABELS_4 = ("A", "B", "C", "D")
-PATCH_QA_FORMAT = "tensor_patch_qa_v2"
-PATCH_QA_PROMPT_CONTRACT = "encoder_zscore_one_based_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,11 +182,42 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+class AtomicJsonlWriter:
+    """Stream JSONL to a temporary file and publish it only after a clean build."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        self.handle: Any = None
+
+    def __enter__(self) -> "AtomicJsonlWriter":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.temporary.open("w", encoding="utf-8")
+        return self
+
+    def write(self, record: Mapping[str, Any]) -> None:
+        if self.handle is None:
+            raise RuntimeError("AtomicJsonlWriter must be entered before writing.")
+        self.handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def write_many(self, records: Sequence[Mapping[str, Any]]) -> None:
         for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self.write(record)
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
+            if exc_type is None:
+                os.replace(self.temporary, self.path)
+        finally:
+            self.temporary.unlink(missing_ok=True)
+
+
+def write_jsonl(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    with AtomicJsonlWriter(path) as writer:
+        writer.write_many(records)
 
 
 def validate_reusable_latent_metadata(
@@ -181,15 +227,19 @@ def validate_reusable_latent_metadata(
     hdf5_path: str | Path,
     fields: Sequence[str],
     patch_size: int,
+    alignment_checkpoint_sha256: str,
+    encoder_input_normalization: Mapping[str, Any],
+    latent_shape: Sequence[int],
+    storage_dtype: str,
     overwrite: bool,
 ) -> None:
     if bool(overwrite) or next(latent_root.glob("*.pt"), None) is None:
         return
     if not metadata_path.exists():
-        raise ValueError(
-            f"Existing latent files in {latent_root} cannot be verified because {metadata_path} is missing. "
-            "Use a new latent_dir or rerun with --overwrite."
-        )
+        # A previous interrupted build may have completed atomic latent files
+        # before writing the final directory manifest. Each referenced payload is
+        # validated below, so a trustworthy partial build can resume safely.
+        return
     with metadata_path.open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     if not isinstance(metadata, Mapping):
@@ -199,12 +249,26 @@ def validate_reusable_latent_metadata(
         "hdf5_path": str(Path(hdf5_path).expanduser().resolve()),
         "fields": [str(field) for field in fields],
         "patch_size": int(patch_size),
+        "alignment_checkpoint_sha256": str(alignment_checkpoint_sha256).lower(),
+        "encoder_input_normalization": canonical_normalization(encoder_input_normalization),
+        "latent_format": PATCH_LATENT_FORMAT,
+        "latent_shape": [int(value) for value in latent_shape],
+        "storage_dtype": str(storage_dtype),
     }
     observed = {
         "alignment_checkpoint": str(Path(str(metadata.get("alignment_checkpoint", ""))).expanduser().resolve()),
         "hdf5_path": str(Path(str(metadata.get("hdf5_path", ""))).expanduser().resolve()),
         "fields": [str(field) for field in metadata.get("fields", [])],
         "patch_size": int(metadata.get("patch_size", -1)),
+        "alignment_checkpoint_sha256": str(metadata.get("alignment_checkpoint_sha256", "")).lower(),
+        "encoder_input_normalization": canonical_normalization(
+            metadata.get("encoder_input_normalization", {})
+            if isinstance(metadata.get("encoder_input_normalization"), Mapping)
+            else {}
+        ),
+        "latent_format": str(metadata.get("latent_format", "")),
+        "latent_shape": [int(value) for value in metadata.get("latent_shape", [])],
+        "storage_dtype": str(metadata.get("storage_dtype", "")),
     }
     if observed != expected:
         raise ValueError(
@@ -592,13 +656,23 @@ def build_questions(
                 variant_index,
             )
         )
+    latent_audit = {
+        "format": PATCH_LATENT_AUDIT_FORMAT,
+        "mean": float(mean),
+        "std": float(std),
+        "scale": float(standardization_scale),
+    }
+    for question_record in result:
+        # This provenance is validated against the latent payload but is never
+        # rendered by the natural-language prompt builder.
+        question_record["latent_audit"] = dict(latent_audit)
     return result
 
 
 def load_alignment_checkpoint(path: str | Path) -> tuple[dict[str, Any], dict[str, Any], torch.nn.Module]:
-    checkpoint = torch.load(Path(path).expanduser(), map_location="cpu")
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError(f"Unsupported alignment checkpoint: {path}")
+    checkpoint_path = Path(path).expanduser()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    validate_stage1_alignment_checkpoint_payload(checkpoint, path=checkpoint_path)
     config = checkpoint.get("compressor_config")
     state = checkpoint.get("compressor_state_dict")
     if not isinstance(config, Mapping) or not isinstance(state, Mapping):
@@ -628,6 +702,14 @@ def main() -> None:
         raise ValueError("Patch QA single-field mode requires a single-channel alignment compressor.")
     normalization_cfg = dict(compressor_config.get("data", {}).get("dataset", {}).get("normalization", {}))
     validate_patch_qa_encoder_normalization(normalization_cfg)
+    alignment_checkpoint_path = canonical_path(args.alignment_checkpoint)
+    print("startup=alignment_checkpoint_sha256", flush=True)
+    alignment_checkpoint_sha256 = sha256_file(alignment_checkpoint_path)
+    # The compressor now owns the copied encoder weights. Release the duplicate
+    # checkpoint payload before iterating over the full QA dataset.
+    checkpoint_args = dict(checkpoint_args)
+    checkpoint = None
+    gc.collect()
     device = resolve_device(args.device)
     compressor.to(device).eval()
     for parameter in compressor.parameters():
@@ -673,6 +755,24 @@ def main() -> None:
     qa_dir.mkdir(parents=True, exist_ok=True)
     latent_root.mkdir(parents=True, exist_ok=True)
     metadata_path = qa_dir / "metadata.json"
+    with torch.no_grad():
+        latent_probe = compressor.encode(
+            torch.zeros(
+                1,
+                int(model_cfg.get("in_channels", 1)),
+                int(args.patch_size),
+                int(args.patch_size),
+                device=device,
+            )
+        )["latent_map"]
+    if latent_probe.ndim != 4 or int(latent_probe.shape[0]) != 1:
+        raise ValueError(
+            "Alignment compressor must emit latent_map [B,C,H,W], got "
+            f"{tuple(latent_probe.shape)}."
+        )
+    latent_shape = tuple(int(value) for value in latent_probe.shape[1:])
+    del latent_probe
+    storage_dtype_name = str(args.storage_dtype)
     validate_reusable_latent_metadata(
         metadata_path=metadata_path,
         latent_root=latent_root,
@@ -680,7 +780,21 @@ def main() -> None:
         hdf5_path=args.hdf5_path,
         fields=fields,
         patch_size=int(args.patch_size),
+        alignment_checkpoint_sha256=alignment_checkpoint_sha256,
+        encoder_input_normalization=normalization_cfg,
+        latent_shape=latent_shape,
+        storage_dtype=storage_dtype_name,
         overwrite=bool(args.overwrite),
+    )
+    build_marker = qa_dir / PATCH_QA_BUILD_MARKER
+    atomic_json_dump(
+        build_marker,
+        {
+            "status": "building",
+            "format": PATCH_QA_FORMAT,
+            "alignment_checkpoint": alignment_checkpoint_path,
+            "alignment_checkpoint_sha256": alignment_checkpoint_sha256,
+        },
     )
     storage_dtype = torch.float16 if args.storage_dtype == "float16" else torch.float32
     summary: dict[str, Any] = {"splits": {}, "tasks": list(args.tasks)}
@@ -696,89 +810,112 @@ def main() -> None:
             include_raw_text=False,
         )
         loader = DataLoader(dataset, batch_size=int(args.batch_size), shuffle=False, collate_fn=collate_patch_text)
-        qa_records: list[dict[str, Any]] = []
+        qa_record_count = 0
         task_counts: Counter[str] = Counter()
         field_counts: Counter[str] = Counter()
-        for batch in tqdm(loader, desc=f"build patch QA {split}"):
-            raw_batch = batch["patch"].float()
-            encoder_input_items: list[torch.Tensor] = []
-            qa_patch_items: list[torch.Tensor] = []
-            stats: list[dict[str, float]] = []
-            for patch in raw_batch:
-                encoder_input, _state = normalize_tensor(patch, normalization_cfg)
-                qa_patch, qa_stats = per_patch_zscore(patch)
-                if not torch.allclose(encoder_input.float(), qa_patch.float(), rtol=1.0e-5, atol=1.0e-6):
-                    raise ValueError(
-                        "Patch QA value space differs from the alignment encoder input despite the normalization "
-                        "preflight. Refusing to generate semantically inconsistent prompts and latents."
-                    )
-                encoder_input_items.append(encoder_input)
-                qa_patch_items.append(qa_patch)
-                stats.append(qa_stats)
-            refs = [patch_id(record) for record in batch["records"]]
-            latent_paths = [latent_root / f"{ref}.pt" for ref in refs]
-            encode_indices = [
-                index
-                for index, latent_path in enumerate(latent_paths)
-                if bool(args.overwrite) or not latent_path.exists()
-            ]
-            encoded_latents: dict[int, torch.Tensor] = {}
-            if encode_indices:
-                encoder_input_batch = torch.stack([encoder_input_items[index] for index in encode_indices]).to(device)
-                with torch.no_grad():
-                    missing_latents = compressor.encode(encoder_input_batch)["latent_map"].detach().cpu()
-                encoded_latents = {
-                    item_index: missing_latents[batch_index]
-                    for batch_index, item_index in enumerate(encode_indices)
-                }
-            for local_index, record in enumerate(batch["records"]):
-                ref = refs[local_index]
-                latent_path = latent_paths[local_index]
-                if local_index in encoded_latents:
-                    torch.save(
-                        {
-                            "latent_map": encoded_latents[local_index].to(dtype=storage_dtype),
-                            "patch_id": ref,
-                            "field": str(record["fields"][0]),
-                            "sample_index": int(record["sample_index"]),
-                            "time_index": int(record["time_index"]),
-                            "top_left": [int(record["row"]), int(record["col"])],
-                            "alignment_checkpoint": str(Path(args.alignment_checkpoint).expanduser().resolve()),
-                            "encoder_input_normalization": normalization_cfg,
-                            "qa_value_space": {
-                                "mode": "per_patch_zscore",
-                                "mean": stats[local_index]["mean"],
-                                "std": stats[local_index]["std"],
-                                "scale": stats[local_index]["scale"],
+        with AtomicJsonlWriter(qa_dir / f"{split}.jsonl") as qa_writer:
+            for batch in tqdm(loader, desc=f"build patch QA {split}"):
+                raw_batch = batch["patch"].float()
+                encoder_input_items: list[torch.Tensor] = []
+                qa_patch_items: list[torch.Tensor] = []
+                stats: list[dict[str, float]] = []
+                for patch in raw_batch:
+                    encoder_input, _state = normalize_tensor(patch, normalization_cfg)
+                    qa_patch, qa_stats = per_patch_zscore(patch)
+                    if not torch.allclose(encoder_input.float(), qa_patch.float(), rtol=1.0e-5, atol=1.0e-6):
+                        raise ValueError(
+                            "Patch QA value space differs from the alignment encoder input despite the normalization "
+                            "preflight. Refusing to generate semantically inconsistent prompts and latents."
+                        )
+                    encoder_input_items.append(encoder_input)
+                    qa_patch_items.append(qa_patch)
+                    stats.append(qa_stats)
+                refs = [patch_id(record) for record in batch["records"]]
+                latent_paths = [latent_root / f"{ref}.pt" for ref in refs]
+                encode_indices: list[int] = []
+                for local_index, (record, latent_path) in enumerate(zip(batch["records"], latent_paths, strict=True)):
+                    if bool(args.overwrite) or not latent_path.exists():
+                        encode_indices.append(local_index)
+                        continue
+                    try:
+                        existing_payload = torch.load(latent_path, map_location="cpu", weights_only=True)
+                        validate_patch_latent_payload(
+                            existing_payload,
+                            path=latent_path,
+                            expected_identity=latent_identity_from_record({**record, "patch_id": refs[local_index]}),
+                            expected_alignment_checkpoint=alignment_checkpoint_path,
+                            expected_alignment_sha256=alignment_checkpoint_sha256,
+                            expected_normalization=normalization_cfg,
+                            expected_shape=latent_shape,
+                            expected_storage_dtype=storage_dtype_name,
+                            expected_qa_stats=stats[local_index],
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Existing latent cache failed strict provenance validation: {latent_path}. "
+                            "Use a new latent_dir or rerun with --overwrite."
+                        ) from exc
+                    finally:
+                        existing_payload = None
+                encoded_latents: dict[int, torch.Tensor] = {}
+                if encode_indices:
+                    encoder_input_batch = torch.stack([encoder_input_items[index] for index in encode_indices]).to(device)
+                    with torch.no_grad():
+                        missing_latents = compressor.encode(encoder_input_batch)["latent_map"].detach().cpu()
+                    encoded_latents = {
+                        item_index: missing_latents[batch_index]
+                        for batch_index, item_index in enumerate(encode_indices)
+                    }
+                for local_index, record in enumerate(batch["records"]):
+                    ref = refs[local_index]
+                    latent_path = latent_paths[local_index]
+                    if local_index in encoded_latents:
+                        atomic_torch_save(
+                            latent_path,
+                            {
+                                "format": PATCH_LATENT_FORMAT,
+                                "latent_map": encoded_latents[local_index].to(dtype=storage_dtype),
+                                "patch_id": ref,
+                                "field": str(record["fields"][0]),
+                                "sample_index": int(record["sample_index"]),
+                                "time_index": int(record["time_index"]),
+                                "top_left": [int(record["row"]), int(record["col"])],
+                                "alignment_checkpoint": alignment_checkpoint_path,
+                                "alignment_checkpoint_sha256": alignment_checkpoint_sha256,
+                                "encoder_input_normalization": normalization_cfg,
+                                "qa_value_space": {
+                                    "mode": "per_patch_zscore",
+                                    "mean": stats[local_index]["mean"],
+                                    "std": stats[local_index]["std"],
+                                    "scale": stats[local_index]["scale"],
+                                },
                             },
-                        },
-                        latent_path,
-                    )
-                for variant_index in range(question_variants[split]):
-                    questions = build_questions(
-                        record=record,
-                        raw_patch=raw_batch[local_index],
-                        normalized_patch=qa_patch_items[local_index],
-                        mean=stats[local_index]["mean"],
-                        std=stats[local_index]["std"],
-                        scale=stats[local_index]["scale"],
-                        tasks=args.tasks,
-                        region_size=int(args.region_size),
-                        spacing=float(args.numeric_choice_spacing),
-                        decimals=int(args.decimal_places),
-                        include_oracle=bool(args.include_oracle),
-                        seed=question_seed(int(args.seed), record, variant_index),
-                        variant_index=variant_index,
-                        variant_family_seed=question_seed(int(args.seed), record, -1),
-                    )
-                    qa_records.extend(questions)
-                    task_counts.update(question["task_type"] for question in questions)
-                field_counts.update([str(record["fields"][0])])
-        write_jsonl(qa_dir / f"{split}.jsonl", qa_records)
+                        )
+                    for variant_index in range(question_variants[split]):
+                        questions = build_questions(
+                            record=record,
+                            raw_patch=raw_batch[local_index],
+                            normalized_patch=qa_patch_items[local_index],
+                            mean=stats[local_index]["mean"],
+                            std=stats[local_index]["std"],
+                            scale=stats[local_index]["scale"],
+                            tasks=args.tasks,
+                            region_size=int(args.region_size),
+                            spacing=float(args.numeric_choice_spacing),
+                            decimals=int(args.decimal_places),
+                            include_oracle=bool(args.include_oracle),
+                            seed=question_seed(int(args.seed), record, variant_index),
+                            variant_index=variant_index,
+                            variant_family_seed=question_seed(int(args.seed), record, -1),
+                        )
+                        qa_writer.write_many(questions)
+                        qa_record_count += len(questions)
+                        task_counts.update(question["task_type"] for question in questions)
+                    field_counts.update([str(record["fields"][0])])
         summary["splits"][split] = {
             "patches": len(records),
             "question_variants_per_patch": question_variants[split],
-            "qa_records": len(qa_records),
+            "qa_records": qa_record_count,
             "by_task": dict(sorted(task_counts.items())),
             "patches_by_field": dict(sorted(field_counts.items())),
         }
@@ -787,13 +924,18 @@ def main() -> None:
         "format": PATCH_QA_FORMAT,
         "prompt_contract": PATCH_QA_PROMPT_CONTRACT,
         "hdf5_path": str(args.hdf5_path),
-        "alignment_checkpoint": str(args.alignment_checkpoint),
+        "alignment_checkpoint": alignment_checkpoint_path,
+        "alignment_checkpoint_sha256": alignment_checkpoint_sha256,
         "alignment_fields": alignment_fields,
         "allow_unseen_alignment_fields": bool(args.allow_unseen_alignment_fields),
         "qa_dir": str(qa_dir),
         "latent_dir": str(latent_root),
         "fields": fields,
         "patch_size": int(args.patch_size),
+        "latent_format": PATCH_LATENT_FORMAT,
+        "latent_audit_format": PATCH_LATENT_AUDIT_FORMAT,
+        "latent_shape": list(latent_shape),
+        "storage_dtype": storage_dtype_name,
         "encoder_input_normalization": normalization_cfg,
         "qa_value_space": "per_patch_zscore_from_raw_patch",
         "natural_language_coordinate_origin": 1,
@@ -805,8 +947,10 @@ def main() -> None:
         "split_overlap": overlap,
         "summary": summary,
     }
-    with (qa_dir / "metadata.json").open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    atomic_json_dump(qa_dir / "metadata.json", metadata)
+    build_marker.unlink(missing_ok=True)
+    compressor_config = {}
+    gc.collect()
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
 
 

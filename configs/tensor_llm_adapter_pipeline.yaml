@@ -28,11 +28,12 @@ data:
 # Current stage-1 config encodes a per-patch z-score matrix; QA keeps raw mean/scale for reversible value queries.
 # Set alignment_checkpoint to the latest successful alignment_best.pt before generation/training.
 patch_qa:
-  # Fill this with the completed Qwen2.5-32B Stage-1 alignment_best.pt before Stage 2.
-  alignment_checkpoint: null
+  # Reuse the completed Qwen2.5-14B Layer-2 Stage-1 checkpoint; legacy metadata is validated by filename/payload.
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
-  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256
-  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256
+  # Use a fresh v3 directory so legacy/incomplete caches remain untouched and cannot be mixed in.
+  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_v3_direct
+  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256_14b_v3_direct
   fields:
     - density
     - pressure
@@ -73,8 +74,8 @@ compressor:
   checkpoint: /home/lpr/wyx/tensor-compression/outputs/runs/20260620_153406_compressor_2d_baseline/checkpoints/best.pt
 
 model:
-  name_or_path: Qwen/Qwen2.5-32B-Instruct
-  local_dir: /data/wyx/tensor_llm_assets/models/Qwen2.5-32B-Instruct
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: /data/wyx/tensor_llm_assets/models/Qwen2.5-14B-Instruct
   revision: main
   trust_remote_code: false
   torch_dtype: bfloat16
@@ -128,7 +129,7 @@ patch_alignment:
   #   text path: serialized patch -> frozen LLM
   # Probe mode reads matching shallow hidden states; alignment_transform selects the InfoNCE feature space.
   enabled: false  # Reserved for future pipeline orchestration; ignored when this script is called directly.
-  run_name: tensor_patch_text_alignment_qwen25_32b_spatial256_stage2_final
+  run_name: tensor_patch_text_alignment_qwen25_14b_spatial256
   output_root: /data/wyx/tensor_llm_outputs/runs
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   fields:
@@ -170,7 +171,7 @@ patch_alignment:
   num_workers: 2
   # Fail with stage diagnostics if a rank stops participating; normal long I/O should not hit this.
   distributed_timeout_seconds: 1800
-  # Retained for bounded activation memory through the frozen Layer-2 teacher path.
+  # Retained for bounded activation memory through the frozen teacher path.
   llm_gradient_checkpointing: true
   # patch_ae_config: build a patch-sized AE from patch_encoder below.
   # checkpoint: load compressor_checkpoint; use this for a trained patch AE or legacy 512x512 AE.
@@ -321,17 +322,23 @@ patch_alignment:
   max_text_tokens: 3072
   # Number of training records checked before AE warmup to catch teacher text truncation early.
   text_preflight_records: 32
-  # Layer 2 is the validated spatial-token training path; changing depth here would confound the final run.
+  # Layer 2 remains the validated Stage-1 target. The latest diagnostic isolates the old Stage-2
+  # question cross-attention as the clear failure, so do not confound the direct-prefix experiment by
+  # retraining Stage 1 with unvalidated trajectory targets. Optional shallow auxiliary supervision is
+  # implemented and can be enabled later (for example [4, 6] with [0.25, 0.25]) if direct Stage-2
+  # hidden-state diagnostics show that tensor sensitivity disappears after Layer 2.
   # Index 0 is rejected because it is the non-contextual input embedding at the readout token.
   teacher_layer: 2
+  auxiliary_teacher_layers: []
+  auxiliary_teacher_layer_weights: []
   # Read-only frozen-Qwen scan used before choosing teacher_layer. It never trains or loads the AE/Q-Former/projector.
   # Run scripts/scan_tensor_teacher_layers.py; --anchor-mode can override probe with eos or representation.
   layer_scan:
     split: val
     records: 64
     batch_size: 1
-    # Optional confirmation scan around the selected late-layer region.
-    layers: "48,52,54,56,58,60,64"
+    # Optional confirmation scan of the shallow trajectory used by the 14B run.
+    layers: "1,2,3,4,6,8,12"
     probe_count: 8
     # Probe mode compares an on-target perturbation with an equal-size off-target control perturbation.
     perturbation_scale: 0.01
@@ -339,21 +346,24 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Clone the stage-1 spatial adapter into a question-conditioned residual branch.
-  architecture: residual_question_adapter
-  # Fill this with the same Qwen2.5-32B Stage-1 checkpoint used by patch_qa.
-  init_checkpoint: null
+  # Reuse the Stage-1 spatial adapter directly: 256 row-major tensor embeddings followed by the
+  # natural-language QA prompt. Qwen itself, rather than a task-specific cross-attention branch,
+  # performs question-to-prefix routing.
+  architecture: alignment_adapter
+  # This must be byte-for-byte the same Stage-1 checkpoint used by patch_qa.
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   soft_prompt_tokens: 256
   adapter_dim: 512
   adapter_layers: 2
   adapter_heads: 8
   dropout: 0.0
   latent_pos_encoding: grid
-  question_conditioning: true
+  question_conditioning: false
   question_condition_gate_init: 0.0
   # Formal runs must let the model read coordinates/tasks/statistics from text instead of regex-parsed features.
   structured_query_conditioning: false
-  # Residual mode keeps all 256 positions and the inherited spatial blocks from stage 1.
+  # The options below are retained for explicitly requested residual/hybrid experiments and are inactive
+  # for alignment_adapter. They do not create parameters or an extra question-encoding forward in this run.
   local_soft_prompt_tokens: 256
   local_adapter_layers: 2
   # Frozen Qwen contextual tokens remain the only question input; no parsed coordinates or task IDs are used.
@@ -383,7 +393,7 @@ adapter:
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_grounded_spatial_reader
+  run_name: tensor_patch_qa_direct_spatial_adapter
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -403,6 +413,9 @@ llm_training:
   latent_cache_size: 8192
   # Two workers per rank overlap local-NVMe reads while avoiding 16 persistent dataset copies on four GPUs.
   num_workers: 2
+  # Rank 0 performs the full latent/prompt audit and diagnostics while peer ranks wait in collectives.
+  # Shared-storage stalls and the frozen 14B diagnostic forward can exceed PyTorch's default 30 minutes.
+  distributed_timeout_seconds: 7200
   # DDP ranks load their full frozen-LLM replicas one at a time. This prevents four temporary CPU
   # checkpoint copies from peaking together before the weights are moved to their GPUs.
   serialize_llm_loading: true
@@ -432,7 +445,8 @@ llm_training:
   # single-GPU 3 x 5 = 15 schedule without reducing optimizer updates by another factor of four.
   # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
   gradient_accumulation_steps: 1
-  lr: 1.0e-4
+  # Fine-tune the already aligned Stage-1 adapter conservatively; Qwen remains frozen.
+  lr: 2.0e-5
   lr_scheduler: cosine
   warmup_ratio: 0.03
   min_lr_ratio: 0.1
@@ -442,10 +456,11 @@ llm_training:
   choice_ce_loss_weight: 1.0
   ranking_loss_weight: 0.1
   ranking_loss_margin: 0.1
-  # Require the question reader to improve over the frozen Stage-1 prompt for the same tensor.
-  ranking_loss_negative: global_only
-  # For the same tensor/task, its own question-conditioned prompt must beat another question's prompt.
-  swapped_question_loss_weight: 0.1
+  # Compare the correct tensor prefix with a same-length zero-information prefix. A shuffled PDE tensor
+  # is not a reliable negative: its answer can legitimately equal the current record's answer.
+  ranking_loss_negative: no_latent
+  # The direct tensor prefix is deliberately question-independent; swapping same-tensor prefixes is an identity.
+  swapped_question_loss_weight: 0.0
   swapped_question_loss_margin: 0.1
   # Same-label swaps are semantically ambiguous, especially for balanced binary tasks.
   swapped_question_require_different_answer: true
@@ -461,8 +476,6 @@ llm_training:
     - shuffled
   final_eval_baselines:
     - correct
-    - global_only
-    - local_only
     - no_latent
     - zero_latent
     - shuffled

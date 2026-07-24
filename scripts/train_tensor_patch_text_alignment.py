@@ -70,6 +70,7 @@ class PatchRecord:
 class HiddenBatch:
     hidden: torch.Tensor
     metrics: dict[str, float]
+    hidden_by_layer: Mapping[int, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,123 @@ def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
+def validate_finite_float(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> float:
+    """Parse a finite configuration scalar and enforce explicit numeric bounds."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number, got {value!r}.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    if minimum is not None:
+        below = number < float(minimum) if minimum_inclusive else number <= float(minimum)
+        if below:
+            relation = ">=" if minimum_inclusive else ">"
+            raise ValueError(f"{name} must be {relation} {minimum}, got {number}.")
+    if maximum is not None:
+        above = number > float(maximum) if maximum_inclusive else number >= float(maximum)
+        if above:
+            relation = "<=" if maximum_inclusive else "<"
+            raise ValueError(f"{name} must be {relation} {maximum}, got {number}.")
+    return number
+
+
+def resolve_teacher_layer_supervision(
+    primary_layer: int,
+    auxiliary_layers: str | Sequence[int] | None,
+    auxiliary_weights: str | Sequence[float] | None,
+) -> tuple[tuple[int, ...], dict[int, float]]:
+    primary = int(primary_layer)
+    parsed_layers = tuple(int(value) for value in parse_csv(auxiliary_layers))
+    parsed_weights = tuple(float(value) for value in parse_csv(auxiliary_weights))
+    if primary <= 0:
+        raise ValueError("patch_alignment.teacher_layer must be at least 1.")
+    if len(parsed_layers) != len(set(parsed_layers)):
+        raise ValueError("patch_alignment.auxiliary_teacher_layers must not contain duplicates.")
+    if primary in parsed_layers:
+        raise ValueError(
+            "patch_alignment.auxiliary_teacher_layers must not repeat patch_alignment.teacher_layer."
+        )
+    if len(parsed_layers) != len(parsed_weights):
+        raise ValueError(
+            "patch_alignment.auxiliary_teacher_layer_weights must contain exactly one weight per auxiliary layer."
+        )
+    if any(layer <= 0 for layer in parsed_layers):
+        raise ValueError("All patch_alignment.auxiliary_teacher_layers must be at least 1.")
+    if any(not math.isfinite(weight) or weight <= 0.0 for weight in parsed_weights):
+        raise ValueError("All patch_alignment.auxiliary_teacher_layer_weights must be finite and positive.")
+    # Keep the primary layer first for the objective, but canonicalize auxiliary
+    # order so config ordering cannot change hook or metric ordering.
+    auxiliary_pairs = sorted(zip(parsed_layers, parsed_weights, strict=True), key=lambda pair: pair[0])
+    weights_by_layer = {layer: weight for layer, weight in auxiliary_pairs}
+    return (primary, *(layer for layer, _weight in auxiliary_pairs)), weights_by_layer
+
+
+def normalize_teacher_layer_indices(
+    teacher_layers: Sequence[int],
+    *,
+    context: str = "teacher layer",
+) -> tuple[int, ...]:
+    """Validate semantic 1-based transformer block indices and canonicalize their order."""
+    if isinstance(teacher_layers, (str, bytes)):
+        raise TypeError(f"{context} must be a sequence of integer block indices, not text.")
+    try:
+        requested = tuple(int(index) for index in teacher_layers)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} must contain integer block indices.") from exc
+    if not requested:
+        raise ValueError(f"At least one {context} must be requested.")
+    if any(index <= 0 for index in requested):
+        raise ValueError(
+            f"{context} uses 1-based transformer block indices; got {requested}. "
+            "Index 0 is the input embedding and is not a contextual readout."
+        )
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"{context} must not contain duplicate indices: {requested}.")
+    return tuple(sorted(requested))
+
+
+def teacher_layers_from_args(args: argparse.Namespace) -> tuple[int, ...]:
+    layers = getattr(args, "teacher_layers", None)
+    requested = tuple(int(layer) for layer in layers) if layers else (int(args.teacher_layer),)
+    return normalize_teacher_layer_indices(requested, context="configured teacher layer")
+
+
+def teacher_supervision_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    layers = teacher_layers_from_args(args)
+    primary = int(args.teacher_layer)
+    auxiliary_weights = {
+        int(layer): float(weight)
+        for layer, weight in dict(
+            getattr(args, "auxiliary_teacher_layer_weights_by_layer", {})
+        ).items()
+    }
+    expected_auxiliary = set(layers) - {primary}
+    if set(auxiliary_weights) != expected_auxiliary:
+        raise ValueError(
+            "Teacher-supervision metadata is inconsistent with the configured layers: "
+            f"layers={layers}, primary={primary}, auxiliary_weights={auxiliary_weights}."
+        )
+    return {
+        "primary_layer": primary,
+        "layers": list(layers),
+        "auxiliary_layers": sorted(expected_auxiliary),
+        "auxiliary_layer_weights": {
+            str(layer): auxiliary_weights[layer] for layer in sorted(auxiliary_weights)
+        },
+        "primary_feature_transform": str(args.alignment_transform_mode),
+        "auxiliary_feature_transform": "native_centered_and_branch_mean",
+    }
+
+
 def reject_removed_alignment_options(config: Mapping[str, Any]) -> None:
     configured = [
         name
@@ -168,8 +286,13 @@ def parse_index_spec(raw: str | Sequence[int] | None, max_count: int) -> list[in
 def dump_json(path: str | Path, payload: Mapping[str, Any]) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    temporary_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def distributed_is_initialized() -> bool:
@@ -274,6 +397,42 @@ def gradient_parameter_entries(
             seen.add(id(parameter))
             entries.append((f"module_{module_index}.{name}", parameter))
     return entries
+
+
+def audit_optimizer_parameter_coverage(
+    optimizer: torch.optim.Optimizer,
+    modules: Sequence[nn.Module | None],
+) -> dict[str, int]:
+    """Require exact optimizer coverage of every currently trainable Stage-1 parameter."""
+    expected_entries = gradient_parameter_entries(modules)
+    expected_ids = {id(parameter) for _name, parameter in expected_entries}
+    optimizer_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group.get("params", [])
+    ]
+    optimizer_ids = [id(parameter) for parameter in optimizer_parameters]
+    optimizer_id_set = set(optimizer_ids)
+    duplicate_count = len(optimizer_ids) - len(optimizer_id_set)
+    missing_count = len(expected_ids - optimizer_id_set)
+    extra_count = len(optimizer_id_set - expected_ids)
+    frozen_count = sum(not bool(parameter.requires_grad) for parameter in optimizer_parameters)
+    if duplicate_count or missing_count or extra_count or frozen_count:
+        raise RuntimeError(
+            "Stage-1 optimizer parameter audit failed: "
+            f"duplicates={duplicate_count}, missing_trainable={missing_count}, "
+            f"unexpected={extra_count}, frozen={frozen_count}."
+        )
+    return {
+        "trainable_parameter_tensors": len(expected_entries),
+        "trainable_parameters": sum(parameter.numel() for _name, parameter in expected_entries),
+        "optimizer_parameter_tensors": len(optimizer_parameters),
+        "optimizer_parameters": sum(parameter.numel() for parameter in optimizer_parameters),
+        "duplicate_parameter_tensors": duplicate_count,
+        "missing_trainable_parameter_tensors": missing_count,
+        "unexpected_parameter_tensors": extra_count,
+        "frozen_parameter_tensors": frozen_count,
+    }
 
 
 def verify_distributed_signature(values: torch.Tensor, description: str) -> None:
@@ -1177,6 +1336,35 @@ class TensorPatchAlignmentAdapter(nn.Module):
     ) -> None:
         super().__init__()
         self.adapter_type = str(adapter_type).lower()
+        latent_channels = int(latent_channels)
+        adapter_dim = int(adapter_dim)
+        projection_dim = int(projection_dim)
+        adapter_layers = int(adapter_layers)
+        adapter_heads = int(adapter_heads)
+        dropout = validate_finite_float(
+            "patch alignment adapter dropout",
+            dropout,
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
+        soft_prompt_scale = validate_finite_float(
+            "patch alignment soft_prompt_scale",
+            soft_prompt_scale,
+            minimum=0.0,
+        )
+        if latent_channels <= 0:
+            raise ValueError(f"latent_channels must be positive, got {latent_channels}.")
+        if adapter_dim <= 0 or projection_dim <= 0:
+            raise ValueError(
+                "adapter_dim and projection_dim must be positive, got "
+                f"{adapter_dim} and {projection_dim}."
+            )
+        if adapter_layers <= 0 or adapter_heads <= 0:
+            raise ValueError(
+                "adapter_layers and adapter_heads must be positive, got "
+                f"{adapter_layers} and {adapter_heads}."
+            )
         self.latent_grid = tuple(int(dim) for dim in latent_grid)
         if len(self.latent_grid) != 2 or any(dim <= 0 for dim in self.latent_grid):
             raise ValueError(f"latent_grid must contain two positive dimensions, got {self.latent_grid}.")
@@ -1189,11 +1377,10 @@ class TensorPatchAlignmentAdapter(nn.Module):
             else 1
         )
         self.structured_query_conditioning = False
-        self.soft_prompt_scale = float(soft_prompt_scale)
-        self.adapter_dim = int(adapter_dim)
+        self.soft_prompt_scale = soft_prompt_scale
+        self.adapter_dim = adapter_dim
         adapter_dim = self.adapter_dim
-        projection_dim = int(projection_dim)
-        if adapter_dim % int(adapter_heads) != 0:
+        if adapter_dim % adapter_heads != 0:
             raise ValueError(
                 f"adapter_dim must be divisible by adapter_heads. Got {adapter_dim} and {adapter_heads}."
             )
@@ -1203,7 +1390,7 @@ class TensorPatchAlignmentAdapter(nn.Module):
                 nn.LayerNorm(input_dim),
                 nn.Linear(input_dim, adapter_dim),
                 nn.GELU(),
-                nn.Dropout(float(dropout)),
+                nn.Dropout(dropout),
                 nn.Linear(adapter_dim, projection_dim),
             )
             return
@@ -1229,8 +1416,8 @@ class TensorPatchAlignmentAdapter(nn.Module):
             self.last_spatial_path_metrics: dict[str, float] = {}
             self.blocks = nn.ModuleList(
                 [
-                    SpatialTransformerBlock(adapter_dim, int(adapter_heads), float(dropout))
-                    for _ in range(int(adapter_layers))
+                    SpatialTransformerBlock(adapter_dim, adapter_heads, dropout)
+                    for _ in range(adapter_layers)
                 ]
             )
             self.output = nn.Sequential(
@@ -1247,8 +1434,8 @@ class TensorPatchAlignmentAdapter(nn.Module):
         self.query_tokens = nn.Parameter(torch.empty(1, int(query_tokens), adapter_dim))
         self.blocks = nn.ModuleList(
             [
-                CrossAttentionBlock(adapter_dim, int(adapter_heads), float(dropout))
-                for _ in range(int(adapter_layers))
+                CrossAttentionBlock(adapter_dim, adapter_heads, dropout)
+                for _ in range(adapter_layers)
             ]
         )
         self.output = nn.Sequential(
@@ -1465,15 +1652,23 @@ class FixedTeacherWhitening(nn.Module):
             raise ValueError(
                 f"Whitening output_dim must be in [1, {hidden_dim}], got {output_dim}."
             )
-        if not 0.0 <= float(shrinkage) <= 1.0:
-            raise ValueError("alignment_transform.whitening.shrinkage must be in [0, 1].")
-        if float(epsilon) <= 0.0:
-            raise ValueError("alignment_transform.whitening.epsilon must be positive.")
-        if float(max_condition_number) < 1.0:
-            raise ValueError("alignment_transform.whitening.max_condition_number must be at least 1.")
-        self.shrinkage = float(shrinkage)
-        self.epsilon = float(epsilon)
-        self.max_condition_number = float(max_condition_number)
+        self.shrinkage = validate_finite_float(
+            "alignment_transform.whitening.shrinkage",
+            shrinkage,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.epsilon = validate_finite_float(
+            "alignment_transform.whitening.epsilon",
+            epsilon,
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        self.max_condition_number = validate_finite_float(
+            "alignment_transform.whitening.max_condition_number",
+            max_condition_number,
+            minimum=1.0,
+        )
         self.register_buffer("mean", torch.zeros(hidden_dim, dtype=torch.float32))
         self.register_buffer("matrix", torch.zeros(hidden_dim, output_dim, dtype=torch.float32))
         self.register_buffer("fitted_records", torch.zeros((), dtype=torch.long))
@@ -1498,6 +1693,8 @@ class FixedTeacherWhitening(nn.Module):
         record_count = int(samples.shape[0])
         if record_count < 2:
             raise ValueError("Whitening requires at least two teacher records.")
+        if not bool(torch.isfinite(samples).all()):
+            raise ValueError("Teacher hidden states for whitening contain NaN or infinity.")
         mean = samples.mean(dim=0)
         centered = (
             samples - mean
@@ -1509,6 +1706,8 @@ class FixedTeacherWhitening(nn.Module):
                 "Whitening covariance residuals must match teacher hidden shape; "
                 f"got {tuple(centered.shape)} and {tuple(samples.shape)}."
             )
+        if not bool(torch.isfinite(centered).all()):
+            raise ValueError("Teacher covariance residuals for whitening contain NaN or infinity.")
         covariance = centered.T @ centered / float(record_count - 1)
         average_variance = float(covariance.diag().mean().item())
         if not np.isfinite(average_variance) or average_variance <= 0.0:
@@ -1666,9 +1865,15 @@ def normalized_contrastive_direction_weights(
 ) -> tuple[float, float]:
     i2t = float(i2t_weight)
     t2i = float(t2i_weight)
-    if i2t < 0.0 or t2i < 0.0 or i2t + t2i <= 0.0:
+    if (
+        not math.isfinite(i2t)
+        or not math.isfinite(t2i)
+        or i2t < 0.0
+        or t2i < 0.0
+        or i2t + t2i <= 0.0
+    ):
         raise ValueError(
-            "Contrastive direction weights must be non-negative and have a positive sum. "
+            "Contrastive direction weights must be finite, non-negative, and have a positive sum. "
             f"Got i2t={i2t}, t2i={t2i}."
         )
     total = i2t + t2i
@@ -2002,14 +2207,40 @@ def hidden_at_last_non_padding(
     teacher_layer: int,
     prefix_tokens: int = 0,
 ) -> torch.Tensor:
+    prefix_count = int(prefix_tokens)
+    if prefix_count < 0:
+        raise ValueError("prefix_tokens must be non-negative.")
+    if attention_mask.ndim != 2 or int(attention_mask.shape[1]) <= 0:
+        raise ValueError(
+            f"Expected a non-empty [batch,tokens] attention mask, got {tuple(attention_mask.shape)}."
+        )
+    if bool(attention_mask.long().sum(dim=1).eq(0).any()):
+        raise ValueError("Every sequence must contain at least one non-padding token.")
     layer_index = int(teacher_layer)
     if not -len(hidden_states) <= layer_index < len(hidden_states):
         raise ValueError(
             f"teacher_layer={teacher_layer} is out of range for {len(hidden_states)} hidden-state tensors."
         )
     hidden = hidden_states[layer_index]
-    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device).unsqueeze(0)
-    last_indices = (attention_mask.long() * positions).amax(dim=1) + int(prefix_tokens)
+    if hidden.ndim != 3 or int(hidden.shape[0]) != int(attention_mask.shape[0]):
+        raise ValueError(
+            "Hidden states and attention mask have incompatible batch shapes: "
+            f"hidden={tuple(hidden.shape)}, mask={tuple(attention_mask.shape)}."
+        )
+    if prefix_count + int(attention_mask.shape[1]) > int(hidden.shape[1]):
+        raise ValueError(
+            "The attention-mask span plus prefix_tokens exceeds the hidden-state sequence: "
+            f"prefix={prefix_count}, mask_tokens={int(attention_mask.shape[1])}, "
+            f"hidden_tokens={int(hidden.shape[1])}."
+        )
+    mask = attention_mask.to(device=hidden.device)
+    positions = torch.arange(mask.shape[1], device=hidden.device).unsqueeze(0)
+    last_indices = (mask.long() * positions).amax(dim=1) + prefix_count
+    if int(last_indices.max().item()) >= int(hidden.shape[1]):
+        raise ValueError(
+            "The last non-padding position plus prefix_tokens is outside the hidden-state sequence: "
+            f"max_index={int(last_indices.max().item())}, hidden_tokens={int(hidden.shape[1])}."
+        )
     batch_indices = torch.arange(hidden.shape[0], device=hidden.device)
     return hidden[batch_indices, last_indices]
 
@@ -2066,9 +2297,7 @@ def transformer_block_hidden_states(
     """Capture only requested transformer-block outputs, before any final backbone norm."""
     backbone = llm_backbone(llm)
     layers = getattr(backbone, "layers", None)
-    requested = sorted({int(index) for index in layer_indices})
-    if not requested:
-        raise ValueError("At least one transformer layer must be requested.")
+    requested = normalize_teacher_layer_indices(layer_indices, context="transformer layer")
     if isinstance(layers, nn.ModuleList):
         invalid = [index for index in requested if index <= 0 or index > len(layers)]
         if invalid:
@@ -2113,7 +2342,150 @@ def transformer_block_hidden_states(
         use_cache=False,
     )
     hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("The LLM did not return hidden states for transformer-block capture.")
+    invalid = [index for index in requested if index >= len(hidden_states)]
+    if invalid:
+        raise ValueError(
+            f"Requested transformer layers {invalid} are outside returned "
+            f"hidden_states[1..{len(hidden_states) - 1}]."
+        )
     return {index: hidden_states[index] for index in requested}
+
+
+def forward_teacher_readout_hiddens(
+    llm: nn.Module,
+    *,
+    attention_mask: torch.Tensor,
+    teacher_layers: Sequence[int],
+    input_ids: torch.Tensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> dict[int, torch.Tensor]:
+    """Read the same final non-padding position from several transformer blocks in one forward."""
+    requested = normalize_teacher_layer_indices(teacher_layers, context="teacher layer")
+    if attention_mask.ndim != 2 or int(attention_mask.shape[1]) <= 0:
+        raise ValueError(f"Expected a non-empty [batch,tokens] attention mask, got {tuple(attention_mask.shape)}.")
+    if bool(attention_mask.long().sum(dim=1).eq(0).any()):
+        raise ValueError("Every teacher/student sequence must contain at least one non-padding token.")
+    if (input_ids is None) == (inputs_embeds is None):
+        raise ValueError("Provide exactly one of input_ids or inputs_embeds to the teacher readout.")
+    if input_ids is not None:
+        if input_ids.ndim != 2 or tuple(input_ids.shape[:2]) != tuple(attention_mask.shape):
+            raise ValueError(
+                "input_ids and attention_mask must have matching [batch,tokens] shapes: "
+                f"input_ids={tuple(input_ids.shape)}, mask={tuple(attention_mask.shape)}."
+            )
+    if inputs_embeds is not None:
+        if inputs_embeds.ndim != 3 or tuple(inputs_embeds.shape[:2]) != tuple(attention_mask.shape):
+            raise ValueError(
+                "inputs_embeds and attention_mask must have matching [batch,tokens] shapes: "
+                f"inputs_embeds={tuple(inputs_embeds.shape)}, mask={tuple(attention_mask.shape)}."
+            )
+
+    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device).unsqueeze(0)
+    last_indices = (attention_mask.long() * positions).amax(dim=1)
+    batch_indices = torch.arange(attention_mask.shape[0], device=attention_mask.device)
+    requires_gradient_path = bool(
+        torch.is_grad_enabled()
+        and inputs_embeds is not None
+        and inputs_embeds.requires_grad
+    )
+    backbone = llm_backbone(llm)
+    layers = getattr(backbone, "layers", None)
+    if isinstance(layers, nn.ModuleList):
+        invalid = [index for index in requested if index <= 0 or index > len(layers)]
+        if invalid:
+            raise ValueError(
+                f"Transformer block indices {invalid} are outside hidden_states[1..{len(layers)}]."
+            )
+        captured: dict[int, torch.Tensor] = {}
+
+        def capture(index: int):
+            def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+                hidden = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.is_tensor(hidden):
+                    raise TypeError(
+                        f"Transformer block {index} returned unsupported output type {type(output).__name__}."
+                    )
+                if hidden.ndim != 3 or tuple(hidden.shape[:2]) != tuple(attention_mask.shape):
+                    raise ValueError(
+                        f"Transformer block {index} returned shape {tuple(hidden.shape)} inconsistent with "
+                        f"attention_mask={tuple(attention_mask.shape)}."
+                    )
+                readout = hidden[batch_indices, last_indices]
+                # Non-reentrant checkpointing invokes the hook again while backward
+                # recomputes a block. Keep the original forward tensor whose retained
+                # gradient is inspected after backward; the recomputed tensor is an
+                # implementation detail and must not overwrite this reference.
+                if index not in captured:
+                    captured[index] = readout
+
+            return hook
+
+        handles = [layers[index - 1].register_forward_hook(capture(index)) for index in requested]
+        try:
+            backbone(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        missing = [index for index in requested if index not in captured]
+        if missing:
+            raise RuntimeError(f"Transformer hooks did not capture requested readout blocks {missing}.")
+        disconnected = [
+            index for index in requested if requires_gradient_path and not captured[index].requires_grad
+        ]
+        if disconnected:
+            raise RuntimeError(
+                "Transformer readout hooks lost the student gradient graph at layers "
+                f"{disconnected}. Non-reentrant gradient checkpointing is required."
+            )
+        non_finite = [
+            index for index in requested if not bool(torch.isfinite(captured[index]).all())
+        ]
+        if non_finite:
+            raise FloatingPointError(
+                f"Transformer readout hidden states contain NaN or infinity at layers {non_finite}."
+            )
+        return captured
+
+    outputs = backbone(
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("The LLM did not return hidden states for the requested teacher readout.")
+    invalid = [index for index in requested if index >= len(hidden_states)]
+    if invalid:
+        raise ValueError(
+            f"Requested teacher layers {invalid} are outside returned hidden_states[1..{len(hidden_states) - 1}]."
+        )
+    captured = {
+        index: hidden_states[index][batch_indices, last_indices]
+        for index in requested
+    }
+    disconnected = [
+        index for index in requested if requires_gradient_path and not captured[index].requires_grad
+    ]
+    if disconnected:
+        raise RuntimeError(f"Student readout hidden states are detached at layers {disconnected}.")
+    non_finite = [
+        index for index in requested if not bool(torch.isfinite(captured[index]).all())
+    ]
+    if non_finite:
+        raise FloatingPointError(
+            f"Transformer readout hidden states contain NaN or infinity at layers {non_finite}."
+        )
+    return captured
 
 
 def forward_teacher_readout_hidden(
@@ -2125,19 +2497,29 @@ def forward_teacher_readout_hidden(
     input_ids: torch.Tensor | None = None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    hidden = transformer_block_hidden_states(
+    """Compatibility wrapper using a full-sequence attention mask.
+
+    ``prefix_tokens`` is retained for older callers as a contract check. The
+    full mask already includes those prefix positions, so the readout offset is
+    inferred directly instead of being added a second time.
+    """
+    prefix_count = int(prefix_tokens)
+    if prefix_count < 0:
+        raise ValueError("prefix_tokens must be non-negative.")
+    if prefix_count:
+        if attention_mask.ndim != 2 or int(attention_mask.shape[1]) <= prefix_count:
+            raise ValueError(
+                "A non-zero prefix_tokens value requires a full [batch,prefix+text] attention mask."
+            )
+        if not bool(attention_mask[:, :prefix_count].to(dtype=torch.bool).all()):
+            raise ValueError("Every declared soft-prefix position must be unmasked.")
+    return forward_teacher_readout_hiddens(
         llm,
         input_ids=input_ids,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        layer_indices=[int(teacher_layer)],
+        teacher_layers=[int(teacher_layer)],
     )[int(teacher_layer)]
-    return hidden_at_last_non_padding(
-        [hidden],
-        attention_mask[:, int(prefix_tokens) :],
-        0,
-        prefix_tokens=int(prefix_tokens),
-    )
 
 
 def masked_token_norm(embeddings: torch.Tensor, attention_mask: torch.Tensor) -> float:
@@ -2661,6 +3043,177 @@ def branch_mean_alignment_loss(
     }
 
 
+def auxiliary_teacher_alignment_loss(
+    student_hidden_by_layer: Mapping[int, torch.Tensor],
+    teacher_hidden_by_layer: Mapping[int, torch.Tensor],
+    layer_weights: Mapping[int, float],
+    semantic_target_ids: torch.Tensor | None,
+    *,
+    temperature: float,
+    i2t_weight: float,
+    t2i_weight: float,
+    native_centered_weight: float,
+    mean_alignment_weight: float,
+    distributed_batch: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if not isinstance(student_hidden_by_layer, Mapping) or not isinstance(
+        teacher_hidden_by_layer, Mapping
+    ):
+        raise TypeError("Auxiliary teacher hidden states must be layer-indexed mappings.")
+    if not isinstance(layer_weights, Mapping):
+        raise TypeError("Auxiliary teacher layer weights must be a layer-indexed mapping.")
+
+    normalized_weights: dict[int, float] = {}
+    for configured_layer, configured_weight in layer_weights.items():
+        layer = int(configured_layer)
+        weight = float(configured_weight)
+        if layer <= 0:
+            raise ValueError(f"Auxiliary teacher layer indices must be at least 1, got {layer}.")
+        if layer in normalized_weights:
+            raise ValueError(f"Auxiliary teacher layer {layer} is configured more than once.")
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                f"Auxiliary teacher layer {layer} has invalid weight {configured_weight!r}; "
+                "weights must be finite and positive."
+            )
+        normalized_weights[layer] = weight
+
+    if not normalized_weights:
+        reference = next(
+            iter(student_hidden_by_layer.values()),
+            next(iter(teacher_hidden_by_layer.values()), None),
+        )
+        if not torch.is_tensor(reference):
+            raise ValueError("At least one hidden tensor is required to construct an empty auxiliary loss.")
+        return reference.new_zeros((), dtype=torch.float32), {
+            "loss": 0.0,
+            "layer_count": 0.0,
+            "weight_sum": 0.0,
+        }
+
+    missing_student = sorted(set(normalized_weights) - set(student_hidden_by_layer))
+    missing_teacher = sorted(set(normalized_weights) - set(teacher_hidden_by_layer))
+    if missing_student or missing_teacher:
+        raise ValueError(
+            "Auxiliary teacher hidden states are incomplete: "
+            f"student_missing={missing_student}, teacher_missing={missing_teacher}."
+        )
+
+    native_weight = float(native_centered_weight)
+    mean_weight = float(mean_alignment_weight)
+    if not math.isfinite(native_weight) or native_weight < 0.0:
+        raise ValueError("native_centered_weight must be finite and non-negative.")
+    if not math.isfinite(mean_weight) or mean_weight < 0.0:
+        raise ValueError("mean_alignment_weight must be finite and non-negative.")
+    if native_weight <= 0.0 and mean_weight <= 0.0:
+        raise ValueError(
+            "Auxiliary teacher layers require a positive native_centered_contrastive_loss_weight "
+            "or mean_alignment_loss_weight."
+        )
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("Auxiliary teacher temperature must be finite and positive.")
+    normalized_contrastive_direction_weights(float(i2t_weight), float(t2i_weight))
+
+    expected_shape: tuple[int, int] | None = None
+    for layer in sorted(normalized_weights):
+        student_hidden = student_hidden_by_layer[layer]
+        teacher_hidden = teacher_hidden_by_layer[layer]
+        if not torch.is_tensor(student_hidden) or not torch.is_tensor(teacher_hidden):
+            raise TypeError(f"Auxiliary Layer-{layer} hidden states must be tensors.")
+        if student_hidden.ndim != 2 or teacher_hidden.ndim != 2:
+            raise ValueError(
+                f"Auxiliary Layer-{layer} hidden states must have shape [batch,hidden]: "
+                f"student={tuple(student_hidden.shape)}, teacher={tuple(teacher_hidden.shape)}."
+            )
+        if tuple(student_hidden.shape) != tuple(teacher_hidden.shape):
+            raise ValueError(
+                f"Auxiliary Layer-{layer} student/teacher shapes differ: "
+                f"student={tuple(student_hidden.shape)}, teacher={tuple(teacher_hidden.shape)}."
+            )
+        layer_shape = (int(student_hidden.shape[0]), int(student_hidden.shape[1]))
+        if layer_shape[0] <= 0 or layer_shape[1] <= 0:
+            raise ValueError(f"Auxiliary Layer-{layer} hidden states must be non-empty.")
+        if expected_shape is None:
+            expected_shape = layer_shape
+        elif layer_shape != expected_shape:
+            raise ValueError(
+                "All auxiliary teacher layers must share one [batch,hidden] shape: "
+                f"expected={expected_shape}, Layer-{layer}={layer_shape}."
+            )
+    if expected_shape is None:  # pragma: no cover - normalized_weights is non-empty
+        raise RuntimeError("Auxiliary teacher shape validation produced no layers.")
+    local_batch = expected_shape[0]
+    has_global_negatives = (
+        bool(distributed_batch)
+        and distributed_is_initialized()
+        and distributed_world_size() > 1
+    )
+    if local_batch <= 1 and not has_global_negatives:
+        raise ValueError("Auxiliary teacher InfoNCE requires at least two effective candidates.")
+    if semantic_target_ids is not None and int(semantic_target_ids.numel()) != local_batch:
+        raise ValueError(
+            "Auxiliary semantic target IDs must contain one value per local record: "
+            f"targets={int(semantic_target_ids.numel())}, batch={local_batch}."
+        )
+
+    contrastive_loss_fn = (
+        distributed_symmetric_contrastive_loss
+        if bool(distributed_batch)
+        else symmetric_contrastive_loss
+    )
+    first_hidden = student_hidden_by_layer[min(normalized_weights)]
+    total = first_hidden.new_zeros((), dtype=torch.float32)
+    metrics: dict[str, float] = {}
+    for layer, configured_weight in sorted(normalized_weights.items()):
+        student_hidden = student_hidden_by_layer[int(layer)]
+        teacher_hidden = teacher_hidden_by_layer[int(layer)].to(
+            device=student_hidden.device,
+            dtype=student_hidden.dtype,
+        )
+        centered_student, centered_teacher = centered_alignment_embeddings(
+            student_hidden,
+            teacher_hidden,
+            distributed_batch=bool(distributed_batch),
+        )
+        centered_loss, centered_metrics = contrastive_loss_fn(
+            centered_student,
+            centered_teacher,
+            float(temperature),
+            semantic_target_ids,
+            i2t_weight=float(i2t_weight),
+            t2i_weight=float(t2i_weight),
+        )
+        mean_loss, mean_metrics = branch_mean_alignment_loss(
+            student_hidden,
+            teacher_hidden,
+            distributed_batch=bool(distributed_batch),
+        )
+        layer_loss = (
+            native_weight * centered_loss
+            + mean_weight * mean_loss
+        )
+        weight = float(configured_weight)
+        total = total + weight * layer_loss
+        prefix = f"layer_{int(layer)}_"
+        metrics.update(prefixed_metrics(centered_metrics, f"{prefix}native_centered"))
+        metrics.update(prefixed_metrics(mean_metrics, f"{prefix}mean_alignment"))
+        metrics[f"{prefix}weight"] = weight
+        metrics[f"{prefix}loss"] = float(layer_loss.detach().cpu().item())
+        metrics[f"{prefix}weighted_loss"] = float((weight * layer_loss).detach().cpu().item())
+        metrics[f"{prefix}hidden_positive_cosine"] = float(
+            F.cosine_similarity(student_hidden.detach().float(), teacher_hidden.detach().float(), dim=-1)
+            .mean()
+            .cpu()
+            .item()
+        )
+        metrics[f"{prefix}student_hidden_pairwise_cosine"] = off_diagonal_cosine_mean(student_hidden)
+        metrics[f"{prefix}teacher_hidden_pairwise_cosine"] = off_diagonal_cosine_mean(teacher_hidden)
+    metrics["loss"] = float(total.detach().cpu().item())
+    metrics["layer_count"] = float(len(normalized_weights))
+    metrics["weight_sum"] = float(sum(normalized_weights.values()))
+    return total, metrics
+
+
 def add_weighted_metrics(
     totals: dict[str, float],
     metrics: Mapping[str, float],
@@ -2710,6 +3263,7 @@ def text_teacher_hidden(
     shared_suffix: str = "\nRepresentation:",
     max_shared_suffix_tokens: int = 8,
     alignment_anchor: AlignmentAnchor | None = None,
+    teacher_layers: Sequence[int] | None = None,
 ) -> HiddenBatch:
     if str(text_layout) == "values_shared_suffix":
         anchor = alignment_anchor or AlignmentAnchor(
@@ -2751,16 +3305,23 @@ def text_teacher_hidden(
         )
     text_embeds = llm.get_input_embeddings()(input_ids)
     metrics["token_embedding_norm"] = masked_token_norm(text_embeds, attention_mask)
-    hidden = forward_teacher_readout_hidden(
+    requested_layers = tuple(int(layer) for layer in (teacher_layers or [int(teacher_layer)]))
+    if int(teacher_layer) not in requested_layers:
+        raise ValueError("The primary teacher_layer must be included in teacher_layers.")
+    hidden_by_layer = forward_teacher_readout_hiddens(
         llm,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        teacher_layer=int(teacher_layer),
+        teacher_layers=requested_layers,
     )
-    hidden = hidden.detach()
+    hidden_by_layer = {layer: hidden.detach() for layer, hidden in hidden_by_layer.items()}
+    hidden = hidden_by_layer[int(teacher_layer)]
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
     metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
-    return HiddenBatch(hidden=hidden, metrics=metrics)
+    for layer, layer_hidden in hidden_by_layer.items():
+        metrics[f"layer_{layer}_hidden_norm"] = mean_token_norm(layer_hidden.unsqueeze(1))
+        metrics[f"layer_{layer}_hidden_pairwise_cosine"] = off_diagonal_cosine_mean(layer_hidden)
+    return HiddenBatch(hidden=hidden, metrics=metrics, hidden_by_layer=hidden_by_layer)
 
 
 def tensor_student_hidden(
@@ -2777,6 +3338,7 @@ def tensor_student_hidden(
     shared_suffix: str = "\nRepresentation:",
     max_shared_suffix_tokens: int = 8,
     alignment_anchor: AlignmentAnchor | None = None,
+    teacher_layers: Sequence[int] | None = None,
 ) -> HiddenBatch:
     if str(text_layout) == "values_shared_suffix":
         anchor = alignment_anchor or AlignmentAnchor(
@@ -2836,16 +3398,22 @@ def tensor_student_hidden(
         device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
-    hidden = forward_teacher_readout_hidden(
+    requested_layers = tuple(int(layer) for layer in (teacher_layers or [int(teacher_layer)]))
+    if int(teacher_layer) not in requested_layers:
+        raise ValueError("The primary teacher_layer must be included in teacher_layers.")
+    hidden_by_layer = forward_teacher_readout_hiddens(
         llm,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        teacher_layer=int(teacher_layer),
-        prefix_tokens=int(soft_prompts.shape[1]),
+        teacher_layers=requested_layers,
     )
+    hidden = hidden_by_layer[int(teacher_layer)]
     metrics["hidden_norm"] = mean_token_norm(hidden.unsqueeze(1))
     metrics["hidden_pairwise_cosine"] = off_diagonal_cosine_mean(hidden)
-    return HiddenBatch(hidden=hidden, metrics=metrics)
+    for layer, layer_hidden in hidden_by_layer.items():
+        metrics[f"layer_{layer}_hidden_norm"] = mean_token_norm(layer_hidden.unsqueeze(1))
+        metrics[f"layer_{layer}_hidden_pairwise_cosine"] = off_diagonal_cosine_mean(layer_hidden)
+    return HiddenBatch(hidden=hidden, metrics=metrics, hidden_by_layer=hidden_by_layer)
 
 
 def normalize_patch_batch(
@@ -3053,15 +3621,13 @@ def train_compressor_during_alignment(args: argparse.Namespace) -> bool:
 
 
 def set_frozen_llm_student_mode(llm: nn.Module, gradient_checkpointing: bool) -> None:
-    if not bool(gradient_checkpointing):
-        llm.eval()
-        return
-    # HF decoder checkpointing is active only in train mode. Keep stochastic layers
-    # disabled so the frozen teacher/student mapping remains deterministic.
-    llm.train()
-    for module in llm.modules():
-        if isinstance(module, nn.Dropout):
-            module.eval()
+    # First disable every stochastic child module, including implementations that
+    # use functional dropout based on ``module.training`` rather than nn.Dropout.
+    llm.eval()
+    if bool(gradient_checkpointing):
+        # Hugging Face decoder backbones gate checkpointing on the backbone's own
+        # training flag. Setting only that flag keeps decoder blocks in eval mode.
+        llm_backbone(llm).training = True
 
 
 def train_one_epoch(
@@ -3094,10 +3660,13 @@ def train_one_epoch(
     total_loss = 0.0
     total_contrastive = 0.0
     total_reconstruction = 0.0
+    total_auxiliary_teacher = 0.0
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
+    teacher_layers = teacher_layers_from_args(args)
+    auxiliary_layer_weights = dict(getattr(args, "auxiliary_teacher_layer_weights_by_layer", {}))
     training_anchors = alignment_anchors_from_args(tokenizer, args, evaluation=False)
     progress = tqdm(loader, desc=f"train align epoch {epoch}", leave=False, disable=not is_main_process())
     for step, batch in enumerate(progress, start=1):
@@ -3133,7 +3702,6 @@ def train_one_epoch(
         if probe_target_ids is not None:
             probe_target_ids = probe_target_ids.to(device)
         teacher_duplicate_fraction = duplicate_text_fraction(texts)
-        llm_was_training = llm.training
         llm.eval()
         with torch.no_grad():
             teacher_output = text_teacher_hidden(
@@ -3153,9 +3721,13 @@ def train_one_epoch(
                 shared_suffix=str(args.shared_suffix),
                 max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
                 alignment_anchor=alignment_anchor,
+                teacher_layers=teacher_layers,
             )
-        if llm_was_training:
-            set_frozen_llm_student_mode(llm, bool(args.llm_gradient_checkpointing))
+        # ``set_frozen_llm_student_mode`` keeps the outer frozen model in eval
+        # mode and flips only the decoder backbone's top-level training flag.
+        # Consequently ``llm.training`` is always false and cannot be used to
+        # decide whether checkpointing must be restored after the teacher pass.
+        set_frozen_llm_student_mode(llm, bool(args.llm_gradient_checkpointing))
         if train_compressor:
             latent = compressor.encode(patches)["latent_map"]
         else:
@@ -3182,7 +3754,17 @@ def train_one_epoch(
             shared_suffix=str(args.shared_suffix),
             max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
             alignment_anchor=alignment_anchor,
+            teacher_layers=teacher_layers,
         )
+        if teacher_output.hidden_by_layer is None or student_output.hidden_by_layer is None:
+            raise RuntimeError("Multi-layer alignment did not return layer-indexed hidden states.")
+        if not soft_prompts.requires_grad:
+            raise RuntimeError("The Stage-1 soft prompts are detached from the trainable adapter.")
+        for layer in teacher_layers:
+            layer_hidden = student_output.hidden_by_layer[layer]
+            if not layer_hidden.requires_grad:
+                raise RuntimeError(f"The student Layer-{layer} readout is detached from the adapter.")
+            layer_hidden.retain_grad()
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
         student_features, teacher_features = apply_alignment_feature_transform(
@@ -3273,6 +3855,18 @@ def train_one_epoch(
                     distributed_batch=True,
                 )
                 mean_alignment_loss = 0.5 * (transformed_mean_loss + native_mean_loss)
+        auxiliary_teacher_loss, auxiliary_teacher_metrics = auxiliary_teacher_alignment_loss(
+            student_output.hidden_by_layer,
+            teacher_output.hidden_by_layer,
+            auxiliary_layer_weights,
+            probe_target_ids,
+            temperature=float(args.temperature),
+            i2t_weight=float(args.contrastive_i2t_weight),
+            t2i_weight=float(args.contrastive_t2i_weight),
+            native_centered_weight=float(args.native_centered_contrastive_loss_weight),
+            mean_alignment_weight=float(args.mean_alignment_loss_weight),
+            distributed_batch=True,
+        )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
@@ -3280,42 +3874,68 @@ def train_one_epoch(
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.native_centered_contrastive_loss_weight) * native_centered_contrastive
             + float(args.mean_alignment_loss_weight) * mean_alignment_loss
+            + auxiliary_teacher_loss
             + reconstruction_weight * reconstruction
         )
 
         optimizer.zero_grad(set_to_none=True)
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(
+                f"Stage-1 total loss is NaN or infinity at epoch={epoch}, step={step}."
+            )
         loss.backward()
-        if soft_prompts.grad is not None:
-            token_gradient_norms = soft_prompts.grad.detach().float().norm(dim=-1)
-            soft_prompt_gradient_norm = float(token_gradient_norms.mean().cpu().item())
-            relative_threshold = token_gradient_norms.amax(dim=1, keepdim=True) * 1.0e-3
-            soft_prompt_active_token_fraction = float(
-                token_gradient_norms.gt(relative_threshold).float().mean().cpu().item()
+        if soft_prompts.grad is None:
+            raise RuntimeError("Stage-1 loss produced no gradient for the adapter soft prompts.")
+        if not bool(torch.isfinite(soft_prompts.grad).all()):
+            raise FloatingPointError("Stage-1 soft-prompt gradients contain NaN or infinity.")
+        token_gradient_norms = soft_prompts.grad.detach().float().norm(dim=-1)
+        soft_prompt_gradient_norm = float(token_gradient_norms.mean().cpu().item())
+        if not math.isfinite(soft_prompt_gradient_norm) or soft_prompt_gradient_norm <= 0.0:
+            raise RuntimeError(
+                "Stage-1 soft-prompt gradient is zero or non-finite; the alignment objective is not "
+                f"connected to the adapter at epoch={epoch}, step={step}."
             )
-            gradient_probabilities = token_gradient_norms / token_gradient_norms.sum(
-                dim=1,
-                keepdim=True,
-            ).clamp_min(1.0e-20)
-            gradient_entropy = -(
-                gradient_probabilities * gradient_probabilities.clamp_min(1.0e-20).log()
-            ).sum(dim=1)
-            entropy_denominator = math.log(max(int(token_gradient_norms.shape[1]), 2))
-            soft_prompt_gradient_entropy = float(
-                (gradient_entropy / entropy_denominator).mean().cpu().item()
+        relative_threshold = token_gradient_norms.amax(dim=1, keepdim=True) * 1.0e-3
+        soft_prompt_active_token_fraction = float(
+            token_gradient_norms.gt(relative_threshold).float().mean().cpu().item()
+        )
+        gradient_probabilities = token_gradient_norms / token_gradient_norms.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1.0e-20)
+        gradient_entropy = -(
+            gradient_probabilities * gradient_probabilities.clamp_min(1.0e-20).log()
+        ).sum(dim=1)
+        entropy_denominator = math.log(max(int(token_gradient_norms.shape[1]), 2))
+        soft_prompt_gradient_entropy = float(
+            (gradient_entropy / entropy_denominator).mean().cpu().item()
+        )
+        soft_prompt_gradient_min = float(token_gradient_norms.amin(dim=1).mean().cpu().item())
+        soft_prompt_gradient_max = float(token_gradient_norms.amax(dim=1).mean().cpu().item())
+        readout_gradient_metrics: dict[str, float] = {}
+        for layer in teacher_layers:
+            layer_gradient = student_output.hidden_by_layer[layer].grad
+            if layer_gradient is None:
+                raise RuntimeError(f"Stage-1 loss produced no gradient at the Layer-{layer} readout.")
+            if not bool(torch.isfinite(layer_gradient).all()):
+                raise FloatingPointError(
+                    f"Stage-1 Layer-{layer} readout gradients contain NaN or infinity."
+                )
+            layer_gradient_norm = float(
+                layer_gradient.detach().float().norm(dim=-1).mean().cpu().item()
             )
-            soft_prompt_gradient_min = float(token_gradient_norms.amin(dim=1).mean().cpu().item())
-            soft_prompt_gradient_max = float(token_gradient_norms.amax(dim=1).mean().cpu().item())
-        else:
-            soft_prompt_gradient_norm = 0.0
-            soft_prompt_active_token_fraction = 0.0
-            soft_prompt_gradient_entropy = 0.0
-            soft_prompt_gradient_min = 0.0
-            soft_prompt_gradient_max = 0.0
+            if not math.isfinite(layer_gradient_norm) or layer_gradient_norm <= 0.0:
+                raise RuntimeError(
+                    f"Stage-1 Layer-{layer} readout gradient is zero or non-finite at "
+                    f"epoch={epoch}, step={step}."
+                )
+            readout_gradient_metrics[f"layer_{layer}_readout_gradient_norm"] = layer_gradient_norm
         synchronize_gradients([compressor if train_compressor else None, adapter, projector])
         if float(args.grad_clip_norm) > 0:
             torch.nn.utils.clip_grad_norm_(
                 [parameter for group in optimizer.param_groups for parameter in group["params"]],
                 float(args.grad_clip_norm),
+                error_if_nonfinite=True,
             )
         optimizer.step()
 
@@ -3323,6 +3943,7 @@ def train_one_epoch(
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_contrastive += float(contrastive.detach().cpu().item()) * batch_size
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
+        total_auxiliary_teacher += float(auxiliary_teacher_loss.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
@@ -3365,6 +3986,12 @@ def train_one_epoch(
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
             metric_totals,
+            auxiliary_teacher_metrics,
+            batch_size,
+            "auxiliary_teacher_",
+        )
+        add_weighted_metrics(
+            metric_totals,
             target_geometry_metrics(teacher_hidden, probe_target_values),
             batch_size,
             "teacher_probe_",
@@ -3375,6 +4002,19 @@ def train_one_epoch(
             batch_size,
             "student_probe_",
         )
+        for layer in auxiliary_layer_weights:
+            add_weighted_metrics(
+                metric_totals,
+                target_geometry_metrics(teacher_output.hidden_by_layer[layer], probe_target_values),
+                batch_size,
+                f"teacher_layer_{layer}_probe_",
+            )
+            add_weighted_metrics(
+                metric_totals,
+                target_geometry_metrics(student_output.hidden_by_layer[layer], probe_target_values),
+                batch_size,
+                f"student_layer_{layer}_probe_",
+            )
         add_weighted_metrics(
             metric_totals,
             {
@@ -3402,6 +4042,7 @@ def train_one_epoch(
                 "soft_prompt_gradient_entropy": soft_prompt_gradient_entropy,
                 "soft_prompt_gradient_min": soft_prompt_gradient_min,
                 "soft_prompt_gradient_max": soft_prompt_gradient_max,
+                **readout_gradient_metrics,
             },
             batch_size,
             "alignment_",
@@ -3418,6 +4059,7 @@ def train_one_epoch(
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
         "reconstruction_loss": total_reconstruction / max(1, total_records),
+        "auxiliary_teacher_loss": total_auxiliary_teacher / max(1, total_records),
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
@@ -3485,6 +4127,7 @@ def pretrain_patch_encoder_one_epoch(
             torch.nn.utils.clip_grad_norm_(
                 [parameter for group in optimizer.param_groups for parameter in group["params"]],
                 float(args.grad_clip_norm),
+                error_if_nonfinite=True,
             )
         optimizer.step()
         batch_size = int(patches.shape[0])
@@ -3660,10 +4303,13 @@ def evaluate(
     total_loss = 0.0
     total_contrastive = 0.0
     total_reconstruction = 0.0
+    total_auxiliary_teacher = 0.0
     total_i2t = 0.0
     total_t2i = 0.0
     total_records = 0
     metric_totals: dict[str, float] = {}
+    teacher_layers = teacher_layers_from_args(args)
+    auxiliary_layer_weights = dict(getattr(args, "auxiliary_teacher_layer_weights_by_layer", {}))
     collected_student_features: list[torch.Tensor] = []
     collected_teacher_features: list[torch.Tensor] = []
     collected_student_hidden: list[torch.Tensor] = []
@@ -3707,6 +4353,7 @@ def evaluate(
             shared_suffix=str(args.shared_suffix),
             max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
             alignment_anchor=alignment_anchor,
+            teacher_layers=teacher_layers,
         )
         latent = compressor.encode(patches)["latent_map"]
         soft_prompts = adapter.forward_soft_prompts(latent)
@@ -3730,6 +4377,7 @@ def evaluate(
             shared_suffix=str(args.shared_suffix),
             max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
             alignment_anchor=alignment_anchor,
+            teacher_layers=teacher_layers,
         )
         student_hidden = student_output.hidden
         teacher_hidden = teacher_output.hidden.to(dtype=student_hidden.dtype)
@@ -3792,6 +4440,20 @@ def evaluate(
             distributed_batch=distributed_eval,
         )
         mean_alignment_loss = 0.5 * (transformed_mean_loss + native_mean_loss)
+        if teacher_output.hidden_by_layer is None or student_output.hidden_by_layer is None:
+            raise RuntimeError("Multi-layer evaluation did not return layer-indexed hidden states.")
+        auxiliary_teacher_loss, auxiliary_teacher_metrics = auxiliary_teacher_alignment_loss(
+            student_output.hidden_by_layer,
+            teacher_output.hidden_by_layer,
+            auxiliary_layer_weights,
+            probe_target_ids,
+            temperature=float(args.temperature),
+            i2t_weight=float(args.contrastive_i2t_weight),
+            t2i_weight=float(args.contrastive_t2i_weight),
+            native_centered_weight=float(args.native_centered_contrastive_loss_weight),
+            mean_alignment_weight=float(args.mean_alignment_loss_weight),
+            distributed_batch=distributed_eval,
+        )
         reconstruction, reconstruction_metrics = reconstruction_loss_with_diagnostics(compressor, latent, patches)
         reconstruction_weight = float(args.reconstruction_loss_weight) if train_compressor else 0.0
         loss = (
@@ -3799,12 +4461,14 @@ def evaluate(
             + float(args.centered_contrastive_loss_weight) * centered_contrastive
             + float(args.native_centered_contrastive_loss_weight) * native_centered_contrastive
             + float(args.mean_alignment_loss_weight) * mean_alignment_loss
+            + auxiliary_teacher_loss
             + reconstruction_weight * reconstruction
         )
         batch_size = int(patches.shape[0])
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_contrastive += float(contrastive.detach().cpu().item()) * batch_size
         total_reconstruction += float(reconstruction.detach().cpu().item()) * batch_size
+        total_auxiliary_teacher += float(auxiliary_teacher_loss.detach().cpu().item()) * batch_size
         total_i2t += float(contrastive_metrics["i2t_accuracy"]) * batch_size
         total_t2i += float(contrastive_metrics["t2i_accuracy"]) * batch_size
         add_weighted_metrics(metric_totals, reconstruction_metrics, batch_size, "reconstruction_")
@@ -3847,6 +4511,12 @@ def evaluate(
         add_weighted_metrics(metric_totals, student_output.metrics, batch_size, "student_")
         add_weighted_metrics(
             metric_totals,
+            auxiliary_teacher_metrics,
+            batch_size,
+            "auxiliary_teacher_",
+        )
+        add_weighted_metrics(
+            metric_totals,
             target_geometry_metrics(teacher_hidden, probe_target_values),
             batch_size,
             "teacher_probe_",
@@ -3857,6 +4527,19 @@ def evaluate(
             batch_size,
             "student_probe_",
         )
+        for layer in auxiliary_layer_weights:
+            add_weighted_metrics(
+                metric_totals,
+                target_geometry_metrics(teacher_output.hidden_by_layer[layer], probe_target_values),
+                batch_size,
+                f"teacher_layer_{layer}_probe_",
+            )
+            add_weighted_metrics(
+                metric_totals,
+                target_geometry_metrics(student_output.hidden_by_layer[layer], probe_target_values),
+                batch_size,
+                f"student_layer_{layer}_probe_",
+            )
         add_weighted_metrics(
             metric_totals,
             {
@@ -3896,6 +4579,7 @@ def evaluate(
         "loss": total_loss / max(1, total_records),
         "contrastive_loss": total_contrastive / max(1, total_records),
         "reconstruction_loss": total_reconstruction / max(1, total_records),
+        "auxiliary_teacher_loss": total_auxiliary_teacher / max(1, total_records),
         "i2t_accuracy": total_i2t / max(1, total_records),
         "t2i_accuracy": total_t2i / max(1, total_records),
     }
@@ -4021,11 +4705,18 @@ def checkpoint_selection_value(metrics: Mapping[str, Any], args: argparse.Namesp
         if mean_key not in metrics:
             raise ValueError(f"Validation metrics are missing mean-alignment checkpoint metric {mean_key!r}.")
         value += mean_weight * float(metrics[mean_key])
+    auxiliary_layers = tuple(getattr(args, "auxiliary_teacher_layers", ()))
+    auxiliary_key = "auxiliary_teacher_loss"
+    if auxiliary_layers:
+        if auxiliary_key not in metrics:
+            raise ValueError(f"Validation metrics are missing auxiliary-layer metric {auxiliary_key!r}.")
+        value += float(metrics[auxiliary_key])
     return (
         f"{primary_weight:g}*({i2t_weight:g}*{strict_i2t_key}+{t2i_weight:g}*{strict_t2i_key})"
         f"+{centered_weight:g}*{centered_key}"
         f"+{native_weight:g}*{native_key}"
-        f"+{mean_weight:g}*{mean_key}",
+        f"+{mean_weight:g}*{mean_key}"
+        + (f"+{auxiliary_key}" if auxiliary_layers else ""),
         value,
     )
 
@@ -4037,6 +4728,18 @@ def teacher_probe_preflight_warnings(
     if not preflight or warn_below_correlation is None:
         return []
     threshold = float(warn_below_correlation)
+    layer_summaries = preflight.get("layers")
+    if isinstance(layer_summaries, Mapping) and layer_summaries:
+        warnings: list[str] = []
+        for layer, summary in layer_summaries.items():
+            if not isinstance(summary, Mapping):
+                warnings.append(f"layer_{layer}=invalid-summary")
+                continue
+            warnings.extend(
+                f"layer_{layer}/{warning}"
+                for warning in teacher_probe_preflight_warnings(summary, threshold)
+            )
+        return warnings
     groups = dict(preflight.get("families") or preflight.get("anchors") or {})
     warnings: list[str] = []
     for name, metrics in groups.items():
@@ -4262,6 +4965,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-text-tokens", type=int, default=None)
     parser.add_argument("--text-preflight-records", type=int, default=None)
     parser.add_argument("--teacher-layer", type=int, default=None)
+    parser.add_argument(
+        "--auxiliary-teacher-layers",
+        type=str,
+        default=None,
+        help="Comma-separated additional block outputs supervised in native hidden space in the same LLM forward.",
+    )
+    parser.add_argument(
+        "--auxiliary-teacher-layer-weights",
+        type=str,
+        default=None,
+        help="Comma-separated positive loss multipliers matching --auxiliary-teacher-layers.",
+    )
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--wandb-api-key", type=str, default=None)
@@ -4575,6 +5290,30 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
     set_default(args, "max_text_tokens", first_nested(config, ["patch_alignment.max_text_tokens"]), 1024)
     set_default(args, "text_preflight_records", first_nested(config, ["patch_alignment.text_preflight_records"]), 32)
     set_default(args, "teacher_layer", first_nested(config, ["patch_alignment.teacher_layer"]), 14)
+    set_default(
+        args,
+        "auxiliary_teacher_layers",
+        value_to_csv(first_nested(config, ["patch_alignment.auxiliary_teacher_layers"])),
+        "",
+    )
+    set_default(
+        args,
+        "auxiliary_teacher_layer_weights",
+        value_to_csv(first_nested(config, ["patch_alignment.auxiliary_teacher_layer_weights"])),
+        "",
+    )
+    teacher_layers, auxiliary_weights_by_layer = resolve_teacher_layer_supervision(
+        int(args.teacher_layer),
+        args.auxiliary_teacher_layers,
+        args.auxiliary_teacher_layer_weights,
+    )
+    args.teacher_layers = teacher_layers
+    auxiliary_layers = sorted(auxiliary_weights_by_layer)
+    args.auxiliary_teacher_layers = auxiliary_layers
+    args.auxiliary_teacher_layer_weights = [
+        float(auxiliary_weights_by_layer[layer]) for layer in auxiliary_layers
+    ]
+    args.auxiliary_teacher_layer_weights_by_layer = auxiliary_weights_by_layer
     set_default(args, "log_interval", first_nested(config, ["patch_alignment.log_interval"]), 20)
     set_default(args, "wandb_enabled", first_nested(config, ["wandb.enabled"]), False)
     set_default(args, "wandb_api_key", first_nested(config, ["wandb.api_key"]), None)
@@ -4603,8 +5342,24 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             raise ValueError(f"patch_alignment.{name} must be positive.")
     if int(args.patch_ae_pretrain_epochs) < 0:
         raise ValueError("patch_alignment.patch_ae_pretrain_epochs must be non-negative.")
-    if float(args.distributed_timeout_seconds) <= 0.0:
-        raise ValueError("patch_alignment.distributed_timeout_seconds must be positive.")
+    validate_finite_float(
+        "patch_alignment.distributed_timeout_seconds",
+        args.distributed_timeout_seconds,
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
+    if int(args.num_workers) < 0:
+        raise ValueError("patch_alignment.num_workers must be non-negative.")
+    validate_finite_float("patch_alignment.lr", args.lr, minimum=0.0, minimum_inclusive=False)
+    validate_finite_float("patch_alignment.weight_decay", args.weight_decay, minimum=0.0)
+    validate_finite_float("patch_alignment.grad_clip_norm", args.grad_clip_norm, minimum=0.0)
+    validate_finite_float(
+        "patch_alignment.dropout",
+        args.dropout,
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
     for name in ("adapter_dim", "query_tokens", "adapter_layers", "adapter_heads"):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"patch_alignment.{name} must be positive.")
@@ -4646,11 +5401,12 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
                 raise ValueError(
                     "patch_alignment.teacher_probe_diagnostic_records must be at least 2 in probe mode."
                 )
-            if args.teacher_probe_warn_below_correlation is not None and not -1.0 <= float(
-                args.teacher_probe_warn_below_correlation
-            ) <= 1.0:
-                raise ValueError(
-                    "patch_alignment.teacher_probe_warn_below_correlation must be in [-1, 1]."
+            if args.teacher_probe_warn_below_correlation is not None:
+                validate_finite_float(
+                    "patch_alignment.teacher_probe_warn_below_correlation",
+                    args.teacher_probe_warn_below_correlation,
+                    minimum=-1.0,
+                    maximum=1.0,
                 )
     if int(args.text_preflight_records) < 0:
         raise ValueError("patch_alignment.text_preflight_records must be non-negative.")
@@ -4660,13 +5416,24 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
         raise ValueError("patch_alignment.global_retrieval_chunk_size must be positive.")
     if str(args.field_sampling_mode).lower() not in {"channels", "single"}:
         raise ValueError("patch_alignment.field_sampling_mode must be 'channels' or 'single'.")
-    split_ratio_sum = float(args.split_train_ratio) + float(args.split_val_ratio) + float(args.split_test_ratio)
+    split_ratios = [
+        validate_finite_float(
+            f"patch_alignment.split_{split}_ratio",
+            getattr(args, f"split_{split}_ratio"),
+            minimum=0.0,
+        )
+        for split in ("train", "val", "test")
+    ]
+    split_ratio_sum = sum(split_ratios)
     if split_ratio_sum <= 0.0:
         raise ValueError("patch_alignment split ratios must sum to a positive value.")
-    if float(args.soft_prompt_scale) < 0.0:
-        raise ValueError("patch_alignment.soft_prompt_scale must be non-negative.")
-    if float(args.temperature) <= 0.0:
-        raise ValueError("patch_alignment.temperature must be positive.")
+    validate_finite_float("patch_alignment.soft_prompt_scale", args.soft_prompt_scale, minimum=0.0)
+    validate_finite_float(
+        "patch_alignment.temperature",
+        args.temperature,
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
     if args.alignment_transform_mode not in {"none", "projection", "whitening"}:
         raise ValueError("patch_alignment.alignment_transform.mode must be none, projection, or whitening.")
     if args.alignment_transform_mode == "projection":
@@ -4676,43 +5443,77 @@ def apply_config_defaults(args: argparse.Namespace, config: Mapping[str, Any]) -
             raise ValueError("patch_alignment.alignment_projection.hidden_dim must be positive.")
         if int(args.alignment_projection_layers) <= 0:
             raise ValueError("patch_alignment.alignment_projection.layers must be positive.")
-        if float(args.alignment_projection_dropout) < 0.0:
-            raise ValueError("patch_alignment.alignment_projection.dropout must be non-negative.")
+        validate_finite_float(
+            "patch_alignment.alignment_projection.dropout",
+            args.alignment_projection_dropout,
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
     if args.alignment_transform_mode == "whitening":
         if int(args.alignment_whitening_records) < 2:
             raise ValueError("patch_alignment.alignment_transform.whitening.records must be at least 2.")
         if int(args.alignment_whitening_dim) <= 0:
             raise ValueError("patch_alignment.alignment_transform.whitening.dim must be positive.")
-        if not 0.0 <= float(args.alignment_whitening_shrinkage) <= 1.0:
-            raise ValueError("patch_alignment.alignment_transform.whitening.shrinkage must be in [0, 1].")
-        if float(args.alignment_whitening_epsilon) <= 0.0:
-            raise ValueError("patch_alignment.alignment_transform.whitening.epsilon must be positive.")
-        if float(args.alignment_whitening_max_condition_number) < 1.0:
-            raise ValueError(
-                "patch_alignment.alignment_transform.whitening.max_condition_number must be at least 1."
-            )
+        validate_finite_float(
+            "patch_alignment.alignment_transform.whitening.shrinkage",
+            args.alignment_whitening_shrinkage,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        validate_finite_float(
+            "patch_alignment.alignment_transform.whitening.epsilon",
+            args.alignment_whitening_epsilon,
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        validate_finite_float(
+            "patch_alignment.alignment_transform.whitening.max_condition_number",
+            args.alignment_whitening_max_condition_number,
+            minimum=1.0,
+        )
     if int(args.text_decimal_places) < 0:
         raise ValueError("patch_alignment.text_decimal_places must be non-negative.")
     if str(args.alignment_anchor_mode) == "probe" and int(args.text_decimal_places) > 8:
         raise ValueError(
             "probe mode supports at most 8 text decimal places so quantized semantic target IDs remain stable."
         )
-    if float(args.contrastive_loss_weight) <= 0.0:
-        raise ValueError("patch_alignment.contrastive_loss_weight must be positive for alignment training.")
+    validate_finite_float(
+        "patch_alignment.contrastive_loss_weight",
+        args.contrastive_loss_weight,
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
     normalized_contrastive_direction_weights(
         float(args.contrastive_i2t_weight),
         float(args.contrastive_t2i_weight),
     )
-    if float(args.centered_contrastive_loss_weight) < 0.0:
-        raise ValueError("patch_alignment.centered_contrastive_loss_weight must be non-negative.")
-    if float(args.native_centered_contrastive_loss_weight) < 0.0:
-        raise ValueError("patch_alignment.native_centered_contrastive_loss_weight must be non-negative.")
-    if float(args.mean_alignment_loss_weight) < 0.0:
-        raise ValueError("patch_alignment.mean_alignment_loss_weight must be non-negative.")
-    if float(args.reconstruction_loss_weight) < 0.0:
-        raise ValueError("patch_alignment.reconstruction_loss_weight must be non-negative.")
-    if not 0.0 < float(args.alignment_patch_ae_lr_scale) <= 1.0:
-        raise ValueError("patch_alignment.alignment_patch_ae_lr_scale must be in (0, 1].")
+    for name in (
+        "centered_contrastive_loss_weight",
+        "native_centered_contrastive_loss_weight",
+        "mean_alignment_loss_weight",
+        "reconstruction_loss_weight",
+    ):
+        validate_finite_float(
+            f"patch_alignment.{name}",
+            getattr(args, name),
+            minimum=0.0,
+        )
+    if args.auxiliary_teacher_layers and (
+        float(args.native_centered_contrastive_loss_weight) <= 0.0
+        and float(args.mean_alignment_loss_weight) <= 0.0
+    ):
+        raise ValueError(
+            "Auxiliary teacher layers require a positive native_centered_contrastive_loss_weight "
+            "or mean_alignment_loss_weight."
+        )
+    validate_finite_float(
+        "patch_alignment.alignment_patch_ae_lr_scale",
+        args.alignment_patch_ae_lr_scale,
+        minimum=0.0,
+        maximum=1.0,
+        minimum_inclusive=False,
+    )
     if bool(args.train_patch_ae) and float(args.reconstruction_loss_weight) <= 0.0:
         raise ValueError(
             "train_patch_ae=true requires a positive patch_alignment.reconstruction_loss_weight."
@@ -4879,10 +5680,15 @@ def preflight_teacher_probe_semantics(
         num_workers=0,
         collate_fn=collate_patch_text,
     )
-    by_anchor: dict[str, dict[str, float]] = {}
+    teacher_layers = teacher_layers_from_args(args)
+    by_layer_anchor: dict[int, dict[str, dict[str, float]]] = {
+        layer: {} for layer in teacher_layers
+    }
     contract_anchors = probe_contract_anchors(tokenizer, args)
     for alignment_anchor in contract_anchors:
-        hidden_rows: list[torch.Tensor] = []
+        hidden_rows_by_layer: dict[int, list[torch.Tensor]] = {
+            layer: [] for layer in teacher_layers
+        }
         target_rows: list[torch.Tensor] = []
         target_id_rows: list[torch.Tensor] = []
         collected = 0
@@ -4915,67 +5721,95 @@ def preflight_teacher_probe_semantics(
                 shared_suffix=str(args.shared_suffix),
                 max_shared_suffix_tokens=int(args.max_shared_suffix_tokens),
                 alignment_anchor=alignment_anchor,
+                teacher_layers=teacher_layers,
             )
             take = min(int(teacher_output.hidden.shape[0]), record_limit - collected)
-            hidden_rows.append(teacher_output.hidden[:take].detach().float().cpu())
+            if teacher_output.hidden_by_layer is None:
+                raise RuntimeError("Teacher probe preflight did not return layer-indexed hidden states.")
+            for layer in teacher_layers:
+                hidden_rows_by_layer[layer].append(
+                    teacher_output.hidden_by_layer[layer][:take].detach().float().cpu()
+                )
             target_rows.append(target_values[:take].detach().float().cpu())
             target_id_rows.append(target_ids[:take].detach().long().cpu())
             collected += take
             if collected >= record_limit:
                 break
-        hidden = torch.cat(hidden_rows, dim=0)
         targets = torch.cat(target_rows, dim=0)
         target_ids = torch.cat(target_id_rows, dim=0)
         _, counts = target_ids.unique(return_counts=True)
-        metrics = target_geometry_metrics(hidden, targets)
-        metrics.update(
-            {
-                "record_count": float(collected),
-                "hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden),
-                "semantic_target_unique_fraction": float(counts.numel() / max(1, collected)),
-                "semantic_collision_fraction": float(
-                    ((counts.float() * (counts.float() - 1.0)).sum() / max(1, collected * (collected - 1))).item()
-                ),
-            }
-        )
-        by_anchor[alignment_anchor.name] = metrics
-    by_family: dict[str, dict[str, float]] = {}
+        for layer in teacher_layers:
+            hidden = torch.cat(hidden_rows_by_layer[layer], dim=0)
+            metrics = target_geometry_metrics(hidden, targets)
+            metrics.update(
+                {
+                    "record_count": float(collected),
+                    "hidden_pairwise_cosine": off_diagonal_cosine_mean(hidden),
+                    "semantic_target_unique_fraction": float(counts.numel() / max(1, collected)),
+                    "semantic_collision_fraction": float(
+                        (
+                            (counts.float() * (counts.float() - 1.0)).sum()
+                            / max(1, collected * (collected - 1))
+                        ).item()
+                    ),
+                }
+            )
+            by_layer_anchor[layer][alignment_anchor.name] = metrics
+
     anchor_family_by_name = {
         str(anchor.name): str(anchor.probe_family)
         for anchor in contract_anchors
     }
-    for family in sorted(set(anchor_family_by_name.values())):
-        template_metrics = [
-            metrics
-            for anchor_name, metrics in by_anchor.items()
-            if anchor_family_by_name.get(str(anchor_name)) == family
-        ]
-        if not template_metrics:
-            continue
-        # The anchor name is intentionally not used as the grouping key. Probe templates
-        # with different wording are observations of the same numeric operation.
-        family_metrics = average_metric_dicts(template_metrics)
-        correlations = [
-            float(metrics["hidden_similarity_vs_negative_target_distance_pearson"])
-            for metrics in template_metrics
-            if np.isfinite(float(metrics.get("hidden_similarity_vs_negative_target_distance_pearson", float("nan"))))
-        ]
-        if correlations:
-            family_metrics["hidden_similarity_vs_negative_target_distance_pearson_median"] = float(
-                np.median(correlations)
-            )
-            family_metrics["hidden_similarity_vs_negative_target_distance_pearson_min"] = float(
-                min(correlations)
-            )
-        family_metrics["template_count"] = float(len(template_metrics))
-        by_family[family] = family_metrics
-    macro = average_metric_dicts(list(by_family.values()) or list(by_anchor.values()))
+    layer_summaries: dict[str, dict[str, Any]] = {}
+    for layer in teacher_layers:
+        by_anchor = by_layer_anchor[layer]
+        by_family: dict[str, dict[str, float]] = {}
+        for family in sorted(set(anchor_family_by_name.values())):
+            template_metrics = [
+                metrics
+                for anchor_name, metrics in by_anchor.items()
+                if anchor_family_by_name.get(str(anchor_name)) == family
+            ]
+            if not template_metrics:
+                continue
+            # Templates with different wording are observations of the same numeric operation.
+            family_metrics = average_metric_dicts(template_metrics)
+            correlations = [
+                float(metrics["hidden_similarity_vs_negative_target_distance_pearson"])
+                for metrics in template_metrics
+                if np.isfinite(
+                    float(
+                        metrics.get(
+                            "hidden_similarity_vs_negative_target_distance_pearson",
+                            float("nan"),
+                        )
+                    )
+                )
+            ]
+            if correlations:
+                family_metrics["hidden_similarity_vs_negative_target_distance_pearson_median"] = float(
+                    np.median(correlations)
+                )
+                family_metrics["hidden_similarity_vs_negative_target_distance_pearson_min"] = float(
+                    min(correlations)
+                )
+            family_metrics["template_count"] = float(len(template_metrics))
+            by_family[family] = family_metrics
+        layer_summaries[str(layer)] = {
+            "macro": average_metric_dicts(list(by_family.values()) or list(by_anchor.values())),
+            "anchors": by_anchor,
+            "families": by_family,
+        }
+
+    primary_summary = layer_summaries[str(int(args.teacher_layer))]
     return {
         "record_limit": int(record_limit),
         "teacher_layer": int(args.teacher_layer),
-        "macro": macro,
-        "anchors": by_anchor,
-        "families": by_family,
+        "teacher_layers": list(teacher_layers),
+        "macro": primary_summary["macro"],
+        "anchors": primary_summary["anchors"],
+        "families": primary_summary["families"],
+        "layers": layer_summaries,
     }
 
 
@@ -5120,11 +5954,22 @@ def save_checkpoint(
     metrics: Mapping[str, Any],
     compressor_config: Mapping[str, Any],
     save_compressor: bool,
+    checkpoint_phase: str,
 ) -> None:
+    phase = str(checkpoint_phase).strip().lower()
+    if phase not in {"patch_ae_pretrain", "alignment"}:
+        raise ValueError(
+            "checkpoint_phase must be patch_ae_pretrain or alignment, "
+            f"got {checkpoint_phase!r}."
+        )
     payload = {
+        "checkpoint_type": "tensor_patch_text_alignment",
+        "checkpoint_version": 3,
+        "checkpoint_phase": phase,
         "adapter_state_dict": adapter.state_dict(),
         "compressor_config": dict(compressor_config),
         "args": redacted_args(args),
+        "teacher_supervision": teacher_supervision_metadata(args),
         "metrics": metrics,
     }
     if projector is not None:
@@ -5134,9 +5979,13 @@ def save_checkpoint(
             payload["alignment_projector_state_dict"] = projector.state_dict()
     if save_compressor:
         payload["compressor_state_dict"] = compressor.state_dict()
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.tmp")
-    torch.save(payload, temporary_path)
-    temporary_path.replace(path)
+    try:
+        torch.save(payload, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def numeric_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -5153,7 +6002,9 @@ def alignment_wandb_payload(prefix: str, metrics: Mapping[str, Any]) -> dict[str
     summary_metrics = {
         key: value
         for key, value in metrics.items()
-        if not key.startswith(("anchor_", "probe_macro_"))
+        if not key.startswith(
+            ("anchor_", "probe_macro_", "auxiliary_teacher_layer_", "teacher_layer_", "student_layer_")
+        )
         and (not key.startswith("contrastive_") or key == "contrastive_loss")
     }
     return numeric_payload(prefix, summary_metrics)
@@ -5186,6 +6037,7 @@ def alignment_metric_summary(metrics: Mapping[str, Any]) -> str:
         f"prompt_grad={fmt_metric(metrics, 'alignment_soft_prompt_gradient_norm')} "
         f"prompt_active={fmt_metric(metrics, 'alignment_soft_prompt_active_token_fraction')} "
         f"prompt_grad_entropy={fmt_metric(metrics, 'alignment_soft_prompt_gradient_entropy')} "
+        f"aux={fmt_metric(metrics, 'auxiliary_teacher_loss')} "
         f"recon={fmt_metric(metrics, 'reconstruction_loss')} "
         f"recon_rel={fmt_metric(metrics, 'reconstruction_relative_rmse_to_target_std')}"
     )
@@ -5283,6 +6135,8 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any]) -> 
             "max_text_tokens": int(args.max_text_tokens),
             "text_preflight_records": int(args.text_preflight_records),
             "teacher_layer": int(args.teacher_layer),
+            "auxiliary_teacher_layers": list(args.auxiliary_teacher_layers),
+            "auxiliary_teacher_layer_weights": list(args.auxiliary_teacher_layer_weights),
             "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
             "eval_batch_size": int(args.eval_batch_size),
@@ -5437,15 +6291,23 @@ def main() -> None:
                 low_cpu_mem_usage=True,
             )
             llm_num_hidden_layers = int(getattr(llm.config, "num_hidden_layers", -1))
-            validate_teacher_hidden_state_index(int(args.teacher_layer), llm_num_hidden_layers)
-            active_teacher_layers = truncate_llm_backbone_to_layer(llm, int(args.teacher_layer))
+            for teacher_layer in teacher_layers_from_args(args):
+                validate_teacher_hidden_state_index(int(teacher_layer), llm_num_hidden_layers)
+            active_teacher_layers = truncate_llm_backbone_to_layer(
+                llm,
+                max(teacher_layers_from_args(args)),
+            )
             if bool(args.llm_gradient_checkpointing):
                 try:
                     llm.gradient_checkpointing_enable(
                         gradient_checkpointing_kwargs={"use_reentrant": False}
                     )
-                except TypeError:
-                    llm.gradient_checkpointing_enable()
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Stage-1 multi-layer readout requires Transformers support for non-reentrant "
+                        "gradient checkpointing. Upgrade transformers or set "
+                        "patch_alignment.llm_gradient_checkpointing=false for a small run."
+                    ) from exc
                 llm.config.use_cache = False
             llm.to(device)
         distributed_barrier()
@@ -5463,7 +6325,7 @@ def main() -> None:
         )
     if active_teacher_layers is not None:
         distributed_barrier()
-    elif is_main_process() and int(args.teacher_layer) < int(llm_num_hidden_layers):
+    elif is_main_process() and max(teacher_layers_from_args(args)) < int(llm_num_hidden_layers):
         print(
             "teacher_backbone_truncation=unavailable "
             "(backbone has no safe ModuleList named 'layers'); continuing with the full frozen LLM"
@@ -5698,14 +6560,18 @@ def main() -> None:
     )
     if is_main_process() and teacher_probe_preflight:
         dump_json(run_dir / "teacher_probe_preflight.json", teacher_probe_preflight)
-        macro = teacher_probe_preflight["macro"]
+        layer_fields = []
+        for layer in teacher_layers_from_args(args):
+            macro = teacher_probe_preflight["layers"][str(layer)]["macro"]
+            layer_fields.append(
+                f"L{layer}[pair_cos={macro.get('hidden_pairwise_cosine', float('nan')):.6f},"
+                f"target_corr={macro.get('hidden_similarity_vs_negative_target_distance_pearson_median', float('nan')):.4f},"
+                f"nearest_error={macro.get('nearest_hidden_target_abs_error', float('nan')):.6g}]"
+            )
         print(
             "teacher_probe_preflight "
             f"records={teacher_probe_preflight['record_limit']} "
-            f"pair_cos={macro.get('hidden_pairwise_cosine', float('nan')):.6f} "
-            f"target_corr_median={macro.get('hidden_similarity_vs_negative_target_distance_pearson_median', float('nan')):.4f} "
-            f"nearest_target_error={macro.get('nearest_hidden_target_abs_error', float('nan')):.6g} "
-            f"target_unique={macro.get('semantic_target_unique_fraction', float('nan')):.4f}"
+            + " ".join(layer_fields)
         )
         if teacher_probe_warnings:
             print(
@@ -5885,7 +6751,11 @@ def main() -> None:
             ),
         },
         "teacher_layer": int(args.teacher_layer),
-        "teacher_transformer_blocks_applied": int(args.teacher_layer),
+        "teacher_layers": list(teacher_layers_from_args(args)),
+        "auxiliary_teacher_layers": list(args.auxiliary_teacher_layers),
+        "auxiliary_teacher_layer_weights": list(args.auxiliary_teacher_layer_weights),
+        "teacher_supervision": teacher_supervision_metadata(args),
+        "teacher_transformer_blocks_applied": max(teacher_layers_from_args(args)),
         "teacher_text_source": str(args.teacher_text_source),
         "alignment_text_layout": str(args.alignment_text_layout),
         "alignment_anchor_mode": str(args.alignment_anchor_mode),
@@ -5941,7 +6811,12 @@ def main() -> None:
             "probe_target_visibility": "internal_diagnostic_only_never_appended_to_llm_input",
             "negative_policy": "exclude_quantized_equal_probe_targets_keep_paired_positive",
             "strict_retrieval_policy": "argmax_over_complete_unmasked_candidate_library",
-            "alignment_hidden": f"{args.alignment_transform_mode}_shared_anchor_hidden",
+            "alignment_hidden": (
+                f"primary_layer_{int(args.teacher_layer)}_{args.alignment_transform_mode}_shared_anchor_hidden"
+                "+native_auxiliary_layer_supervision"
+                if args.auxiliary_teacher_layers
+                else f"layer_{int(args.teacher_layer)}_{args.alignment_transform_mode}_shared_anchor_hidden"
+            ),
             "primary_embedding_centering": "separate_branch_ddp_global_same_probe_mean",
             "centered_retrieval": (
                 "ddp_global_batch_primary_residual_loss_and_diagnostic"
@@ -5962,7 +6837,11 @@ def main() -> None:
         "global_retrieval_eval": bool(args.global_retrieval_eval),
         "global_retrieval_max_records": int(args.global_retrieval_max_records),
         "global_retrieval_chunk_size": int(args.global_retrieval_chunk_size),
-        "checkpoint_selection": "i2t_primary_global_uncentered_plus_batch_centered_native_and_mean_losses",
+        "checkpoint_selection": (
+            "directional_primary_global_uncentered_plus_batch_centered_native_mean_and_auxiliary_layer_losses"
+            if args.auxiliary_teacher_layers
+            else "directional_primary_global_uncentered_plus_batch_centered_native_and_mean_losses"
+        ),
         "text_preflight_records": int(args.text_preflight_records),
         "text_preflight": dict(text_preflight_metrics),
         "teacher_probe_preflight": dict(teacher_probe_preflight),
@@ -6008,6 +6887,10 @@ def main() -> None:
         ),
     }
     if is_main_process():
+        auxiliary_weight_summary = ",".join(
+            f"L{layer}:{weight:.4g}"
+            for layer, weight in sorted(args.auxiliary_teacher_layer_weights_by_layer.items())
+        ) or "none"
         dump_json(run_dir / "run_summary.json", run_summary)
         print(
             "patch_split "
@@ -6031,6 +6914,8 @@ def main() -> None:
             f"centered_contrastive_weight={float(args.centered_contrastive_loss_weight):.4g} "
             f"native_centered_weight={float(args.native_centered_contrastive_loss_weight):.4g} "
             f"mean_alignment_weight={float(args.mean_alignment_loss_weight):.4g} "
+            f"teacher_layers={','.join(str(layer) for layer in teacher_layers_from_args(args))} "
+            f"auxiliary_layer_weights={auxiliary_weight_summary} "
             f"alignment_transform={str(args.alignment_transform_mode)} "
             f"projection_dim={int(args.alignment_projection_dim) if isinstance(alignment_projector, AlignmentProjectionPair) else 'n/a'} "
             f"whitening_records={int(whitening_metrics.get('records', 0.0)) if isinstance(alignment_projector, FixedTeacherWhitening) else 'n/a'} "
@@ -6069,6 +6954,13 @@ def main() -> None:
             lr=float(args.lr),
             weight_decay=float(args.weight_decay),
         )
+        pretrain_optimizer_audit = audit_optimizer_parameter_coverage(
+            compressor_optimizer,
+            [compressor],
+        )
+        run_summary["patch_ae_pretrain_optimizer_audit"] = pretrain_optimizer_audit
+        if is_main_process():
+            dump_json(run_dir / "run_summary.json", run_summary)
         for pretrain_epoch in range(1, int(args.patch_ae_pretrain_epochs) + 1):
             pretrain_metrics, global_step = pretrain_patch_encoder_one_epoch(
                 compressor=compressor,
@@ -6130,6 +7022,7 @@ def main() -> None:
                     metrics=pretrain_epoch_metrics,
                     compressor_config=compressor_config,
                     save_compressor=True,
+                    checkpoint_phase="patch_ae_pretrain",
                 )
                 current_patch_ae_val = float(pretrain_val_metrics["reconstruction_loss"])
                 if current_patch_ae_val < best_patch_ae_val:
@@ -6144,6 +7037,7 @@ def main() -> None:
                         metrics=pretrain_epoch_metrics,
                         compressor_config=compressor_config,
                         save_compressor=True,
+                        checkpoint_phase="patch_ae_pretrain",
                     )
                 print(
                     f"patch_ae_pretrain_epoch={pretrain_epoch:04d} "
@@ -6154,7 +7048,7 @@ def main() -> None:
                 )
             distributed_barrier(f"patch_ae_pretrain_epoch_{pretrain_epoch:04d}_saved")
 
-        best_patch_ae = torch.load(run_dir / "patch_ae_pretrain_best.pt", map_location=device)
+        best_patch_ae = torch.load(run_dir / "patch_ae_pretrain_best.pt", map_location="cpu")
         compressor.load_state_dict(best_patch_ae["compressor_state_dict"])
         if is_main_process():
             metrics_history["patch_ae_pretrain_best"] = {
@@ -6169,6 +7063,9 @@ def main() -> None:
         distributed_barrier("patch_ae_pretrain_best_restored")
         # Release persistent pretrain workers and their HDF5 handles before alignment starts.
         pretrain_loader = None
+        del best_patch_ae, compressor_optimizer
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     if bool(args.alignment_train_patch_ae):
         for parameter in compressor.parameters():
@@ -6196,6 +7093,13 @@ def main() -> None:
             }
         )
     optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=float(args.weight_decay))
+    alignment_optimizer_audit = audit_optimizer_parameter_coverage(
+        optimizer,
+        [compressor if bool(args.alignment_train_patch_ae) else None, adapter, alignment_projector],
+    )
+    run_summary["alignment_optimizer_audit"] = alignment_optimizer_audit
+    if is_main_process():
+        dump_json(run_dir / "run_summary.json", run_summary)
 
     best_val_selection = float("inf")
     best_val_metric = ""
@@ -6241,6 +7145,7 @@ def main() -> None:
                 metrics=epoch_metrics,
                 compressor_config=compressor_config,
                 save_compressor=True,
+                checkpoint_phase="alignment",
             )
             selection_metric, selection_value = checkpoint_selection_value(val_metrics, args)
             if best_val_metric and selection_metric != best_val_metric:
@@ -6261,6 +7166,7 @@ def main() -> None:
                     metrics=epoch_metrics,
                     compressor_config=compressor_config,
                     save_compressor=True,
+                    checkpoint_phase="alignment",
                 )
             wandb_payload = {
                 "epoch": float(epoch),
@@ -6287,7 +7193,7 @@ def main() -> None:
             )
         distributed_barrier(f"alignment_epoch_{epoch:04d}_checkpointed")
 
-    best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location=device)
+    best_checkpoint = torch.load(run_dir / "alignment_best.pt", map_location="cpu")
     adapter.load_state_dict(best_checkpoint["adapter_state_dict"])
     if alignment_projector is not None:
         transform_state = best_checkpoint.get("alignment_feature_transform_state_dict")
@@ -6299,8 +7205,12 @@ def main() -> None:
                 "alignment_feature_transform_state_dict."
             )
         alignment_projector.load_state_dict(transform_state)
+        transform_state = None
     if "compressor_state_dict" in best_checkpoint:
         compressor.load_state_dict(best_checkpoint["compressor_state_dict"])
+    del best_checkpoint
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     test_metrics = evaluate_anchor_bank(
         compressor=compressor,
         adapter=adapter,

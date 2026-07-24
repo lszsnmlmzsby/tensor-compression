@@ -26,7 +26,9 @@ def test_readout_position_is_preserved_across_hidden_layers() -> None:
 
 def test_parse_layer_indices_defaults_and_validates_bounds() -> None:
     assert parse_layer_indices("all", 4) == [1, 2, 3, 4]
-    assert parse_layer_indices("4,2,2,0", 4) == [0, 2, 4]
+    assert parse_layer_indices("4,2,2", 4) == [2, 4]
+    with pytest.raises(ValueError, match="non-contextual input embedding"):
+        parse_layer_indices("0,2", 4)
     with pytest.raises(ValueError, match="outside"):
         parse_layer_indices("5", 4)
 

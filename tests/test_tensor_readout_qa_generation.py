@@ -25,6 +25,7 @@ from build_tensor_readout_qa import (  # noqa: E402
     split_sample_indices,
 )
 from build_tensor_patch_qa import (  # noqa: E402
+    AtomicJsonlWriter,
     build_questions,
     labeled_numeric_choices,
     per_patch_zscore,
@@ -47,6 +48,25 @@ def _write_synthetic_pdebench_file(path: Path) -> None:
 
 
 class TestTensorReadoutQAGeneration(unittest.TestCase):
+    def test_atomic_jsonl_writer_publishes_only_complete_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.jsonl"
+            path.write_text('{"old":true}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                with AtomicJsonlWriter(path) as writer:
+                    writer.write({"new": 1})
+                    raise RuntimeError("stop")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"old":true}\n')
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+            with AtomicJsonlWriter(path) as writer:
+                writer.write_many([{"new": 1}, {"new": 2}])
+
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records, [{"new": 1}, {"new": 2}])
+
     def test_patch_question_seed_depends_on_record_identity(self) -> None:
         first = {
             "fields": ["Vx"],
@@ -134,6 +154,9 @@ class TestTensorReadoutQAGeneration(unittest.TestCase):
         self.assertEqual(questions[0]["metadata"]["qa_value_space"], "per_patch_zscore")
         self.assertEqual(questions[0]["metadata"]["prompt_contract"], "encoder_zscore_one_based_v2")
         self.assertEqual(questions[0]["metadata"]["coordinate_origin"], 1)
+        self.assertEqual(questions[0]["latent_audit"]["format"], "per_patch_zscore_v1")
+        self.assertAlmostEqual(questions[0]["latent_audit"]["mean"], stats["mean"])
+        self.assertAlmostEqual(questions[0]["latent_audit"]["scale"], stats["scale"])
         self.assertAlmostEqual(float(qa_patch.mean().item()), 0.0, places=6)
 
     def test_patch_qa_normalization_matches_alignment_encoder_contract(self) -> None:
