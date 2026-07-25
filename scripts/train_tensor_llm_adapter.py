@@ -2310,6 +2310,31 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
         yield from batches
 
 
+def validate_atomic_group_batch_size(
+    batch_size: int,
+    group_size: int,
+    *,
+    context: str,
+) -> int:
+    """Validate a tunable outer batch while preserving complete task groups."""
+    batch = int(batch_size)
+    group = int(group_size)
+    if group <= 0:
+        raise ValueError(f"{context} atomic group size must be positive, got {group}.")
+    if batch < group:
+        raise ValueError(
+            f"{context} batch_size must be at least one complete atomic group: "
+            f"batch_size={batch}, group_size={group}."
+        )
+    if batch % group != 0:
+        raise ValueError(
+            f"{context} batch_size must be a multiple of the atomic group size so no group "
+            f"is split or silently under-fills a forward: batch_size={batch}, group_size={group}. "
+            f"Use one of {group}, {group * 2}, {group * 3}, ..."
+        )
+    return batch // group
+
+
 class ExactDistributedEvalSampler(Sampler[int]):
     """Shard evaluation records without padding or repeating any example."""
 
@@ -3430,11 +3455,16 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(
                 "Grounded evidence requires a positive grounding_routing_loss_weight."
             )
-        if int(args.batch_size) != 3 or int(args.questions_per_state_group) != 3:
+        if int(args.questions_per_state_group) != 3:
             raise ValueError(
-                "Grounded Stage-2B requires batch_size=questions_per_state_group=3 so each "
-                "explicit matched batch remains atomic."
+                "Grounded Stage-2B requires questions_per_state_group=3 because that is the "
+                "immutable matched-task group size."
             )
+        validate_atomic_group_batch_size(
+            int(args.batch_size),
+            int(args.questions_per_state_group),
+            context="Grounded Stage-2B",
+        )
         if str(args.choice_scoring_mode) != "label":
             raise ValueError(
                 "Grounded Stage-2B requires choice_scoring_mode=label so routing, choice, and "
@@ -4018,11 +4048,17 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 "Matched Stage-2 QA must declare three-record atomic groups and nine records per state."
             )
-        if int(args.batch_size) != expected_batch_group_size:
+        if int(args.questions_per_state_group) != expected_batch_group_size:
             raise ValueError(
-                "The configured training batch must equal the matched QA atomic group size: "
-                f"batch_size={args.batch_size}, group_size={expected_batch_group_size}."
+                "The configured questions_per_state_group must equal the matched QA atomic "
+                f"group size: configured={args.questions_per_state_group}, "
+                f"group_size={expected_batch_group_size}."
             )
+        validate_atomic_group_batch_size(
+            int(args.batch_size),
+            expected_batch_group_size,
+            context="Matched Stage-2 QA",
+        )
     elif str(args.adapter_architecture) == "grounded_evidence_adapter":
         raise ValueError(
             "grounded_evidence_adapter requires tensor_patch_matched_qa_v1 assets; "
@@ -10025,6 +10061,16 @@ def main() -> None:
             "rank": distributed_rank(),
             "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
             "per_rank_batch_size": int(args.batch_size),
+            "atomic_group_size": (
+                int(args.questions_per_state_group)
+                if str(args.adapter_architecture) == "grounded_evidence_adapter"
+                else None
+            ),
+            "atomic_groups_per_rank_batch": (
+                int(args.batch_size) // int(args.questions_per_state_group)
+                if str(args.adapter_architecture) == "grounded_evidence_adapter"
+                else None
+            ),
             "train_choice_batch_size": int(args.train_choice_batch_size),
             "train_grounding_batch_size": int(args.train_grounding_batch_size),
             "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
@@ -10200,6 +10246,8 @@ def main() -> None:
             f"train/val/test={len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} "
             f"question_input={summary['question_input_mode']} fusion={summary['local_fusion_mode']} "
             f"scheduler={summary['lr_scheduler']} grouped={int(summary['group_questions_by_state'])} "
+            f"per_rank_batch={summary['distributed']['per_rank_batch_size']} "
+            f"atomic_groups={summary['distributed']['atomic_groups_per_rank_batch']} "
             f"effective_batch={summary['distributed']['effective_train_batch_size']} "
             f"ddp_timeout={float(args.distributed_timeout_seconds):g}s "
             f"eval_batch={int(args.eval_batch_size)} "

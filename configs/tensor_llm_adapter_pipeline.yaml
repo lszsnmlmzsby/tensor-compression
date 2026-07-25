@@ -440,7 +440,8 @@ llm_training:
   grounding_warmup_min_axis_top1: 0.95
   grounding_warmup_min_target_mass: 0.50
   grounding_warmup_min_gate_accuracy: 0.95
-  # Keep one complete same-tensor group per forward. The single-token choice path does not expand candidates.
+  # Tunable per-GPU microbatch. Each matched task unit has three records, so use 3, 6, 9, ...;
+  # the grouped sampler packs that many complete units without splitting one across forwards.
   batch_size: 3
   # Evaluation is no-grad and uses one prompt-only forward for single-token choices; it can use the
   # measured training-safe batch without changing any metric or training gradient.
@@ -448,13 +449,13 @@ llm_training:
   eval_choice_batch_size: 4
   # Used only by the sequence-likelihood fallback; auto single-token scoring uses one forward directly.
   train_choice_batch_size: 12
-  # Ranking and swapped-question losses are concatenated but chunked above the measured safe forward batch.
-  # This preserves every margin term when --batch-size 8 produces six grouped records (6 negatives + 3 swaps).
+  # Ranking and swapped-question losses are concatenated and chunked independently of the tunable outer batch.
+  # This preserves every margin term when a forward contains multiple complete matched groups.
   train_grounding_batch_size: 8
   # Non-reentrant checkpointing retains gradients to the tensor prefix without storing every Qwen activation.
   llm_gradient_checkpointing: true
-  # Four torchrun ranks give an effective optimizer batch of 3 x 4 = 12, close to the former
-  # single-GPU 3 x 5 = 15 schedule without reducing optimizer updates by another factor of four.
+  # At the default, four torchrun ranks give an effective optimizer batch of 3 x 4 = 12.
+  # In general: effective batch = batch_size x 4 ranks x gradient_accumulation_steps.
   # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
   gradient_accumulation_steps: 1
   # Only the small grounded reader trains; Qwen and the direct global adapter remain frozen.

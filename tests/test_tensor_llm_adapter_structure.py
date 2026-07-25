@@ -67,6 +67,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     training_loss,
     validate_adapter_loss_contract,
     validate_adapter_checkpoint_payload,
+    validate_atomic_group_batch_size,
     validate_qa_latent_contract,
     validate_stage1_alignment_checkpoint_phase,
     validate_stage1_model_identity,
@@ -1107,6 +1108,56 @@ class TestDistributedSampling(unittest.TestCase):
                     sorted(spec["batch_member_index"] for spec in specs),
                     [0, 1, 2],
                 )
+
+    def test_explicit_matched_sampler_packs_multiple_complete_groups(self) -> None:
+        records = []
+        for group_index in range(8):
+            for member_index in range(3):
+                record = _record(
+                    f"state_{group_index}",
+                    "normalized_point_value",
+                    "density",
+                    f"question_{member_index}",
+                )
+                record["matched_group"] = {
+                    "format": MATCHED_GROUP_FORMAT,
+                    "batch_group_id": f"group_{group_index}",
+                    "batch_group_size": 3,
+                    "batch_member_index": member_index,
+                }
+                records.append(record)
+        dataset = SimpleNamespace(records=records)
+
+        batches = list(
+            StateTaskGroupedBatchSampler(
+                dataset=dataset,
+                batch_size=6,
+                questions_per_group=3,
+                seed=23,
+            )
+        )
+
+        self.assertEqual([len(batch) for batch in batches], [6, 6, 6, 6])
+        for batch in batches:
+            members_by_group: dict[str, list[int]] = {}
+            for index in batch:
+                spec = records[index]["matched_group"]
+                members_by_group.setdefault(spec["batch_group_id"], []).append(
+                    spec["batch_member_index"]
+                )
+            self.assertEqual(len(members_by_group), 2)
+            self.assertTrue(
+                all(sorted(members) == [0, 1, 2] for members in members_by_group.values())
+            )
+
+    def test_atomic_group_batch_size_is_tunable_in_complete_group_steps(self) -> None:
+        self.assertEqual(validate_atomic_group_batch_size(3, 3, context="test"), 1)
+        self.assertEqual(validate_atomic_group_batch_size(6, 3, context="test"), 2)
+        self.assertEqual(validate_atomic_group_batch_size(12, 3, context="test"), 4)
+        with self.assertRaisesRegex(ValueError, "at least one complete atomic group"):
+            validate_atomic_group_batch_size(2, 3, context="test")
+        with self.assertRaisesRegex(ValueError, "must be a multiple"):
+            validate_atomic_group_batch_size(4, 3, context="test")
 
     def test_exact_eval_sampler_never_pads_or_repeats(self) -> None:
         dataset = list(range(10))
