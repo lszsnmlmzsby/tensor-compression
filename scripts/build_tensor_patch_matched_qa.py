@@ -51,6 +51,14 @@ from tensor_compression.utils.pipeline_config import (  # noqa: E402
 
 
 LABELS = ("A", "B", "C", "D")
+ZSCORE_EPSILON = 1.0e-6
+# Retain this builder's former broad mean guard.  Float32 reduction of
+# high-offset, very-low-variance patches can leave a small normalized residual;
+# cache corruption is primarily detected by the metadata-conditioned variance
+# check and the exact constant-patch rule below.
+PRESERVED_Z_MEAN_ATOL = 1.0e-1
+PRESERVED_Z_STD_ATOL = 5.0e-3
+PRESERVED_Z_STD_RTOL = 2.0e-2
 EXTREME_RE = re.compile(r"\b(maximum|minimum)\b", re.IGNORECASE)
 POINT_RE = re.compile(r"\brow\s+(\d+)\s*,?\s*column\s+(\d+)\b", re.IGNORECASE)
 POINT_PAIR_RE = re.compile(
@@ -62,8 +70,13 @@ REGION_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 REGION_SIZE_RE = re.compile(r"two (\d+) by (\d+) regions", re.IGNORECASE)
+NUMBER_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 DISPLAYED_OPTION_RE = re.compile(
-    r"(?:Options:\s*|;\s*)([A-D]):\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+    rf"(?:Options:\s*|;\s*)([A-D]):\s*({NUMBER_PATTERN})"
+)
+RAW_STATS_RE = re.compile(
+    rf"where mean is\s+({NUMBER_PATTERN})\s+and scale is\s+({NUMBER_PATTERN})",
+    re.IGNORECASE,
 )
 
 
@@ -279,6 +292,7 @@ def load_preserved_z(
     path: Path,
     contract: Mapping[str, Any],
 ) -> torch.Tensor:
+    qa_stats = latent_qa_stats_from_record(record)
     payload = torch.load(path, map_location="cpu", weights_only=True)
     latent = validate_patch_latent_payload(
         payload,
@@ -289,7 +303,7 @@ def load_preserved_z(
         expected_normalization=contract["normalization"],
         expected_shape=contract["latent_shape"],
         expected_storage_dtype=contract["storage_dtype"],
-        expected_qa_stats=latent_qa_stats_from_record(record),
+        expected_qa_stats=qa_stats,
     )
     if latent.dtype != getattr(torch, str(contract["storage_dtype"])):
         raise ValueError(f"Latent {path} dtype changed after validation: {latent.dtype}.")
@@ -298,11 +312,189 @@ def load_preserved_z(
         raise FloatingPointError(f"Preserved channel contains non-finite values: {path}")
     mean = float(values.mean().item())
     std = float(values.std(unbiased=False).item())
-    if abs(mean) > 0.1 or not 0.75 <= std <= 1.25:
+    raw_std = float(qa_stats["std"])
+    scale = float(qa_stats["scale"])
+    # The source builder performs this addition in float32.  In particular,
+    # a constant raw patch has raw_std=0, scale=1e-6, and an exactly-zero
+    # preserved z channel; z-score data are not required to have unit variance
+    # when the stabilizing epsilon is material relative to raw_std.
+    expected_scale = float(
+        (torch.tensor(raw_std, dtype=torch.float32) + float(ZSCORE_EPSILON)).item()
+    )
+    if not math.isclose(scale, expected_scale, rel_tol=5.0e-7, abs_tol=5.0e-12):
         raise ValueError(
-            f"Preserved channel no longer looks like per-patch z-score data: {path}, mean={mean}, std={std}."
+            f"Latent z-score metadata has a stale scale for {path}: "
+            f"raw_std={raw_std}, scale={scale}, expected_scale={expected_scale}."
+        )
+    expected_std = raw_std / scale
+    std_tolerance = max(
+        float(PRESERVED_Z_STD_ATOL),
+        float(PRESERVED_Z_STD_RTOL) * abs(expected_std),
+    )
+    if raw_std == 0.0 and int(torch.count_nonzero(values).item()) != 0:
+        raise ValueError(
+            f"Constant-patch metadata requires an exactly-zero preserved channel: {path}."
+        )
+    # A non-zero expected standard deviation above FP16's subnormal resolution
+    # cannot legitimately serialize to an exactly constant channel.
+    fp16_min_subnormal = 2.0 ** -24
+    if expected_std > fp16_min_subnormal and std == 0.0:
+        raise ValueError(
+            f"Preserved channel is constant despite non-degenerate z-score metadata: {path}, "
+            f"expected_std={expected_std}."
+        )
+    if abs(mean) > float(PRESERVED_Z_MEAN_ATOL) or abs(std - expected_std) > std_tolerance:
+        raise ValueError(
+            f"Preserved channel no longer matches its per-patch z-score metadata: {path}, "
+            f"observed_mean={mean}, observed_std={std}, expected_std={expected_std}, "
+            f"mean_atol={PRESERVED_Z_MEAN_ATOL}, std_tolerance={std_tolerance}."
         )
     return values
+
+
+def numeric_triplet_available(values: torch.Tensor, minimum_gap: float) -> bool:
+    """Return whether three stored values can be pairwise separated by the gap."""
+    ordered = sorted(float(value) for value in values.reshape(-1).tolist())
+    if len(ordered) < 3:
+        return False
+    low, high = ordered[0], ordered[-1]
+    gap = float(minimum_gap)
+    return any(value - low >= gap and high - value >= gap for value in ordered[1:-1])
+
+
+def region_mean_grid(values: torch.Tensor, region_size: int) -> torch.Tensor:
+    height, width = int(values.shape[0]), int(values.shape[1])
+    region = int(region_size)
+    if region <= 0 or region > height or region > width:
+        raise ValueError(
+            f"region_size={region} must fit the stored grid {(height, width)} without clamping."
+        )
+    windows = values.unfold(0, region, 1).unfold(1, region, 1)
+    return windows.mean(dim=(-1, -2))
+
+
+def region_mean_range(values: torch.Tensor, region_size: int) -> float:
+    means = region_mean_grid(values, int(region_size))
+    return float((means.max() - means.min()).item())
+
+
+def train_state_capability(
+    values: torch.Tensor,
+    *,
+    numeric_gap: float,
+    region_gap: float,
+    region_size: int,
+) -> dict[str, Any]:
+    """Audit task feasibility from the exact stored-FP16 value channel."""
+    minimum = float(values.min().item())
+    maximum = float(values.max().item())
+    value_range = maximum - minimum
+    is_constant = value_range == 0.0
+    numeric_supported = numeric_triplet_available(values, float(numeric_gap))
+    point_supported = value_range >= float(numeric_gap)
+    observed_region_range = region_mean_range(values, int(region_size))
+    region_supported = observed_region_range >= float(region_gap)
+    if is_constant:
+        exclusion_reason = "constant_preserved_channel"
+    elif not numeric_supported:
+        exclusion_reason = "insufficient_numeric_triplet_gap"
+    elif not point_supported:
+        exclusion_reason = "insufficient_point_pair_gap"
+    else:
+        exclusion_reason = None
+    return {
+        "eligible": exclusion_reason is None,
+        "exclusion_reason": exclusion_reason,
+        "constant_preserved_channel": is_constant,
+        "stored_value_range": value_range,
+        "numeric_triplet_supported": numeric_supported,
+        "point_pair_supported": point_supported,
+        "region_mean_range": observed_region_range,
+        "region_pair_supported": region_supported,
+    }
+
+
+def assign_spatial_families(
+    representatives: Mapping[str, Mapping[str, Any]],
+    capabilities: Mapping[str, Mapping[str, Any]],
+    *,
+    seed: int,
+) -> dict[str, str]:
+    """Balance point/region families without assigning an unsupported region task."""
+    by_field: dict[str, list[str]] = defaultdict(list)
+    for state_ref, record in representatives.items():
+        capability = capabilities.get(state_ref)
+        if not isinstance(capability, Mapping) or not bool(capability.get("eligible", False)):
+            raise ValueError(f"Cannot assign an ineligible Stage-2B train state: {state_ref}.")
+        if not bool(capability.get("point_pair_supported", False)):
+            raise ValueError(f"Eligible Stage-2B state lacks point-pair support: {state_ref}.")
+        by_field[str(record["field"])].append(state_ref)
+
+    result: dict[str, str] = {}
+    for field, states in sorted(by_field.items()):
+        ordered = sorted(
+            states,
+            key=lambda state: namespaced_seed(int(seed), state, f"family:{field}"),
+        )
+        region_candidates = [
+            state
+            for state in ordered
+            if bool(capabilities[state].get("region_pair_supported", False))
+        ]
+        target_region_count = len(ordered) // 2
+        region_states = set(region_candidates[:target_region_count])
+        for state_ref in ordered:
+            result[state_ref] = "region" if state_ref in region_states else "point"
+    return result
+
+
+def state_selection_summary(
+    representatives: Mapping[str, Mapping[str, Any]],
+    included_states: set[str],
+    exclusion_reasons: Mapping[str, str],
+) -> dict[str, Any]:
+    source_by_field: Counter[str] = Counter()
+    included_by_field: Counter[str] = Counter()
+    excluded_by_field: Counter[str] = Counter()
+    excluded_by_time_index: Counter[int] = Counter()
+    excluded_by_reason: Counter[str] = Counter()
+    excluded_by_field_and_reason: dict[str, Counter[str]] = defaultdict(Counter)
+    for state_ref, record in representatives.items():
+        field = str(record["field"])
+        source_by_field[field] += 1
+        if state_ref in included_states:
+            included_by_field[field] += 1
+            continue
+        reason = str(exclusion_reasons.get(state_ref, "missing_exclusion_reason"))
+        excluded_by_field[field] += 1
+        excluded_by_time_index[int(record["time_index"])] += 1
+        excluded_by_reason[reason] += 1
+        excluded_by_field_and_reason[field][reason] += 1
+    if set(representatives) != included_states | set(exclusion_reasons):
+        raise RuntimeError("Stage-2B state-selection audit does not cover every source state exactly once.")
+    if included_states & set(exclusion_reasons):
+        raise RuntimeError("Stage-2B state-selection audit marks states as both included and excluded.")
+    return {
+        "source_states": len(representatives),
+        "included_states": len(included_states),
+        "excluded_states": len(representatives) - len(included_states),
+        "excluded_fraction": (
+            (len(representatives) - len(included_states)) / max(1, len(representatives))
+        ),
+        "source_by_field": dict(sorted(source_by_field.items())),
+        "included_by_field": dict(sorted(included_by_field.items())),
+        "excluded_by_field": dict(sorted(excluded_by_field.items())),
+        "excluded_by_time_index": {
+            str(time_index): int(count)
+            for time_index, count in sorted(excluded_by_time_index.items())
+        },
+        "excluded_by_reason": dict(sorted(excluded_by_reason.items())),
+        "excluded_state_preview": sorted(exclusion_reasons)[:16],
+        "excluded_by_field_and_reason": {
+            field: dict(sorted(counts.items()))
+            for field, counts in sorted(excluded_by_field_and_reason.items())
+        },
+    }
 
 
 def separated_option_cells(
@@ -331,27 +523,30 @@ def separated_option_cells(
             chosen_targets = candidate
             break
     if chosen_targets is None:
-        # Deterministic exhaustive fallback proves whether the FP16 patch has a legal triple.
-        ordered = list(flat)
-        rng.shuffle(ordered)
-        for left_index, left in enumerate(ordered):
-            for right_index in range(left_index + 1, len(ordered)):
-                right = ordered[right_index]
-                if abs(left[0] - right[0]) < float(minimum_gap):
-                    continue
-                third = next(
-                    (
-                        item
-                        for item in ordered[right_index + 1 :]
-                        if separated((left, right, item))
-                    ),
-                    None,
-                )
-                if third is not None:
-                    chosen_targets = [left, right, third]
-                    break
-            if chosen_targets is not None:
-                break
+        # A value-sorted fallback is a complete one-dimensional feasibility
+        # test.  The former shuffled-index search could miss a legal triple.
+        ordered = sorted(flat, key=lambda item: (item[0], item[1], item[2]))
+        low_value, high_value = ordered[0][0], ordered[-1][0]
+        middle_candidates = [
+            item
+            for item in ordered[1:-1]
+            if item[0] - low_value >= float(minimum_gap)
+            and high_value - item[0] >= float(minimum_gap)
+        ]
+        if middle_candidates:
+            middle = rng.choice(middle_candidates)
+            low_candidates = [
+                item for item in ordered if middle[0] - item[0] >= float(minimum_gap)
+            ]
+            high_candidates = [
+                item for item in ordered if item[0] - middle[0] >= float(minimum_gap)
+            ]
+            chosen_targets = [
+                rng.choice(low_candidates),
+                middle,
+                rng.choice(high_candidates),
+            ]
+            rng.shuffle(chosen_targets)
     if chosen_targets is None:
         value_range = max(item[0] for item in flat) - min(item[0] for item in flat)
         raise ValueError(
@@ -617,16 +812,13 @@ def region_pair(
     minimum_gap: float,
     rng: random.Random,
 ) -> tuple[list[int], list[int], float, float]:
-    height, width = values.shape
     region = int(region_size)
-    if region <= 0 or region > height or region > width:
-        raise ValueError(
-            f"region_size={region} must fit the stored grid {(height, width)} without clamping."
-        )
+    mean_grid = region_mean_grid(values, region)
+    mean_rows = mean_grid.tolist()
     candidates: list[tuple[float, int, int]] = []
-    for row in range(height - region + 1):
-        for col in range(width - region + 1):
-            candidates.append((float(values[row : row + region, col : col + region].mean()), row, col))
+    for row, row_values in enumerate(mean_rows):
+        for col, mean in enumerate(row_values):
+            candidates.append((float(mean), row, col))
     first: tuple[float, int, int] | None = None
     second: tuple[float, int, int] | None = None
     for _ in range(2048):
@@ -763,6 +955,133 @@ def grounding_target_from_source(record: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Extreme source record {record.get('qa_id')} has no operation.")
         return {"type": "none", "coordinate_origin": 0}
     raise ValueError(f"Unsupported source task for evaluation grounding: {task!r}.")
+
+
+def evaluation_record_replay(
+    record: Mapping[str, Any],
+    values: torch.Tensor,
+    *,
+    numeric_gap: float,
+    region_gap: float,
+) -> dict[str, Any]:
+    """Replay one source evaluation label against the stored FP16 value channel.
+
+    Malformed prompts/provenance raise immediately.  Well-formed but weak or
+    quantization-ambiguous records return eligible=false so the whole state can
+    be excluded without publishing a partial task set.
+    """
+    task = str(record.get("task_type", ""))
+    answer = str(record.get("answer", ""))
+    query = str(record.get("query") or record.get("question") or "")
+    target = grounding_target_from_source(record)
+
+    def result(eligible: bool, reason: str | None, **audit: Any) -> dict[str, Any]:
+        return {
+            "eligible": bool(eligible),
+            "reason": reason,
+            "task_type": task,
+            **audit,
+        }
+
+    if task in {"normalized_point_value", "raw_point_value_with_stats"}:
+        displayed = DISPLAYED_OPTION_RE.findall(query)
+        choices = [str(value) for value in record.get("choices", ())]
+        if (
+            len(displayed) != len(choices)
+            or [label for label, _value in displayed] != choices
+            or len({label for label, _value in displayed}) != len(displayed)
+        ):
+            raise ValueError(
+                f"Evaluation numeric options are missing, reordered, or duplicated in "
+                f"{record.get('qa_id')}."
+            )
+        option_values = {label: float(value) for label, value in displayed}
+        row, col = int(target["row"]), int(target["col"])
+        stored_z = float(values[row, col].item())
+        if task == "normalized_point_value":
+            target_value = stored_z
+        else:
+            stats_match = RAW_STATS_RE.search(query)
+            if stats_match is None:
+                raise ValueError(
+                    f"Raw-value evaluation prompt has no displayed mean/scale: {record.get('qa_id')}."
+                )
+            displayed_mean, displayed_scale = (float(value) for value in stats_match.groups())
+            if not math.isfinite(displayed_mean) or not math.isfinite(displayed_scale):
+                raise ValueError(f"Raw-value prompt has non-finite statistics: {record.get('qa_id')}.")
+            if displayed_scale <= 0.0:
+                raise ValueError(f"Raw-value prompt has non-positive scale: {record.get('qa_id')}.")
+            target_value = displayed_mean + displayed_scale * stored_z
+        distances = {
+            label: abs(target_value - option_value)
+            for label, option_value in option_values.items()
+        }
+        ordered = sorted(distances, key=distances.__getitem__)
+        magnitude = max(
+            [1.0, abs(target_value)]
+            + [abs(value) for value in option_values.values()]
+        )
+        tolerance = magnitude * 1.0e-12
+        if len(ordered) < 2 or distances[ordered[1]] - distances[ordered[0]] <= tolerance:
+            return result(False, f"ambiguous_{task}_stored_fp16_target")
+        expected_answer = ordered[0]
+        if answer != expected_answer:
+            return result(
+                False,
+                f"stale_{task}_stored_fp16_answer",
+                source_answer=answer,
+                stored_fp16_answer=expected_answer,
+            )
+        return result(True, None)
+
+    if task == "point_compare":
+        point_a = tuple(int(value) for value in target["a"])
+        point_b = tuple(int(value) for value in target["b"])
+        if point_a == point_b:
+            return result(False, "duplicate_point_compare_coordinates")
+        value_a = float(values[point_a].item())
+        value_b = float(values[point_b].item())
+        gap = abs(value_a - value_b)
+        if gap < float(numeric_gap):
+            return result(False, "insufficient_point_compare_stored_fp16_gap", observed_gap=gap)
+        expected_answer = "A" if value_a > value_b else "B"
+        if answer != expected_answer:
+            return result(
+                False,
+                "stale_point_compare_stored_fp16_answer",
+                source_answer=answer,
+                stored_fp16_answer=expected_answer,
+            )
+        return result(True, None, observed_gap=gap)
+
+    if task == "region_mean_compare":
+        region_a = tuple(int(value) for value in target["a"])
+        region_b = tuple(int(value) for value in target["b"])
+        if region_a == region_b:
+            return result(False, "duplicate_region_compare_coordinates")
+
+        def region_mean(spec: tuple[int, ...]) -> float:
+            row, col, region_h, region_w = spec
+            return float(values[row : row + region_h, col : col + region_w].mean().item())
+
+        mean_a, mean_b = region_mean(region_a), region_mean(region_b)
+        gap = abs(mean_a - mean_b)
+        if gap < float(region_gap):
+            return result(False, "insufficient_region_compare_stored_fp16_gap", observed_gap=gap)
+        expected_answer = "A" if mean_a > mean_b else "B"
+        if answer != expected_answer:
+            return result(
+                False,
+                "stale_region_compare_stored_fp16_answer",
+                source_answer=answer,
+                stored_fp16_answer=expected_answer,
+            )
+        return result(True, None, observed_gap=gap)
+
+    if task == "extreme_quadrant":
+        audit = verify_extreme_replay(record, values)
+        return result(True, None, extreme_replay=audit)
+    raise ValueError(f"Unsupported source task for evaluation replay: {task!r}.")
 
 
 def build_state_records(
@@ -1111,23 +1430,99 @@ def main() -> None:
         },
     )
     try:
-        family_by_state: dict[str, str] = {}
-        by_field: dict[str, list[str]] = defaultdict(list)
-        for state_ref, record in train_representatives.items():
-            by_field[str(record["field"])].append(state_ref)
-        for field, states in by_field.items():
-            ordered = sorted(states, key=lambda state: namespaced_seed(int(args.seed), state, f"family:{field}"))
-            for index, state_ref in enumerate(ordered):
-                family_by_state[state_ref] = "point" if index % 2 == 0 else "region"
+        # Validate every train latent first, then separate data integrity from
+        # task feasibility.  Constant/low-variation states are valid cache
+        # entries but cannot honestly supply the three distinct numeric answers
+        # required by the matched Stage-2B objective.
+        train_values: dict[str, torch.Tensor] = {}
+        train_capabilities: dict[str, dict[str, Any]] = {}
+        train_exclusion_reasons: dict[str, str] = {}
+        included_train_states: set[str] = set()
+        for train_index, state_ref in enumerate(sorted(train_representatives), start=1):
+            source = train_representatives[state_ref]
+            values = load_preserved_z(source, latent_paths[state_ref], contract)
+            capability = train_state_capability(
+                values,
+                numeric_gap=float(args.numeric_min_gap),
+                region_gap=float(args.region_min_gap),
+                region_size=int(args.region_size),
+            )
+            train_capabilities[state_ref] = capability
+            if bool(capability["eligible"]):
+                included_train_states.add(state_ref)
+                train_values[state_ref] = values
+            else:
+                train_exclusion_reasons[state_ref] = str(capability["exclusion_reason"])
+            if train_index % 1024 == 0:
+                print(
+                    f"stage2b_preflight split=train validated={train_index} "
+                    f"eligible={len(included_train_states)} "
+                    f"excluded={len(train_exclusion_reasons)}",
+                    flush=True,
+                )
+        if not included_train_states:
+            raise ValueError(
+                "No train state can supply the configured Stage-2B numeric gaps; "
+                "rebuild source QA with variance-aware patch sampling or lower the gaps explicitly."
+            )
+        source_train_fields = {
+            str(record["field"]) for record in train_representatives.values()
+        }
+        included_train_fields = {
+            str(train_representatives[state_ref]["field"])
+            for state_ref in included_train_states
+        }
+        if included_train_fields != source_train_fields:
+            raise ValueError(
+                "Stage-2B feasibility filtering removed every train state for one or more fields: "
+                f"source_fields={sorted(source_train_fields)}, "
+                f"included_fields={sorted(included_train_fields)}. Rebuild the source QA with "
+                "variance-aware sampling instead of silently dropping a field."
+            )
+        included_train_representatives = {
+            state_ref: train_representatives[state_ref]
+            for state_ref in sorted(included_train_states)
+        }
+        family_by_state = assign_spatial_families(
+            included_train_representatives,
+            train_capabilities,
+            seed=int(args.seed),
+        )
+        family_counts = Counter(family_by_state.values())
+        if not family_counts["point"] or not family_counts["region"]:
+            raise ValueError(
+                "Stage-2B feasibility filtering left no support for one spatial family: "
+                f"family_counts={dict(family_counts)}. Rebuild source QA with more varied patches."
+            )
+        train_selection = state_selection_summary(
+            train_representatives,
+            included_train_states,
+            train_exclusion_reasons,
+        )
+        train_selection["family_counts"] = dict(sorted(family_counts.items()))
+        family_counts_by_field: dict[str, Counter[str]] = defaultdict(Counter)
+        for state_ref, family in family_by_state.items():
+            family_counts_by_field[
+                str(included_train_representatives[state_ref]["field"])
+            ][family] += 1
+        train_selection["family_counts_by_field"] = {
+            field: dict(sorted(counts.items()))
+            for field, counts in sorted(family_counts_by_field.items())
+        }
+        train_selection["region_capable_included_states"] = sum(
+            int(bool(train_capabilities[state_ref]["region_pair_supported"]))
+            for state_ref in included_train_states
+        )
 
         output_counts: Counter[str] = Counter()
         output_answer_counts: dict[str, Counter[str]] = defaultdict(Counter)
+        output_choice_labels: dict[str, set[str]] = defaultdict(set)
         numeric_group_audits: list[dict[str, Any]] = []
         extreme_replay_audit_counts: Counter[str] = Counter()
         with AtomicJsonlWriter(output_root / "train.jsonl") as writer:
-            for state_ref in sorted(train_representatives):
-                source = train_representatives[state_ref]
-                values = load_preserved_z(source, latent_paths[state_ref], contract)
+            for train_index, state_ref in enumerate(sorted(included_train_states), start=1):
+                source = included_train_representatives[state_ref]
+                values = train_values[state_ref]
                 records = build_state_records(
                     source,
                     train_extremes[state_ref],
@@ -1149,27 +1544,143 @@ def main() -> None:
                 )
                 output_counts.update(str(record["task_type"]) for record in records)
                 for record in records:
-                    output_answer_counts[str(record["task_type"])][str(record["answer"])] += 1
-        if int(extreme_replay_audit_counts["records"]) != len(train_representatives):
-            raise RuntimeError(
-                "Extreme replay audit did not cover every train state: "
-                f"audited={extreme_replay_audit_counts['records']}, "
-                f"expected={len(train_representatives)}."
-            )
+                    task = str(record["task_type"])
+                    output_answer_counts[task][str(record["answer"])] += 1
+                    output_choice_labels[task].update(
+                        str(choice) for choice in record["choices"]
+                    )
+                if train_index % 2048 == 0:
+                    print(
+                        f"stage2b_generate split=train states={train_index} "
+                        f"records={sum(output_counts.values())}",
+                        flush=True,
+                    )
+            if int(extreme_replay_audit_counts["records"]) != len(included_train_states):
+                raise RuntimeError(
+                    "Extreme replay audit did not cover every train state: "
+                    f"audited={extreme_replay_audit_counts['records']}, "
+                    f"expected={len(included_train_states)}."
+                )
+            missing_train_answer_labels = {
+                task: sorted(labels - set(output_answer_counts[task]))
+                for task, labels in output_choice_labels.items()
+                if labels - set(output_answer_counts[task])
+            }
+            if missing_train_answer_labels:
+                raise ValueError(
+                    "Stage-2B train filtering removed required answer-label coverage: "
+                    f"{missing_train_answer_labels}."
+                )
+        train_values.clear()
 
+        evaluation_selection: dict[str, dict[str, Any]] = {}
+        evaluation_output_counts: dict[str, Counter[str]] = {}
+        evaluation_answer_counts: dict[str, dict[str, Counter[str]]] = {}
         for split in ("val", "test"):
-            # The copied evaluation records remain part of the formal contract, so validate
-            # every referenced payload before publishing the new metadata envelope.
-            for state_ref, source in split_representatives[split].items():
-                load_preserved_z(source, latent_paths[state_ref], contract)
+            # Validate every payload and replay every source label from the
+            # stored FP16 value channel before copying a complete state.
+            candidate_values: dict[str, torch.Tensor] = {}
+            exclusion_reasons: dict[str, str] = {}
+            for eval_index, (state_ref, source) in enumerate(
+                split_representatives[split].items(),
+                start=1,
+            ):
+                values = load_preserved_z(source, latent_paths[state_ref], contract)
+                if float(values.max().item()) == float(values.min().item()):
+                    exclusion_reasons[state_ref] = "constant_preserved_channel"
+                else:
+                    candidate_values[state_ref] = values
+                if eval_index % 1024 == 0:
+                    print(
+                        f"stage2b_preflight split={split} validated={eval_index} "
+                        f"nonconstant={len(candidate_values)} "
+                        f"constant={len(exclusion_reasons)}",
+                        flush=True,
+                    )
+            invalid_record_counts: Counter[str] = Counter()
+            invalid_state_reasons: dict[str, set[str]] = defaultdict(set)
+            for source_record in iter_jsonl(split_paths[split]):
+                state_ref = str(source_record["state_ref"])
+                values = candidate_values.get(state_ref)
+                if values is None:
+                    continue
+                replay = evaluation_record_replay(
+                    source_record,
+                    values,
+                    numeric_gap=float(args.numeric_min_gap),
+                    region_gap=float(args.region_min_gap),
+                )
+                if not bool(replay["eligible"]):
+                    reason = str(replay["reason"])
+                    invalid_record_counts[reason] += 1
+                    invalid_state_reasons[state_ref].add(reason)
+            invalid_state_reason_counts: Counter[str] = Counter()
+            for state_ref, reasons in invalid_state_reasons.items():
+                primary_reason = sorted(reasons)[0]
+                exclusion_reasons[state_ref] = primary_reason
+                for reason in reasons:
+                    invalid_state_reason_counts[reason] += 1
+                candidate_values.pop(state_ref, None)
+            included_states = set(candidate_values)
+            if not included_states:
+                raise ValueError(f"Stage-2B filtering removed the entire {split} split.")
+            source_fields = {
+                str(record["field"])
+                for record in split_representatives[split].values()
+            }
+            included_fields = {
+                str(split_representatives[split][state_ref]["field"])
+                for state_ref in included_states
+            }
+            if included_fields != source_fields:
+                raise ValueError(
+                    f"Stage-2B evaluation replay filtering removed every {split} state for one or "
+                    f"more fields: source_fields={sorted(source_fields)}, "
+                    f"included_fields={sorted(included_fields)}."
+                )
+            evaluation_selection[split] = state_selection_summary(
+                split_representatives[split],
+                included_states,
+                exclusion_reasons,
+            )
+            evaluation_selection[split]["invalid_record_counts_by_reason"] = dict(
+                sorted(invalid_record_counts.items())
+            )
+            evaluation_selection[split]["invalid_state_counts_by_record_reason"] = dict(
+                sorted(invalid_state_reason_counts.items())
+            )
+            split_counts: Counter[str] = Counter()
+            split_answer_counts: dict[str, Counter[str]] = defaultdict(Counter)
+            split_choice_labels: dict[str, set[str]] = defaultdict(set)
             with AtomicJsonlWriter(output_root / f"{split}.jsonl") as writer:
                 for source_record in iter_jsonl(split_paths[split]):
+                    if str(source_record["state_ref"]) not in included_states:
+                        continue
                     output_record = copy.deepcopy(source_record)
                     output_record.pop("oracle", None)
                     output_record["grounding_target"] = grounding_target_from_source(
                         output_record
                     )
                     writer.write_many([output_record])
+                    task = str(output_record["task_type"])
+                    split_counts[task] += 1
+                    split_answer_counts[task][str(output_record["answer"])] += 1
+                    split_choice_labels[task].update(
+                        str(choice) for choice in output_record["choices"]
+                    )
+                missing_answer_labels = {
+                    task: sorted(labels - set(split_answer_counts[task]))
+                    for task, labels in split_choice_labels.items()
+                    if labels - set(split_answer_counts[task])
+                }
+                if missing_answer_labels:
+                    raise ValueError(
+                        f"Stage-2B {split} filtering removed required answer-label coverage: "
+                        f"{missing_answer_labels}."
+                    )
+            evaluation_output_counts[split] = split_counts
+            evaluation_answer_counts[split] = split_answer_counts
+            candidate_values.clear()
 
         after_digest, after_inventory = latent_inventory(latent_paths)
         if before_digest != after_digest or before_inventory != after_inventory:
@@ -1187,7 +1698,7 @@ def main() -> None:
         output_metadata = copy.deepcopy(dict(source_metadata))
         numeric_rank_summary = finalize_numeric_rank_audit(
             numeric_group_audits,
-            expected_groups_per_task=len(train_representatives),
+            expected_groups_per_task=len(included_train_states),
         )
         output_metadata.update(
             {
@@ -1211,7 +1722,8 @@ def main() -> None:
                     "numeric_min_gap_z": float(args.numeric_min_gap),
                     "region_min_gap_z": float(args.region_min_gap),
                     "region_size": int(args.region_size),
-                    "train_states": len(train_representatives),
+                    "source_train_states": len(train_representatives),
+                    "train_states": len(included_train_states),
                     "train_records": sum(output_counts.values()),
                     "train_by_task": dict(sorted(output_counts.items())),
                     "train_answers_by_task": {
@@ -1219,6 +1731,25 @@ def main() -> None:
                         for task, counts in sorted(output_answer_counts.items())
                     },
                     "numeric_rank_audit": numeric_rank_summary,
+                    "state_selection": {
+                        "policy": (
+                            "train_requires_three_stored_fp16_values_at_numeric_gap;"
+                            "region_family_requires_region_mean_gap;"
+                            "evaluation_strictly_replays_every_label_excludes_the_complete_state_"
+                            "on_constant_ambiguous_weak_gap_or_stale_numeric_compare_records_"
+                            "and_fails_on_unsupported_extreme_provenance"
+                        ),
+                        "train": train_selection,
+                        "val": evaluation_selection["val"],
+                        "test": evaluation_selection["test"],
+                    },
+                    "preserved_z_validation": {
+                        "expected_std": "latent_audit.std / latent_audit.scale",
+                        "expected_scale": "float32(latent_audit.std + 1e-6)",
+                        "constant_patch_policy": (
+                            "raw_std_zero_requires_exactly_zero_preserved_channel"
+                        ),
+                    },
                     "extreme_replay_audit": {
                         "policy": (
                             "source_float32_answer_must_belong_to_stored_fp16_tied_extreme_quadrants"
@@ -1230,7 +1761,8 @@ def main() -> None:
                         "train_numeric_and_compare": "preserved_input_channel_0_as_stored_float16",
                         "train_extreme": "validated_source_v3_variant_0_replay",
                         "val_test": (
-                            "source_v3_prompt_and_label_replay_with_non_prompt_grounding_targets"
+                            "stored_fp16_revalidated_source_v3_prompt_and_label_replay_with_"
+                            "non_prompt_grounding_targets"
                         ),
                     },
                     "grounding_annotation_contract": {
@@ -1254,16 +1786,34 @@ def main() -> None:
             raise ValueError("Copied output metadata lost summary.splits.train.")
         output_splits["train"].update(
             {
-                "patches": len(train_representatives),
+                "patches": len(included_train_states),
                 "question_variants_per_patch": 9,
                 "qa_records": sum(output_counts.values()),
                 "by_task": dict(sorted(output_counts.items())),
+                "patches_by_field": dict(train_selection["included_by_field"]),
                 "answers_by_task": {
                     task: dict(sorted(counts.items()))
                     for task, counts in sorted(output_answer_counts.items())
                 },
             }
         )
+        for split in ("val", "test"):
+            if not isinstance(output_splits.get(split), dict):
+                raise ValueError(f"Copied output metadata lost summary.splits.{split}.")
+            output_splits[split].update(
+                {
+                    "patches": int(evaluation_selection[split]["included_states"]),
+                    "qa_records": sum(evaluation_output_counts[split].values()),
+                    "by_task": dict(sorted(evaluation_output_counts[split].items())),
+                    "patches_by_field": dict(
+                        evaluation_selection[split]["included_by_field"]
+                    ),
+                    "answers_by_task": {
+                        task: dict(sorted(counts.items()))
+                        for task, counts in sorted(evaluation_answer_counts[split].items())
+                    },
+                }
+            )
         atomic_dump(output_root / "metadata.json", output_metadata)
         marker.unlink()
     except BaseException as exc:
@@ -1279,8 +1829,12 @@ def main() -> None:
         raise
 
     print(
-        f"stage2b_qa_dir={output_root} train_states={len(train_representatives)} "
+        f"stage2b_qa_dir={output_root} source_train_states={len(train_representatives)} "
+        f"train_states={len(included_train_states)} "
+        f"excluded_train_states={len(train_representatives) - len(included_train_states)} "
         f"train_records={sum(output_counts.values())} "
+        f"excluded_val_states={evaluation_selection['val']['excluded_states']} "
+        f"excluded_test_states={evaluation_selection['test']['excluded_states']} "
         "extreme_cross_quadrant_ties="
         f"{int(extreme_replay_audit_counts['cross_quadrant_tie_records'])} "
         f"latent_inventory={after_digest}"
