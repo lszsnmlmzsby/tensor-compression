@@ -14,7 +14,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -118,6 +117,26 @@ REMOVED_PATCH_ALIGNMENT_OPTIONS = (
     # The old parameter turned a noisy semantic diagnostic into a hard training gate.
     "teacher_probe_min_correlation",
 )
+
+
+def require_h5py() -> Any:
+    """Import h5py only for Stage-1 paths that actually read HDF5 data.
+
+    Stage 2 imports the alignment adapter and position-encoding utilities from
+    this module, but it trains from cached latent tensors and does not need
+    h5py.  Keeping the dependency lazy prevents that shared-code import from
+    making HDF5 support an unrelated Stage-2 startup requirement.
+    """
+    try:
+        import h5py
+    except ModuleNotFoundError as exc:
+        if exc.name != "h5py":
+            raise
+        raise ImportError(
+            "HDF5-backed Stage-1 patch alignment requires h5py. "
+            "Install the project-pinned dependency with: python -m pip install h5py==3.12.1"
+        ) from exc
+    return h5py
 
 
 def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
@@ -737,8 +756,9 @@ def checkpoint_channel_count(config: Mapping[str, Any]) -> int | None:
 
 
 def hdf5_axis_sizes(hdf5_path: str | Path, field: str) -> tuple[int, int, int, int]:
-    with h5py.File(Path(hdf5_path).expanduser(), "r") as handle:
-        if field not in handle or not isinstance(handle[field], h5py.Dataset):
+    h5py_module = require_h5py()
+    with h5py_module.File(Path(hdf5_path).expanduser(), "r") as handle:
+        if field not in handle or not isinstance(handle[field], h5py_module.Dataset):
             raise KeyError(f"HDF5 dataset key {field!r} not found in {hdf5_path}.")
         shape = tuple(int(dim) for dim in handle[field].shape)
     if len(shape) != 4:
@@ -1070,7 +1090,7 @@ class PDEBenchPatchTextDataset(Dataset):
         self.decimal_places = int(decimal_places)
         self.prompt_template = str(prompt_template)
         self.include_raw_text = bool(include_raw_text)
-        self._hdf5_handle: h5py.File | None = None
+        self._hdf5_handle: Any | None = None
         self._hdf5_pid: int | None = None
 
     def __getstate__(self) -> dict[str, Any]:
@@ -1093,14 +1113,15 @@ class PDEBenchPatchTextDataset(Dataset):
         self._hdf5_handle = None
         self._hdf5_pid = None
 
-    def _open_hdf5(self) -> h5py.File:
+    def _open_hdf5(self) -> Any:
         process_id = os.getpid()
         handle = self._hdf5_handle
         if handle is not None and self._hdf5_pid == process_id and bool(handle.id.valid):
             return handle
         # A forked worker may inherit the parent's Python object. Reopen lazily in the worker process.
         self.close()
-        self._hdf5_handle = h5py.File(self.hdf5_path, "r")
+        h5py_module = require_h5py()
+        self._hdf5_handle = h5py_module.File(self.hdf5_path, "r")
         self._hdf5_pid = process_id
         return self._hdf5_handle
 

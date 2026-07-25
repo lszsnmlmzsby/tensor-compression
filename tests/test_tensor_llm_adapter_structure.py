@@ -87,6 +87,7 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     TensorPatchAlignmentAdapter,
     alignment_adapter_path_metrics,
     alignment_adapter_parameter_metrics,
+    require_h5py,
     sinusoidal_2d_position_encoding,
 )
 
@@ -99,6 +100,23 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
         "query": question,
         "question": question,
     }
+
+
+class TestOptionalHdf5Dependency(unittest.TestCase):
+    def test_shared_stage1_utilities_report_h5py_only_when_hdf5_is_used(self) -> None:
+        original_import = __import__
+
+        def import_without_h5py(name: str, *args: object, **kwargs: object) -> object:
+            if name == "h5py":
+                raise ModuleNotFoundError("No module named 'h5py'", name="h5py")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=import_without_h5py):
+            with self.assertRaisesRegex(
+                ImportError,
+                "HDF5-backed Stage-1 patch alignment requires h5py",
+            ):
+                require_h5py()
 
 
 def _stage1_checkpoint_payload(
