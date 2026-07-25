@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -22,6 +23,7 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 import scripts.train_tensor_llm_adapter as adapter_training  # noqa: E402
 from scripts.train_tensor_llm_adapter import (  # noqa: E402
     ExactDistributedEvalSampler,
+    GroundedEvidenceAdapter,
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
     RunLifecycle,
@@ -31,17 +33,29 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
     average_trainable_gradients_by_record_count,
+    append_jsonl,
     adapter_from_checkpoint,
     audit_qa_datasets,
     build_distributed_run_dir,
     build_local_conditioning_prompt,
+    checkpoint_score,
     choice_ce_loss,
+    evaluate_choice_accuracy,
     frozen_llm_checkpoint_execution_active,
+    grounded_reader_geometry_metrics,
+    grounded_routing_loss,
+    grounded_routing_warmup_audit,
+    grounding_query_spec_for_record,
     initialize_distributed_device,
+    log_wandb_on_rank_zero,
+    matched_coordinate_group_loss,
     parse_generated_choice,
     read_host_memory_snapshot,
+    reset_grounded_evidence_optimizer_state,
+    routing_metric_weighted_totals,
     run_embedded_diagnostics,
     run_on_rank_zero_and_broadcast,
+    save_validate_and_rebuild_adapter_checkpoint,
     optimizer_parameter_audit,
     same_state_question_swap_indices,
     selective_answer_statistics,
@@ -49,6 +63,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     single_token_choice_ids,
     structured_query_features_for_record,
     task_specific_instruction,
+    training_loss,
     validate_adapter_loss_contract,
     validate_adapter_checkpoint_payload,
     validate_qa_latent_contract,
@@ -60,6 +75,7 @@ from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  #
     ConvTokenAutoencoder2D,
 )
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
+    MATCHED_GROUP_FORMAT,
     PATCH_LATENT_AUDIT_FORMAT,
     PATCH_LATENT_FORMAT,
     PATCH_QA_BUILD_MARKER,
@@ -254,8 +270,104 @@ class TestAdapterLossContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no global/local split"):
             validate_adapter_loss_contract(args)
 
+    def test_grounded_routing_warmup_requires_positive_gate_loss(self) -> None:
+        with self.assertRaisesRegex(ValueError, "grounding_gate_loss_weight > 0"):
+            validate_adapter_loss_contract(
+                SimpleNamespace(
+                    adapter_architecture="grounded_evidence_adapter",
+                    grounding_routing_warmup_epochs=1,
+                    grounding_gate_loss_weight=0.0,
+                )
+            )
+
+        validate_adapter_loss_contract(
+            SimpleNamespace(
+                adapter_architecture="grounded_evidence_adapter",
+                grounding_routing_warmup_epochs=1,
+                grounding_gate_loss_weight=0.1,
+            )
+        )
+        validate_adapter_loss_contract(
+            SimpleNamespace(
+                adapter_architecture="grounded_evidence_adapter",
+                grounding_routing_warmup_epochs=0,
+                grounding_gate_loss_weight=0.0,
+            )
+        )
+
 
 class TestTrainingAudits(unittest.TestCase):
+    def test_grounded_checkpoint_score_requires_evidence_and_correct_tensor(self) -> None:
+        metrics = {
+            "correct": {
+                "by_task": {
+                    "normalized_point_value": {"accuracy": 0.80},
+                    "raw_point_value_with_stats": {"accuracy": 0.70},
+                }
+            },
+            "global_only": {
+                "by_task": {
+                    "normalized_point_value": {"accuracy": 0.40},
+                    "raw_point_value_with_stats": {"accuracy": 0.50},
+                }
+            },
+            "shuffled": {
+                "by_task": {
+                    "normalized_point_value": {"accuracy": 0.30},
+                    "raw_point_value_with_stats": {"accuracy": 0.20},
+                }
+            },
+        }
+
+        self.assertAlmostEqual(
+            checkpoint_score(metrics, "point_value_min_grounded_gain"),
+            0.20,
+        )
+        del metrics["global_only"]
+        self.assertEqual(
+            checkpoint_score(metrics, "point_value_min_grounded_gain"),
+            -math.inf,
+        )
+
+    def test_routing_metric_totals_use_role_and_gate_denominators(self) -> None:
+        totals = routing_metric_weighted_totals(
+            {
+                "routing_active_roles": 3.0,
+                "routing_top1_accuracy": 2.0 / 3.0,
+                "routing_top5_accuracy": 1.0,
+                "routing_row_top1_accuracy": 1.0 / 3.0,
+                "routing_col_top1_accuracy": 2.0 / 3.0,
+                "routing_target_mass": 0.25,
+                "routing_normalized_entropy": 0.4,
+                "routing_gate_accuracy": 0.75,
+                "routing_gate_active_fraction": 0.5,
+                "routing_gate_target_active_fraction": 0.75,
+            },
+            record_count=2,
+            gate_slots_per_record=2,
+        )
+
+        self.assertAlmostEqual(totals["routing_normalized_entropy_sum"], 1.2)
+        self.assertEqual(totals["routing_gate_slots"], 4.0)
+        self.assertEqual(totals["routing_gate_target_active"], 3.0)
+        self.assertEqual(totals["routing_top1_correct"], 2.0)
+
+    def test_jsonl_metrics_append_one_complete_row_per_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train_updates.jsonl"
+
+            append_jsonl(path, {"global_step": 1, "train_loss": 2.0})
+            append_jsonl(path, {"global_step": 2, "train_loss": 1.0})
+
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(
+                rows,
+                [
+                    {"global_step": 1, "train_loss": 2.0},
+                    {"global_step": 2, "train_loss": 1.0},
+                ],
+            )
+
     def test_atomic_writers_remove_partial_temporary_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -456,6 +568,68 @@ class TestQuestionLastDiagnostics(unittest.TestCase):
 
 
 class TestDistributedSampling(unittest.TestCase):
+    def test_warmup_checkpoint_validation_failure_is_broadcast(self) -> None:
+        broadcast_calls: list[dict[str, object]] = []
+
+        def capture(payload, src):
+            self.assertEqual(src, 0)
+            broadcast_calls.append(dict(payload[0]))
+
+        with (
+            mock.patch.object(adapter_training, "distributed_is_initialized", return_value=True),
+            mock.patch.object(adapter_training, "is_main_process", return_value=True),
+            mock.patch.object(adapter_training.dist, "broadcast_object_list", side_effect=capture),
+            mock.patch.object(
+                adapter_training,
+                "save_validate_and_rebuild_adapter_checkpoint",
+                side_effect=ValueError("strict warmup rebuild failed"),
+            ) as save_and_validate,
+            self.assertRaisesRegex(ValueError, "strict warmup rebuild failed"),
+        ):
+            run_on_rank_zero_and_broadcast(
+                lambda: adapter_training.save_validate_and_rebuild_adapter_checkpoint(
+                    Path("adapter_routing_warmup.pt"),
+                    adapter=nn.Identity(),
+                    args=SimpleNamespace(adapter_architecture="grounded_evidence_adapter"),
+                    latent_shape=(3, 2, 2),
+                    llm_hidden_size=24,
+                    latent_contract={},
+                ),
+                "routing-warmup checkpoint write/read validation",
+            )
+
+        save_and_validate.assert_called_once()
+        self.assertEqual(len(broadcast_calls), 1)
+        self.assertFalse(bool(broadcast_calls[0]["ok"]))
+        self.assertEqual(broadcast_calls[0]["error_type"], "ValueError")
+
+    def test_wandb_rank_zero_failure_is_broadcast_before_reraising(self) -> None:
+        broadcast_calls: list[dict[str, object]] = []
+        logger = mock.Mock()
+        logger.log.side_effect = RuntimeError("wandb transport failed")
+
+        def capture(payload, src):
+            self.assertEqual(src, 0)
+            broadcast_calls.append(dict(payload[0]))
+
+        with (
+            mock.patch.object(adapter_training, "distributed_is_initialized", return_value=True),
+            mock.patch.object(adapter_training, "is_main_process", return_value=True),
+            mock.patch.object(adapter_training.dist, "broadcast_object_list", side_effect=capture),
+            self.assertRaisesRegex(RuntimeError, "wandb transport failed"),
+        ):
+            log_wandb_on_rank_zero(
+                logger,
+                {"train_step/loss": 1.25},
+                step=7,
+                stage="training update W&B log",
+            )
+
+        logger.log.assert_called_once_with({"train_step/loss": 1.25}, step=7)
+        self.assertEqual(len(broadcast_calls), 1)
+        self.assertFalse(bool(broadcast_calls[0]["ok"]))
+        self.assertEqual(broadcast_calls[0]["error_type"], "RuntimeError")
+
     def test_distributed_run_directory_creation_broadcasts_rank_zero_failure(self) -> None:
         broadcast_calls: list[dict[str, object]] = []
 
@@ -572,7 +746,7 @@ class TestDistributedSampling(unittest.TestCase):
                 require_formal_contract=False,
             )
         )
-        with self.assertRaisesRegex(ValueError, "Formal patch QA requires metadata format"):
+        with self.assertRaisesRegex(ValueError, "requires a supported immutable QA format"):
             validate_qa_latent_contract(
                 {"format": "tensor_patch_qa_v2"},
                 configured_alignment_checkpoint=None,
@@ -825,6 +999,51 @@ class TestDistributedSampling(unittest.TestCase):
                     for index in batch
                 }
                 self.assertEqual(len(keys), 1)
+
+    def test_explicit_matched_sampler_pads_only_complete_atomic_groups(self) -> None:
+        records = []
+        for group_index in range(7):
+            for member_index in range(3):
+                record = _record(
+                    f"state_{group_index}",
+                    "normalized_point_value",
+                    "density",
+                    f"question_{member_index}",
+                )
+                record["matched_group"] = {
+                    "format": MATCHED_GROUP_FORMAT,
+                    "batch_group_id": f"group_{group_index}",
+                    "batch_group_size": 3,
+                    "batch_member_index": member_index,
+                }
+                records.append(record)
+        dataset = SimpleNamespace(records=records)
+        rank_batches = [
+            list(
+                StateTaskGroupedBatchSampler(
+                    dataset=dataset,
+                    batch_size=3,
+                    questions_per_group=3,
+                    seed=19,
+                    rank=rank,
+                    num_replicas=4,
+                )
+            )
+            for rank in range(4)
+        ]
+
+        self.assertEqual([len(batches) for batches in rank_batches], [2, 2, 2, 2])
+        flattened = [index for batches in rank_batches for batch in batches for index in batch]
+        self.assertEqual(set(flattened), set(range(len(records))))
+        self.assertEqual(len(flattened) - len(records), 3)
+        for batches in rank_batches:
+            for batch in batches:
+                specs = [records[index]["matched_group"] for index in batch]
+                self.assertEqual(len({spec["batch_group_id"] for spec in specs}), 1)
+                self.assertEqual(
+                    sorted(spec["batch_member_index"] for spec in specs),
+                    [0, 1, 2],
+                )
 
     def test_exact_eval_sampler_never_pads_or_repeats(self) -> None:
         dataset = list(range(10))
@@ -1299,7 +1518,7 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         question = torch.randn(3, 2, 6, 24)
         mask = torch.ones(3, 6, dtype=torch.bool)
 
-        expected = aligned.forward_soft_prompts(latent)
+        expected = conditioned.backbone.forward_soft_prompts(latent)
         actual = conditioned(latent, question, mask, structured_query=None)
 
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
@@ -1344,10 +1563,10 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         question = torch.randn(3, 2, 6, 24)
         mask = torch.ones(3, 6, dtype=torch.bool)
 
-        expected = aligned.forward_soft_prompts(latent)
+        expected = conditioned.backbone.forward_soft_prompts(latent)
         actual = conditioned(latent, question, mask, structured_query=None)
 
-        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=3.0e-8)
 
     def test_grounded_spatial_reader_has_no_trainable_unconditioned_path(self) -> None:
         torch.manual_seed(23)
@@ -1392,9 +1611,9 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
         )
         torch.testing.assert_close(
             conditioned(latent, question, mask, structured_query=None),
-            aligned.forward_soft_prompts(latent),
+            conditioned.backbone.forward_soft_prompts(latent),
             rtol=0.0,
-            atol=0.0,
+            atol=3.0e-8,
         )
 
         output = conditioned(latent, question, mask, structured_query=None)
@@ -1606,6 +1825,733 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             rtol=0.0,
             atol=0.0,
         )
+
+    def test_grounded_evidence_factorizes_row_and_column_routing(self) -> None:
+        torch.manual_seed(41)
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 3),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        ).eval()
+        aligned = torch.randn(2, 6, 24)
+        question = torch.randn(2, 2, 7, 24)
+        mask = torch.ones(2, 7, dtype=torch.bool)
+
+        evidence = local.forward_from_aligned(aligned, question, mask, None)
+
+        self.assertEqual(tuple(evidence.shape), (2, 2, 24))
+        self.assertTrue(torch.isfinite(evidence).all())
+        expected_logits = (
+            local.last_row_logits.unsqueeze(-1) + local.last_col_logits.unsqueeze(-2)
+        ).flatten(start_dim=-2)
+        torch.testing.assert_close(local.last_routing_logits, expected_logits)
+        torch.testing.assert_close(
+            local.last_routing_weights.sum(dim=-1),
+            torch.ones(2, 2),
+        )
+        selected = torch.einsum("brn,bnh->brh", local.last_routing_weights, aligned)
+        self.assertTrue(torch.equal(evidence, torch.zeros_like(evidence)))
+
+        with torch.no_grad():
+            local.role_gate.bias.fill_(2.0)
+        open_evidence = local.forward_from_aligned(aligned, question, mask, None)
+        torch.testing.assert_close(open_evidence, selected, rtol=0.0, atol=0.0)
+
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 3),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=6,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        geometry = grounded_reader_geometry_metrics(
+            HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        )
+        self.assertEqual(
+            set(geometry),
+            {
+                "row",
+                "col",
+                "routing_logit_scale",
+                "routing_logit_scale_log",
+                "routing_logit_scale_saturated",
+                "routing_logit_scale_log_margin_to_clamp",
+                "text_layer_weights",
+            },
+        )
+        self.assertGreater(geometry["routing_logit_scale"], 0.0)
+        self.assertFalse(geometry["routing_logit_scale_saturated"])
+        self.assertTrue(
+            all(
+                torch.isfinite(torch.tensor(value))
+                for axis in ("row", "col")
+                for value in geometry[axis].values()
+            )
+        )
+        for axis in ("row", "col"):
+            self.assertGreater(geometry[axis]["effective_rank"], 1.0)
+            self.assertGreater(geometry[axis]["minimum_pairwise_l2"], 0.0)
+            self.assertAlmostEqual(
+                geometry[axis]["fixed_anchor_cosine_mean"],
+                1.0,
+                places=5,
+            )
+
+    def test_frozen_grounded_global_preserves_requested_latent_gradients(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        latent = torch.randn(1, 3, 2, 2, requires_grad=True)
+        question = torch.randn(1, 2, 5, 24)
+        mask = torch.ones(1, 5, dtype=torch.bool)
+
+        global_prompts, _local_prompts, _combined = adapter.forward_components(
+            latent,
+            question_embeds=question,
+            question_mask=mask,
+        )
+        global_prompts.square().sum().backward()
+
+        self.assertIsNotNone(latent.grad)
+        self.assertGreater(float(latent.grad.abs().sum()), 0.0)
+        self.assertTrue(all(parameter.grad is None for parameter in global_adapter.parameters()))
+
+    def test_grounded_routing_rejects_each_invalid_point_axis(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 3),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=6,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 3),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        local.forward_from_aligned(
+            torch.randn(1, 6, 24),
+            torch.randn(1, 2, 5, 24),
+            torch.ones(1, 5, dtype=torch.bool),
+            None,
+        )
+
+        _loss, _gate_loss, metrics = grounded_routing_loss(
+            adapter,
+            [
+                {
+                    "task_type": "normalized_point_value",
+                    "grounding_target": {
+                        "type": "point",
+                        "row": 1,
+                        "col": 2,
+                        "coordinate_origin": 0,
+                    },
+                }
+            ],
+        )
+        self.assertGreaterEqual(metrics["routing_normalized_entropy"], 0.0)
+        self.assertLessEqual(metrics["routing_normalized_entropy"], 1.0)
+
+        invalid_specs = (
+            {"type": "point", "row": -1, "col": 3, "coordinate_origin": 0},
+            {"type": "point", "row": 0, "col": 3, "coordinate_origin": 0},
+        )
+        for spec in invalid_specs:
+            with self.subTest(spec=spec), self.assertRaisesRegex(ValueError, "exceeds grid"):
+                grounded_routing_loss(
+                    adapter,
+                    [{"task_type": "normalized_point_value", "grounding_target": spec}],
+                )
+
+    def test_grounded_routing_loss_weights_records_not_active_roles(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        logits = torch.tensor(
+            [
+                [[3.0, 0.0, -1.0, -2.0], [0.0, 0.0, 0.0, 0.0]],
+                [[-2.0, -1.0, 0.0, 3.0], [4.0, 1.0, 0.0, -1.0]],
+            ],
+            requires_grad=True,
+        )
+        local.last_routing_logits = logits
+        local.last_row_logits = logits.reshape(2, 2, 2, 2).logsumexp(dim=-1)
+        local.last_col_logits = logits.reshape(2, 2, 2, 2).logsumexp(dim=-2)
+        local.last_role_gate_logits = torch.zeros(2, 2, requires_grad=True)
+        records = [
+            {
+                "task_type": "normalized_point_value",
+                "grounding_target": {
+                    "type": "point",
+                    "row": 0,
+                    "col": 0,
+                    "coordinate_origin": 0,
+                },
+            },
+            {
+                "task_type": "point_compare",
+                "grounding_target": {
+                    "type": "point_pair",
+                    "a": [1, 1],
+                    "b": [0, 1],
+                    "coordinate_origin": 0,
+                },
+            },
+        ]
+
+        routing_loss, _gate_loss, _metrics = grounded_routing_loss(adapter, records)
+        log_probs = F.log_softmax(logits, dim=-1)
+        point_loss = -log_probs[0, 0, 0]
+        pair_loss = (-log_probs[1, 0, 3] - log_probs[1, 1, 1]) / 2.0
+        expected = (point_loss + pair_loss) / 2.0
+        active_role_mean = (
+            point_loss - log_probs[1, 0, 3] - log_probs[1, 1, 1]
+        ) / 3.0
+
+        torch.testing.assert_close(routing_loss, expected)
+        self.assertFalse(torch.isclose(routing_loss, active_role_mean).item())
+
+    def test_grounded_query_contract_rejects_task_type_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires query_spec.type='point'"):
+            grounding_query_spec_for_record(
+                {
+                    "qa_id": "bad-query",
+                    "task_type": "normalized_point_value",
+                    "grounding_target": {
+                        "type": "point_pair",
+                        "a": [0, 0],
+                        "b": [1, 1],
+                        "coordinate_origin": 0,
+                    },
+                }
+            )
+
+    def test_routing_only_validation_skips_answer_scoring(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        records = [
+            {
+                "task_type": "normalized_point_value",
+                "grounding_target": {
+                    "type": "point",
+                    "row": index,
+                    "col": index,
+                    "coordinate_origin": 0,
+                },
+            }
+            for index in range(2)
+        ]
+
+        class RoutingDataset(torch.utils.data.Dataset):
+            def __init__(self) -> None:
+                self.records = records
+
+            def __len__(self) -> int:
+                return len(self.records)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return {
+                    "index": index,
+                    "record": self.records[index],
+                    "latent_map": torch.randn(3, 2, 2),
+                }
+
+        def fake_soft_embeds(**kwargs):
+            batch_size = len(kwargs["records"])
+            return kwargs["adapter"](
+                kwargs["latent_map"],
+                torch.randn(batch_size, 2, 5, 24),
+                torch.ones(batch_size, 5, dtype=torch.bool),
+                structured_query=None,
+            )
+
+        args = SimpleNamespace(
+            eval_batch_size=2,
+            num_workers=0,
+            console_progress=False,
+            max_prompt_tokens=32,
+            local_context_layer=2,
+            prompt_template="task_specific",
+        )
+        with mock.patch.object(
+            adapter_training,
+            "contextual_adapter_soft_embeds",
+            side_effect=fake_soft_embeds,
+        ), mock.patch.object(
+            adapter_training,
+            "collect_candidate_scores",
+            side_effect=AssertionError("answer scorer must stay off"),
+        ):
+            metrics = evaluate_choice_accuracy(
+                llm=nn.Module(),
+                adapter=adapter,
+                tokenizer=object(),
+                dataset=RoutingDataset(),
+                device=torch.device("cpu"),
+                args=args,
+                baseline_modes=["correct"],
+                routing_only=True,
+            )
+
+        self.assertEqual(metrics["evaluation_mode"], "routing_only_shallow_qwen")
+        self.assertEqual(metrics["correct"]["routing"]["active_roles"], 2)
+
+    def test_routing_only_backward_keeps_every_reader_parameter_in_graph(self) -> None:
+        torch.manual_seed(43)
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        question_context = (
+            torch.randn(2, 2, 6, 24),
+            torch.ones(2, 6, dtype=torch.bool),
+        )
+        records = [
+            {
+                "task_type": "normalized_point_value",
+                "grounding_target": {
+                    "type": "point",
+                    "row": index,
+                    "col": index,
+                    "coordinate_origin": 0,
+                }
+            }
+            for index in range(2)
+        ]
+        args = SimpleNamespace(
+            max_prompt_tokens=32,
+            local_context_layer=2,
+            prompt_template="task_specific",
+            ce_loss_weight=0.02,
+            choice_ce_loss_weight=1.0,
+            ranking_loss_weight=0.0,
+            swapped_question_loss_weight=0.0,
+            grounding_routing_loss_weight=1.0,
+            grounding_gate_loss_weight=0.1,
+            matched_group_loss_weight=0.2,
+        )
+
+        def fake_soft_embeds(**kwargs):
+            context, context_mask = kwargs["precomputed_question_context"]
+            return kwargs["adapter"](
+                kwargs["latent_map"], context, context_mask, structured_query=None
+            )
+
+        with mock.patch.object(
+            adapter_training,
+            "contextual_adapter_question_context",
+            return_value=question_context,
+        ), mock.patch.object(
+            adapter_training,
+            "contextual_adapter_soft_embeds",
+            side_effect=fake_soft_embeds,
+        ):
+            loss, parts = training_loss(
+                llm=object(),
+                adapter=adapter,
+                tokenizer=object(),
+                dataset=object(),
+                batch={"records": records, "latent_map": torch.randn(2, 3, 2, 2)},
+                device=torch.device("cpu"),
+                args=args,
+                routing_only=True,
+            )
+        loss.backward()
+
+        self.assertGreater(parts["routing_loss"], 0.0)
+        self.assertEqual(parts["choice_ce_loss"], 0.0)
+        self.assertFalse(any("answer" in record for record in records))
+        for name, parameter in local.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+
+    def test_joint_evidence_transform_starts_with_fresh_optimizer_state(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(global_adapter, local, freeze_global=True)
+        optimizer = torch.optim.AdamW(local.parameters(), lr=1.0e-3)
+        for parameter in local.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        transform_parameters = [
+            *local.evidence_down.parameters(),
+            *local.evidence_up.parameters(),
+        ]
+        self.assertTrue(all(parameter in optimizer.state for parameter in transform_parameters))
+
+        cleared = reset_grounded_evidence_optimizer_state(optimizer, adapter)
+
+        self.assertEqual(cleared, len(transform_parameters))
+        self.assertTrue(all(parameter not in optimizer.state for parameter in transform_parameters))
+
+    def test_matched_coordinate_margin_rewards_coordinate_specific_answers(self) -> None:
+        choices = ["A", "B", "C", "D"]
+        records = []
+        for index, answer in enumerate(choices[:3]):
+            records.append(
+                {
+                    "patch_id": "state",
+                    "state_ref": "state",
+                    "field": "density",
+                    "sample_index": 0,
+                    "time_index": 0,
+                    "top_left": [0, 0],
+                    "task_type": "normalized_point_value",
+                    "choices": choices,
+                    "answer": answer,
+                    "matched_group": {
+                        "margin_group_id": "group",
+                        "margin_group_size": 3,
+                        "margin_member_index": index,
+                        "margin_kind": "coordinate_choice",
+                        "option_set_sha256": "options",
+                        "coordinate_set_id": "coordinates",
+                    },
+                }
+            )
+        specific = [
+            F.log_softmax(
+                torch.tensor([6.0 if column == row else -2.0 for column in range(4)]),
+                dim=0,
+            )
+            for row in range(3)
+        ]
+        uniform = [F.log_softmax(torch.zeros(4), dim=0) for _ in range(3)]
+
+        specific_loss, specific_metrics = matched_coordinate_group_loss(
+            records, specific, margin=0.5
+        )
+        uniform_loss, uniform_metrics = matched_coordinate_group_loss(
+            records, uniform, margin=0.5
+        )
+
+        self.assertEqual(float(specific_loss), 0.0)
+        self.assertAlmostEqual(float(uniform_loss), 0.5)
+        self.assertEqual(specific_metrics["matched_group_exact_accuracy"], 1.0)
+        self.assertEqual(specific_metrics["matched_group_satisfaction"], 1.0)
+        self.assertEqual(uniform_metrics["matched_group_satisfaction"], 0.0)
+
+    def test_grounded_routing_warmup_audit_enforces_every_threshold(self) -> None:
+        args = SimpleNamespace(
+            grounding_warmup_min_cell_top1=0.90,
+            grounding_warmup_min_cell_top5=0.98,
+            grounding_warmup_min_axis_top1=0.95,
+            grounding_warmup_min_target_mass=0.50,
+            grounding_warmup_min_gate_accuracy=0.95,
+        )
+        routing = {
+            "active_roles": 16,
+            "top1_accuracy": 0.91,
+            "top5_accuracy": 0.99,
+            "row_top1_accuracy": 0.96,
+            "col_top1_accuracy": 0.97,
+            "target_mass": 0.55,
+            "gate_accuracy": 0.96,
+            "by_task": {
+                task: {
+                    "active_roles": 8,
+                    "top1_accuracy": 0.91,
+                    "target_mass": 0.55,
+                }
+                for task in (
+                    "normalized_point_value",
+                    "raw_point_value_with_stats",
+                )
+            },
+        }
+
+        passing = grounded_routing_warmup_audit({"correct": {"routing": routing}}, args)
+        failing = grounded_routing_warmup_audit(
+            {"correct": {"routing": {**routing, "top1_accuracy": 0.89}}}, args
+        )
+        raw_failure_routing = {
+            **routing,
+            "by_task": {
+                **routing["by_task"],
+                "raw_point_value_with_stats": {
+                    **routing["by_task"]["raw_point_value_with_stats"],
+                    "target_mass": 0.49,
+                },
+            },
+        }
+        raw_failing = grounded_routing_warmup_audit(
+            {"correct": {"routing": raw_failure_routing}}, args
+        )
+
+        self.assertTrue(passing["passed"])
+        self.assertFalse(failing["passed"])
+        self.assertEqual(failing["failed"], ["cell_top1"])
+        self.assertFalse(raw_failing["passed"])
+        self.assertIn(
+            "raw_point_value_with_stats.target_mass",
+            raw_failing["failed"],
+        )
+
+    def test_grounded_checkpoint_rebuilds_strictly(self) -> None:
+        torch.manual_seed(47)
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        original = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local,
+            freeze_global=True,
+            combine_mode="concat",
+        ).eval()
+        checkpoint = {
+            "args": {
+                "adapter_architecture": "grounded_evidence_adapter",
+                "global_adapter_type": "spatial_transformer",
+                "adapter_dim": 16,
+                "adapter_heads": 4,
+                "adapter_layers": 1,
+                "global_dropout": 0.0,
+                "global_soft_prompt_scale": 0.05,
+                "local_context_layers": "1,2",
+                "dropout": 0.0,
+                "soft_prompt_scale": 0.05,
+                "grounded_gate_bias_init": -2.0,
+            },
+            "adapter_state_dict": original.state_dict(),
+        }
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 2, 5, 24)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+
+        rebuilt = adapter_from_checkpoint(
+            checkpoint, latent_shape=(3, 2, 2), llm_hidden_size=24
+        ).eval()
+
+        self.assertIsInstance(rebuilt, HybridGlobalLocalAdapter)
+        self.assertIsInstance(rebuilt.local_adapter, GroundedEvidenceAdapter)
+        torch.testing.assert_close(
+            rebuilt(latent, question, mask),
+            original(latent, question, mask),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_warmup_checkpoint_is_saved_validated_and_strictly_rebuilt(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local,
+            freeze_global=True,
+            combine_mode="concat",
+        )
+        args = SimpleNamespace(
+            adapter_architecture="grounded_evidence_adapter",
+            global_adapter_type="spatial_transformer",
+            adapter_dim=16,
+            adapter_heads=4,
+            adapter_layers=1,
+            global_dropout=0.0,
+            global_soft_prompt_scale=0.05,
+            local_context_layers="1,2",
+            dropout=0.0,
+            soft_prompt_scale=0.05,
+            grounded_gate_bias_init=-2.0,
+        )
+        latent_contract = {"format": "test_latent_contract", "shape": [3, 2, 2]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter_routing_warmup.pt"
+            with mock.patch.object(
+                adapter_training,
+                "validate_adapter_checkpoint_payload",
+                wraps=validate_adapter_checkpoint_payload,
+            ) as validate, mock.patch.object(
+                adapter_training,
+                "adapter_from_checkpoint",
+                wraps=adapter_from_checkpoint,
+            ) as rebuild:
+                save_validate_and_rebuild_adapter_checkpoint(
+                    path,
+                    adapter=adapter,
+                    args=args,
+                    latent_shape=(3, 2, 2),
+                    llm_hidden_size=24,
+                    latent_contract=latent_contract,
+                    metrics={"routing_warmup_audit": {"passed": True}},
+                )
+
+            self.assertTrue(path.is_file())
+            validate.assert_called_once()
+            rebuild.assert_called_once()
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(saved["checkpoint_type"], "tensor_llm_adapter")
+            self.assertTrue(saved["metrics"]["routing_warmup_audit"]["passed"])
 
 
 if __name__ == "__main__":

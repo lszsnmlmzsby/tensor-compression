@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Mechanism-oriented diagnostics for the direct spatial Stage-2 adapter.
+"""Mechanism-oriented diagnostics for direct and grounded spatial Stage-2 adapters.
 
 This script deliberately keeps diagnostics separate from the training path.  It
 uses the formal single-token restricted-choice logits, then adds three probes:
@@ -47,6 +47,7 @@ from scripts.diagnose_spatial_token_readout import (  # noqa: E402
     unique_state_examples,
 )
 from scripts.train_tensor_llm_adapter import (  # noqa: E402
+    GroundedEvidenceAdapter,
     HybridGlobalLocalAdapter,
     TensorReadoutQADataset,
     _decoder_for_diagnostics,
@@ -224,7 +225,11 @@ def preflight_checkpoint_envelope(
     if not isinstance(checkpoint_args, Mapping):
         raise ValueError("Stage-2 checkpoint has no args mapping.")
     if str(checkpoint_args.get("adapter_architecture", "")) != str(expected_architecture):
-        raise ValueError("Stage-2 checkpoint architecture is not alignment_adapter.")
+        raise ValueError(
+            "Stage-2 checkpoint architecture differs from the requested diagnostic contract: "
+            f"checkpoint={checkpoint_args.get('adapter_architecture')!r}, "
+            f"expected={expected_architecture!r}."
+        )
     if not isinstance(checkpoint.get("latent_contract"), Mapping):
         raise ValueError("Formal Stage-2 checkpoint is missing latent_contract provenance.")
     if expected_latent_contract is not None and dict(checkpoint.get("latent_contract", {})) != dict(expected_latent_contract):
@@ -1967,12 +1972,11 @@ def _text_control_variants(record: Mapping[str, Any], latent: torch.Tensor) -> l
     stats = parse_stats(record)
     if task == "raw_point_value_with_stats" and stats is not None:
         mean, scale = stats
-        raw_value = mean + scale * z_value
         variants.append(
             (
-                "explicit_z_mean_scale_raw",
+                "explicit_z_mean_scale_no_result",
                 f"Diagnostic numeric facts: standardized z at the requested cell is {z_value:.8g}; "
-                f"mean is {mean:.8g}; scale is {scale:.8g}; therefore x is {raw_value:.8g}.",
+                f"mean is {mean:.8g}; scale is {scale:.8g}. Compute x = mean + scale * z.",
             )
         )
     return variants
@@ -2053,6 +2057,25 @@ def run_text_controls(
             for row_index, record in enumerate(batch_records):
                 rows.append(prediction_row(record, logits[row_index], labels[row_index], prefix=f"{variant}__"))
         state_refs = [str(row.get("state_ref", "")) for row in rows]
+        by_task: dict[str, Any] = {}
+        for task in sorted({str(row.get("task_type", "unknown")) for row in rows}):
+            task_rows = [row for row in rows if str(row.get("task_type", "unknown")) == task]
+            task_states = [str(row.get("state_ref", "")) for row in task_rows]
+            by_task[task] = {
+                "n_records": len(task_rows),
+                "accuracy": _cluster_metric(
+                    [1.0 if bool(row["correct"]) else 0.0 for row in task_rows],
+                    task_states,
+                    args,
+                    403,
+                ),
+                "margin": _cluster_metric(
+                    [float(row["margin"]) for row in task_rows],
+                    task_states,
+                    args,
+                    404,
+                ),
+            }
         result["variants"][variant] = {
             "n_records": len(rows),
             "accuracy": _cluster_metric(
@@ -2065,6 +2088,7 @@ def run_text_controls(
                 "max": max(token_counts) if token_counts else None,
             },
             "errors": errors[:8],
+            "by_task": by_task,
             "examples": rows[: min(12, len(rows))],
         }
     return result
@@ -2716,14 +2740,21 @@ def main() -> None:
     checkpoint = load_checkpoint(checkpoint_path)
     args, stage1_path = configure_runtime_args(raw_args, checkpoint)
     validate_diagnostic_args(args)
-    if str(args.adapter_architecture) != "alignment_adapter":
-        raise ValueError(
-            "This diagnostic requires adapter_architecture=alignment_adapter; "
-            f"observed {args.adapter_architecture!r}."
-        )
     checkpoint_args = checkpoint.get("args")
     if not isinstance(checkpoint_args, Mapping):
         raise ValueError("Stage-2 checkpoint has no args mapping.")
+    checkpoint_architecture = str(checkpoint_args.get("adapter_architecture", ""))
+    supported_architectures = {"alignment_adapter", "grounded_evidence_adapter"}
+    if checkpoint_architecture not in supported_architectures:
+        raise ValueError(
+            "This diagnostic supports alignment_adapter and grounded_evidence_adapter, got "
+            f"{checkpoint_architecture!r}."
+        )
+    if str(args.adapter_architecture) != checkpoint_architecture:
+        raise ValueError(
+            "Runtime adapter architecture differs from the checkpoint contract: "
+            f"runtime={args.adapter_architecture!r}, checkpoint={checkpoint_architecture!r}."
+        )
     # The frozen decoder is part of the formal scoring contract.  A same-width
     # but different Qwen/tokenizer would make every logit comparison invalid.
     try:
@@ -2742,7 +2773,7 @@ def main() -> None:
     latent_contract = qa_audit.get("latent_contract") if isinstance(qa_audit, Mapping) else None
     preflight_checkpoint_envelope(
         checkpoint,
-        expected_architecture="alignment_adapter",
+        expected_architecture=checkpoint_architecture,
         expected_latent_contract=latent_contract if isinstance(latent_contract, Mapping) else None,
     )
     apply_runtime_environment(args)
@@ -2847,7 +2878,7 @@ def main() -> None:
             checkpoint,
             expected_latent_shape=tuple(int(value) for value in first_latent.shape),
             expected_llm_hidden_size=int(llm.get_input_embeddings().embedding_dim),
-            expected_architecture="alignment_adapter",
+            expected_architecture=checkpoint_architecture,
             expected_latent_contract=latent_contract,
         )
     else:
@@ -2860,16 +2891,20 @@ def main() -> None:
     stage2_adapter.eval()
     expected_tokens = int(first_latent.shape[-2]) * int(first_latent.shape[-1])
     if isinstance(stage2_adapter, HybridGlobalLocalAdapter):
-        raise TypeError("This diagnostic is for a direct alignment adapter, not a question-conditioned Hybrid adapter.")
-    if int(getattr(stage2_adapter, "soft_prompt_tokens", -1)) != expected_tokens:
+        if not isinstance(stage2_adapter.local_adapter, GroundedEvidenceAdapter):
+            raise TypeError("Only the factorized grounded-evidence Hybrid adapter is supported here.")
+        stage2_spatial_adapter = stage2_adapter.global_adapter
+    else:
+        stage2_spatial_adapter = stage2_adapter
+    if int(getattr(stage2_spatial_adapter, "soft_prompt_tokens", -1)) != expected_tokens:
         raise ValueError(
             "Direct grounding diagnostics require one row-major soft token per latent cell: "
-            f"observed={getattr(stage2_adapter, 'soft_prompt_tokens', None)}, expected={expected_tokens}."
+            f"observed={getattr(stage2_spatial_adapter, 'soft_prompt_tokens', None)}, expected={expected_tokens}."
         )
-    if str(getattr(stage2_adapter, "adapter_type", "")) != "spatial_transformer":
+    if str(getattr(stage2_spatial_adapter, "adapter_type", "")) != "spatial_transformer":
         raise ValueError(
             "Direct grounding diagnostics require global_adapter_type=spatial_transformer; "
-            f"observed {getattr(stage2_adapter, 'adapter_type', None)!r}."
+            f"observed {getattr(stage2_spatial_adapter, 'adapter_type', None)!r}."
         )
     stage1_adapter: nn.Module | None = None
     stage1_checkpoint_summary: dict[str, Any] = {}
@@ -2919,6 +2954,7 @@ def main() -> None:
             "Use spatial_probe R2 and representation drift only as auxiliary support; never require a linear cell readout as the grounding criterion.",
         ],
         "checkpoint": str(checkpoint_path),
+        "adapter_architecture": checkpoint_architecture,
         "stage1_checkpoint": str(stage1_path) if stage1_path else None,
         "checkpoint_summary": _checkpoint_summary(checkpoint),
         "checkpoint_metrics": dict(checkpoint.get("metrics", {})) if isinstance(checkpoint.get("metrics"), Mapping) else {},
@@ -2961,8 +2997,14 @@ def main() -> None:
             "candidate_tokenization": "single_distinct_token_required",
             "oracle_passed_to_model": False,
             "text_controls_derive_values_from_latent": True,
-            "direct_adapter_prefix_depends_on_query": False,
-            "coordinate_routing_location": "frozen_llm_attention_over_query_invariant_spatial_prefix",
+            "adapter_prefix_depends_on_query": (
+                checkpoint_architecture == "grounded_evidence_adapter"
+            ),
+            "coordinate_routing_location": (
+                "grounded_adapter_factorized_row_column_reader"
+                if checkpoint_architecture == "grounded_evidence_adapter"
+                else "frozen_llm_attention_over_query_invariant_spatial_prefix"
+            ),
             "choice_tokenization": choice_tokenization,
         },
         "qa_metadata_audit": qa_audit,
@@ -3041,7 +3083,7 @@ def main() -> None:
             train_dataset,
             val_dataset,
             llm,
-            stage2_adapter,
+            stage2_spatial_adapter,
             stage1_adapter,
             tokenizer,
             args,

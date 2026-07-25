@@ -19,6 +19,7 @@ from scripts.diagnose_direct_tensor_grounding import (
     parse_coordinates,
     parse_numeric_options,
     parse_region_specs,
+    preflight_checkpoint_envelope,
     region_cells,
     text_control_prompt,
     validate_diagnostic_args,
@@ -52,6 +53,30 @@ def point_record(task: str = "normalized_point_value") -> dict:
 
 
 class TestDirectGroundingPrimitives(unittest.TestCase):
+    def test_checkpoint_preflight_accepts_direct_and_grounded_architectures(self) -> None:
+        latent_contract = {"format": "latent-v1"}
+        for architecture in ("alignment_adapter", "grounded_evidence_adapter"):
+            checkpoint = {
+                "checkpoint_type": "tensor_llm_adapter",
+                "checkpoint_version": 2,
+                "adapter_state_dict": {"weight": torch.ones(1)},
+                "args": {"adapter_architecture": architecture},
+                "latent_contract": latent_contract,
+            }
+
+            preflight_checkpoint_envelope(
+                checkpoint,
+                expected_architecture=architecture,
+                expected_latent_contract=latent_contract,
+            )
+
+        with self.assertRaisesRegex(ValueError, "differs from the requested"):
+            preflight_checkpoint_envelope(
+                checkpoint,
+                expected_architecture="alignment_adapter",
+                expected_latent_contract=latent_contract,
+            )
+
     def test_zero_max_records_means_unlimited(self) -> None:
         args = argparse.Namespace(
             max_records=0,

@@ -34,15 +34,18 @@ if str(SRC_ROOT) not in sys.path:
 
 from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     TensorPatchAlignmentAdapter,
+    sinusoidal_2d_position_encoding,
     synchronize_gradients,
 )
 
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     PATCH_LATENT_AUDIT_FORMAT,
     PATCH_LATENT_FORMAT,
+    PATCH_MATCHED_QA_FORMAT,
     PATCH_QA_BUILD_MARKER,
     PATCH_QA_FORMAT,
     PATCH_QA_PROMPT_CONTRACT,
+    MATCHED_GROUP_FORMAT,
     canonical_normalization,
     canonical_path,
     latent_identity_from_record,
@@ -87,7 +90,12 @@ SUPPORTED_BASELINE_MODES = {
 }
 DIRECT_ALIGNMENT_ARCHITECTURES = frozenset({"alignment_qformer", "alignment_adapter"})
 CONTEXTUAL_LOCAL_ARCHITECTURES = frozenset(
-    {"hybrid_local_qformer", "residual_question_qformer", "residual_question_adapter"}
+    {
+        "hybrid_local_qformer",
+        "residual_question_qformer",
+        "residual_question_adapter",
+        "grounded_evidence_adapter",
+    }
 )
 
 
@@ -298,6 +306,16 @@ def validate_direct_alignment_provenance(
 
 def validate_adapter_loss_contract(args: argparse.Namespace) -> None:
     direct_alignment_architecture = is_direct_alignment_architecture(args.adapter_architecture)
+    if (
+        str(args.adapter_architecture) == "grounded_evidence_adapter"
+        and int(getattr(args, "grounding_routing_warmup_epochs", 0)) > 0
+        and float(getattr(args, "grounding_gate_loss_weight", 0.0)) <= 0.0
+    ):
+        raise ValueError(
+            "grounded_evidence_adapter with routing warmup requires "
+            "llm_training.grounding_gate_loss_weight > 0 so role gates are supervised "
+            "before joint answer training."
+        )
     if (
         direct_alignment_architecture
         and float(args.ranking_loss_weight) > 0.0
@@ -540,6 +558,19 @@ def distributed_sum_scalars(values: Mapping[str, float], device: torch.device) -
     return {name: float(value) for name, value in zip(names, tensor.cpu().tolist())}
 
 
+def numeric_quantile(values: Sequence[float], probability: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    position = max(0.0, min(1.0, float(probability))) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
 def gather_cuda_memory(device: torch.device) -> list[dict[str, float]]:
     if device.type != "cuda":
         return []
@@ -661,6 +692,14 @@ def atomic_dump_json(path: str | Path, payload: dict[str, Any]) -> None:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def append_jsonl(path: str | Path, payload: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(dict(payload), ensure_ascii=True, allow_nan=False)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(serialized + "\n")
 
 
 def atomic_torch_save(path: str | Path, payload: Mapping[str, Any]) -> None:
@@ -1480,6 +1519,223 @@ class ResidualQuestionConditionedAdapter(nn.Module):
         return self.backbone.scale_soft_prompts(self.backbone.output(queries))
 
 
+class GroundedEvidenceAdapter(nn.Module):
+    """Route language to factorized 2D keys without changing the frozen LLM's 1D RoPE."""
+
+    def __init__(
+        self,
+        latent_grid: Sequence[int],
+        llm_hidden_size: int,
+        context_layers: Sequence[int],
+        adapter_dim: int,
+        adapter_heads: int,
+        dropout: float,
+        evidence_tokens: int,
+        soft_prompt_scale: float,
+        gate_bias_init: float,
+    ) -> None:
+        super().__init__()
+        self.latent_grid = tuple(int(value) for value in latent_grid)
+        if len(self.latent_grid) != 2 or any(value <= 0 for value in self.latent_grid):
+            raise ValueError(f"Grounded evidence requires a positive 2D latent grid, got {self.latent_grid}.")
+        if int(adapter_dim) % int(adapter_heads) != 0:
+            raise ValueError("adapter_dim must be divisible by adapter_heads for grounded evidence.")
+        self.context_layers = tuple(int(value) for value in context_layers)
+        if not self.context_layers:
+            raise ValueError("Grounded evidence requires at least one contextual Qwen layer.")
+        self.soft_prompt_tokens = int(evidence_tokens)
+        if self.soft_prompt_tokens <= 0:
+            raise ValueError("Grounded evidence requires at least one role/evidence token.")
+        self.soft_prompt_scale = float(soft_prompt_scale)
+        self.structured_query_conditioning = False
+        self.question_input_mode = "contextual_tokens"
+        self.fusion_mode = "grounded_role_routing"
+        self.requires_aligned_tokens = True
+
+        self.text_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(int(llm_hidden_size)),
+                    nn.Linear(int(llm_hidden_size), int(adapter_dim)),
+                )
+                for _ in self.context_layers
+            ]
+        )
+        self.text_layer_logits = nn.Parameter(torch.zeros(len(self.context_layers)))
+        self.role_queries = nn.Parameter(
+            torch.randn(1, self.soft_prompt_tokens, int(adapter_dim)) * 0.02
+        )
+        self.text_block = CrossAttentionBlock(
+            dim=int(adapter_dim),
+            heads=int(adapter_heads),
+            dropout=float(dropout),
+        )
+        self.query_norm = nn.LayerNorm(int(adapter_dim))
+        self.row_key_dim = int(adapter_dim) // 2
+        self.col_key_dim = int(adapter_dim) - self.row_key_dim
+        self.row_query_projection = nn.Linear(
+            int(adapter_dim), self.row_key_dim, bias=False
+        )
+        self.col_query_projection = nn.Linear(
+            int(adapter_dim), self.col_key_dim, bias=False
+        )
+        self.row_key_norm = nn.LayerNorm(self.row_key_dim)
+        self.col_key_norm = nn.LayerNorm(self.col_key_dim)
+        self.row_key_projection = nn.Linear(
+            self.row_key_dim, self.row_key_dim, bias=False
+        )
+        self.col_key_projection = nn.Linear(
+            self.col_key_dim, self.col_key_dim, bias=False
+        )
+        nn.init.eye_(self.row_key_projection.weight)
+        nn.init.eye_(self.col_key_projection.weight)
+        fixed_grid = sinusoidal_2d_position_encoding(
+            *self.latent_grid,
+            int(adapter_dim),
+        ).reshape(self.latent_grid[0], self.latent_grid[1], int(adapter_dim))
+        self.register_buffer(
+            "fixed_row_keys",
+            fixed_grid[:, 0, : self.row_key_dim].contiguous(),
+            persistent=True,
+        )
+        self.register_buffer(
+            "fixed_col_keys",
+            fixed_grid[0, :, self.row_key_dim :].contiguous(),
+            persistent=True,
+        )
+        self.row_keys = nn.Parameter(
+            torch.zeros(self.latent_grid[0], self.row_key_dim)
+        )
+        self.col_keys = nn.Parameter(
+            torch.zeros(self.latent_grid[1], self.col_key_dim)
+        )
+        self.routing_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.role_gate = nn.Linear(int(adapter_dim), 1)
+        nn.init.zeros_(self.role_gate.weight)
+        nn.init.constant_(self.role_gate.bias, float(gate_bias_init))
+
+        bottleneck = max(32, int(adapter_dim))
+        self.evidence_down = nn.Linear(int(llm_hidden_size), bottleneck, bias=False)
+        self.evidence_up = nn.Linear(bottleneck, int(llm_hidden_size), bias=False)
+        nn.init.zeros_(self.evidence_up.weight)
+
+        self.last_routing_logits: torch.Tensor | None = None
+        self.last_row_logits: torch.Tensor | None = None
+        self.last_col_logits: torch.Tensor | None = None
+        self.last_role_gate_logits: torch.Tensor | None = None
+        self.last_routing_weights: torch.Tensor | None = None
+
+    def _text_context(
+        self,
+        question_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        if question_embeds.ndim == 3:
+            question_embeds = question_embeds.unsqueeze(1)
+        if question_embeds.ndim != 4 or int(question_embeds.shape[1]) != len(self.context_layers):
+            raise ValueError(
+                "Grounded evidence expected question states [batch,layers,tokens,hidden] for layers "
+                f"{self.context_layers}, got {tuple(question_embeds.shape)}."
+            )
+        projected = [
+            projection(question_embeds[:, index].detach().to(dtype=projection[1].weight.dtype))
+            for index, projection in enumerate(self.text_projections)
+        ]
+        weights = torch.softmax(self.text_layer_logits.float(), dim=0).to(dtype=projected[0].dtype)
+        return sum(weights[index] * value for index, value in enumerate(projected))
+
+    def _axis_keys(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row_keys = self.fixed_row_keys.to(device=device, dtype=dtype) + self.row_keys.to(
+            device=device, dtype=dtype
+        )
+        col_keys = self.fixed_col_keys.to(device=device, dtype=dtype) + self.col_keys.to(
+            device=device, dtype=dtype
+        )
+        return (
+            F.normalize(self.row_key_projection(self.row_key_norm(row_keys)), dim=-1),
+            F.normalize(self.col_key_projection(self.col_key_norm(col_keys)), dim=-1),
+        )
+
+    def forward_from_aligned(
+        self,
+        aligned_tokens: torch.Tensor,
+        question_embeds: torch.Tensor,
+        question_mask: torch.Tensor | None,
+        structured_query: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if structured_query is not None:
+            raise ValueError("Grounded evidence does not accept parsed coordinate or task features.")
+        expected_tokens = int(self.latent_grid[0] * self.latent_grid[1])
+        if aligned_tokens.ndim != 3 or int(aligned_tokens.shape[1]) != expected_tokens:
+            raise ValueError(
+                f"Grounded evidence expected {expected_tokens} aligned cell tokens, got "
+                f"{tuple(aligned_tokens.shape)}."
+            )
+        text_context = self._text_context(question_embeds)
+        key_padding_mask = (
+            ~question_mask.to(device=text_context.device, dtype=torch.bool)
+            if question_mask is not None
+            else None
+        )
+        role_states = self.text_block(
+            self.role_queries.expand(text_context.shape[0], -1, -1),
+            text_context,
+            key_padding_mask=key_padding_mask,
+        )
+        normalized_queries = self.query_norm(role_states)
+        row_queries = F.normalize(self.row_query_projection(normalized_queries), dim=-1)
+        col_queries = F.normalize(self.col_query_projection(normalized_queries), dim=-1)
+        row_keys, col_keys = self._axis_keys(
+            device=normalized_queries.device,
+            dtype=normalized_queries.dtype,
+        )
+        logit_scale = self.routing_logit_scale.exp().clamp(max=100.0).to(
+            dtype=normalized_queries.dtype
+        )
+        row_logits = logit_scale * torch.einsum("brd,nd->brn", row_queries, row_keys)
+        col_logits = logit_scale * torch.einsum("brd,nd->brn", col_queries, col_keys)
+        routing_logits = (
+            row_logits.unsqueeze(-1) + col_logits.unsqueeze(-2)
+        ).flatten(start_dim=-2)
+        routing_weights = torch.softmax(routing_logits.float(), dim=-1).to(
+            dtype=aligned_tokens.dtype
+        )
+        selected = torch.einsum("brn,bnh->brh", routing_weights, aligned_tokens)
+        residual = self.evidence_up(F.gelu(self.evidence_down(selected)))
+        if self.soft_prompt_scale > 0.0:
+            residual = torch.tanh(residual) * self.soft_prompt_scale
+        gate_logits = self.role_gate(role_states).squeeze(-1)
+        gate_probability = torch.sigmoid(gate_logits)
+        # A soft magnitude gate is undone by the frozen decoder's RMSNorm.
+        hard_gate = (gate_probability >= 0.5).to(dtype=gate_probability.dtype)
+        if self.training:
+            hard_gate = hard_gate.detach() + gate_probability - gate_probability.detach()
+        evidence = hard_gate.to(dtype=selected.dtype).unsqueeze(-1) * (
+            selected + residual.to(dtype=selected.dtype)
+        )
+        self.last_routing_logits = routing_logits
+        self.last_row_logits = row_logits
+        self.last_col_logits = col_logits
+        self.last_role_gate_logits = gate_logits
+        self.last_routing_weights = routing_weights
+        return evidence
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        question_embeds: torch.Tensor,
+        question_mask: torch.Tensor | None,
+        structured_query: torch.Tensor | None,
+    ) -> torch.Tensor:
+        raise RuntimeError(
+            "GroundedEvidenceAdapter must consume the frozen aligned spatial tokens through "
+            "HybridGlobalLocalAdapter.forward_components()."
+        )
+
+
 class HybridGlobalLocalAdapter(nn.Module):
     def __init__(
         self,
@@ -1540,12 +1796,28 @@ class HybridGlobalLocalAdapter(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if question_embeds is None:
             raise ValueError("hybrid_local_qformer requires natural-language question embeddings.")
-        if self.freeze_global:
+        # Frozen parameters do not require a no-grad graph. Preserve gradients
+        # with respect to an explicitly differentiable latent for mechanism
+        # diagnostics while retaining the cheaper training/eval path.
+        if self.freeze_global and not latent_map.requires_grad:
             with torch.no_grad():
                 global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
         else:
             global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
-        conditioned_prompts = self.local_adapter(latent_map, question_embeds, question_mask, structured_query)
+        if bool(getattr(self.local_adapter, "requires_aligned_tokens", False)):
+            conditioned_prompts = self.local_adapter.forward_from_aligned(
+                global_prompts,
+                question_embeds,
+                question_mask,
+                structured_query,
+            )
+        else:
+            conditioned_prompts = self.local_adapter(
+                latent_map,
+                question_embeds,
+                question_mask,
+                structured_query,
+            )
         if self.residual_mode:
             if conditioned_prompts.shape != global_prompts.shape:
                 raise ValueError(
@@ -1881,7 +2153,7 @@ class TensorReadoutQADataset(Dataset):
 
 
 class StateTaskGroupedBatchSampler(Sampler[list[int]]):
-    """Keep a few same-tensor, same-operation questions together without parsing their text."""
+    """Keep legacy state/task chunks or explicit Stage-2B groups atomically batched."""
 
     def __init__(
         self,
@@ -1907,6 +2179,14 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
         self.epoch = 0
         initial_batches = self._global_batches(epoch=0)
         self._length = math.ceil(len(initial_batches) / self.num_replicas)
+        self.initial_global_batch_count = len(initial_batches)
+        self.initial_padding_batch_count = (
+            self._length * self.num_replicas - len(initial_batches)
+        )
+        self.initial_padding_record_count = sum(
+            len(initial_batches[index % len(initial_batches)])
+            for index in range(self.initial_padding_batch_count)
+        ) if initial_batches else 0
         initial_sizes = [len(batch) for batch in initial_batches]
         self.initial_batch_size_min = min(initial_sizes, default=0)
         self.initial_batch_size_max = max(initial_sizes, default=0)
@@ -1922,18 +2202,52 @@ class StateTaskGroupedBatchSampler(Sampler[list[int]]):
 
     def _global_batches(self, epoch: int) -> list[list[int]]:
         rng = random.Random(self.seed + int(epoch))
-        grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for index, record in enumerate(self.dataset.records):
-            key = (str(record.get("state_ref", "")), str(record.get("task_type", "")))
-            grouped[key].append(index)
+        explicit_flags = [isinstance(record.get("matched_group"), Mapping) for record in self.dataset.records]
+        if any(explicit_flags) and not all(explicit_flags):
+            raise ValueError("A dataset cannot mix explicit matched groups with legacy ungrouped records.")
 
         units: list[list[int]] = []
-        for indices in grouped.values():
-            rng.shuffle(indices)
-            units.extend(
-                indices[start : start + self.questions_per_group]
-                for start in range(0, len(indices), self.questions_per_group)
-            )
+        if explicit_flags and all(explicit_flags):
+            grouped: dict[str, list[tuple[int, int]]] = defaultdict(list)
+            declared_sizes: dict[str, int] = {}
+            for index, record in enumerate(self.dataset.records):
+                spec = record["matched_group"]
+                if str(spec.get("format", "")) != MATCHED_GROUP_FORMAT:
+                    raise ValueError(
+                        f"Record {record.get('qa_id')} has unsupported matched_group format."
+                    )
+                group_id = str(spec.get("batch_group_id", ""))
+                size = int(spec.get("batch_group_size", 0))
+                member = int(spec.get("batch_member_index", -1))
+                if not group_id or size <= 0 or member < 0 or member >= size:
+                    raise ValueError(f"Record {record.get('qa_id')} has an invalid batch group contract.")
+                if size > self.batch_size:
+                    raise ValueError(
+                        f"Explicit group {group_id} has size {size}, exceeding batch_size={self.batch_size}."
+                    )
+                previous_size = declared_sizes.setdefault(group_id, size)
+                if previous_size != size:
+                    raise ValueError(f"Explicit group {group_id} declares inconsistent sizes.")
+                grouped[group_id].append((member, index))
+            for group_id, members in grouped.items():
+                size = declared_sizes[group_id]
+                observed_members = sorted(member for member, _index in members)
+                if observed_members != list(range(size)):
+                    raise ValueError(
+                        f"Explicit group {group_id} is incomplete or duplicates members: {observed_members}."
+                    )
+                units.append([index for _member, index in sorted(members)])
+        else:
+            grouped_legacy: dict[tuple[str, str], list[int]] = defaultdict(list)
+            for index, record in enumerate(self.dataset.records):
+                key = (str(record.get("state_ref", "")), str(record.get("task_type", "")))
+                grouped_legacy[key].append(index)
+            for indices in grouped_legacy.values():
+                rng.shuffle(indices)
+                units.extend(
+                    indices[start : start + self.questions_per_group]
+                    for start in range(0, len(indices), self.questions_per_group)
+                )
         rng.shuffle(units)
         units.sort(key=len, reverse=True)
         batches: list[list[int]] = []
@@ -2002,6 +2316,139 @@ def collate_tensor_readout(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
 _DISPLAYED_OPTION_PATTERN = re.compile(
     r"(?:Options:\s*|;\s*)([A-D]):\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 )
+
+_GROUNDING_QUERY_TYPE_BY_TASK = {
+    "normalized_point_value": "point",
+    "raw_point_value_with_stats": "point",
+    "point_compare": "point_pair",
+    "region_mean_compare": "region_pair",
+    "extreme_quadrant": "none",
+}
+_GROUNDING_ACTIVE_ROLES_BY_TYPE = {
+    "point": 1,
+    "point_pair": 2,
+    "region_pair": 2,
+    "none": 0,
+}
+
+
+def grounding_query_spec_for_record(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    task = str(record.get("task_type", ""))
+    expected_type = _GROUNDING_QUERY_TYPE_BY_TASK.get(task)
+    if expected_type is None:
+        raise ValueError(f"Grounded Stage-2B does not support task_type={task!r}.")
+    matched = record.get("matched_group")
+    query_spec = matched.get("query_spec") if isinstance(matched, Mapping) else None
+    if not isinstance(query_spec, Mapping):
+        query_spec = record.get("grounding_target")
+    if not isinstance(query_spec, Mapping):
+        raise ValueError(f"Grounded record {record.get('qa_id')} has no query_spec.")
+    observed_type = str(query_spec.get("type", ""))
+    if observed_type != expected_type:
+        raise ValueError(
+            f"Grounded task {task!r} requires query_spec.type={expected_type!r}, "
+            f"got {observed_type!r}."
+        )
+    if int(query_spec.get("coordinate_origin", -1)) != 0:
+        raise ValueError("Grounded routing targets must use zero-based coordinates.")
+    return query_spec
+
+
+def audit_matched_groups(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    explicit = [record for record in records if isinstance(record.get("matched_group"), Mapping)]
+    if not explicit:
+        return {"present": False, "records": 0, "batch_groups": 0, "margin_groups": 0}
+    if len(explicit) != len(records):
+        raise ValueError("A split cannot mix matched-group and ordinary records.")
+    batch_groups: dict[str, list[tuple[int, Mapping[str, Any], Mapping[str, Any]]]] = defaultdict(list)
+    margin_groups: dict[str, list[tuple[int, Mapping[str, Any], Mapping[str, Any]]]] = defaultdict(list)
+    active_roles = 0
+    for record in records:
+        spec = record["matched_group"]
+        if str(spec.get("format", "")) != MATCHED_GROUP_FORMAT:
+            raise ValueError(f"Unsupported matched_group format in {record.get('qa_id')}.")
+        query_spec = grounding_query_spec_for_record(record)
+        active_roles += _GROUNDING_ACTIVE_ROLES_BY_TYPE[str(query_spec["type"])]
+        batch_id = str(spec.get("batch_group_id", ""))
+        batch_groups[batch_id].append((int(spec.get("batch_member_index", -1)), record, spec))
+        margin_id = str(spec.get("margin_group_id") or "")
+        if margin_id:
+            margin_groups[margin_id].append(
+                (int(spec.get("margin_member_index", -1)), record, spec)
+            )
+
+    def validate_members(
+        groups: Mapping[str, Sequence[tuple[int, Mapping[str, Any], Mapping[str, Any]]]],
+        size_field: str,
+    ) -> None:
+        for group_id, members in groups.items():
+            if not group_id:
+                raise ValueError("Matched groups require non-empty identifiers.")
+            declared = {int(spec.get(size_field, 0)) for _member, _record, spec in members}
+            if len(declared) != 1:
+                raise ValueError(f"Matched group {group_id} declares inconsistent sizes: {declared}.")
+            size = next(iter(declared))
+            observed = sorted(member for member, _record, _spec in members)
+            if size <= 0 or observed != list(range(size)):
+                raise ValueError(
+                    f"Matched group {group_id} is incomplete or duplicated: size={size}, members={observed}."
+                )
+
+    validate_members(batch_groups, "batch_group_size")
+    validate_members(margin_groups, "margin_group_size")
+    for group_id, members in batch_groups.items():
+        states = {str(record.get("state_ref", "")) for _member, record, _spec in members}
+        declared_sizes = {int(spec.get("batch_group_size", 0)) for _member, _record, spec in members}
+        if len(states) != 1 or declared_sizes != {3}:
+            raise ValueError(
+                f"Atomic batch group {group_id} must contain exactly three records from one state."
+            )
+    coordinate_groups = 0
+    role_swap_groups = 0
+    for group_id, members in margin_groups.items():
+        ordered_items = sorted(members, key=lambda item: item[0])
+        ordered = [record for _member, record, _spec in ordered_items]
+        specs = [spec for _member, _record, spec in ordered_items]
+        kinds = {str(spec.get("margin_kind", "")) for spec in specs}
+        if len(kinds) != 1:
+            raise ValueError(f"Margin group {group_id} mixes margin kinds: {kinds}.")
+        choices = [tuple(str(value) for value in item.get("choices", ())) for item in ordered]
+        if len(set(choices)) != 1:
+            raise ValueError(f"Margin group {group_id} must share ordered choices.")
+        option_hashes = {str(spec.get("option_set_sha256", "")) for spec in specs}
+        coordinate_sets = {str(spec.get("coordinate_set_id", "")) for spec in specs}
+        tasks = {str(item.get("task_type", "")) for item in ordered}
+        if (
+            len(option_hashes) != 1
+            or "" in option_hashes
+            or len(coordinate_sets) != 1
+            or "" in coordinate_sets
+            or len(tasks) != 1
+        ):
+            raise ValueError(
+                f"Margin group {group_id} must share task, option-set hash, and coordinate-set hash."
+            )
+        kind = next(iter(kinds))
+        if kind == "coordinate_choice":
+            coordinate_groups += 1
+            answers = [str(item.get("answer", "")) for item in ordered]
+            if len(set(answers)) != len(answers):
+                raise ValueError(f"Coordinate group {group_id} must use distinct answers.")
+        elif kind == "role_swap":
+            role_swap_groups += 1
+            if len(ordered) != 2 or {str(item.get("answer", "")) for item in ordered} != {"A", "B"}:
+                raise ValueError(f"Role-swap group {group_id} must be one A/B answer pair.")
+        else:
+            raise ValueError(f"Margin group {group_id} has unsupported kind={kind!r}.")
+    return {
+        "present": True,
+        "records": len(records),
+        "batch_groups": len(batch_groups),
+        "margin_groups": len(margin_groups),
+        "coordinate_groups": coordinate_groups,
+        "role_swap_groups": role_swap_groups,
+        "active_roles": active_roles,
+    }
 
 
 def audit_qa_datasets(
@@ -2130,6 +2577,7 @@ def audit_qa_datasets(
             "missing_answer_labels": missing_answer_labels,
             "numeric_option_records": numeric_option_records,
             "ascending_numeric_option_fraction": ascending_fraction,
+            "matched_groups": audit_matched_groups(dataset.records),
             "complete_coverage_checked": bool(require_complete_split_coverage),
         }
     reference_split = "train" if "train" in split_tasks else next(iter(split_tasks))
@@ -2260,6 +2708,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--shuffle-seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--grounding-routing-warmup-epochs", type=int, default=None)
+    parser.add_argument("--grounding-warmup-min-cell-top1", type=float, default=None)
+    parser.add_argument("--grounding-warmup-min-cell-top5", type=float, default=None)
+    parser.add_argument("--grounding-warmup-min-axis-top1", type=float, default=None)
+    parser.add_argument("--grounding-warmup-min-target-mass", type=float, default=None)
+    parser.add_argument("--grounding-warmup-min-gate-accuracy", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--eval-choice-batch-size", type=int, default=None)
@@ -2294,6 +2748,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ranking-loss-margin", type=float, default=None)
     parser.add_argument("--swapped-question-loss-weight", type=float, default=None)
     parser.add_argument("--swapped-question-loss-margin", type=float, default=None)
+    parser.add_argument("--grounding-routing-loss-weight", type=float, default=None)
+    parser.add_argument("--grounding-gate-loss-weight", type=float, default=None)
+    parser.add_argument("--matched-group-loss-weight", type=float, default=None)
+    parser.add_argument("--matched-group-loss-margin", type=float, default=None)
     parser.add_argument("--swapped-question-max-records", type=int, default=None)
     parser.add_argument(
         "--swapped-question-require-different-answer",
@@ -2318,10 +2776,12 @@ def parse_args() -> argparse.Namespace:
             "hybrid_local_qformer",
             "residual_question_qformer",
             "residual_question_adapter",
+            "grounded_evidence_adapter",
         ),
         default=None,
     )
     parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
+    parser.add_argument("--stage2-warm-start-checkpoint", type=str, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
@@ -2360,10 +2820,12 @@ def parse_args() -> argparse.Namespace:
             "anchor_queries",
             "residual_qformer",
             "residual_spatial_transformer",
+            "grounded_role_routing",
         ),
         default=None,
     )
     parser.add_argument("--local-gate-init", type=float, default=None)
+    parser.add_argument("--grounded-gate-bias-init", type=float, default=None)
     parser.add_argument("--local-text-gate-init", type=float, default=None)
     parser.add_argument(
         "--freeze-conditioned-backbone",
@@ -2452,7 +2914,13 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-metric",
         type=str,
         default=None,
-        choices=("correct_accuracy", "macro_latent_gain"),
+        choices=(
+            "correct_accuracy",
+            "macro_latent_gain",
+            "normalized_point_latent_gain",
+            "point_value_min_latent_gain",
+            "point_value_min_grounded_gain",
+        ),
     )
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--wandb-api-key", type=str, default=None)
@@ -2478,6 +2946,11 @@ def parse_args() -> argparse.Namespace:
 
 def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     config = load_yaml_mapping(args.config)
+    configured_architecture = str(
+        args.adapter_architecture
+        or first_nested(config, ["adapter.architecture"])
+        or "legacy"
+    )
     configured_loss_fields = {
         "ce_loss_weight": first_nested(config, ["llm_training.ce_loss_weight"]),
         "choice_ce_loss_weight": first_nested(config, ["llm_training.choice_ce_loss_weight"]),
@@ -2485,6 +2958,18 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "ranking_loss_margin": first_nested(config, ["llm_training.ranking_loss_margin"]),
         "swapped_question_loss_weight": first_nested(config, ["llm_training.swapped_question_loss_weight"]),
         "swapped_question_loss_margin": first_nested(config, ["llm_training.swapped_question_loss_margin"]),
+        "grounding_routing_loss_weight": first_nested(
+            config, ["llm_training.grounding_routing_loss_weight"]
+        ),
+        "grounding_gate_loss_weight": first_nested(
+            config, ["llm_training.grounding_gate_loss_weight"]
+        ),
+        "matched_group_loss_weight": first_nested(
+            config, ["llm_training.matched_group_loss_weight"]
+        ),
+        "matched_group_loss_margin": first_nested(
+            config, ["llm_training.matched_group_loss_margin"]
+        ),
     }
     defaulted_loss_fields = [
         field
@@ -2501,11 +2986,19 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             else model_name
         )
 
+    configured_qa_dir = (
+        first_nested(config, ["patch_qa.stage2b_qa_dir"])
+        if configured_architecture == "grounded_evidence_adapter"
+        else None
+    ) or first_nested(config, ["patch_qa.qa_dir", "data.qa_dir"])
     path_defaults = {
-        "qa_dir": first_nested(config, ["patch_qa.qa_dir", "data.qa_dir"]),
+        "qa_dir": configured_qa_dir,
         "latent_dir": first_nested(config, ["patch_qa.latent_dir", "data.latent_dir", "latent_export.output_dir"]),
         "qa_alignment_checkpoint": first_nested(config, ["patch_qa.alignment_checkpoint"]),
         "adapter_init_checkpoint": first_nested(config, ["adapter.init_checkpoint", "patch_qa.alignment_checkpoint"]),
+        "stage2_warm_start_checkpoint": first_nested(
+            config, ["adapter.stage2_warm_start_checkpoint"]
+        ),
         "output_root": first_nested(config, ["llm_training.output_root", "storage.output_root"]),
         "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
         "hf_home": first_nested(config, ["storage.hf_home"]),
@@ -2567,6 +3060,42 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "seed", first_nested(config, ["llm_training.seed", "runtime.seed"]), 42)
     set_default(args, "shuffle_seed", first_nested(config, ["llm_training.shuffle_seed", "runtime.seed"]), 42)
     set_default(args, "epochs", first_nested(config, ["llm_training.epochs"]), 3)
+    set_default(
+        args,
+        "grounding_routing_warmup_epochs",
+        first_nested(config, ["llm_training.grounding_routing_warmup_epochs"]),
+        0,
+    )
+    set_default(
+        args,
+        "grounding_warmup_min_cell_top1",
+        first_nested(config, ["llm_training.grounding_warmup_min_cell_top1"]),
+        0.90,
+    )
+    set_default(
+        args,
+        "grounding_warmup_min_cell_top5",
+        first_nested(config, ["llm_training.grounding_warmup_min_cell_top5"]),
+        0.98,
+    )
+    set_default(
+        args,
+        "grounding_warmup_min_axis_top1",
+        first_nested(config, ["llm_training.grounding_warmup_min_axis_top1"]),
+        0.95,
+    )
+    set_default(
+        args,
+        "grounding_warmup_min_target_mass",
+        first_nested(config, ["llm_training.grounding_warmup_min_target_mass"]),
+        0.50,
+    )
+    set_default(
+        args,
+        "grounding_warmup_min_gate_accuracy",
+        first_nested(config, ["llm_training.grounding_warmup_min_gate_accuracy"]),
+        0.95,
+    )
     set_default(args, "batch_size", first_nested(config, ["llm_training.batch_size"]), 2)
     set_default(args, "eval_batch_size", first_nested(config, ["llm_training.eval_batch_size"]), 2)
     set_default(args, "eval_choice_batch_size", first_nested(config, ["llm_training.eval_choice_batch_size"]), 16)
@@ -2606,6 +3135,30 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "ranking_loss_margin", configured_loss_fields["ranking_loss_margin"], 0.1)
     set_default(args, "swapped_question_loss_weight", configured_loss_fields["swapped_question_loss_weight"], 0.0)
     set_default(args, "swapped_question_loss_margin", configured_loss_fields["swapped_question_loss_margin"], 0.1)
+    set_default(
+        args,
+        "grounding_routing_loss_weight",
+        configured_loss_fields["grounding_routing_loss_weight"],
+        0.0,
+    )
+    set_default(
+        args,
+        "grounding_gate_loss_weight",
+        configured_loss_fields["grounding_gate_loss_weight"],
+        0.0,
+    )
+    set_default(
+        args,
+        "matched_group_loss_weight",
+        configured_loss_fields["matched_group_loss_weight"],
+        0.0,
+    )
+    set_default(
+        args,
+        "matched_group_loss_margin",
+        configured_loss_fields["matched_group_loss_margin"],
+        0.5,
+    )
     set_default(
         args,
         "swapped_question_max_records",
@@ -2662,6 +3215,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(args, "local_fusion_mode", first_nested(config, ["adapter.local_fusion_mode"]), "text_latent_pool")
     set_default(args, "local_gate_init", first_nested(config, ["adapter.local_gate_init"]), 1.0)
+    set_default(
+        args,
+        "grounded_gate_bias_init",
+        first_nested(config, ["adapter.grounded_gate_bias_init"]),
+        -2.0,
+    )
     set_default(args, "local_text_gate_init", first_nested(config, ["adapter.local_text_gate_init"]), 1.0)
     set_default(
         args,
@@ -2793,6 +3352,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "hybrid_local_qformer",
         "residual_question_qformer",
         "residual_question_adapter",
+        "grounded_evidence_adapter",
     }
     if str(args.adapter_architecture) not in supported_adapter_architectures:
         raise ValueError(f"Unsupported adapter.architecture: {args.adapter_architecture}")
@@ -2803,6 +3363,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "alignment_adapter",
         "residual_question_qformer",
         "residual_question_adapter",
+        "grounded_evidence_adapter",
     } and str(args.adapter_init_checkpoint or "").strip().lower() in {"", "none", "null", "random"}:
         raise ValueError(
             f"adapter.architecture={args.adapter_architecture} requires adapter.init_checkpoint from stage 1."
@@ -2812,6 +3373,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "anchor_queries",
         "residual_qformer",
         "residual_spatial_transformer",
+        "grounded_role_routing",
     }
     if str(args.local_fusion_mode) not in supported_local_fusion_modes:
         raise ValueError(f"Unsupported adapter.local_fusion_mode: {args.local_fusion_mode}")
@@ -2827,6 +3389,54 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("A fixed adapter.local_text_gate_init cannot be zero for residual question conditioning.")
         if not bool(args.local_residual_gate_trainable) and float(args.local_gate_init) == 0.0:
             raise ValueError("A fixed adapter.local_gate_init cannot be zero for residual question conditioning.")
+    if str(args.adapter_architecture) == "grounded_evidence_adapter":
+        if str(args.local_question_input_mode) != "contextual_tokens":
+            raise ValueError(
+                "Grounded evidence requires adapter.local_question_input_mode=contextual_tokens."
+            )
+        if int(args.local_soft_prompt_tokens) != 2:
+            raise ValueError(
+                "Grounded evidence uses exactly two role/evidence tokens (primary/A and B)."
+            )
+        if not bool(args.group_questions_by_state):
+            raise ValueError(
+                "Grounded evidence requires explicit matched-group batches."
+            )
+        if float(args.grounding_routing_loss_weight) <= 0.0:
+            raise ValueError(
+                "Grounded evidence requires a positive grounding_routing_loss_weight."
+            )
+        if int(args.batch_size) != 3 or int(args.questions_per_state_group) != 3:
+            raise ValueError(
+                "Grounded Stage-2B requires batch_size=questions_per_state_group=3 so each "
+                "explicit matched batch remains atomic."
+            )
+        if str(args.choice_scoring_mode) != "label":
+            raise ValueError(
+                "Grounded Stage-2B requires choice_scoring_mode=label so routing, choice, and "
+                "cross-question margins come from one positive forward."
+            )
+        if int(args.grounding_routing_warmup_epochs) < 0:
+            raise ValueError("grounding_routing_warmup_epochs must be non-negative.")
+        if int(args.grounding_routing_warmup_epochs) >= int(args.epochs):
+            raise ValueError(
+                "Grounded Stage-2B must retain at least one joint answer-training epoch after "
+                "the routing-only warmup."
+            )
+        for setting in (
+            "grounding_warmup_min_cell_top1",
+            "grounding_warmup_min_cell_top5",
+            "grounding_warmup_min_axis_top1",
+            "grounding_warmup_min_target_mass",
+            "grounding_warmup_min_gate_accuracy",
+        ):
+            value = float(getattr(args, setting))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"llm_training.{setting} must be finite and in [0, 1].")
+    elif int(args.grounding_routing_warmup_epochs) != 0:
+        raise ValueError(
+            "grounding_routing_warmup_epochs is only valid for grounded_evidence_adapter."
+        )
     if int(args.initial_eval_records) < 0:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
     if int(args.latent_cache_size) < 0 or int(args.num_workers) < 0:
@@ -2845,6 +3455,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "ranking_loss_margin",
         "swapped_question_loss_weight",
         "swapped_question_loss_margin",
+        "grounding_routing_loss_weight",
+        "grounding_gate_loss_weight",
+        "matched_group_loss_weight",
+        "matched_group_loss_margin",
     ):
         if float(getattr(args, setting)) < 0.0:
             raise ValueError(f"llm_training.{setting} must be non-negative.")
@@ -2855,6 +3469,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             args.choice_ce_loss_weight,
             args.ranking_loss_weight,
             args.swapped_question_loss_weight,
+            args.grounding_routing_loss_weight,
+            args.grounding_gate_loss_weight,
+            args.matched_group_loss_weight,
         )
     ):
         raise ValueError("At least one training loss weight must be positive.")
@@ -2881,6 +3498,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("swapped_question_loss_weight requires llm_training.group_questions_by_state: true.")
     if float(args.swapped_question_loss_weight) > 0.0 and float(args.choice_ce_loss_weight) <= 0.0:
         raise ValueError("swapped_question_loss_weight requires a positive choice_ce_loss_weight.")
+    if float(args.matched_group_loss_weight) > 0.0:
+        if not bool(args.group_questions_by_state):
+            raise ValueError("matched_group_loss_weight requires explicit grouped batches.")
+        if float(args.choice_ce_loss_weight) <= 0.0:
+            raise ValueError("matched_group_loss_weight requires a positive choice_ce_loss_weight.")
     if int(args.swapped_question_max_records) <= 0:
         raise ValueError("llm_training.swapped_question_max_records must be positive.")
     if not 0.0 <= float(args.warmup_ratio) < 1.0:
@@ -2900,8 +3522,23 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(f"llm_training.{setting} contains unsupported modes: {unknown_baselines}")
         if "correct" not in configured_baselines:
             raise ValueError(f"llm_training.{setting} must include correct.")
-    if str(args.checkpoint_metric) == "macro_latent_gain" and "shuffled" not in parse_csv(args.eval_baselines):
-        raise ValueError("checkpoint_metric=macro_latent_gain requires shuffled in llm_training.eval_baselines.")
+    if str(args.checkpoint_metric) in {
+        "macro_latent_gain",
+        "normalized_point_latent_gain",
+        "point_value_min_latent_gain",
+        "point_value_min_grounded_gain",
+    } and "shuffled" not in parse_csv(args.eval_baselines):
+        raise ValueError(
+            f"checkpoint_metric={args.checkpoint_metric} requires shuffled in llm_training.eval_baselines."
+        )
+    if (
+        str(args.checkpoint_metric) == "point_value_min_grounded_gain"
+        and "global_only" not in parse_csv(args.eval_baselines)
+    ):
+        raise ValueError(
+            "checkpoint_metric=point_value_min_grounded_gain requires global_only in "
+            "llm_training.eval_baselines."
+        )
     if defaulted_loss_fields:
         print(
             "warning: config omits "
@@ -3222,10 +3859,11 @@ def validate_qa_latent_contract(
 ) -> dict[str, Any] | None:
     """Bind every formal latent payload to one immutable Stage-1 checkpoint."""
     metadata_format = str(metadata.get("format", ""))
-    if metadata_format != PATCH_QA_FORMAT:
+    if metadata_format not in {PATCH_QA_FORMAT, PATCH_MATCHED_QA_FORMAT}:
         if require_formal_contract:
             raise ValueError(
-                f"Formal patch QA requires metadata format {PATCH_QA_FORMAT!r}, got {metadata_format!r}. "
+                "Formal patch QA requires a supported immutable QA format, got "
+                f"{metadata_format!r}. "
                 "Regenerate QA and latent caches with scripts/build_tensor_patch_qa.py."
             )
         return None
@@ -3316,8 +3954,9 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
     legacy_metadata_format = "tensor_patch_qa_v2"
     prompt_contract = str(metadata.get("prompt_contract", ""))
     coordinate_origin = int(metadata.get("natural_language_coordinate_origin", -1))
+    supported_formal_formats = {PATCH_QA_FORMAT, PATCH_MATCHED_QA_FORMAT}
     if bool(args.require_disjoint_splits) and (
-        metadata_format != PATCH_QA_FORMAT
+        metadata_format not in supported_formal_formats
         or prompt_contract != PATCH_QA_PROMPT_CONTRACT
         or coordinate_origin != 1
     ):
@@ -3329,9 +3968,42 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         )
     if not bool(args.require_disjoint_splits) and metadata_format not in {
         PATCH_QA_FORMAT,
+        PATCH_MATCHED_QA_FORMAT,
         legacy_metadata_format,
     }:
         raise ValueError(f"Unsupported patch QA metadata format={metadata_format!r}.")
+    matched_group_format = str(metadata.get("matched_group_format", ""))
+    if metadata_format == PATCH_MATCHED_QA_FORMAT:
+        if matched_group_format != MATCHED_GROUP_FORMAT:
+            raise ValueError(
+                "Matched Stage-2 QA metadata has an unsupported group contract: "
+                f"{matched_group_format!r}."
+            )
+        if not bool(metadata.get("requires_explicit_group_sampler", False)):
+            raise ValueError("Matched Stage-2 QA must require the explicit group sampler.")
+        if not bool(args.group_questions_by_state):
+            raise ValueError(
+                "tensor_patch_matched_qa_v1 cannot be trained without group_questions_by_state=true."
+            )
+        stage2b = metadata.get("stage2b")
+        if not isinstance(stage2b, Mapping):
+            raise ValueError("Matched Stage-2 QA metadata is missing its stage2b contract.")
+        expected_batch_group_size = int(stage2b.get("batch_group_size", 0))
+        expected_records_per_state = int(stage2b.get("records_per_train_state", 0))
+        if expected_batch_group_size != 3 or expected_records_per_state != 9:
+            raise ValueError(
+                "Matched Stage-2 QA must declare three-record atomic groups and nine records per state."
+            )
+        if int(args.batch_size) != expected_batch_group_size:
+            raise ValueError(
+                "The configured training batch must equal the matched QA atomic group size: "
+                f"batch_size={args.batch_size}, group_size={expected_batch_group_size}."
+            )
+    elif str(args.adapter_architecture) == "grounded_evidence_adapter":
+        raise ValueError(
+            "grounded_evidence_adapter requires tensor_patch_matched_qa_v1 assets; "
+            "run scripts/build_tensor_patch_matched_qa.py first."
+        )
     qa_fields = [str(field) for field in metadata.get("fields", [])]
     alignment_fields = [str(field) for field in metadata.get("alignment_fields", [])]
     allow_unseen_alignment_fields = bool(metadata.get("allow_unseen_alignment_fields", False))
@@ -3349,7 +4021,9 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
     configured_alignment = getattr(args, "qa_alignment_checkpoint", None)
     adapter_init = str(args.adapter_init_checkpoint or "").strip()
     direct_alignment_provenance: dict[str, Any] | None = None
-    if is_direct_alignment_architecture(args.adapter_architecture):
+    if is_direct_alignment_architecture(args.adapter_architecture) or str(
+        args.adapter_architecture
+    ) == "grounded_evidence_adapter":
         direct_alignment_provenance = validate_direct_alignment_provenance(
             metadata_checkpoint=observed_alignment,
             configured_checkpoint=configured_alignment,
@@ -3375,14 +4049,18 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
             f"Formal patch QA training requires metadata split_mode=sample, got {split_mode!r}."
         )
     question_seed_mode = str(metadata.get("question_seed_mode", "legacy_record_order"))
-    supported_seed_modes = {"sha256(seed|patch_id)", "sha256(seed|patch_id|variant)"}
+    supported_seed_modes = {
+        "sha256(seed|patch_id)",
+        "sha256(seed|patch_id|variant)",
+        "sha256(seed|state_ref|namespace)",
+    }
     if bool(args.require_disjoint_splits) and question_seed_mode not in supported_seed_modes:
         raise ValueError(
             "Formal patch QA training requires independently seeded questions. Regenerate the QA JSONL with "
             "scripts/build_tensor_patch_qa.py; existing latent files will be reused."
         )
     question_variants = dict(metadata.get("question_variants", {}))
-    if bool(args.group_questions_by_state):
+    if bool(args.group_questions_by_state) and metadata_format != PATCH_MATCHED_QA_FORMAT:
         train_variants = int(question_variants.get(str(args.train_split), 1))
         if train_variants < int(args.questions_per_state_group):
             raise ValueError(
@@ -3394,6 +4072,7 @@ def audit_qa_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "available": True,
         "path": str(metadata_path),
         "format": metadata_format,
+        "matched_group_format": matched_group_format or None,
         "prompt_contract": prompt_contract,
         "natural_language_coordinate_origin": coordinate_origin,
         "alignment_checkpoint": str(observed_alignment or ""),
@@ -3872,6 +4551,16 @@ def contextual_question_tokens_for_adapter(
             prompt_mask=prompt_mask,
             layer_indices=adapter.local_adapter.context_layers,
         )
+    if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
+        adapter.local_adapter, GroundedEvidenceAdapter
+    ):
+        return contextual_question_token_layers(
+            llm=llm,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_mask=prompt_mask,
+            layer_indices=adapter.local_adapter.context_layers,
+        )
     return contextual_question_tokens(
         llm=llm,
         input_ids=input_ids,
@@ -3990,7 +4679,7 @@ def adapter_soft_embeds(
         else None
     )
     if mode == "global_only" and isinstance(adapter, HybridGlobalLocalAdapter):
-        if adapter.freeze_global:
+        if adapter.freeze_global and not latent_map.requires_grad:
             with torch.no_grad():
                 global_prompts = adapter.global_adapter.forward_soft_prompts(latent_map)
         else:
@@ -4310,7 +4999,7 @@ def single_token_choice_ce_loss(
     choice_token_spec: tuple[list[list[int]], list[int]] | None = None,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     answers = [str(record["answer"]) for record in records]
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -4382,9 +5071,11 @@ def single_token_choice_ce_loss(
         raise ValueError("Single-token choice scoring received a non-single-token choice set.")
     token_ids_by_record, target_indices = choice_token_spec
     losses: list[torch.Tensor] = []
+    candidate_log_probs: list[torch.Tensor] = []
     hard_correct = 0
     for row, (candidate_ids, target_index) in enumerate(zip(token_ids_by_record, target_indices)):
         candidate_logits = first_logits[row, torch.tensor(candidate_ids, device=device)]
+        candidate_log_probs.append(F.log_softmax(candidate_logits.float(), dim=-1))
         losses.append(
             F.cross_entropy(
                 candidate_logits.unsqueeze(0),
@@ -4403,6 +5094,8 @@ def single_token_choice_ce_loss(
             "choice_accuracy": hard_correct / max(1, len(losses)),
             "choice_01_loss": 1.0 - hard_correct / max(1, len(losses)),
             "choice_single_token_path": 1.0,
+            "candidate_log_probs": candidate_log_probs,
+            "candidate_target_indices": [int(value) for value in target_indices],
         },
     )
 
@@ -4418,7 +5111,7 @@ def _sequence_choice_ce_loss(
     soft_prompt_mode: str = "correct",
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -4500,12 +5193,14 @@ def _sequence_choice_ce_loss(
     else:
         raise ValueError(f"Unsupported choice_score: {args.choice_score}")
     losses: list[torch.Tensor] = []
+    candidate_log_probs: list[torch.Tensor] = []
     correct_nll_sums: list[torch.Tensor] = []
     correct_target_counts: list[torch.Tensor] = []
     hard_correct = 0
     start = 0
     for count, target_index in zip(candidate_counts, target_indices):
         scores = -flat_nll[start : start + count]
+        candidate_log_probs.append(F.log_softmax(scores.float(), dim=-1))
         target = torch.tensor([int(target_index)], dtype=torch.long, device=device)
         losses.append(F.cross_entropy(scores.unsqueeze(0), target))
         correct_flat_index = start + int(target_index)
@@ -4526,6 +5221,8 @@ def _sequence_choice_ce_loss(
         "choice_accuracy": float(accuracy),
         "choice_01_loss": float(1.0 - accuracy),
         "choice_single_token_path": 0.0,
+        "candidate_log_probs": candidate_log_probs,
+        "candidate_target_indices": [int(value) for value in target_indices],
     }
 
 
@@ -4540,7 +5237,7 @@ def choice_ce_loss(
     soft_prompt_mode: str = "correct",
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     choice_token_spec = single_token_choice_ids(records, tokenizer)
     scoring_mode = str(args.choice_scoring_mode)
     if scoring_mode == "sequence":
@@ -4573,6 +5270,543 @@ def choice_ce_loss(
         precomputed_question_context=precomputed_question_context,
         precomputed_soft_embeds=precomputed_soft_embeds,
     )
+
+
+def matched_coordinate_group_loss(
+    records: Sequence[Mapping[str, Any]],
+    candidate_log_probs: Sequence[torch.Tensor],
+    margin: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if len(candidate_log_probs) != len(records) or not records:
+        raise ValueError("Matched-coordinate loss requires one candidate distribution per record.")
+    grouped: dict[str, list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        spec = record.get("matched_group")
+        if not isinstance(spec, Mapping):
+            continue
+        group_id = str(spec.get("margin_group_id") or "")
+        if group_id:
+            grouped[group_id].append(index)
+    terms: list[torch.Tensor] = []
+    gaps: list[torch.Tensor] = []
+    group_exact = 0
+    eligible_records = 0
+    for group_id, indices in grouped.items():
+        members = sorted(
+            indices,
+            key=lambda index: int(records[index]["matched_group"].get("margin_member_index", -1)),
+        )
+        specs = [records[index]["matched_group"] for index in members]
+        declared_sizes = {int(spec.get("margin_group_size", 0)) for spec in specs}
+        observed_members = [int(spec.get("margin_member_index", -1)) for spec in specs]
+        if declared_sizes != {len(members)} or observed_members != list(range(len(members))):
+            raise ValueError(
+                f"Margin group {group_id} is incomplete: sizes={declared_sizes}, members={observed_members}."
+            )
+        if len(members) < 2:
+            raise ValueError(f"Margin group {group_id} must contain at least two records.")
+        states = {str(records[index].get("state_ref", "")) for index in members}
+        tasks = {str(records[index].get("task_type", "")) for index in members}
+        identities = {
+            json.dumps(
+                latent_identity_from_record(records[index]),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for index in members
+        }
+        choices = [tuple(str(value) for value in records[index].get("choices", ())) for index in members]
+        option_hashes = {
+            str(records[index]["matched_group"].get("option_set_sha256", ""))
+            for index in members
+        }
+        coordinate_sets = {
+            str(records[index]["matched_group"].get("coordinate_set_id", ""))
+            for index in members
+        }
+        margin_kinds = {
+            str(records[index]["matched_group"].get("margin_kind", ""))
+            for index in members
+        }
+        if (
+            len(states) != 1
+            or len(tasks) != 1
+            or len(identities) != 1
+            or len(set(choices)) != 1
+            or len(option_hashes) != 1
+            or "" in option_hashes
+            or len(coordinate_sets) != 1
+            or "" in coordinate_sets
+            or len(margin_kinds) != 1
+        ):
+            raise ValueError(
+                f"Margin group {group_id} must share state, latent, task, choices, coordinate set, "
+                "margin kind, and option-set identity."
+            )
+        margin_kind = next(iter(margin_kinds))
+        expected_size = 3 if margin_kind == "coordinate_choice" else 2 if margin_kind == "role_swap" else 0
+        if len(members) != expected_size:
+            raise ValueError(
+                f"Margin group {group_id} kind={margin_kind!r} requires size {expected_size}, "
+                f"got {len(members)}."
+            )
+        labels = choices[0]
+        answers = [str(records[index].get("answer", "")) for index in members]
+        if len(set(answers)) != len(answers) or any(answer not in labels for answer in answers):
+            raise ValueError(f"Margin group {group_id} requires distinct valid answers.")
+        group_correct = True
+        for owner in members:
+            owner_probs = candidate_log_probs[owner]
+            if int(owner_probs.numel()) != len(labels):
+                raise ValueError(f"Margin group {group_id} candidate width does not match its choices.")
+            answer_index = labels.index(str(records[owner]["answer"]))
+            owner_gaps: list[torch.Tensor] = []
+            for counterfactual in members:
+                if counterfactual == owner:
+                    continue
+                other_probs = candidate_log_probs[counterfactual]
+                gap = owner_probs[answer_index] - other_probs[answer_index]
+                gaps.append(gap)
+                owner_gaps.append(gap)
+            terms.append(
+                torch.stack(
+                    [F.relu(float(margin) - gap) for gap in owner_gaps]
+                ).mean()
+            )
+            group_correct = group_correct and (
+                int(torch.argmax(owner_probs.detach()).item()) == int(answer_index)
+            )
+        eligible_records += len(members)
+        group_exact += int(group_correct)
+    reference = candidate_log_probs[0]
+    loss = (
+        torch.stack(terms).sum() / float(len(records))
+        if terms
+        else reference.new_zeros(())
+    )
+    detached_gaps = torch.stack([gap.detach().float() for gap in gaps]) if gaps else None
+    return loss, {
+        "matched_group_count": float(len(grouped)),
+        "matched_group_records": float(eligible_records),
+        "matched_group_pairs": float(len(gaps)),
+        "matched_group_gap_mean": (
+            float(detached_gaps.mean().cpu().item()) if detached_gaps is not None else 0.0
+        ),
+        "matched_group_satisfaction": (
+            float((detached_gaps >= float(margin)).float().mean().cpu().item())
+            if detached_gaps is not None
+            else 0.0
+        ),
+        "matched_group_exact_accuracy": group_exact / max(1, len(grouped)),
+    }
+
+
+def _grounded_local_adapter(adapter: nn.Module) -> GroundedEvidenceAdapter | None:
+    if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
+        adapter.local_adapter, GroundedEvidenceAdapter
+    ):
+        return adapter.local_adapter
+    return None
+
+
+def _key_cosine_metrics(keys: torch.Tensor) -> dict[str, float]:
+    normalized = F.normalize(keys.detach().float(), dim=-1)
+    singular_values = torch.linalg.svdvals(normalized)
+    singular_mass = singular_values / singular_values.sum().clamp_min(1.0e-12)
+    effective_rank = torch.exp(
+        -(singular_mass * singular_mass.clamp_min(1.0e-12).log()).sum()
+    )
+    similarity = normalized @ normalized.transpose(0, 1)
+    mask = ~torch.eye(
+        int(similarity.shape[0]),
+        dtype=torch.bool,
+        device=similarity.device,
+    )
+    off_diagonal = similarity[mask]
+    if int(off_diagonal.numel()) == 0:
+        return {
+            "off_diagonal_cosine_mean": 0.0,
+            "off_diagonal_cosine_max": 0.0,
+            "minimum_pairwise_l2": 0.0,
+            "effective_rank": float(effective_rank.cpu().item()),
+        }
+    maximum_cosine = float(off_diagonal.max().cpu().item())
+    return {
+        "off_diagonal_cosine_mean": float(off_diagonal.mean().cpu().item()),
+        "off_diagonal_cosine_max": maximum_cosine,
+        "minimum_pairwise_l2": math.sqrt(max(0.0, 2.0 - 2.0 * maximum_cosine)),
+        "effective_rank": float(effective_rank.cpu().item()),
+    }
+
+
+@torch.no_grad()
+def grounded_reader_geometry_metrics(adapter: nn.Module) -> dict[str, Any]:
+    """Summarize whether learned axis keys have separated from their fixed 2D anchors."""
+
+    local = _grounded_local_adapter(adapter)
+    if local is None:
+        return {}
+    row_keys, col_keys = local._axis_keys(
+        device=local.row_keys.device,
+        dtype=local.row_keys.dtype,
+    )
+    row_fixed_reference = F.normalize(
+        local.row_key_projection(
+            local.row_key_norm(
+                local.fixed_row_keys.to(
+                    device=local.row_keys.device,
+                    dtype=local.row_keys.dtype,
+                )
+            )
+        ),
+        dim=-1,
+    )
+    col_fixed_reference = F.normalize(
+        local.col_key_projection(
+            local.col_key_norm(
+                local.fixed_col_keys.to(
+                    device=local.col_keys.device,
+                    dtype=local.col_keys.dtype,
+                )
+            )
+        ),
+        dim=-1,
+    )
+
+    def axis_metrics(
+        effective: torch.Tensor,
+        fixed_reference: torch.Tensor,
+        fixed: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> dict[str, float]:
+        fixed_rms = float(fixed.detach().float().square().mean().sqrt().cpu().item())
+        residual_rms = float(
+            residual.detach().float().square().mean().sqrt().cpu().item()
+        )
+        anchor_cosine = (
+            F.normalize(effective.detach().float(), dim=-1)
+            * F.normalize(fixed_reference.detach().float(), dim=-1)
+        ).sum(dim=-1)
+        return {
+            **_key_cosine_metrics(effective),
+            "fixed_rms": fixed_rms,
+            "learned_residual_rms": residual_rms,
+            "learned_to_fixed_rms_ratio": residual_rms / max(1.0e-12, fixed_rms),
+            "fixed_anchor_cosine_mean": float(anchor_cosine.mean().cpu().item()),
+            "fixed_anchor_cosine_min": float(anchor_cosine.min().cpu().item()),
+        }
+
+    raw_logit_scale = float(
+        local.routing_logit_scale.detach().float().cpu().item()
+    )
+    logit_scale_limit = math.log(100.0)
+    return {
+        "row": axis_metrics(
+            row_keys,
+            row_fixed_reference,
+            local.fixed_row_keys,
+            local.row_keys,
+        ),
+        "col": axis_metrics(
+            col_keys,
+            col_fixed_reference,
+            local.fixed_col_keys,
+            local.col_keys,
+        ),
+        "routing_logit_scale": float(
+            local.routing_logit_scale.detach().float().exp().clamp(max=100.0).cpu().item()
+        ),
+        "routing_logit_scale_log": raw_logit_scale,
+        "routing_logit_scale_saturated": bool(raw_logit_scale >= logit_scale_limit),
+        "routing_logit_scale_log_margin_to_clamp": logit_scale_limit - raw_logit_scale,
+        "text_layer_weights": [
+            float(value)
+            for value in (
+                torch.softmax(local.text_layer_logits.detach().float(), dim=0)
+                .cpu()
+                .tolist()
+            )
+        ],
+    }
+
+
+def _grounded_evidence_transform_parameters(adapter: nn.Module) -> list[nn.Parameter]:
+    local = _grounded_local_adapter(adapter)
+    if local is None:
+        return []
+    return [
+        *local.evidence_down.parameters(),
+        *local.evidence_up.parameters(),
+    ]
+
+
+def clear_grounded_evidence_transform_gradients(adapter: nn.Module) -> int:
+    parameters = _grounded_evidence_transform_parameters(adapter)
+    for parameter in parameters:
+        parameter.grad = None
+    return len(parameters)
+
+
+def reset_grounded_evidence_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    adapter: nn.Module,
+) -> int:
+    cleared = 0
+    for parameter in _grounded_evidence_transform_parameters(adapter):
+        if parameter in optimizer.state:
+            optimizer.state.pop(parameter)
+            cleared += 1
+    return cleared
+
+
+def _region_indices(spec: Sequence[Any], height: int, width: int) -> list[int]:
+    if len(spec) != 4:
+        raise ValueError(f"Region routing target must be [row,col,height,width], got {spec}.")
+    row, col, region_h, region_w = [int(value) for value in spec]
+    if row < 0 or col < 0 or region_h <= 0 or region_w <= 0:
+        raise ValueError(f"Invalid region routing target: {spec}.")
+    if row + region_h > height or col + region_w > width:
+        raise ValueError(f"Region routing target exceeds grid {(height, width)}: {spec}.")
+    return [
+        current_row * width + current_col
+        for current_row in range(row, row + region_h)
+        for current_col in range(col, col + region_w)
+    ]
+
+
+def _point_index(row: Any, col: Any, height: int, width: int) -> int:
+    row_value, col_value = int(row), int(col)
+    if not (0 <= row_value < height and 0 <= col_value < width):
+        raise ValueError(
+            f"Point routing target {(row_value, col_value)} exceeds grid {(height, width)}."
+        )
+    return row_value * width + col_value
+
+
+def grounded_routing_loss(
+    adapter: nn.Module,
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    local = _grounded_local_adapter(adapter)
+    if local is None or local.last_routing_logits is None or local.last_role_gate_logits is None:
+        raise RuntimeError("Grounded routing outputs were not produced by the positive adapter forward.")
+    logits = local.last_routing_logits
+    row_logits = local.last_row_logits
+    col_logits = local.last_col_logits
+    gate_logits = local.last_role_gate_logits
+    if row_logits is None or col_logits is None:
+        raise RuntimeError("Grounded factorized row/column routing outputs are missing.")
+    if int(logits.shape[0]) != len(records) or tuple(logits.shape[:2]) != tuple(gate_logits.shape):
+        raise ValueError("Grounded routing outputs do not match the record batch.")
+    if tuple(row_logits.shape[:2]) != tuple(logits.shape[:2]) or tuple(
+        col_logits.shape[:2]
+    ) != tuple(logits.shape[:2]):
+        raise ValueError("Grounded row/column logits do not match the cell-routing batch.")
+    height, width = local.latent_grid
+    role_targets: list[list[list[int] | None]] = []
+    for record in records:
+        query_spec = grounding_query_spec_for_record(record)
+        targets: list[list[int] | None] = [None] * int(local.soft_prompt_tokens)
+        kind = str(query_spec["type"])
+        if kind == "point":
+            targets[0] = [
+                _point_index(query_spec["row"], query_spec["col"], height, width)
+            ]
+        elif kind == "point_pair":
+            for role, key in enumerate(("a", "b")):
+                row, col = query_spec[key]
+                targets[role] = [_point_index(row, col, height, width)]
+        elif kind == "region_pair":
+            targets[0] = _region_indices(query_spec["a"], height, width)
+            targets[1] = _region_indices(query_spec["b"], height, width)
+        for target in targets:
+            if target is not None and any(index < 0 or index >= height * width for index in target):
+                raise ValueError(f"Grounded routing target exceeds grid {(height, width)}.")
+        role_targets.append(targets)
+
+    routing_terms_by_record: list[list[torch.Tensor]] = [
+        [] for _record in records
+    ]
+    routing_top1 = 0
+    routing_top5 = 0
+    routing_row_top1 = 0
+    routing_col_top1 = 0
+    target_mass = 0.0
+    normalized_entropy_sum = 0.0
+    active_roles = 0
+    by_task: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "active_roles": 0.0,
+            "top1_correct": 0.0,
+            "top5_correct": 0.0,
+            "row_top1_correct": 0.0,
+            "col_top1_correct": 0.0,
+            "target_mass_sum": 0.0,
+            "normalized_entropy_sum": 0.0,
+            "gate_correct": 0.0,
+            "gate_predicted_active": 0.0,
+            "gate_target_active": 0.0,
+            "gate_slots": 0.0,
+        }
+    )
+    gate_targets = torch.zeros_like(gate_logits, dtype=torch.float32)
+    for row, targets in enumerate(role_targets):
+        task = str(records[row].get("task_type", "unknown"))
+        for role, target in enumerate(targets):
+            if target is None:
+                continue
+            active_roles += 1
+            gate_targets[row, role] = 1.0
+            log_probs = F.log_softmax(logits[row, role].float(), dim=-1)
+            target_tensor = torch.tensor(target, dtype=torch.long, device=logits.device)
+            routing_terms_by_record[row].append(-log_probs[target_tensor].mean())
+            prediction = int(torch.argmax(log_probs.detach()).item())
+            top5 = torch.topk(log_probs.detach(), k=min(5, int(log_probs.numel()))).indices.tolist()
+            routing_top1 += int(prediction in target)
+            routing_top5 += int(any(index in target for index in top5))
+            target_rows = {int(index) // width for index in target}
+            target_cols = {int(index) % width for index in target}
+            routing_row_top1 += int(
+                int(torch.argmax(row_logits[row, role].detach()).item()) in target_rows
+            )
+            routing_col_top1 += int(
+                int(torch.argmax(col_logits[row, role].detach()).item()) in target_cols
+            )
+            target_mass += float(log_probs.detach()[target_tensor].exp().sum().cpu().item())
+            probabilities = log_probs.detach().exp()
+            normalized_entropy = float(
+                (
+                    -(probabilities * log_probs.detach()).sum()
+                    / math.log(max(2, int(probabilities.numel())))
+                )
+                .cpu()
+                .item()
+            )
+            normalized_entropy_sum += normalized_entropy
+            task_totals = by_task[task]
+            task_totals["active_roles"] += 1.0
+            task_totals["top1_correct"] += float(prediction in target)
+            task_totals["top5_correct"] += float(any(index in target for index in top5))
+            task_totals["row_top1_correct"] += float(
+                int(torch.argmax(row_logits[row, role].detach()).item()) in target_rows
+            )
+            task_totals["col_top1_correct"] += float(
+                int(torch.argmax(col_logits[row, role].detach()).item()) in target_cols
+            )
+            task_totals["target_mass_sum"] += float(
+                log_probs.detach()[target_tensor].exp().sum().cpu().item()
+            )
+            task_totals["normalized_entropy_sum"] += normalized_entropy
+    # Keep every record equally weighted even though comparison tasks activate two
+    # role slots while point-value tasks activate one. Records without a routing
+    # target contribute an exact zero; their role gate remains supervised below.
+    record_routing_losses = [
+        (
+            torch.stack(terms).mean()
+            if terms
+            else logits[row].float().sum() * 0.0
+        )
+        for row, terms in enumerate(routing_terms_by_record)
+    ]
+    routing_loss = (
+        torch.stack(record_routing_losses).mean()
+        if record_routing_losses
+        else logits.float().sum() * 0.0
+    )
+    gate_loss = F.binary_cross_entropy_with_logits(gate_logits.float(), gate_targets)
+    gate_predictions = gate_logits.detach().float() >= 0.0
+    gate_accuracy = float((gate_predictions == gate_targets.bool()).float().mean().cpu().item())
+    for row, record in enumerate(records):
+        task_totals = by_task[str(record.get("task_type", "unknown"))]
+        task_totals["gate_correct"] += float(
+            (gate_predictions[row] == gate_targets[row].bool()).float().sum().cpu().item()
+        )
+        task_totals["gate_predicted_active"] += float(
+            gate_predictions[row].float().sum().cpu().item()
+        )
+        task_totals["gate_target_active"] += float(
+            gate_targets[row].sum().cpu().item()
+        )
+        task_totals["gate_slots"] += float(gate_targets.shape[1])
+    task_metrics = {}
+    for task, totals in sorted(by_task.items()):
+        task_active = max(1.0, totals["active_roles"])
+        task_gate_slots = max(1.0, totals["gate_slots"])
+        task_metrics[task] = {
+            "active_roles": totals["active_roles"],
+            "top1_accuracy": totals["top1_correct"] / task_active,
+            "top5_accuracy": totals["top5_correct"] / task_active,
+            "row_top1_accuracy": totals["row_top1_correct"] / task_active,
+            "col_top1_accuracy": totals["col_top1_correct"] / task_active,
+            "target_mass": totals["target_mass_sum"] / task_active,
+            "normalized_entropy": totals["normalized_entropy_sum"] / task_active,
+            "gate_accuracy": totals["gate_correct"] / task_gate_slots,
+            "gate_active_fraction": totals["gate_predicted_active"] / task_gate_slots,
+            "gate_target_active_fraction": totals["gate_target_active"] / task_gate_slots,
+            "gate_slots": totals["gate_slots"],
+        }
+    return routing_loss, gate_loss, {
+        "routing_active_roles": float(active_roles),
+        "routing_top1_accuracy": routing_top1 / max(1, active_roles),
+        "routing_top5_accuracy": routing_top5 / max(1, active_roles),
+        "routing_row_top1_accuracy": routing_row_top1 / max(1, active_roles),
+        "routing_col_top1_accuracy": routing_col_top1 / max(1, active_roles),
+        "routing_target_mass": target_mass / max(1, active_roles),
+        "routing_normalized_entropy": normalized_entropy_sum / max(1, active_roles),
+        "routing_gate_accuracy": gate_accuracy,
+        "routing_gate_active_fraction": float(
+            gate_predictions.float().mean().cpu().item()
+        ),
+        "routing_gate_target_active_fraction": float(
+            gate_targets.mean().cpu().item()
+        ),
+        "routing_by_task": task_metrics,
+    }
+
+
+def routing_metric_weighted_totals(
+    metrics: Mapping[str, Any],
+    *,
+    record_count: int,
+    gate_slots_per_record: int,
+) -> dict[str, float]:
+    """Convert routing means into additive totals for update/epoch reduction."""
+    if int(record_count) < 0 or int(gate_slots_per_record) < 0:
+        raise ValueError("Routing metric counts must be non-negative.")
+    active_roles = float(metrics.get("routing_active_roles", 0.0))
+    gate_slots = float(int(record_count) * int(gate_slots_per_record))
+    return {
+        "routing_active_roles": active_roles,
+        "routing_top1_correct": float(metrics.get("routing_top1_accuracy", 0.0))
+        * active_roles,
+        "routing_top5_correct": float(metrics.get("routing_top5_accuracy", 0.0))
+        * active_roles,
+        "routing_row_top1_correct": float(
+            metrics.get("routing_row_top1_accuracy", 0.0)
+        )
+        * active_roles,
+        "routing_col_top1_correct": float(
+            metrics.get("routing_col_top1_accuracy", 0.0)
+        )
+        * active_roles,
+        "routing_target_mass_sum": float(metrics.get("routing_target_mass", 0.0))
+        * active_roles,
+        "routing_normalized_entropy_sum": float(
+            metrics.get("routing_normalized_entropy", 0.0)
+        )
+        * active_roles,
+        "routing_gate_correct": float(metrics.get("routing_gate_accuracy", 0.0))
+        * gate_slots,
+        "routing_gate_active": float(
+            metrics.get("routing_gate_active_fraction", 0.0)
+        )
+        * gate_slots,
+        "routing_gate_target_active": float(
+            metrics.get("routing_gate_target_active_fraction", 0.0)
+        )
+        * gate_slots,
+        "routing_gate_slots": gate_slots,
+    }
 
 
 def same_state_question_swap_indices(
@@ -4676,9 +5910,9 @@ def training_loss(
     batch: Mapping[str, Any],
     device: torch.device,
     args: argparse.Namespace,
+    routing_only: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     records = batch["records"]
-    answers = [str(record["answer"]) for record in records]
     question_context = contextual_adapter_question_context(
         llm=llm,
         adapter=adapter,
@@ -4689,15 +5923,87 @@ def training_loss(
         layer_index=int(args.local_context_layer),
         prompt_template=str(args.prompt_template),
     )
-    ce_weight = float(args.ce_loss_weight)
-    choice_ce_weight = float(args.choice_ce_loss_weight)
-    ranking_weight = float(args.ranking_loss_weight)
-    swapped_weight = float(args.swapped_question_loss_weight)
+    ce_weight = 0.0 if routing_only else float(args.ce_loss_weight)
+    choice_ce_weight = 0.0 if routing_only else float(args.choice_ce_loss_weight)
+    ranking_weight = 0.0 if routing_only else float(args.ranking_loss_weight)
+    swapped_weight = 0.0 if routing_only else float(args.swapped_question_loss_weight)
+    routing_weight = float(args.grounding_routing_loss_weight)
+    gate_weight = float(args.grounding_gate_loss_weight)
+    matched_group_weight = 0.0 if routing_only else float(args.matched_group_loss_weight)
     choice_metrics = {
         "choice_accuracy": 0.0,
         "choice_01_loss": 0.0,
         "choice_single_token_path": 0.0,
     }
+    answer_objective_active = any(
+        weight > 0.0
+        for weight in (
+            ce_weight,
+            choice_ce_weight,
+            ranking_weight,
+            swapped_weight,
+            matched_group_weight,
+        )
+    )
+    if not answer_objective_active:
+        if _grounded_local_adapter(adapter) is None:
+            raise ValueError("Routing-only training requires grounded_evidence_adapter.")
+        soft_embeds = contextual_adapter_soft_embeds(
+            llm=llm,
+            adapter=adapter,
+            tokenizer=tokenizer,
+            records=records,
+            latent_map=batch["latent_map"],
+            device=device,
+            max_prompt_tokens=int(args.max_prompt_tokens),
+            layer_index=int(args.local_context_layer),
+            mode="correct",
+            prompt_template=str(args.prompt_template),
+            precomputed_question_context=question_context,
+        )
+        if soft_embeds is None:
+            raise RuntimeError("Grounded routing-only forward did not produce soft embeddings.")
+        routing_loss, gate_loss, routing_metrics = grounded_routing_loss(adapter, records)
+        # Keep every trainable reader parameter in the distributed gradient schema. Evidence
+        # transforms receive exact zero gradients until the answer objective is enabled.
+        graph_anchor = soft_embeds.sum() * 0.0
+        total_loss = (
+            routing_weight * routing_loss
+            + gate_weight * gate_loss
+            + graph_anchor
+        )
+        zero = routing_loss.new_zeros(())
+        return total_loss, {
+            "loss": float(total_loss.detach().cpu().item()),
+            "ce_loss": 0.0,
+            "weighted_ce_loss": 0.0,
+            "choice_ce_loss": 0.0,
+            "weighted_choice_ce_loss": 0.0,
+            "choice_accuracy": 0.0,
+            "choice_01_loss": 0.0,
+            "choice_single_token_path": 0.0,
+            "ranking_loss": 0.0,
+            "weighted_ranking_loss": 0.0,
+            "ranking_margin_mean": 0.0,
+            "swapped_question_loss": 0.0,
+            "weighted_swapped_question_loss": 0.0,
+            "swapped_question_pairs": 0.0,
+            "swapped_question_margin_mean": 0.0,
+            "routing_loss": float(routing_loss.detach().cpu().item()),
+            "weighted_routing_loss": float((routing_weight * routing_loss).detach().cpu().item()),
+            "routing_gate_loss": float(gate_loss.detach().cpu().item()),
+            "weighted_routing_gate_loss": float((gate_weight * gate_loss).detach().cpu().item()),
+            "matched_group_loss": float(zero.cpu().item()),
+            "weighted_matched_group_loss": float(zero.cpu().item()),
+            "matched_group_count": 0.0,
+            "matched_group_records": 0.0,
+            "matched_group_pairs": 0.0,
+            "matched_group_gap_mean": 0.0,
+            "matched_group_satisfaction": 0.0,
+            "matched_group_exact_accuracy": 0.0,
+            **routing_metrics,
+        }
+    answers = [str(record["answer"]) for record in records]
     if choice_ce_weight > 0.0:
         (
             choice_loss_value,
@@ -4742,7 +6048,7 @@ def training_loss(
             _answer_ce,
             positive_choice_nll,
             positive_soft_embeds,
-            _choice_metrics,
+            choice_metrics,
         ) = choice_ce_loss(
             llm=llm,
             adapter=adapter,
@@ -4754,6 +6060,31 @@ def training_loss(
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
         )
+    candidate_log_probs = choice_metrics.get("candidate_log_probs")
+    if not isinstance(candidate_log_probs, Sequence) or len(candidate_log_probs) != len(records):
+        raise RuntimeError("Positive restricted-choice scoring did not return candidate log-probabilities.")
+    matched_group_loss, matched_group_metrics = matched_coordinate_group_loss(
+        records=records,
+        candidate_log_probs=candidate_log_probs,
+        margin=float(args.matched_group_loss_margin),
+    )
+    if _grounded_local_adapter(adapter) is not None:
+        routing_loss, gate_loss, routing_metrics = grounded_routing_loss(adapter, records)
+    else:
+        routing_loss = positive_choice_nll.new_zeros(())
+        gate_loss = positive_choice_nll.new_zeros(())
+        routing_metrics = {
+            "routing_active_roles": 0.0,
+            "routing_top1_accuracy": 0.0,
+            "routing_top5_accuracy": 0.0,
+            "routing_row_top1_accuracy": 0.0,
+            "routing_col_top1_accuracy": 0.0,
+            "routing_target_mass": 0.0,
+            "routing_normalized_entropy": 0.0,
+            "routing_gate_accuracy": 0.0,
+            "routing_gate_active_fraction": 0.0,
+            "routing_gate_target_active_fraction": 0.0,
+        }
     ranking_loss = positive_choice_nll.new_zeros(())
     ranking_margin_mean = 0.0
     swapped_loss = positive_choice_nll.new_zeros(())
@@ -4899,7 +6230,18 @@ def training_loss(
     weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
     weighted_ranking_loss = ranking_weight * ranking_loss
     weighted_swapped_loss = swapped_weight * swapped_loss
-    total_loss = weighted_ce_loss + weighted_choice_ce_loss + weighted_ranking_loss + weighted_swapped_loss
+    weighted_routing_loss = routing_weight * routing_loss
+    weighted_gate_loss = gate_weight * gate_loss
+    weighted_matched_group_loss = matched_group_weight * matched_group_loss
+    total_loss = (
+        weighted_ce_loss
+        + weighted_choice_ce_loss
+        + weighted_ranking_loss
+        + weighted_swapped_loss
+        + weighted_routing_loss
+        + weighted_gate_loss
+        + weighted_matched_group_loss
+    )
     return total_loss, {
         "loss": float(total_loss.detach().cpu().item()),
         "ce_loss": float(ce_loss.detach().cpu().item()),
@@ -4914,6 +6256,14 @@ def training_loss(
         "ranking_margin_mean": ranking_margin_mean,
         "swapped_question_loss": float(swapped_loss.detach().cpu().item()),
         "weighted_swapped_question_loss": float(weighted_swapped_loss.detach().cpu().item()),
+        "routing_loss": float(routing_loss.detach().cpu().item()),
+        "weighted_routing_loss": float(weighted_routing_loss.detach().cpu().item()),
+        "routing_gate_loss": float(gate_loss.detach().cpu().item()),
+        "weighted_routing_gate_loss": float(weighted_gate_loss.detach().cpu().item()),
+        "matched_group_loss": float(matched_group_loss.detach().cpu().item()),
+        "weighted_matched_group_loss": float(weighted_matched_group_loss.detach().cpu().item()),
+        **routing_metrics,
+        **matched_group_metrics,
         **swapped_metrics,
     }
 
@@ -5407,7 +6757,12 @@ def evaluate_choice_accuracy(
     device: torch.device,
     args: argparse.Namespace,
     baseline_modes: Sequence[str],
+    routing_only: bool = False,
 ) -> dict[str, Any]:
+    if routing_only and list(baseline_modes) != ["correct"]:
+        raise ValueError("Routing-only validation supports exactly the correct latent mode.")
+    if routing_only and _grounded_local_adapter(adapter) is None:
+        raise ValueError("Routing-only validation requires grounded_evidence_adapter.")
     adapter_was_training = bool(adapter.training)
     llm_checkpoint_training = frozen_llm_checkpoint_execution_active(llm)
     llm.eval()
@@ -5444,6 +6799,38 @@ def evaluate_choice_accuracy(
         field_correct: dict[str, int] = defaultdict(int)
         task_field_total: dict[str, int] = defaultdict(int)
         task_field_correct: dict[str, int] = defaultdict(int)
+        routing_totals = {
+            "active_roles": 0.0,
+            "top1_correct": 0.0,
+            "top5_correct": 0.0,
+            "row_top1_correct": 0.0,
+            "col_top1_correct": 0.0,
+            "target_mass_sum": 0.0,
+            "normalized_entropy_sum": 0.0,
+            "gate_correct": 0.0,
+            "gate_active": 0.0,
+            "gate_target_active": 0.0,
+            "gate_slots": 0.0,
+        }
+        routing_tasks = sorted(
+            {str(record.get("task_type", "unknown")) for record in dataset.records}
+        )
+        routing_by_task_totals = {
+            task: {
+                "active_roles": 0.0,
+                "top1_correct": 0.0,
+                "top5_correct": 0.0,
+                "row_top1_correct": 0.0,
+                "col_top1_correct": 0.0,
+                "target_mass_sum": 0.0,
+                "normalized_entropy_sum": 0.0,
+                "gate_correct": 0.0,
+                "gate_active": 0.0,
+                "gate_target_active": 0.0,
+                "gate_slots": 0.0,
+            }
+            for task in routing_tasks
+        }
         for batch in tqdm(
             loader,
             desc=f"Eval [{mode}]",
@@ -5452,16 +6839,104 @@ def evaluate_choice_accuracy(
         ):
             records = records_for_baseline(mode, batch, dataset)
             latents = baseline_latents(mode, batch, dataset)
-            predictions = collect_candidate_scores(
-                llm=llm,
-                adapter=adapter,
-                tokenizer=tokenizer,
-                records=records,
-                latent_map=latents,
-                device=device,
-                args=args,
-                mode="correct" if mode == "shuffled_stats" else mode,
-            )
+            if routing_only:
+                soft_embeds = contextual_adapter_soft_embeds(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    records=records,
+                    latent_map=latents,
+                    device=device,
+                    max_prompt_tokens=int(args.max_prompt_tokens),
+                    layer_index=int(args.local_context_layer),
+                    mode="correct",
+                    prompt_template=str(args.prompt_template),
+                )
+                if soft_embeds is None:
+                    raise RuntimeError("Routing-only validation did not produce grounded soft embeddings.")
+                predictions: Sequence[str] = ()
+            else:
+                predictions = collect_candidate_scores(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    records=records,
+                    latent_map=latents,
+                    device=device,
+                    args=args,
+                    mode="correct" if mode == "shuffled_stats" else mode,
+                )
+            if mode == "correct" and _grounded_local_adapter(adapter) is not None:
+                _routing_loss, _gate_loss, routing_metrics = grounded_routing_loss(
+                    adapter,
+                    records,
+                )
+                active_roles = float(routing_metrics["routing_active_roles"])
+                gate_slots = float(
+                    len(records) * int(_grounded_local_adapter(adapter).soft_prompt_tokens)
+                )
+                routing_totals["active_roles"] += active_roles
+                routing_totals["top1_correct"] += (
+                    float(routing_metrics["routing_top1_accuracy"]) * active_roles
+                )
+                routing_totals["top5_correct"] += (
+                    float(routing_metrics["routing_top5_accuracy"]) * active_roles
+                )
+                routing_totals["row_top1_correct"] += (
+                    float(routing_metrics["routing_row_top1_accuracy"]) * active_roles
+                )
+                routing_totals["col_top1_correct"] += (
+                    float(routing_metrics["routing_col_top1_accuracy"]) * active_roles
+                )
+                routing_totals["target_mass_sum"] += (
+                    float(routing_metrics["routing_target_mass"]) * active_roles
+                )
+                routing_totals["normalized_entropy_sum"] += (
+                    float(routing_metrics["routing_normalized_entropy"]) * active_roles
+                )
+                routing_totals["gate_correct"] += (
+                    float(routing_metrics["routing_gate_accuracy"]) * gate_slots
+                )
+                routing_totals["gate_active"] += (
+                    float(routing_metrics["routing_gate_active_fraction"]) * gate_slots
+                )
+                routing_totals["gate_target_active"] += (
+                    float(routing_metrics["routing_gate_target_active_fraction"])
+                    * gate_slots
+                )
+                routing_totals["gate_slots"] += gate_slots
+                task_routing = routing_metrics.get("routing_by_task", {})
+                if not isinstance(task_routing, Mapping):
+                    raise TypeError("Grounded routing_by_task metrics must be a mapping.")
+                for task, task_metrics in task_routing.items():
+                    if task not in routing_by_task_totals or not isinstance(task_metrics, Mapping):
+                        raise ValueError(f"Unexpected grounded routing task metrics for {task!r}.")
+                    totals = routing_by_task_totals[task]
+                    task_active = float(task_metrics.get("active_roles", 0.0))
+                    task_gate_slots = float(task_metrics.get("gate_slots", 0.0))
+                    totals["active_roles"] += task_active
+                    totals["top1_correct"] += float(task_metrics.get("top1_accuracy", 0.0)) * task_active
+                    totals["top5_correct"] += float(task_metrics.get("top5_accuracy", 0.0)) * task_active
+                    totals["row_top1_correct"] += (
+                        float(task_metrics.get("row_top1_accuracy", 0.0)) * task_active
+                    )
+                    totals["col_top1_correct"] += (
+                        float(task_metrics.get("col_top1_accuracy", 0.0)) * task_active
+                    )
+                    totals["target_mass_sum"] += float(task_metrics.get("target_mass", 0.0)) * task_active
+                    totals["normalized_entropy_sum"] += (
+                        float(task_metrics.get("normalized_entropy", 0.0)) * task_active
+                    )
+                    totals["gate_correct"] += float(task_metrics.get("gate_accuracy", 0.0)) * task_gate_slots
+                    totals["gate_active"] += (
+                        float(task_metrics.get("gate_active_fraction", 0.0))
+                        * task_gate_slots
+                    )
+                    totals["gate_target_active"] += (
+                        float(task_metrics.get("gate_target_active_fraction", 0.0))
+                        * task_gate_slots
+                    )
+                    totals["gate_slots"] += task_gate_slots
             for record, prediction in zip(records, predictions):
                 answer = str(record["answer"])
                 task_type = str(record.get("task_type", "unknown"))
@@ -5524,6 +6999,58 @@ def evaluate_choice_accuracy(
                 for key, count in sorted(task_field_total.items())
             },
         }
+        if mode == "correct" and _grounded_local_adapter(adapter) is not None:
+            routing_totals = distributed_sum_scalars(routing_totals, device=device)
+            routing_by_task_totals = {
+                task: distributed_sum_scalars(totals, device=device)
+                for task, totals in routing_by_task_totals.items()
+            }
+            active_roles = max(1.0, routing_totals["active_roles"])
+            gate_slots = max(1.0, routing_totals["gate_slots"])
+            metrics[mode]["routing"] = {
+                "active_roles": int(round(routing_totals["active_roles"])),
+                "top1_accuracy": routing_totals["top1_correct"] / active_roles,
+                "top5_accuracy": routing_totals["top5_correct"] / active_roles,
+                "row_top1_accuracy": routing_totals["row_top1_correct"] / active_roles,
+                "col_top1_accuracy": routing_totals["col_top1_correct"] / active_roles,
+                "target_mass": routing_totals["target_mass_sum"] / active_roles,
+                "normalized_entropy": routing_totals["normalized_entropy_sum"]
+                / active_roles,
+                "gate_accuracy": routing_totals["gate_correct"] / gate_slots,
+                "gate_active_fraction": routing_totals["gate_active"] / gate_slots,
+                "gate_target_active_fraction": routing_totals[
+                    "gate_target_active"
+                ]
+                / gate_slots,
+                "by_task": {
+                    task: {
+                        "active_roles": int(round(totals["active_roles"])),
+                        "top1_accuracy": totals["top1_correct"]
+                        / max(1.0, totals["active_roles"]),
+                        "top5_accuracy": totals["top5_correct"]
+                        / max(1.0, totals["active_roles"]),
+                        "row_top1_accuracy": totals["row_top1_correct"]
+                        / max(1.0, totals["active_roles"]),
+                        "col_top1_accuracy": totals["col_top1_correct"]
+                        / max(1.0, totals["active_roles"]),
+                        "target_mass": totals["target_mass_sum"]
+                        / max(1.0, totals["active_roles"]),
+                        "normalized_entropy": totals["normalized_entropy_sum"]
+                        / max(1.0, totals["active_roles"]),
+                        "gate_accuracy": totals["gate_correct"]
+                        / max(1.0, totals["gate_slots"]),
+                        "gate_active_fraction": totals["gate_active"]
+                        / max(1.0, totals["gate_slots"]),
+                        "gate_target_active_fraction": totals[
+                            "gate_target_active"
+                        ]
+                        / max(1.0, totals["gate_slots"]),
+                    }
+                    for task, totals in sorted(routing_by_task_totals.items())
+                },
+            }
+    if routing_only:
+        metrics["evaluation_mode"] = "routing_only_shallow_qwen"
     adapter.train(adapter_was_training)
     set_frozen_llm_execution_mode(llm, checkpoint_training=llm_checkpoint_training)
     return metrics
@@ -5756,6 +7283,8 @@ def _adapter_forward_with_trace(
 
         return hook
 
+    local_groups: list[dict[str, Any]] | None = None
+    global_groups: list[dict[str, Any]] | None = None
     if isinstance(adapter, HybridGlobalLocalAdapter):
         local_query_tokens = getattr(adapter.local_adapter, "query_tokens", None)
         global_query_tokens = getattr(adapter.global_adapter, "query_tokens", None)
@@ -5787,6 +7316,11 @@ def _adapter_forward_with_trace(
             handles.append(module.register_forward_hook(capture(f"local_text_encoder_{index}", pool_text=True)))
         for index, module in enumerate(getattr(adapter.local_adapter, "text_blocks", [])):
             handles.append(module.register_forward_hook(capture(f"local_after_text_{index}")))
+        grounded_text_block = getattr(adapter.local_adapter, "text_block", None)
+        if grounded_text_block is not None:
+            handles.append(
+                grounded_text_block.register_forward_hook(capture("grounded_role_states"))
+            )
         for index, module in enumerate(getattr(adapter.local_adapter, "latent_blocks", [])):
             handles.append(module.register_forward_hook(capture(f"local_after_latent_{index}")))
         if isinstance(adapter.local_adapter, ResidualQuestionConditionedAdapter):
@@ -5814,6 +7348,11 @@ def _adapter_forward_with_trace(
     if isinstance(adapter, HybridGlobalLocalAdapter):
         attention_blocks = [
             *getattr(adapter.local_adapter, "text_blocks", []),
+            *(
+                [adapter.local_adapter.text_block]
+                if isinstance(adapter.local_adapter, GroundedEvidenceAdapter)
+                else []
+            ),
             *getattr(adapter.local_adapter, "latent_blocks", []),
             *(
                 list(adapter.local_adapter.backbone.blocks)
@@ -5834,6 +7373,16 @@ def _adapter_forward_with_trace(
             trace["global_prompt"] = global_prompts[0].detach().float().cpu()
             trace["local_prompt_or_residual"] = local_prompts[0].detach().float().cpu()
             trace["combined_prompt"] = soft[0].detach().float().cpu()
+            if isinstance(adapter.local_adapter, GroundedEvidenceAdapter):
+                grounded = adapter.local_adapter
+                for name, value in (
+                    ("grounded_routing_weights", grounded.last_routing_weights),
+                    ("grounded_row_logits", grounded.last_row_logits),
+                    ("grounded_col_logits", grounded.last_col_logits),
+                    ("grounded_role_gate_logits", grounded.last_role_gate_logits),
+                ):
+                    if isinstance(value, torch.Tensor):
+                        trace[name] = value[0].detach().float().cpu()
         else:
             soft = adapter(
                 latent,
@@ -5862,6 +7411,12 @@ def _adapter_forward_with_trace(
                     block.last_attention_weights = None
                     if hasattr(block, "last_self_attention_weights"):
                         block.last_self_attention_weights = None
+            if isinstance(adapter.local_adapter, GroundedEvidenceAdapter):
+                grounded_text_block = adapter.local_adapter.text_block
+                if grounded_text_block.last_attention_weights is not None:
+                    trace["grounded_text_attention"] = grounded_text_block.last_attention_weights
+                grounded_text_block.capture_attention = False
+                grounded_text_block.last_attention_weights = None
         for handle in handles:
             handle.remove()
     return soft, trace
@@ -6090,6 +7645,85 @@ def _run_embedded_diagnostics_impl(
                         }
                         for value, index in zip(values.tolist(), indices.tolist())
                     ]
+            grounded_routing = correct_state["adapter_hidden"].get(
+                "grounded_routing_weights"
+            )
+            if isinstance(grounded_routing, torch.Tensor):
+                local = adapter.local_adapter
+                if not isinstance(local, GroundedEvidenceAdapter):
+                    raise TypeError("Grounded diagnostic tensors require GroundedEvidenceAdapter.")
+                height, width = local.latent_grid
+                row_logits = correct_state["adapter_hidden"].get("grounded_row_logits")
+                col_logits = correct_state["adapter_hidden"].get("grounded_col_logits")
+                gate_logits = correct_state["adapter_hidden"].get(
+                    "grounded_role_gate_logits"
+                )
+                text_attention = correct_state["adapter_hidden"].get(
+                    "grounded_text_attention"
+                )
+                role_text_weights = (
+                    text_attention[0].mean(dim=0)
+                    if isinstance(text_attention, torch.Tensor) and text_attention.ndim == 4
+                    else None
+                )
+                grounded_roles: list[dict[str, Any]] = []
+                for role in range(int(grounded_routing.shape[0])):
+                    weights = grounded_routing[role].float()
+                    top_count = min(8, int(weights.numel()))
+                    cell_values, cell_indices = torch.topk(weights, k=top_count)
+                    role_payload: dict[str, Any] = {
+                        "role": role,
+                        "gate_probability": (
+                            float(torch.sigmoid(gate_logits[role]).item())
+                            if isinstance(gate_logits, torch.Tensor)
+                            else None
+                        ),
+                        "normalized_entropy": float(
+                            (-(weights.clamp_min(1.0e-12) * weights.clamp_min(1.0e-12).log()).sum()
+                             / math.log(max(2, int(weights.numel())))).item()
+                        ),
+                        "top_cells": [
+                            {
+                                "index": int(index),
+                                "row": int(index) // width,
+                                "col": int(index) % width,
+                                "weight": float(value),
+                            }
+                            for value, index in zip(
+                                cell_values.tolist(), cell_indices.tolist()
+                            )
+                        ],
+                    }
+                    for axis, logits in (("rows", row_logits), ("cols", col_logits)):
+                        if isinstance(logits, torch.Tensor):
+                            probabilities = torch.softmax(logits[role].float(), dim=-1)
+                            axis_count = min(5, int(probabilities.numel()))
+                            values, indices = torch.topk(probabilities, k=axis_count)
+                            role_payload[f"top_{axis}"] = [
+                                {"index": int(index), "probability": float(value)}
+                                for value, index in zip(values.tolist(), indices.tolist())
+                            ]
+                    if isinstance(role_text_weights, torch.Tensor):
+                        token_weights = role_text_weights[role]
+                        token_count = min(8, int(token_weights.numel()))
+                        values, indices = torch.topk(token_weights, k=token_count)
+                        role_payload["top_text_tokens"] = [
+                            {
+                                "index": int(token_index),
+                                "token": str(
+                                    tokenizer.convert_ids_to_tokens(
+                                        int(local_ids[0, token_index].item())
+                                    )
+                                ),
+                                "text": tokenizer.decode(
+                                    [int(local_ids[0, token_index].item())]
+                                ),
+                                "weight": float(value),
+                            }
+                            for value, token_index in zip(values.tolist(), indices.tolist())
+                        ]
+                    grounded_roles.append(role_payload)
+                local_attention_summary["grounded_roles"] = grounded_roles
         soft_comparison = _cosine_and_relative_l2(correct_state["soft_prompt"], shuffled_state["soft_prompt"])
         soft_comparison["query_off_diagonal_cosine"] = _mean_off_diagonal_cosine(
             correct_state["soft_prompt"]
@@ -6402,7 +8036,9 @@ def _run_embedded_diagnostics_impl(
     conditioned_backbone_trainable_parameters = 0
     question_conditioning_trainable_parameters = 0
     if isinstance(adapter, HybridGlobalLocalAdapter):
-        residual_gate = float(adapter.local_adapter.gate.detach().float().cpu().item())
+        local_gate = getattr(adapter.local_adapter, "gate", None)
+        if isinstance(local_gate, torch.Tensor) and int(local_gate.numel()) == 1:
+            residual_gate = float(local_gate.detach().float().cpu().item())
         layer_logits = getattr(adapter.local_adapter, "text_layer_logits", None)
         context_layers = getattr(adapter.local_adapter, "context_layers", ())
         if isinstance(layer_logits, torch.Tensor):
@@ -6626,6 +8262,10 @@ def save_adapter_checkpoint(
         "latent_shape_chw": list(int(dim) for dim in latent_shape),
         "llm_hidden_size": int(llm_hidden_size),
         "latent_contract": dict(latent_contract),
+        "lineage": {
+            "stage2_warm_start_checkpoint": getattr(args, "stage2_warm_start_checkpoint", None),
+            "stage2_warm_start_sha256": getattr(args, "stage2_warm_start_sha256", None),
+        },
         "metrics": dict(metrics or {}),
     }
     atomic_torch_save(path, payload)
@@ -6798,12 +8438,18 @@ def adapter_from_checkpoint(
             "hybrid_local_qformer",
             "residual_question_qformer",
             "residual_question_adapter",
+            "grounded_evidence_adapter",
         }
         else ""
     )
     global_adapter_type = str(
         ckpt_args.get("global_adapter_type", ckpt_args.get("adapter_type", "qformer"))
     ).lower()
+    if architecture == "grounded_evidence_adapter" and global_adapter_type != "spatial_transformer":
+        raise ValueError(
+            "Grounded evidence checkpoints require a spatial_transformer global adapter whose "
+            "row-major tokens remain aligned one-to-one with latent cells."
+        )
     if global_adapter_type == "spatial_transformer":
         global_tokens = int(latent_shape[-2]) * int(latent_shape[-1])
     else:
@@ -6837,6 +8483,33 @@ def adapter_from_checkpoint(
     if architecture in {"alignment_qformer", "alignment_adapter"}:
         global_adapter.load_state_dict(state_dict, strict=True)
         return global_adapter
+
+    if architecture == "grounded_evidence_adapter":
+        role_queries = state_dict.get("local_adapter.role_queries")
+        if not isinstance(role_queries, torch.Tensor):
+            raise ValueError("Grounded evidence checkpoint is missing local_adapter.role_queries.")
+        local_adapter = GroundedEvidenceAdapter(
+            latent_grid=tuple(int(value) for value in latent_shape[-2:]),
+            llm_hidden_size=llm_hidden_size,
+            context_layers=[
+                int(value) for value in parse_csv(ckpt_args.get("local_context_layers", "2,6"))
+            ],
+            adapter_dim=adapter_dim,
+            adapter_heads=adapter_heads,
+            dropout=float(ckpt_args.get("dropout", 0.0)),
+            evidence_tokens=int(role_queries.shape[1]),
+            soft_prompt_scale=float(ckpt_args.get("soft_prompt_scale", 0.05)),
+            gate_bias_init=float(ckpt_args.get("grounded_gate_bias_init", -2.0)),
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local_adapter,
+            freeze_global=True,
+            global_prompt_dropout=0.0,
+            combine_mode="concat",
+        )
+        adapter.load_state_dict(state_dict, strict=True)
+        return adapter
 
     if architecture in {"residual_question_qformer", "residual_question_adapter"}:
         local_adapter = ResidualQuestionConditionedAdapter(
@@ -6900,6 +8573,52 @@ def adapter_from_checkpoint(
     return adapter
 
 
+def save_validate_and_rebuild_adapter_checkpoint(
+    path: str | Path,
+    *,
+    adapter: nn.Module,
+    args: argparse.Namespace,
+    latent_shape: Sequence[int],
+    llm_hidden_size: int,
+    latent_contract: Mapping[str, Any],
+    metrics: Mapping[str, Any] | None = None,
+) -> None:
+    """Persist a checkpoint and prove that its standalone strict-load path works."""
+    save_adapter_checkpoint(
+        path,
+        adapter=adapter,
+        args=args,
+        latent_shape=latent_shape,
+        llm_hidden_size=llm_hidden_size,
+        latent_contract=latent_contract,
+        metrics=metrics,
+    )
+    checkpoint: Any = None
+    rebuilt: nn.Module | None = None
+    try:
+        checkpoint = torch.load(
+            Path(path),
+            map_location="cpu",
+            weights_only=True,
+        )
+        validate_adapter_checkpoint_payload(
+            checkpoint,
+            expected_latent_shape=latent_shape,
+            expected_llm_hidden_size=int(llm_hidden_size),
+            expected_architecture=str(args.adapter_architecture),
+            expected_latent_contract=latent_contract,
+        )
+        rebuilt = adapter_from_checkpoint(
+            checkpoint,
+            latent_shape=latent_shape,
+            llm_hidden_size=int(llm_hidden_size),
+        )
+    finally:
+        del rebuilt
+        del checkpoint
+        gc.collect()
+
+
 def flatten_numeric_metrics(prefix: str, metrics: Mapping[str, Any]) -> dict[str, float]:
     flattened: dict[str, float] = {}
     for key, value in metrics.items():
@@ -6950,6 +8669,10 @@ def compact_accuracy_metrics(prefix: str, metrics: Mapping[str, Any]) -> dict[st
                     payload[f"{prefix}/task/{task}/accuracy"] = float(task_metrics["accuracy"])
     correct = metrics.get("correct")
     shuffled = metrics.get("shuffled")
+    if isinstance(correct, Mapping) and isinstance(correct.get("routing"), Mapping):
+        for key, value in correct["routing"].items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                payload[f"{prefix}/routing/{key}"] = float(value)
     if isinstance(correct, Mapping) and isinstance(shuffled, Mapping):
         correct_tasks = correct.get("by_task")
         shuffled_tasks = shuffled.get("by_task")
@@ -7030,7 +8753,113 @@ def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
     if metric_name == "correct_accuracy":
         correct = metrics.get("correct")
         return float(correct.get("accuracy", -math.inf)) if isinstance(correct, Mapping) else -math.inf
+    if metric_name in {
+        "normalized_point_latent_gain",
+        "point_value_min_latent_gain",
+        "point_value_min_grounded_gain",
+    }:
+        correct = metrics.get("correct")
+        shuffled = metrics.get("shuffled")
+        if not isinstance(correct, Mapping) or not isinstance(shuffled, Mapping):
+            return -math.inf
+        correct_tasks = correct.get("by_task")
+        shuffled_tasks = shuffled.get("by_task")
+        if not isinstance(correct_tasks, Mapping) or not isinstance(shuffled_tasks, Mapping):
+            return -math.inf
+        global_tasks: Mapping[str, Any] | None = None
+        if metric_name == "point_value_min_grounded_gain":
+            global_only = metrics.get("global_only")
+            if not isinstance(global_only, Mapping) or not isinstance(
+                global_only.get("by_task"), Mapping
+            ):
+                return -math.inf
+            global_tasks = global_only["by_task"]
+
+        def gain(task: str) -> float:
+            correct_task = correct_tasks.get(task)
+            shuffled_task = shuffled_tasks.get(task)
+            if not isinstance(correct_task, Mapping) or not isinstance(shuffled_task, Mapping):
+                return -math.inf
+            baselines = [float(shuffled_task.get("accuracy", math.inf))]
+            if global_tasks is not None:
+                global_task = global_tasks.get(task)
+                if not isinstance(global_task, Mapping):
+                    return -math.inf
+                baselines.append(float(global_task.get("accuracy", math.inf)))
+            return float(correct_task.get("accuracy", -math.inf)) - max(baselines)
+
+        normalized_gain = gain("normalized_point_value")
+        if metric_name == "normalized_point_latent_gain":
+            return normalized_gain
+        return min(normalized_gain, gain("raw_point_value_with_stats"))
     raise ValueError(f"Unsupported checkpoint metric: {metric_name}")
+
+
+def grounded_routing_warmup_audit(
+    metrics: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    correct = metrics.get("correct")
+    routing = correct.get("routing") if isinstance(correct, Mapping) else None
+    if not isinstance(routing, Mapping):
+        raise ValueError("Routing warmup validation did not produce correct.routing metrics.")
+    observed = {
+        "cell_top1": float(routing.get("top1_accuracy", math.nan)),
+        "cell_top5": float(routing.get("top5_accuracy", math.nan)),
+        "row_top1": float(routing.get("row_top1_accuracy", math.nan)),
+        "col_top1": float(routing.get("col_top1_accuracy", math.nan)),
+        "target_mass": float(routing.get("target_mass", math.nan)),
+        "normalized_entropy": float(routing.get("normalized_entropy", math.nan)),
+        "gate_accuracy": float(routing.get("gate_accuracy", math.nan)),
+    }
+    thresholds = {
+        "cell_top1": float(args.grounding_warmup_min_cell_top1),
+        "cell_top5": float(args.grounding_warmup_min_cell_top5),
+        "row_top1": float(args.grounding_warmup_min_axis_top1),
+        "col_top1": float(args.grounding_warmup_min_axis_top1),
+        "target_mass": float(args.grounding_warmup_min_target_mass),
+        "gate_accuracy": float(args.grounding_warmup_min_gate_accuracy),
+    }
+    checks = {
+        name: math.isfinite(observed[name]) and observed[name] >= threshold
+        for name, threshold in thresholds.items()
+    }
+    active_roles = int(routing.get("active_roles", 0))
+    if active_roles <= 0:
+        checks["active_roles"] = False
+    by_task = routing.get("by_task")
+    point_task_observed: dict[str, dict[str, float]] = {}
+    for task in ("normalized_point_value", "raw_point_value_with_stats"):
+        task_metrics = by_task.get(task) if isinstance(by_task, Mapping) else None
+        if not isinstance(task_metrics, Mapping):
+            checks[f"{task}.present"] = False
+            continue
+        task_values = {
+            "cell_top1": float(task_metrics.get("top1_accuracy", math.nan)),
+            "target_mass": float(task_metrics.get("target_mass", math.nan)),
+            "normalized_entropy": float(
+                task_metrics.get("normalized_entropy", math.nan)
+            ),
+        }
+        point_task_observed[task] = task_values
+        checks[f"{task}.cell_top1"] = (
+            int(task_metrics.get("active_roles", 0)) > 0
+            and math.isfinite(task_values["cell_top1"])
+            and task_values["cell_top1"] >= thresholds["cell_top1"]
+        )
+        checks[f"{task}.target_mass"] = (
+            math.isfinite(task_values["target_mass"])
+            and task_values["target_mass"] >= thresholds["target_mass"]
+        )
+    return {
+        "passed": all(checks.values()),
+        "active_roles": active_roles,
+        "observed": observed,
+        "point_tasks": point_task_observed,
+        "thresholds": thresholds,
+        "checks": checks,
+        "failed": [name for name, passed in checks.items() if not passed],
+    }
 
 
 def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -7075,6 +8904,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
         "adapter": {
             "architecture": str(args.adapter_architecture),
             "init_checkpoint": args.adapter_init_checkpoint,
+            "stage2_warm_start_checkpoint": args.stage2_warm_start_checkpoint,
             "soft_prompt_tokens": int(args.soft_prompt_tokens),
             "adapter_dim": int(args.adapter_dim),
             "adapter_layers": int(args.adapter_layers),
@@ -7092,6 +8922,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "local_context_layers": parse_csv(args.local_context_layers),
             "local_fusion_mode": str(args.local_fusion_mode),
             "local_gate_init": float(args.local_gate_init),
+            "grounded_gate_bias_init": float(args.grounded_gate_bias_init),
             "local_text_gate_init": float(args.local_text_gate_init),
             "freeze_conditioned_backbone": bool(args.freeze_conditioned_backbone),
             "local_text_gate_trainable": bool(args.local_text_gate_trainable),
@@ -7110,6 +8941,14 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
         "llm_training": {
             "prompt_template": str(args.prompt_template),
             "epochs": int(args.epochs),
+            "grounding_routing_warmup_epochs": int(args.grounding_routing_warmup_epochs),
+            "grounding_warmup_thresholds": {
+                "cell_top1": float(args.grounding_warmup_min_cell_top1),
+                "cell_top5": float(args.grounding_warmup_min_cell_top5),
+                "axis_top1": float(args.grounding_warmup_min_axis_top1),
+                "target_mass": float(args.grounding_warmup_min_target_mass),
+                "gate_accuracy": float(args.grounding_warmup_min_gate_accuracy),
+            },
             "batch_size": int(args.batch_size),
             "eval_batch_size": int(args.eval_batch_size),
             "eval_choice_batch_size": int(args.eval_choice_batch_size),
@@ -7127,6 +8966,10 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "ranking_loss_negative": str(args.ranking_loss_negative),
             "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
             "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
+            "grounding_routing_loss_weight": float(args.grounding_routing_loss_weight),
+            "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
+            "matched_group_loss_weight": float(args.matched_group_loss_weight),
+            "matched_group_loss_margin": float(args.matched_group_loss_margin),
             "swapped_question_max_records": int(args.swapped_question_max_records),
             "swapped_question_require_different_answer": bool(
                 args.swapped_question_require_different_answer
@@ -7173,6 +9016,19 @@ def log_adapter_artifact(wandb_logger: WandbLogger, path: Path, name: str) -> No
     artifact = wandb_logger._wandb.Artifact(name=name, type="adapter-checkpoint")
     artifact.add_file(str(path))
     wandb_logger.run.log_artifact(artifact)
+
+
+def log_wandb_on_rank_zero(
+    wandb_logger: WandbLogger,
+    payload: Mapping[str, Any],
+    step: int,
+    stage: str,
+) -> None:
+    """Log once while propagating a rank-0 W&B failure to every worker."""
+    run_on_rank_zero_and_broadcast(
+        lambda: wandb_logger.log(dict(payload), step=int(step)),
+        stage,
+    )
 
 
 def main() -> None:
@@ -7444,6 +9300,7 @@ def main() -> None:
         "hybrid_local_qformer",
         "residual_question_qformer",
         "residual_question_adapter",
+        "grounded_evidence_adapter",
     }:
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_args: Mapping[str, Any] = {}
@@ -7461,7 +9318,9 @@ def main() -> None:
                 raise ValueError(f"Unsupported alignment checkpoint: {args.adapter_init_checkpoint}")
             checkpoint = loaded
             checkpoint_args = loaded.get("args", {}) if isinstance(loaded.get("args"), Mapping) else {}
-            if is_direct_alignment_architecture(args.adapter_architecture):
+            if is_direct_alignment_architecture(args.adapter_architecture) or str(
+                args.adapter_architecture
+            ) == "grounded_evidence_adapter":
                 checkpoint_validation = validate_stage1_alignment_checkpoint_payload(
                     loaded,
                     path=init_checkpoint,
@@ -7521,6 +9380,14 @@ def main() -> None:
                 else int(checkpoint_args.get("query_tokens", args.soft_prompt_tokens))
             )
             adapter_layers = int(checkpoint_args.get("adapter_layers", args.adapter_layers))
+        if (
+            str(args.adapter_architecture) == "grounded_evidence_adapter"
+            and global_adapter_type != "spatial_transformer"
+        ):
+            raise ValueError(
+                "grounded_evidence_adapter requires a Stage-1 spatial_transformer adapter with "
+                "one row-major token per latent cell."
+            )
         adapter_heads = int(checkpoint_args.get("adapter_heads", args.adapter_heads))
         adapter_dim = int(checkpoint_args.get("adapter_dim", args.adapter_dim))
         checkpoint_projection_dim = int(checkpoint_args.get("projection_dim") or llm_hidden_size)
@@ -7596,6 +9463,49 @@ def main() -> None:
         args.global_adapter_type = global_adapter_type
         args.global_dropout = global_dropout
         args.global_soft_prompt_scale = global_soft_prompt_scale
+        if str(args.adapter_architecture) == "grounded_evidence_adapter":
+            warm_path = str(args.stage2_warm_start_checkpoint or "").strip()
+            if warm_path.lower() in {"", "none", "null", "random"}:
+                raise ValueError(
+                    "grounded_evidence_adapter requires adapter.stage2_warm_start_checkpoint "
+                    "from the completed direct Stage 2 run."
+                )
+            warm_checkpoint = torch.load(
+                Path(warm_path).expanduser(),
+                map_location="cpu",
+                weights_only=True,
+            )
+            warm_state = validate_adapter_checkpoint_payload(
+                warm_checkpoint,
+                expected_latent_shape=latent_shape,
+                expected_llm_hidden_size=llm_hidden_size,
+                expected_architecture="alignment_adapter",
+                expected_latent_contract=latent_contract or {},
+            )
+            warm_args = warm_checkpoint.get("args")
+            if not isinstance(warm_args, Mapping):
+                raise ValueError("Stage-2 warm-start checkpoint is missing its argument contract.")
+            validate_stage1_model_identity(warm_args, args.model_name_or_path)
+            warm_stage1 = _configured_checkpoint_path(warm_args.get("adapter_init_checkpoint"))
+            configured_stage1 = _configured_checkpoint_path(init_checkpoint)
+            if warm_stage1 is None or configured_stage1 is None or warm_stage1 != configured_stage1:
+                raise ValueError(
+                    "Stage-2 warm start and the configured Stage-1 initialization do not share provenance: "
+                    f"warm_parent={warm_stage1}, configured_stage1={configured_stage1}."
+                )
+            adapter.load_state_dict(warm_state, strict=True)
+            args.stage2_warm_start_checkpoint = str(Path(warm_path).expanduser().resolve())
+            args.stage2_warm_start_sha256 = sha256_file(Path(warm_path).expanduser())
+            checkpoint_load_report = {
+                **checkpoint_load_report,
+                "mode": "strict_stage2_direct_global_warm_start",
+                "stage2_warm_start_checkpoint": args.stage2_warm_start_checkpoint,
+                "stage2_warm_start_sha256": args.stage2_warm_start_sha256,
+                "stage2_warm_start_architecture": "alignment_adapter",
+                "stage2_warm_start_strict_load": True,
+            }
+            initialization = "stage2_direct_checkpoint_plus_grounded_reader"
+            del warm_args, warm_state, warm_checkpoint
         if str(args.adapter_architecture) in {"alignment_qformer", "alignment_adapter"}:
             args.question_conditioning = False
             args.structured_query_conditioning = False
@@ -7668,6 +9578,47 @@ def main() -> None:
             args.freeze_global_adapter = freeze_global_adapter
             args.question_conditioning = True
             args.structured_query_conditioning = bool(adapter.structured_query_conditioning)
+        if str(args.adapter_architecture) == "grounded_evidence_adapter":
+            context_layers = [int(value) for value in parse_csv(args.local_context_layers)]
+            global_adapter = adapter
+            local_adapter = GroundedEvidenceAdapter(
+                latent_grid=latent_grid,
+                llm_hidden_size=llm_hidden_size,
+                context_layers=context_layers,
+                adapter_dim=int(args.adapter_dim),
+                adapter_heads=int(args.adapter_heads),
+                dropout=float(args.dropout),
+                evidence_tokens=int(args.local_soft_prompt_tokens),
+                soft_prompt_scale=float(args.soft_prompt_scale),
+                gate_bias_init=float(args.grounded_gate_bias_init),
+            )
+            adapter = HybridGlobalLocalAdapter(
+                global_adapter=global_adapter,
+                local_adapter=local_adapter,
+                freeze_global=True,
+                global_prompt_dropout=0.0,
+                combine_mode="concat",
+            ).to(device)
+            checkpoint_load_report.update(
+                {
+                    "grounded_reader_initialized": True,
+                    "grounded_reader_parameters": sum(
+                        int(parameter.numel()) for parameter in local_adapter.parameters()
+                    ),
+                    "global_adapter_frozen": True,
+                }
+            )
+            args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
+            args.local_soft_prompt_tokens = int(local_adapter.soft_prompt_tokens)
+            args.local_adapter_layers = 1
+            args.local_question_input_mode = "contextual_tokens"
+            args.local_context_layer = int(max(context_layers))
+            args.local_fusion_mode = str(local_adapter.fusion_mode)
+            args.freeze_global_adapter = True
+            args.global_unfreeze_epoch = 0
+            args.global_prompt_dropout = 0.0
+            args.question_conditioning = True
+            args.structured_query_conditioning = False
         if str(args.adapter_architecture) in {
             "residual_question_qformer",
             "residual_question_adapter",
@@ -7902,6 +9853,8 @@ def main() -> None:
             isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.residual_mode
         ),
     )
+    local_groups = None
+    global_groups = None
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
     total_optimizer_updates = max(1, updates_per_epoch * int(args.epochs))
@@ -7952,6 +9905,9 @@ def main() -> None:
                 "minimum": int(train_epoch_sampler.initial_batch_size_min),
                 "maximum": int(train_epoch_sampler.initial_batch_size_max),
                 "mean": float(train_epoch_sampler.initial_batch_size_mean),
+                "global_batches": int(train_epoch_sampler.initial_global_batch_count),
+                "ddp_padding_batches": int(train_epoch_sampler.initial_padding_batch_count),
+                "ddp_padding_records": int(train_epoch_sampler.initial_padding_record_count),
             }
             if isinstance(train_epoch_sampler, StateTaskGroupedBatchSampler)
             else None
@@ -7965,6 +9921,12 @@ def main() -> None:
         "test_records": len(test_dataset),
         "latent_cache_size": int(args.latent_cache_size),
         "num_workers": int(args.num_workers),
+        "train_update_metrics": {
+            "enabled": bool(args.save_step_metrics),
+            "format": "tensor_stage2_train_update_v1",
+            "path": "train_updates.jsonl" if bool(args.save_step_metrics) else None,
+            "aggregation": "one globally reduced record-weighted row per optimizer update",
+        },
         "host_memory": {
             "serialize_llm_loading": bool(args.serialize_llm_loading),
             "low_cpu_mem_usage": bool(args.low_cpu_mem_usage),
@@ -7988,6 +9950,18 @@ def main() -> None:
         "ranking_loss_negative": str(args.ranking_loss_negative),
         "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
         "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
+        "grounding_routing_loss_weight": float(args.grounding_routing_loss_weight),
+        "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
+        "matched_group_loss_weight": float(args.matched_group_loss_weight),
+        "matched_group_loss_margin": float(args.matched_group_loss_margin),
+        "grounding_routing_warmup_epochs": int(args.grounding_routing_warmup_epochs),
+        "grounding_warmup_thresholds": {
+            "cell_top1": float(args.grounding_warmup_min_cell_top1),
+            "cell_top5": float(args.grounding_warmup_min_cell_top5),
+            "axis_top1": float(args.grounding_warmup_min_axis_top1),
+            "target_mass": float(args.grounding_warmup_min_target_mass),
+            "gate_accuracy": float(args.grounding_warmup_min_gate_accuracy),
+        },
         "swapped_question_max_records": int(args.swapped_question_max_records),
         "swapped_question_require_different_answer": bool(
             args.swapped_question_require_different_answer
@@ -8011,15 +9985,21 @@ def main() -> None:
         "local_context_layer": int(args.local_context_layer),
         "local_context_layers": [int(value) for value in parse_csv(args.local_context_layers)],
         "local_fusion_mode": str(args.local_fusion_mode),
+        "grounded_reader_geometry_initial": grounded_reader_geometry_metrics(adapter),
         "soft_prompt_scale": float(args.soft_prompt_scale),
         "adapter_architecture": str(args.adapter_architecture),
         "global_adapter_type": str(getattr(args, "global_adapter_type", "legacy")),
         "adapter_initialization": initialization,
         "adapter_init_checkpoint": str(args.adapter_init_checkpoint) if args.adapter_init_checkpoint else None,
+        "stage2_warm_start_checkpoint": (
+            str(args.stage2_warm_start_checkpoint) if args.stage2_warm_start_checkpoint else None
+        ),
+        "stage2_warm_start_sha256": getattr(args, "stage2_warm_start_sha256", None),
         "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),
         "local_adapter_layers": int(args.local_adapter_layers),
         "local_text_encoder_layers": int(args.local_text_encoder_layers),
         "local_gate_init": float(args.local_gate_init),
+        "grounded_gate_bias_init": float(args.grounded_gate_bias_init),
         "local_text_gate_init": float(args.local_text_gate_init),
         "freeze_conditioned_backbone": bool(args.freeze_conditioned_backbone),
         "local_text_gate_trainable": bool(args.local_text_gate_trainable),
@@ -8145,7 +10125,12 @@ def main() -> None:
                 if bool(args.wandb_detailed_metrics)
                 else compact_accuracy_metrics("initial_eval", initial_metrics)
             )
-            wandb_logger.log(initial_payload, step=0)
+            log_wandb_on_rank_zero(
+                wandb_logger,
+                initial_payload,
+                step=0,
+                stage="initial evaluation W&B log",
+            )
             if is_main_process():
                 print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
             if bool(args.diagnostics_enabled):
@@ -8167,14 +10152,31 @@ def main() -> None:
                     lambda: atomic_dump_json(metrics_path, history),
                     "pretrain diagnostic metrics write",
                 )
-                if is_main_process():
-                    wandb_logger.log(
-                        compact_diagnostic_metrics(pretrain_diagnostic_aggregate), step=0
-                    )
+                log_wandb_on_rank_zero(
+                    wandb_logger,
+                    compact_diagnostic_metrics(pretrain_diagnostic_aggregate),
+                    step=0,
+                    stage="pretrain diagnostics W&B log",
+                )
             distributed_barrier()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         for epoch in range(1, int(args.epochs) + 1):
+            routing_warmup_active = bool(
+                str(args.adapter_architecture) == "grounded_evidence_adapter"
+                and epoch <= int(args.grounding_routing_warmup_epochs)
+            )
+            training_phase = "routing_warmup" if routing_warmup_active else "joint_answer"
+            evidence_optimizer_states_cleared = 0
+            if (
+                str(args.adapter_architecture) == "grounded_evidence_adapter"
+                and int(args.grounding_routing_warmup_epochs) > 0
+                and epoch == int(args.grounding_routing_warmup_epochs) + 1
+            ):
+                evidence_optimizer_states_cleared = reset_grounded_evidence_optimizer_state(
+                    optimizer,
+                    adapter,
+                )
             if train_epoch_sampler is not None and hasattr(train_epoch_sampler, "set_epoch"):
                 train_epoch_sampler.set_epoch(epoch - 1)
             if (
@@ -8205,16 +10207,84 @@ def main() -> None:
             running_weighted_swapped_question_loss = 0.0
             running_swapped_question_margin = 0.0
             running_swapped_question_pairs = 0.0
+            running_routing_loss = 0.0
+            running_weighted_routing_loss = 0.0
+            running_routing_gate_loss = 0.0
+            running_weighted_routing_gate_loss = 0.0
+            running_routing_active_roles = 0.0
+            running_routing_top1_correct = 0.0
+            running_routing_top5_correct = 0.0
+            running_routing_row_top1_correct = 0.0
+            running_routing_col_top1_correct = 0.0
+            running_routing_target_mass = 0.0
+            running_routing_normalized_entropy = 0.0
+            running_routing_gate_correct = 0.0
+            running_routing_gate_active = 0.0
+            running_routing_gate_target_active = 0.0
+            running_matched_group_loss = 0.0
+            running_weighted_matched_group_loss = 0.0
+            running_matched_group_count = 0.0
+            running_matched_group_exact = 0.0
+            running_matched_group_pairs = 0.0
+            running_matched_group_gap_sum = 0.0
+            running_matched_group_satisfied = 0.0
             running_record_count = 0
             running_total_grad_norm = 0.0
+            running_post_clip_grad_norm = 0.0
+            running_clipped_updates = 0
+            pre_clip_grad_norms: list[float] = []
+            post_clip_grad_norms: list[float] = []
             running_local_grad_norm = 0.0
             running_global_grad_norm = 0.0
             running_global_dropout_batches = 0
             optimizer_update_count = 0
+            update_record_metric_names = (
+                "loss",
+                "ce_loss",
+                "weighted_ce_loss",
+                "choice_ce_loss",
+                "weighted_choice_ce_loss",
+                "choice_accuracy",
+                "choice_01_loss",
+                "ranking_loss",
+                "weighted_ranking_loss",
+                "ranking_margin_mean",
+                "swapped_question_loss",
+                "weighted_swapped_question_loss",
+                "swapped_question_margin_mean",
+                "routing_loss",
+                "weighted_routing_loss",
+                "routing_gate_loss",
+                "weighted_routing_gate_loss",
+                "matched_group_loss",
+                "weighted_matched_group_loss",
+            )
+            update_sums = {
+                **{name: 0.0 for name in update_record_metric_names},
+                "record_count": 0.0,
+                "batch_count": 0.0,
+                "global_dropout_batches": 0.0,
+                "routing_active_roles": 0.0,
+                "routing_top1_correct": 0.0,
+                "routing_top5_correct": 0.0,
+                "routing_row_top1_correct": 0.0,
+                "routing_col_top1_correct": 0.0,
+                "routing_target_mass_sum": 0.0,
+                "routing_normalized_entropy_sum": 0.0,
+                "routing_gate_correct": 0.0,
+                "routing_gate_active": 0.0,
+                "routing_gate_target_active": 0.0,
+                "routing_gate_slots": 0.0,
+                "matched_group_count": 0.0,
+                "matched_group_exact": 0.0,
+                "matched_group_pairs": 0.0,
+                "matched_group_gap_sum": 0.0,
+                "matched_group_satisfied": 0.0,
+            }
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(
                 train_loader,
-                desc=f"Epoch {epoch:03d} [train]",
+                desc=f"Epoch {epoch:03d} [{training_phase}]",
                 disable=not bool(args.console_progress) or not is_main_process(),
             )
             accumulated_local_records = 0
@@ -8235,6 +10305,7 @@ def main() -> None:
                         batch=batch,
                         device=device,
                         args=args,
+                        routing_only=routing_warmup_active,
                     )
                 finally:
                     if isinstance(adapter, HybridGlobalLocalAdapter):
@@ -8263,14 +10334,81 @@ def main() -> None:
                 running_weighted_swapped_question_loss += float(loss_parts["weighted_swapped_question_loss"]) * batch_record_count
                 running_swapped_question_margin += float(loss_parts["swapped_question_margin_mean"]) * batch_record_count
                 running_swapped_question_pairs += float(loss_parts["swapped_question_pairs"]) * batch_record_count
+                running_routing_loss += float(loss_parts["routing_loss"]) * batch_record_count
+                running_weighted_routing_loss += float(loss_parts["weighted_routing_loss"]) * batch_record_count
+                running_routing_gate_loss += float(loss_parts["routing_gate_loss"]) * batch_record_count
+                running_weighted_routing_gate_loss += float(loss_parts["weighted_routing_gate_loss"]) * batch_record_count
+                routing_batch_totals = routing_metric_weighted_totals(
+                    loss_parts,
+                    record_count=batch_record_count,
+                    gate_slots_per_record=int(args.local_soft_prompt_tokens),
+                )
+                active_roles = routing_batch_totals["routing_active_roles"]
+                running_routing_active_roles += active_roles
+                running_routing_top1_correct += routing_batch_totals[
+                    "routing_top1_correct"
+                ]
+                running_routing_top5_correct += routing_batch_totals[
+                    "routing_top5_correct"
+                ]
+                running_routing_row_top1_correct += routing_batch_totals[
+                    "routing_row_top1_correct"
+                ]
+                running_routing_col_top1_correct += routing_batch_totals[
+                    "routing_col_top1_correct"
+                ]
+                running_routing_target_mass += routing_batch_totals[
+                    "routing_target_mass_sum"
+                ]
+                running_routing_normalized_entropy += routing_batch_totals[
+                    "routing_normalized_entropy_sum"
+                ]
+                running_routing_gate_correct += routing_batch_totals[
+                    "routing_gate_correct"
+                ]
+                running_routing_gate_active += routing_batch_totals[
+                    "routing_gate_active"
+                ]
+                running_routing_gate_target_active += routing_batch_totals[
+                    "routing_gate_target_active"
+                ]
+                running_matched_group_loss += float(loss_parts["matched_group_loss"]) * batch_record_count
+                running_weighted_matched_group_loss += float(loss_parts["weighted_matched_group_loss"]) * batch_record_count
+                matched_groups = float(loss_parts["matched_group_count"])
+                matched_pairs = float(loss_parts["matched_group_pairs"])
+                running_matched_group_count += matched_groups
+                running_matched_group_exact += float(loss_parts["matched_group_exact_accuracy"]) * matched_groups
+                running_matched_group_pairs += matched_pairs
+                running_matched_group_gap_sum += float(loss_parts["matched_group_gap_mean"]) * matched_pairs
+                running_matched_group_satisfied += float(loss_parts["matched_group_satisfaction"]) * matched_pairs
                 running_record_count += int(batch_record_count)
+                for name in update_record_metric_names:
+                    update_sums[name] += float(loss_parts[name]) * batch_record_count
+                update_sums["record_count"] += float(batch_record_count)
+                update_sums["batch_count"] += 1.0
+                update_sums["global_dropout_batches"] += float(drop_global_for_batch)
+                for name, value in routing_batch_totals.items():
+                    update_sums[name] += value
+                update_sums["matched_group_count"] += matched_groups
+                update_sums["matched_group_exact"] += (
+                    float(loss_parts["matched_group_exact_accuracy"]) * matched_groups
+                )
+                update_sums["matched_group_pairs"] += matched_pairs
+                update_sums["matched_group_gap_sum"] += (
+                    float(loss_parts["matched_group_gap_mean"]) * matched_pairs
+                )
+                update_sums["matched_group_satisfied"] += (
+                    float(loss_parts["matched_group_satisfaction"]) * matched_pairs
+                )
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
-                    average_trainable_gradients_by_record_count(
+                    update_global_record_count = average_trainable_gradients_by_record_count(
                         adapter,
                         accumulated_local_records,
                         device,
                     )
+                    if routing_warmup_active:
+                        clear_grounded_evidence_transform_gradients(adapter)
                     assert_finite_gradients(adapter, f"epoch {epoch} step {step}")
                     if isinstance(adapter, HybridGlobalLocalAdapter):
                         local_grad_norm = gradient_l2_norm(adapter.local_adapter.parameters())
@@ -8288,21 +10426,284 @@ def main() -> None:
                             f"Non-finite gradient norm at epoch {epoch} step {step}: "
                             f"total={total_grad_norm}, local={local_grad_norm}, global={global_grad_norm}."
                         )
+                    post_clip_grad_norm = total_grad_norm
                     if float(args.grad_clip_norm) > 0:
                         torch.nn.utils.clip_grad_norm_(
                             adapter.parameters(),
                             float(args.grad_clip_norm),
                             error_if_nonfinite=True,
                         )
+                        post_clip_grad_norm = gradient_l2_norm(adapter.parameters())
+                    pre_clip_grad_norms.append(float(total_grad_norm))
+                    post_clip_grad_norms.append(float(post_clip_grad_norm))
+                    running_clipped_updates += int(
+                        float(args.grad_clip_norm) > 0
+                        and total_grad_norm > float(args.grad_clip_norm)
+                    )
                     running_total_grad_norm += total_grad_norm
+                    running_post_clip_grad_norm += post_clip_grad_norm
                     running_local_grad_norm += local_grad_norm
                     running_global_grad_norm += global_grad_norm
                     optimizer_update_count += 1
+                    update_learning_rate = optimizer_group_lr(
+                        optimizer,
+                        optimizer_lr_prefix,
+                        float(args.lr),
+                    )
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     accumulated_local_records = 0
                     global_step += 1
+                    update_totals = distributed_sum_scalars(
+                        {
+                            **update_sums,
+                            "grad_norm_pre_clip_sum": total_grad_norm,
+                            "grad_norm_post_clip_sum": post_clip_grad_norm,
+                            "local_grad_norm_sum": local_grad_norm,
+                            "global_grad_norm_sum": global_grad_norm,
+                            "clipped_ranks": float(
+                                float(args.grad_clip_norm) > 0
+                                and total_grad_norm > float(args.grad_clip_norm)
+                            ),
+                            "contributing_ranks": 1.0,
+                        },
+                        device=device,
+                    )
+                    observed_update_records = int(round(update_totals["record_count"]))
+                    if observed_update_records != int(update_global_record_count):
+                        raise RuntimeError(
+                            "Optimizer-update metric reduction disagrees with gradient normalization: "
+                            f"metrics={observed_update_records}, gradients={update_global_record_count}."
+                        )
+                    update_records = max(1.0, update_totals["record_count"])
+                    update_active_roles = max(1.0, update_totals["routing_active_roles"])
+                    update_gate_slots = max(1.0, update_totals["routing_gate_slots"])
+                    update_groups = max(1.0, update_totals["matched_group_count"])
+                    update_pairs = max(1.0, update_totals["matched_group_pairs"])
+                    update_ranks = max(1.0, update_totals["contributing_ranks"])
+                    update_batches = max(1.0, update_totals["batch_count"])
+                    update_payload = {
+                        "format": "tensor_stage2_train_update_v1",
+                        "timestamp": local_timestamp(),
+                        "epoch": int(epoch),
+                        "training_phase": training_phase,
+                        "batch_step": int(step),
+                        "optimizer_update_in_epoch": int(optimizer_update_count),
+                        "global_step": int(global_step),
+                        "global_record_count": int(round(update_totals["record_count"])),
+                        "global_batch_count": int(round(update_totals["batch_count"])),
+                        "train_loss": update_totals["loss"] / update_records,
+                        "train_ce_loss": update_totals["ce_loss"] / update_records,
+                        "train_weighted_ce_loss": (
+                            update_totals["weighted_ce_loss"] / update_records
+                        ),
+                        "train_choice_ce_loss": (
+                            update_totals["choice_ce_loss"] / update_records
+                        ),
+                        "train_weighted_choice_ce_loss": (
+                            update_totals["weighted_choice_ce_loss"] / update_records
+                        ),
+                        "train_choice_accuracy": (
+                            update_totals["choice_accuracy"] / update_records
+                        ),
+                        "train_choice_01_loss": (
+                            update_totals["choice_01_loss"] / update_records
+                        ),
+                        "train_ranking_loss": update_totals["ranking_loss"] / update_records,
+                        "train_weighted_ranking_loss": (
+                            update_totals["weighted_ranking_loss"] / update_records
+                        ),
+                        "train_ranking_margin": (
+                            update_totals["ranking_margin_mean"] / update_records
+                        ),
+                        "train_swapped_question_loss": (
+                            update_totals["swapped_question_loss"] / update_records
+                        ),
+                        "train_weighted_swapped_question_loss": (
+                            update_totals["weighted_swapped_question_loss"] / update_records
+                        ),
+                        "train_swapped_question_margin": (
+                            update_totals["swapped_question_margin_mean"] / update_records
+                        ),
+                        "train_routing_loss": update_totals["routing_loss"] / update_records,
+                        "train_weighted_routing_loss": (
+                            update_totals["weighted_routing_loss"] / update_records
+                        ),
+                        "train_routing_gate_loss": (
+                            update_totals["routing_gate_loss"] / update_records
+                        ),
+                        "train_weighted_routing_gate_loss": (
+                            update_totals["weighted_routing_gate_loss"] / update_records
+                        ),
+                        "train_routing_active_roles": int(
+                            round(update_totals["routing_active_roles"])
+                        ),
+                        "train_routing_top1_accuracy": (
+                            update_totals["routing_top1_correct"] / update_active_roles
+                        ),
+                        "train_routing_top5_accuracy": (
+                            update_totals["routing_top5_correct"] / update_active_roles
+                        ),
+                        "train_routing_row_top1_accuracy": (
+                            update_totals["routing_row_top1_correct"] / update_active_roles
+                        ),
+                        "train_routing_col_top1_accuracy": (
+                            update_totals["routing_col_top1_correct"] / update_active_roles
+                        ),
+                        "train_routing_target_mass": (
+                            update_totals["routing_target_mass_sum"] / update_active_roles
+                        ),
+                        "train_routing_normalized_entropy": (
+                            update_totals["routing_normalized_entropy_sum"]
+                            / update_active_roles
+                        ),
+                        "train_routing_gate_accuracy": (
+                            update_totals["routing_gate_correct"] / update_gate_slots
+                        ),
+                        "train_routing_gate_active_fraction": (
+                            update_totals["routing_gate_active"] / update_gate_slots
+                        ),
+                        "train_routing_gate_target_active_fraction": (
+                            update_totals["routing_gate_target_active"]
+                            / update_gate_slots
+                        ),
+                        "train_matched_group_loss": (
+                            update_totals["matched_group_loss"] / update_records
+                        ),
+                        "train_weighted_matched_group_loss": (
+                            update_totals["weighted_matched_group_loss"] / update_records
+                        ),
+                        "train_matched_group_exact_accuracy": (
+                            update_totals["matched_group_exact"] / update_groups
+                        ),
+                        "train_matched_group_gap_mean": (
+                            update_totals["matched_group_gap_sum"] / update_pairs
+                        ),
+                        "train_matched_group_satisfaction": (
+                            update_totals["matched_group_satisfied"] / update_pairs
+                        ),
+                        "train_total_grad_norm": (
+                            update_totals["grad_norm_pre_clip_sum"] / update_ranks
+                        ),
+                        "train_post_clip_grad_norm": (
+                            update_totals["grad_norm_post_clip_sum"] / update_ranks
+                        ),
+                        "train_clip_fraction": update_totals["clipped_ranks"] / update_ranks,
+                        "train_local_grad_norm": (
+                            update_totals["local_grad_norm_sum"] / update_ranks
+                        ),
+                        "train_global_grad_norm": (
+                            update_totals["global_grad_norm_sum"] / update_ranks
+                        ),
+                        "train_global_prompt_dropout_rate": (
+                            update_totals["global_dropout_batches"] / update_batches
+                        ),
+                        "lr": update_learning_rate,
+                    }
+                    host_memory_reports: list[dict[str, float]] = []
+                    if global_step % max(1, int(args.log_interval)) == 0:
+                        host_memory_reports = enforce_host_memory_floor(
+                            device,
+                            float(args.min_host_memory_available_gib),
+                            f"epoch {epoch} update {global_step}",
+                        )
+                        if host_memory_reports:
+                            update_payload["host_memory_available_gib"] = min(
+                                item["available_gib"] for item in host_memory_reports
+                            )
+                            update_payload["host_process_rss_gib"] = host_memory_reports[
+                                distributed_rank()
+                            ]["process_rss_gib"]
+                    if bool(args.save_step_metrics):
+                        run_on_rank_zero_and_broadcast(
+                            lambda payload=dict(update_payload): append_jsonl(
+                                run_dir / "train_updates.jsonl",
+                                payload,
+                            ),
+                            f"epoch {epoch} update {global_step} metrics append",
+                        )
+                    if global_step % max(1, int(args.log_interval)) == 0:
+                        log_wandb_on_rank_zero(
+                            wandb_logger,
+                            {
+                                "train_step/loss": update_payload["train_loss"],
+                                "train_step/choice_ce_loss": update_payload[
+                                    "train_choice_ce_loss"
+                                ],
+                                "train_step/choice_accuracy": update_payload[
+                                    "train_choice_accuracy"
+                                ],
+                                "train_step/ranking_loss": update_payload[
+                                    "train_ranking_loss"
+                                ],
+                                "train_step/ranking_margin": update_payload[
+                                    "train_ranking_margin"
+                                ],
+                                "train_step/swapped_question_loss": update_payload[
+                                    "train_swapped_question_loss"
+                                ],
+                                "train_step/swapped_question_margin": update_payload[
+                                    "train_swapped_question_margin"
+                                ],
+                                "train_step/routing_loss": update_payload[
+                                    "train_routing_loss"
+                                ],
+                                "train_step/routing_top1_accuracy": update_payload[
+                                    "train_routing_top1_accuracy"
+                                ],
+                                "train_step/routing_top5_accuracy": update_payload[
+                                    "train_routing_top5_accuracy"
+                                ],
+                                "train_step/routing_row_top1_accuracy": update_payload[
+                                    "train_routing_row_top1_accuracy"
+                                ],
+                                "train_step/routing_col_top1_accuracy": update_payload[
+                                    "train_routing_col_top1_accuracy"
+                                ],
+                                "train_step/routing_target_mass": update_payload[
+                                    "train_routing_target_mass"
+                                ],
+                                "train_step/routing_normalized_entropy": update_payload[
+                                    "train_routing_normalized_entropy"
+                                ],
+                                "train_step/routing_gate_accuracy": update_payload[
+                                    "train_routing_gate_accuracy"
+                                ],
+                                "train_step/routing_gate_target_active_fraction": update_payload[
+                                    "train_routing_gate_target_active_fraction"
+                                ],
+                                "train_step/matched_group_loss": update_payload[
+                                    "train_matched_group_loss"
+                                ],
+                                "train_step/matched_group_exact_accuracy": update_payload[
+                                    "train_matched_group_exact_accuracy"
+                                ],
+                                "train_step/grad_norm_pre_clip": update_payload[
+                                    "train_total_grad_norm"
+                                ],
+                                "train_step/grad_norm_post_clip": update_payload[
+                                    "train_post_clip_grad_norm"
+                                ],
+                                "train_step/clip_fraction": update_payload[
+                                    "train_clip_fraction"
+                                ],
+                                "train_step/lr": update_payload["lr"],
+                                **(
+                                    {
+                                        "system/host_memory_available_gib": update_payload[
+                                            "host_memory_available_gib"
+                                        ]
+                                    }
+                                    if "host_memory_available_gib" in update_payload
+                                    else {}
+                                ),
+                            },
+                            step=global_step,
+                            stage=f"epoch {epoch} update {global_step} W&B log",
+                        )
+                    for name in update_sums:
+                        update_sums[name] = 0.0
 
                 average_loss = running_loss / max(1, running_record_count)
                 average_ce_loss = running_ce_loss / max(1, running_record_count)
@@ -8316,7 +10717,32 @@ def main() -> None:
                 average_ranking_margin = running_ranking_margin / max(1, running_record_count)
                 average_swapped_question_loss = running_swapped_question_loss / max(1, running_record_count)
                 average_swapped_question_margin = running_swapped_question_margin / max(1, running_record_count)
+                average_routing_loss = running_routing_loss / max(1, running_record_count)
+                average_routing_top1 = running_routing_top1_correct / max(1.0, running_routing_active_roles)
+                average_routing_top5 = running_routing_top5_correct / max(
+                    1.0, running_routing_active_roles
+                )
+                average_routing_row_top1 = running_routing_row_top1_correct / max(
+                    1.0, running_routing_active_roles
+                )
+                average_routing_col_top1 = running_routing_col_top1_correct / max(
+                    1.0, running_routing_active_roles
+                )
+                average_routing_target_mass = running_routing_target_mass / max(
+                    1.0, running_routing_active_roles
+                )
+                running_gate_slots = max(
+                    1.0,
+                    float(running_record_count * int(args.local_soft_prompt_tokens)),
+                )
+                average_routing_gate_accuracy = (
+                    running_routing_gate_correct / running_gate_slots
+                )
+                average_matched_group_loss = running_matched_group_loss / max(1, running_record_count)
+                average_matched_group_exact = running_matched_group_exact / max(1.0, running_matched_group_count)
                 average_total_grad_norm = running_total_grad_norm / max(1, optimizer_update_count)
+                average_post_clip_grad_norm = running_post_clip_grad_norm / max(1, optimizer_update_count)
+                clip_fraction = running_clipped_updates / max(1, optimizer_update_count)
                 average_local_grad_norm = running_local_grad_norm / max(1, optimizer_update_count)
                 average_global_grad_norm = running_global_grad_norm / max(1, optimizer_update_count)
                 progress.set_postfix(
@@ -8325,75 +10751,9 @@ def main() -> None:
                     choice=f"{average_choice_ce_loss:.4f}",
                     acc=f"{average_choice_accuracy:.3f}",
                     rank=f"{average_ranking_loss:.4f}",
+                    route=f"{average_routing_top1:.3f}",
+                    group=f"{average_matched_group_exact:.3f}",
                 )
-                if step % max(1, int(args.log_interval)) == 0:
-                    host_memory_reports = enforce_host_memory_floor(
-                        device,
-                        float(args.min_host_memory_available_gib),
-                        f"epoch {epoch} step {step}",
-                    )
-                    host_available_gib = (
-                        min(item["available_gib"] for item in host_memory_reports)
-                        if host_memory_reports
-                        else None
-                    )
-                    step_payload = {
-                        "epoch": epoch,
-                        "step": step,
-                        "global_step": global_step,
-                        "train_loss": average_loss,
-                        "train_ce_loss": average_ce_loss,
-                        "train_weighted_ce_loss": average_weighted_ce_loss,
-                        "train_choice_ce_loss": average_choice_ce_loss,
-                        "train_weighted_choice_ce_loss": average_weighted_choice_ce_loss,
-                        "train_choice_accuracy": average_choice_accuracy,
-                        "train_choice_01_loss": average_choice_01_loss,
-                        "train_ranking_loss": average_ranking_loss,
-                        "train_weighted_ranking_loss": average_weighted_ranking_loss,
-                        "train_ranking_margin": average_ranking_margin,
-                        "train_swapped_question_loss": average_swapped_question_loss,
-                        "train_swapped_question_margin": average_swapped_question_margin,
-                        "train_total_grad_norm": average_total_grad_norm,
-                        "train_local_grad_norm": average_local_grad_norm,
-                        "train_global_grad_norm": average_global_grad_norm,
-                        "host_memory_available_gib": host_available_gib,
-                        "host_process_rss_gib": (
-                            host_memory_reports[distributed_rank()]["process_rss_gib"]
-                            if host_memory_reports
-                            else None
-                        ),
-                    }
-                    if bool(args.save_step_metrics):
-                        def write_step_metrics() -> None:
-                            history[f"epoch_{epoch:04d}_step_{step:06d}"] = step_payload
-                            atomic_dump_json(run_dir / "metrics_latest.json", history)
-
-                        run_on_rank_zero_and_broadcast(
-                            write_step_metrics,
-                            f"epoch {epoch} step {step} metrics write",
-                        )
-                    wandb_logger.log(
-                        {
-                            "train_step/loss": average_loss,
-                            "train_step/choice_ce_loss": average_choice_ce_loss,
-                            "train_step/choice_accuracy": average_choice_accuracy,
-                            "train_step/ranking_loss": average_ranking_loss,
-                            "train_step/ranking_margin": average_ranking_margin,
-                            "train_step/swapped_question_loss": average_swapped_question_loss,
-                            "train_step/swapped_question_margin": average_swapped_question_margin,
-                            "train_step/lr": optimizer_group_lr(
-                                optimizer,
-                                optimizer_lr_prefix,
-                                float(args.lr),
-                            ),
-                            **(
-                                {"system/host_memory_available_gib": float(host_available_gib)}
-                                if host_available_gib is not None
-                                else {}
-                            ),
-                        },
-                        step=global_step,
-                    )
 
             train_totals = distributed_sum_scalars(
                 {
@@ -8411,7 +10771,33 @@ def main() -> None:
                     "weighted_swapped_question_loss": running_weighted_swapped_question_loss,
                     "swapped_question_margin": running_swapped_question_margin,
                     "swapped_question_pairs": running_swapped_question_pairs,
+                    "routing_loss": running_routing_loss,
+                    "weighted_routing_loss": running_weighted_routing_loss,
+                    "routing_gate_loss": running_routing_gate_loss,
+                    "weighted_routing_gate_loss": running_weighted_routing_gate_loss,
+                    "routing_active_roles": running_routing_active_roles,
+                    "routing_top1_correct": running_routing_top1_correct,
+                    "routing_top5_correct": running_routing_top5_correct,
+                    "routing_row_top1_correct": running_routing_row_top1_correct,
+                    "routing_col_top1_correct": running_routing_col_top1_correct,
+                    "routing_target_mass": running_routing_target_mass,
+                    "routing_normalized_entropy": running_routing_normalized_entropy,
+                    "routing_gate_correct": running_routing_gate_correct,
+                    "routing_gate_active": running_routing_gate_active,
+                    "routing_gate_target_active": running_routing_gate_target_active,
+                    "routing_gate_slots": float(
+                        running_record_count * int(args.local_soft_prompt_tokens)
+                    ),
+                    "matched_group_loss": running_matched_group_loss,
+                    "weighted_matched_group_loss": running_weighted_matched_group_loss,
+                    "matched_group_count": running_matched_group_count,
+                    "matched_group_exact": running_matched_group_exact,
+                    "matched_group_pairs": running_matched_group_pairs,
+                    "matched_group_gap_sum": running_matched_group_gap_sum,
+                    "matched_group_satisfied": running_matched_group_satisfied,
                     "total_grad_norm": running_total_grad_norm,
+                    "post_clip_grad_norm": running_post_clip_grad_norm,
+                    "clipped_updates": float(running_clipped_updates),
                     "local_grad_norm": running_local_grad_norm,
                     "global_grad_norm": running_global_grad_norm,
                     "global_dropout_batches": float(running_global_dropout_batches),
@@ -8450,7 +10836,55 @@ def main() -> None:
             train_swapped_question_pairs = (
                 train_totals["swapped_question_pairs"] / global_record_count
             )
+            train_routing_loss = train_totals["routing_loss"] / global_record_count
+            train_weighted_routing_loss = train_totals["weighted_routing_loss"] / global_record_count
+            train_routing_gate_loss = train_totals["routing_gate_loss"] / global_record_count
+            train_weighted_routing_gate_loss = (
+                train_totals["weighted_routing_gate_loss"] / global_record_count
+            )
+            train_routing_top1_accuracy = train_totals["routing_top1_correct"] / max(
+                1.0, train_totals["routing_active_roles"]
+            )
+            train_routing_top5_accuracy = train_totals["routing_top5_correct"] / max(
+                1.0, train_totals["routing_active_roles"]
+            )
+            train_routing_row_top1_accuracy = train_totals[
+                "routing_row_top1_correct"
+            ] / max(1.0, train_totals["routing_active_roles"])
+            train_routing_col_top1_accuracy = train_totals[
+                "routing_col_top1_correct"
+            ] / max(1.0, train_totals["routing_active_roles"])
+            train_routing_target_mass = train_totals["routing_target_mass"] / max(
+                1.0, train_totals["routing_active_roles"]
+            )
+            train_routing_normalized_entropy = train_totals[
+                "routing_normalized_entropy"
+            ] / max(1.0, train_totals["routing_active_roles"])
+            train_routing_gate_accuracy = train_totals["routing_gate_correct"] / max(
+                1.0, train_totals["routing_gate_slots"]
+            )
+            train_routing_gate_active_fraction = train_totals[
+                "routing_gate_active"
+            ] / max(1.0, train_totals["routing_gate_slots"])
+            train_routing_gate_target_active_fraction = train_totals[
+                "routing_gate_target_active"
+            ] / max(1.0, train_totals["routing_gate_slots"])
+            train_matched_group_loss = train_totals["matched_group_loss"] / global_record_count
+            train_weighted_matched_group_loss = (
+                train_totals["weighted_matched_group_loss"] / global_record_count
+            )
+            train_matched_group_exact_accuracy = train_totals["matched_group_exact"] / max(
+                1.0, train_totals["matched_group_count"]
+            )
+            train_matched_group_gap_mean = train_totals["matched_group_gap_sum"] / max(
+                1.0, train_totals["matched_group_pairs"]
+            )
+            train_matched_group_satisfaction = train_totals["matched_group_satisfied"] / max(
+                1.0, train_totals["matched_group_pairs"]
+            )
             train_total_grad_norm = train_totals["total_grad_norm"] / global_update_count
+            train_post_clip_grad_norm = train_totals["post_clip_grad_norm"] / global_update_count
+            train_clip_fraction = train_totals["clipped_updates"] / global_update_count
             train_local_grad_norm = train_totals["local_grad_norm"] / global_update_count
             train_global_grad_norm = train_totals["global_grad_norm"] / global_update_count
             train_global_dropout_rate = (
@@ -8463,10 +10897,16 @@ def main() -> None:
                 dataset=val_dataset,
                 device=device,
                 args=args,
-                baseline_modes=baseline_modes,
+                baseline_modes=["correct"] if routing_warmup_active else baseline_modes,
+                routing_only=routing_warmup_active,
             )
+            routing_warmup_audit: dict[str, Any] | None = None
+            if routing_warmup_active and epoch == int(args.grounding_routing_warmup_epochs):
+                routing_warmup_audit = grounded_routing_warmup_audit(val_metrics, args)
             epoch_payload = {
                 "epoch": epoch,
+                "training_phase": training_phase,
+                "evidence_optimizer_states_cleared": evidence_optimizer_states_cleared,
                 "train_loss": train_loss,
                 "train_ce_loss": train_ce_loss,
                 "train_weighted_ce_loss": train_weighted_ce_loss,
@@ -8481,12 +10921,43 @@ def main() -> None:
                 "train_weighted_swapped_question_loss": train_weighted_swapped_question_loss,
                 "train_swapped_question_margin": train_swapped_question_margin,
                 "train_swapped_question_pairs_per_batch": train_swapped_question_pairs,
+                "train_routing_loss": train_routing_loss,
+                "train_weighted_routing_loss": train_weighted_routing_loss,
+                "train_routing_gate_loss": train_routing_gate_loss,
+                "train_weighted_routing_gate_loss": train_weighted_routing_gate_loss,
+                "train_routing_top1_accuracy": train_routing_top1_accuracy,
+                "train_routing_top5_accuracy": train_routing_top5_accuracy,
+                "train_routing_row_top1_accuracy": train_routing_row_top1_accuracy,
+                "train_routing_col_top1_accuracy": train_routing_col_top1_accuracy,
+                "train_routing_target_mass": train_routing_target_mass,
+                "train_routing_normalized_entropy": train_routing_normalized_entropy,
+                "train_routing_gate_accuracy": train_routing_gate_accuracy,
+                "train_routing_gate_active_fraction": train_routing_gate_active_fraction,
+                "train_routing_gate_target_active_fraction": (
+                    train_routing_gate_target_active_fraction
+                ),
+                "train_matched_group_loss": train_matched_group_loss,
+                "train_weighted_matched_group_loss": train_weighted_matched_group_loss,
+                "train_matched_group_exact_accuracy": train_matched_group_exact_accuracy,
+                "train_matched_group_gap_mean": train_matched_group_gap_mean,
+                "train_matched_group_satisfaction": train_matched_group_satisfaction,
                 "train_total_grad_norm": train_total_grad_norm,
+                "train_post_clip_grad_norm": train_post_clip_grad_norm,
+                "train_clip_fraction": train_clip_fraction,
+                "train_pre_clip_grad_norm_p50": numeric_quantile(pre_clip_grad_norms, 0.50),
+                "train_pre_clip_grad_norm_p95": numeric_quantile(pre_clip_grad_norms, 0.95),
+                "train_pre_clip_grad_norm_max": max(pre_clip_grad_norms, default=0.0),
+                "train_post_clip_grad_norm_p50": numeric_quantile(post_clip_grad_norms, 0.50),
+                "train_post_clip_grad_norm_p95": numeric_quantile(post_clip_grad_norms, 0.95),
+                "train_post_clip_grad_norm_max": max(post_clip_grad_norms, default=0.0),
                 "train_local_grad_norm": train_local_grad_norm,
                 "train_global_grad_norm": train_global_grad_norm,
                 "train_global_prompt_dropout_rate": train_global_dropout_rate,
+                "grounded_reader_geometry": grounded_reader_geometry_metrics(adapter),
                 "val": val_metrics,
             }
+            if routing_warmup_audit is not None:
+                epoch_payload["routing_warmup_audit"] = routing_warmup_audit
             history[f"epoch_{epoch:04d}"] = epoch_payload
 
             def write_epoch_outputs() -> None:
@@ -8505,11 +10976,31 @@ def main() -> None:
                 write_epoch_outputs,
                 f"epoch {epoch} metrics and last-checkpoint write",
             )
+            if routing_warmup_audit is not None:
+                run_on_rank_zero_and_broadcast(
+                    lambda: save_validate_and_rebuild_adapter_checkpoint(
+                        run_dir / "adapter_routing_warmup.pt",
+                        adapter=adapter,
+                        args=args,
+                        latent_shape=latent_shape,
+                        llm_hidden_size=llm_hidden_size,
+                        latent_contract=latent_contract or {},
+                        metrics=epoch_payload,
+                    ),
+                    f"epoch {epoch} routing-warmup checkpoint write/read validation",
+                )
             val_accuracy = float(val_metrics.get("correct", {}).get("accuracy", 0.0))
-            val_macro_latent_gain = macro_latent_gain(val_metrics)
-            val_score = checkpoint_score(val_metrics, str(args.checkpoint_metric))
+            val_macro_latent_gain = (
+                0.0 if routing_warmup_active else macro_latent_gain(val_metrics)
+            )
+            val_score = (
+                -math.inf
+                if routing_warmup_active
+                else checkpoint_score(val_metrics, str(args.checkpoint_metric))
+            )
             wandb_payload = {
                 "epoch": float(epoch),
+                "phase/routing_warmup": float(routing_warmup_active),
                 "train/loss": float(train_loss),
                 "train/ce_loss": float(train_ce_loss),
                 "train/weighted_ce_loss": float(train_weighted_ce_loss),
@@ -8523,13 +11014,68 @@ def main() -> None:
                 "train/swapped_question_loss": float(train_swapped_question_loss),
                 "train/swapped_question_margin": float(train_swapped_question_margin),
                 "train/swapped_question_pairs_per_batch": float(train_swapped_question_pairs),
+                "train/routing_loss": float(train_routing_loss),
+                "train/weighted_routing_loss": float(train_weighted_routing_loss),
+                "train/routing_gate_loss": float(train_routing_gate_loss),
+                "train/weighted_routing_gate_loss": float(train_weighted_routing_gate_loss),
+                "train/routing_top1_accuracy": float(train_routing_top1_accuracy),
+                "train/routing_top5_accuracy": float(train_routing_top5_accuracy),
+                "train/routing_row_top1_accuracy": float(
+                    train_routing_row_top1_accuracy
+                ),
+                "train/routing_col_top1_accuracy": float(
+                    train_routing_col_top1_accuracy
+                ),
+                "train/routing_target_mass": float(train_routing_target_mass),
+                "train/routing_normalized_entropy": float(
+                    train_routing_normalized_entropy
+                ),
+                "train/routing_gate_accuracy": float(train_routing_gate_accuracy),
+                "train/routing_gate_active_fraction": float(
+                    train_routing_gate_active_fraction
+                ),
+                "train/routing_gate_target_active_fraction": float(
+                    train_routing_gate_target_active_fraction
+                ),
+                "train/matched_group_loss": float(train_matched_group_loss),
+                "train/weighted_matched_group_loss": float(
+                    train_weighted_matched_group_loss
+                ),
+                "train/matched_group_exact_accuracy": float(
+                    train_matched_group_exact_accuracy
+                ),
+                "train/matched_group_gap_mean": float(train_matched_group_gap_mean),
+                "train/matched_group_satisfaction": float(
+                    train_matched_group_satisfaction
+                ),
                 "train/total_grad_norm": float(train_total_grad_norm),
+                "train/post_clip_grad_norm": float(train_post_clip_grad_norm),
+                "train/clip_fraction": float(train_clip_fraction),
+                "train/pre_clip_grad_norm_p50": float(
+                    epoch_payload["train_pre_clip_grad_norm_p50"]
+                ),
+                "train/pre_clip_grad_norm_p95": float(
+                    epoch_payload["train_pre_clip_grad_norm_p95"]
+                ),
+                "train/pre_clip_grad_norm_max": float(
+                    epoch_payload["train_pre_clip_grad_norm_max"]
+                ),
+                "train/post_clip_grad_norm_p50": float(
+                    epoch_payload["train_post_clip_grad_norm_p50"]
+                ),
+                "train/post_clip_grad_norm_p95": float(
+                    epoch_payload["train_post_clip_grad_norm_p95"]
+                ),
+                "train/post_clip_grad_norm_max": float(
+                    epoch_payload["train_post_clip_grad_norm_max"]
+                ),
                 "train/local_grad_norm": float(train_local_grad_norm),
                 "train/global_grad_norm": float(train_global_grad_norm),
                 "train/global_prompt_dropout_rate": float(train_global_dropout_rate),
                 "adapter/local_gate": float(
-                    adapter.local_adapter.gate.detach().float().cpu().item()
+                    getattr(adapter.local_adapter, "gate").detach().float().cpu().item()
                     if isinstance(adapter, HybridGlobalLocalAdapter)
+                    and getattr(adapter.local_adapter, "gate", None) is not None
                     else 0.0
                 ),
                 "adapter/local_anchor_gate": float(
@@ -8553,14 +11099,27 @@ def main() -> None:
                     isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                 ),
                 "val/macro_latent_gain": float(val_macro_latent_gain),
-                "best_val/checkpoint_score": float(max(best_val_score, val_score)),
             }
+            if not routing_warmup_active:
+                wandb_payload["best_val/checkpoint_score"] = float(
+                    max(best_val_score, val_score)
+                )
+            if routing_warmup_audit is not None:
+                wandb_payload["routing_warmup/passed"] = float(
+                    bool(routing_warmup_audit["passed"])
+                )
+                wandb_payload.update(
+                    {
+                        f"routing_warmup/{name}": float(value)
+                        for name, value in routing_warmup_audit["observed"].items()
+                    }
+                )
             wandb_payload.update(
                 flatten_numeric_metrics("val", val_metrics)
                 if bool(args.wandb_detailed_metrics)
                 else compact_accuracy_metrics("val", val_metrics)
             )
-            if val_score > best_val_score:
+            if not routing_warmup_active and val_score > best_val_score:
                 best_val_score = val_score
                 best_epoch = epoch
                 run_on_rank_zero_and_broadcast(
@@ -8577,6 +11136,8 @@ def main() -> None:
                 )
             diagnostic_suffix = ""
             if (
+                not routing_warmup_active
+                and
                 bool(args.diagnostics_enabled)
                 and int(args.diagnostics_every_epochs) > 0
                 and epoch % int(args.diagnostics_every_epochs) == 0
@@ -8636,15 +11197,30 @@ def main() -> None:
                         f" diag_margin_gain={float(diagnostic_aggregate['answer_margin_correct_minus_shuffled']):.4f}"
                     )
             distributed_barrier()
-            wandb_logger.log(wandb_payload, step=global_step)
+            log_wandb_on_rank_zero(
+                wandb_logger,
+                wandb_payload,
+                step=global_step,
+                stage=f"epoch {epoch} W&B log",
+            )
             if is_main_process():
                 print(
                     f"epoch={epoch:03d}/{int(args.epochs):03d} "
+                    f"phase={training_phase} "
                     f"loss={train_loss:.4f} train_acc={train_choice_accuracy:.4f} "
                     f"val={val_accuracy:.4f} "
                     f"shuffled={float(val_metrics.get('shuffled', {}).get('accuracy', 0.0)):.4f} "
                     f"macro_gain={val_macro_latent_gain:.4f} best_epoch={best_epoch}"
                     f"{diagnostic_suffix}"
+                )
+            if routing_warmup_audit is not None and not bool(
+                routing_warmup_audit["passed"]
+            ):
+                failed = ",".join(str(value) for value in routing_warmup_audit["failed"])
+                raise RuntimeError(
+                    "Grounded routing warmup failed validation thresholds "
+                    f"({failed}). The reader checkpoint and audit were saved; joint answer "
+                    "training was not started."
                 )
 
         distributed_barrier()
@@ -8671,8 +11247,21 @@ def main() -> None:
             latent_shape=latent_shape,
             llm_hidden_size=llm_hidden_size,
         )
-        del adapter, best_checkpoint
+        loss = None
+        loss_parts = None
+        batch = None
+        progress = None
+        del optimizer, lr_scheduler, best_checkpoint
+        global_adapter = None
+        local_adapter = None
+        local_groups = None
+        global_groups = None
+        del adapter
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         adapter = reloaded_adapter.to(device)
+        del reloaded_adapter
         if is_main_process():
             print(
                 f"testing best checkpoint: epoch={best_epoch} "
@@ -8696,7 +11285,12 @@ def main() -> None:
             if bool(args.wandb_detailed_metrics)
             else compact_accuracy_metrics("test", test_metrics)
         )
-        wandb_logger.log(test_payload, step=global_step + 1)
+        log_wandb_on_rank_zero(
+            wandb_logger,
+            test_payload,
+            step=global_step + 1,
+            stage="test evaluation W&B log",
+        )
 
         def write_final_outputs() -> None:
             summary["result"] = {

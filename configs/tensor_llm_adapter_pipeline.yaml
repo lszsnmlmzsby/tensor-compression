@@ -33,6 +33,8 @@ patch_qa:
   hdf5_path: /data/PiERN/PDEbench/data/2d-ns/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
   # Use a fresh v3 directory so legacy/incomplete caches remain untouched and cannot be mixed in.
   qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_v3_direct
+  # QA-only Stage-2B asset built from the immutable v3 records and stored FP16 latents.
+  stage2b_qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_stage2b_matched_v1
   latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256_14b_v3_direct
   fields:
     - density
@@ -61,6 +63,9 @@ patch_qa:
   region_size: 4
   # Numeric distractors differ by this amount in z space; raw-value spacing is this value times patch std.
   numeric_choice_spacing: 0.5
+  stage2b_numeric_min_gap: 0.5
+  stage2b_region_min_gap: 0.2
+  stage2b_overwrite: false
   decimal_places: 6
   batch_size: 256
   device: auto
@@ -346,12 +351,13 @@ patch_alignment:
   log_interval: 20
 
 adapter:
-  # Reuse the Stage-1 spatial adapter directly: 256 row-major tensor embeddings followed by the
-  # natural-language QA prompt. Qwen itself, rather than a task-specific cross-attention branch,
-  # performs question-to-prefix routing.
-  architecture: alignment_adapter
+  # Freeze the successful direct 256-token prefix and add a two-token factorized row/column
+  # evidence reader. Qwen's native one-dimensional RoPE is unchanged.
+  architecture: grounded_evidence_adapter
   # This must be byte-for-byte the same Stage-1 checkpoint used by patch_qa.
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
+  # Warm-start the frozen global branch from the completed direct Stage-2 run.
+  stage2_warm_start_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
   soft_prompt_tokens: 256
   adapter_dim: 512
   adapter_layers: 2
@@ -362,38 +368,37 @@ adapter:
   question_condition_gate_init: 0.0
   # Formal runs must let the model read coordinates/tasks/statistics from text instead of regex-parsed features.
   structured_query_conditioning: false
-  # The options below are retained for explicitly requested residual/hybrid experiments and are inactive
-  # for alignment_adapter. They do not create parameters or an extra question-encoding forward in this run.
-  local_soft_prompt_tokens: 256
-  local_adapter_layers: 2
+  local_soft_prompt_tokens: 2
+  local_adapter_layers: 1
   # Frozen Qwen contextual tokens remain the only question input; no parsed coordinates or task IDs are used.
   local_question_input_mode: contextual_tokens
   local_context_layer: 6
   # Fuse full token sequences from a shallow lexical layer and a middle contextual layer.
   local_context_layers: [2, 6]
-  local_fusion_mode: residual_spatial_transformer
+  local_fusion_mode: grounded_role_routing
   local_text_encoder_layers: 0
-  # Use one unsuppressed question path. Zero-initialized attention outputs make the initial
-  # conditioned branch exactly equal Stage 1 without multiplying two small trainable gates.
+  # Both evidence roles start hard-closed; a straight-through gate plus role-presence supervision
+  # opens only required roles without RMSNorm undoing a soft magnitude gate.
+  grounded_gate_bias_init: -2.0
+  # Legacy residual-reader settings below are ignored by grounded_evidence_adapter and retained
+  # only so the shared config can still be switched back to an older residual architecture.
   local_text_gate_init: 1.0
   local_text_gate_trainable: false
   local_gate_init: 1.0
   local_residual_gate_trainable: false
   zero_init_local_text_attention: true
-  # Preserve the Stage-1 spatial/value mapping. Only natural-language projections and
-  # cross-attention may create the residual during this training stage.
   freeze_conditioned_backbone: true
   # The original stage-1 branch remains a fixed reference anchor.
   freeze_global_adapter: true
   global_unfreeze_epoch: 0
   # Retained for old hybrid checkpoints; unused while the residual reference is frozen.
   global_lr: 1.0e-5
-  # Dropping the base would leave only a small residual; question grounding is enforced by swap loss instead.
+  # Keep the frozen 256-token reference present in every formal Stage-2B forward.
   global_prompt_dropout: 0.0
   soft_prompt_scale: 0.05
 
 llm_training:
-  run_name: tensor_patch_qa_direct_spatial_adapter
+  run_name: tensor_patch_qa_stage2b_grounded_evidence
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
@@ -401,8 +406,8 @@ llm_training:
   max_train_records: null
   max_val_records: null
   max_test_records: null
-  # Evaluate transfer before QA fine-tuning on this many validation questions.
-  initial_eval_records: 512
+  # Preflight the combined and exact global_only paths before training without paying for a full split.
+  initial_eval_records: 256
   # Formal train/val/test splits must not share PDEBench sample_index values.
   require_disjoint_splits: true
   # Fail instead of silently truncating any natural-language instruction or query.
@@ -426,8 +431,15 @@ llm_training:
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # The 256-token prefix is substantially longer than the former 16-token path.
+  # Epoch 1 trains only text-to-row/column routing through shallow frozen-Qwen layers. The
+  # expensive answer objective starts only after held-out routing passes the thresholds below.
   epochs: 2
+  grounding_routing_warmup_epochs: 1
+  grounding_warmup_min_cell_top1: 0.90
+  grounding_warmup_min_cell_top5: 0.98
+  grounding_warmup_min_axis_top1: 0.95
+  grounding_warmup_min_target_mass: 0.50
+  grounding_warmup_min_gate_accuracy: 0.95
   # Keep one complete same-tensor group per forward. The single-token choice path does not expand candidates.
   batch_size: 3
   # Evaluation is no-grad and uses one prompt-only forward for single-token choices; it can use the
@@ -445,21 +457,26 @@ llm_training:
   # single-GPU 3 x 5 = 15 schedule without reducing optimizer updates by another factor of four.
   # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
   gradient_accumulation_steps: 1
-  # Fine-tune the already aligned Stage-1 adapter conservatively; Qwen remains frozen.
-  lr: 2.0e-5
-  lr_scheduler: cosine
-  warmup_ratio: 0.03
-  min_lr_ratio: 0.1
+  # Only the small grounded reader trains; Qwen and the direct global adapter remain frozen.
+  lr: 5.0e-5
+  lr_scheduler: constant
+  warmup_ratio: 0.0
+  min_lr_ratio: 1.0
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
-  ce_loss_weight: 0.05
+  ce_loss_weight: 0.02
   choice_ce_loss_weight: 1.0
-  ranking_loss_weight: 0.1
+  ranking_loss_weight: 0.0
   ranking_loss_margin: 0.1
+  grounding_routing_loss_weight: 1.0
+  grounding_gate_loss_weight: 0.1
+  matched_group_loss_weight: 0.2
+  matched_group_loss_margin: 0.5
   # Compare the correct tensor prefix with a same-length zero-information prefix. A shuffled PDE tensor
   # is not a reliable negative: its answer can legitimately equal the current record's answer.
   ranking_loss_negative: no_latent
-  # The direct tensor prefix is deliberately question-independent; swapping same-tensor prefixes is an identity.
+  # Explicit matched-coordinate and role-swap groups provide the counterfactual supervision;
+  # disable the generic swap objective to avoid duplicating expensive frozen-Qwen forwards.
   swapped_question_loss_weight: 0.0
   swapped_question_loss_margin: 0.1
   # Same-label swaps are semantically ambiguous, especially for balanced binary tasks.
@@ -473,25 +490,28 @@ llm_training:
   # Keep per-epoch evaluation cheap; run the full baseline set once on the final best checkpoint.
   eval_baselines:
     - correct
+    - global_only
     - shuffled
   final_eval_baselines:
     - correct
+    - global_only
     - no_latent
     - zero_latent
     - shuffled
     - shuffled_stats
   choice_score: mean
-  # auto uses one-forward restricted-label scoring for the current A/B/C/D tasks; sequence preserves the old exact scorer.
-  choice_scoring_mode: auto
+  # The A/B/C/D labels are preflighted as unique single tokens; one forward supplies CE and matched margins.
+  choice_scoring_mode: label
   # Group different natural-language questions for the same tensor and operation inside each batch.
   group_questions_by_state: true
   questions_per_state_group: 3
-  # Prevent the easy quadrant task from dominating checkpoint selection.
-  checkpoint_metric: macro_latent_gain
+  # Select the weaker point task and require the grounded path to beat both the frozen
+  # global-only branch and a same-query shuffled tensor.
+  checkpoint_metric: point_value_min_grounded_gain
   log_interval: 20
-  # W&B retains step curves; the terminal and metrics JSON stay compact by default.
+  # Preserve local curves even when W&B is unavailable on the training server.
   console_progress: false
-  save_step_metrics: false
+  save_step_metrics: true
   diagnostics:
     enabled: true
     every_epochs: 1

@@ -12,6 +12,8 @@ import torch
 
 
 PATCH_QA_FORMAT = "tensor_patch_qa_v3"
+PATCH_MATCHED_QA_FORMAT = "tensor_patch_matched_qa_v1"
+MATCHED_GROUP_FORMAT = "stage2b_matched_groups_v1"
 PATCH_QA_PROMPT_CONTRACT = "encoder_zscore_one_based_v2"
 PATCH_QA_BUILD_MARKER = ".build_in_progress.json"
 PATCH_LATENT_FORMAT = "tensor_patch_latent_v1"
