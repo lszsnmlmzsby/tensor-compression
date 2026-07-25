@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
+for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from diagnose_spatial_token_readout import (  # noqa: E402
+from scripts.diagnose_spatial_token_readout import (  # noqa: E402
     adapter_structure_summary,
     coordinate_routing_groups,
     extract_spatial_token_stages,
@@ -24,11 +24,11 @@ from diagnose_spatial_token_readout import (  # noqa: E402
     summarize_routing_statistics,
     unique_state_examples,
 )
-from train_tensor_llm_adapter import (  # noqa: E402
+from scripts.train_tensor_llm_adapter import (  # noqa: E402
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
 )
-from train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
+from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
 
 
 class TestSpatialReadoutDiagnosticPrimitives(unittest.TestCase):

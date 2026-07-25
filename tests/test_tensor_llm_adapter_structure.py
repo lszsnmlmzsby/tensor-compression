@@ -15,12 +15,12 @@ import torch.nn.functional as F
 from torch import nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for path in (PROJECT_ROOT, PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
+for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import train_tensor_llm_adapter as adapter_training  # noqa: E402
-from train_tensor_llm_adapter import (  # noqa: E402
+import scripts.train_tensor_llm_adapter as adapter_training  # noqa: E402
+from scripts.train_tensor_llm_adapter import (  # noqa: E402
     ExactDistributedEvalSampler,
     HybridGlobalLocalAdapter,
     ResidualQuestionConditionedAdapter,
@@ -67,7 +67,7 @@ from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     sha256_file,
     validate_stage1_alignment_checkpoint_payload,
 )
-from train_tensor_patch_text_alignment import (  # noqa: E402
+from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     TensorPatchAlignmentAdapter,
     alignment_adapter_path_metrics,
     alignment_adapter_parameter_metrics,
@@ -949,10 +949,10 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
         with (
             mock.patch(
-                "train_tensor_llm_adapter.contextual_adapter_soft_embeds",
+                "scripts.train_tensor_llm_adapter.contextual_adapter_soft_embeds",
                 return_value=torch.zeros(2, 2, 4),
             ),
-            mock.patch("train_tensor_llm_adapter.forward_answer_nll", side_effect=fake_answer_nll),
+            mock.patch("scripts.train_tensor_llm_adapter.forward_answer_nll", side_effect=fake_answer_nll),
         ):
             chunked = _sequence_choice_ce_loss(
                 llm=object(),
@@ -1012,15 +1012,15 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
         with (
             mock.patch(
-                "train_tensor_llm_adapter.build_text_tensors",
+                "scripts.train_tensor_llm_adapter.build_text_tensors",
                 return_value=(input_ids, attention, labels),
             ),
             mock.patch(
-                "train_tensor_llm_adapter.contextual_adapter_soft_embeds",
+                "scripts.train_tensor_llm_adapter.contextual_adapter_soft_embeds",
                 return_value=torch.zeros(2, 2, 4),
             ),
             mock.patch(
-                "train_tensor_llm_adapter.selective_answer_statistics",
+                "scripts.train_tensor_llm_adapter.selective_answer_statistics",
                 return_value=(torch.tensor([100.0, 200.0]), torch.tensor([2, 2]), first_logits),
             ),
         ):
