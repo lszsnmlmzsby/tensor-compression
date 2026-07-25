@@ -252,6 +252,20 @@ def extract_spatial_token_stages(
     captures: dict[str, torch.Tensor] = {
         "latent_raw": global_backbone.flatten_latent_tokens(latent_map),
     }
+    local_adapter: ResidualQuestionConditionedAdapter | None = None
+    conditioned_backbone: TensorPatchAlignmentAdapter | None = None
+    if isinstance(adapter, HybridGlobalLocalAdapter):
+        if not adapter.residual_mode:
+            raise TypeError("The Stage-2 routing diagnostic requires residual global/local combination.")
+        if not isinstance(adapter.local_adapter, ResidualQuestionConditionedAdapter):
+            raise TypeError("The Stage-2 routing diagnostic supports ResidualQuestionConditionedAdapter only.")
+        local_adapter = adapter.local_adapter
+        conditioned_backbone = local_adapter.backbone
+        if conditioned_backbone.adapter_type != "spatial_transformer":
+            raise TypeError("The conditioned Stage-2 backbone is not a spatial_transformer.")
+        if question_embeds is None or question_mask is None:
+            raise ValueError("Stage-2 extraction requires contextual natural-language question states and their mask.")
+
     handles: list[Any] = [
         global_backbone.latent_projection.register_forward_hook(
             _capture_output(captures, "global_projected_content")
@@ -271,35 +285,30 @@ def extract_spatial_token_stages(
         )
     for index, block in enumerate(global_backbone.blocks, start=1):
         handles.append(block.register_forward_hook(_capture_output(captures, f"global_spatial_block_{index}")))
-    try:
-        global_soft = global_backbone.forward_soft_prompts(latent_map)
-    finally:
-        for handle in handles:
-            handle.remove()
-    captures["global_soft_prompt"] = global_soft
 
-    if not isinstance(adapter, HybridGlobalLocalAdapter):
+    if local_adapter is None or conditioned_backbone is None:
+        try:
+            captures["global_soft_prompt"] = global_backbone.forward_soft_prompts(latent_map)
+        finally:
+            for handle in handles:
+                handle.remove()
         return captures
-    local_adapter = adapter.local_adapter
-    if not isinstance(local_adapter, ResidualQuestionConditionedAdapter):
-        raise TypeError("The Stage-2 routing diagnostic supports ResidualQuestionConditionedAdapter only.")
-    if local_adapter.backbone.adapter_type != "spatial_transformer":
-        raise TypeError("The conditioned Stage-2 backbone is not a spatial_transformer.")
-    if question_embeds is None or question_mask is None:
-        raise ValueError("Stage-2 extraction requires contextual natural-language question states and their mask.")
-
-    conditioned_backbone = local_adapter.backbone
-    handles = [
-        conditioned_backbone.latent_projection.register_forward_hook(
-            _capture_output(captures, "conditioned_projected_content")
-        ),
-        conditioned_backbone.local_residual_projection.register_forward_hook(
-            _capture_output(captures, "conditioned_local_residual_projection")
-        ),
-        conditioned_backbone.output.register_forward_pre_hook(
-            _capture_input(captures, "conditioned_pre_output")
-        ),
-    ]
+    handles.extend(
+        [
+            local_adapter.register_forward_hook(
+                _capture_output(captures, "conditioned_soft_prompt")
+            ),
+            conditioned_backbone.latent_projection.register_forward_hook(
+                _capture_output(captures, "conditioned_projected_content")
+            ),
+            conditioned_backbone.local_residual_projection.register_forward_hook(
+                _capture_output(captures, "conditioned_local_residual_projection")
+            ),
+            conditioned_backbone.output.register_forward_pre_hook(
+                _capture_input(captures, "conditioned_pre_output")
+            ),
+        ]
+    )
     if local_adapter.text_blocks:
         handles.append(
             local_adapter.text_blocks[0].register_forward_pre_hook(
@@ -317,8 +326,8 @@ def extract_spatial_token_stages(
             spatial_block.register_forward_hook(_capture_output(captures, f"conditioned_spatial_block_{index}"))
         )
     try:
-        conditioned_soft = local_adapter(
-            latent_map,
+        global_soft, question_residual, combined_soft = adapter.forward_components(
+            latent_map=latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
             structured_query=None,
@@ -326,12 +335,11 @@ def extract_spatial_token_stages(
     finally:
         for handle in handles:
             handle.remove()
-    captures["conditioned_soft_prompt"] = conditioned_soft
-    question_residual = local_adapter.gate.to(dtype=conditioned_soft.dtype) * (
-        conditioned_soft - global_soft
-    )
+    if "conditioned_soft_prompt" not in captures:
+        raise RuntimeError("The conditioned adapter forward hook did not capture its soft prompts.")
+    captures["global_soft_prompt"] = global_soft
     captures["question_residual"] = question_residual
-    captures["combined_soft_prompt"] = global_soft + question_residual
+    captures["combined_soft_prompt"] = combined_soft
     return captures
 
 

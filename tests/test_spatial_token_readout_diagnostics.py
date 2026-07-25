@@ -186,11 +186,19 @@ class TestSpatialReadoutStageCapture(unittest.TestCase):
         question = torch.randn(2, 2, 5, 24)
         mask = torch.ones(2, 5, dtype=torch.bool)
 
-        stages = extract_spatial_token_stages(adapter, latent, question, mask)
-        expected = adapter.forward_components(latent, question, mask, structured_query=None)[2]
+        with torch.no_grad():
+            stages = extract_spatial_token_stages(adapter, latent, question, mask)
+            expected = adapter.forward_components(latent, question, mask, structured_query=None)[2]
         structure = adapter_structure_summary(adapter)
 
-        torch.testing.assert_close(stages["combined_soft_prompt"], expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            stages["combined_soft_prompt"],
+            stages["global_soft_prompt"] + stages["question_residual"],
+            rtol=0.0,
+            atol=0.0,
+        )
+        # A second MHA forward may differ by a few float32 ULPs across PyTorch backends.
+        torch.testing.assert_close(stages["combined_soft_prompt"], expected, rtol=1.0e-6, atol=1.0e-7)
         self.assertTrue(all(int(value.shape[1]) == 4 for value in stages.values()))
         self.assertTrue(structure["question_cross_attention"])
         self.assertEqual(
