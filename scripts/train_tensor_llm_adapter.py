@@ -304,6 +304,30 @@ def validate_direct_alignment_provenance(
     }
 
 
+def validate_stage2_warm_start_file(args: argparse.Namespace) -> Path | None:
+    """Fail before distributed/model startup when Stage-2B's parent is absent."""
+    if str(args.adapter_architecture) != "grounded_evidence_adapter":
+        return None
+    raw_path = str(getattr(args, "stage2_warm_start_checkpoint", None) or "").strip()
+    if raw_path.lower() in {"", "none", "null", "random"}:
+        raise ValueError(
+            "grounded_evidence_adapter requires adapter.stage2_warm_start_checkpoint "
+            "from the completed direct Stage 2 run."
+        )
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            "Grounded Stage-2B cannot start because its completed direct Stage-2 parent "
+            f"checkpoint is missing: {path}. Migrate adapter_best.pt to this exact path; "
+            "do not replace it with the Stage-1 alignment checkpoint or silently train the "
+            "grounded architecture from a different initialization."
+        )
+    if path.stat().st_size <= 0:
+        raise ValueError(f"Stage-2 warm-start checkpoint is empty: {path}")
+    args.stage2_warm_start_checkpoint = str(path)
+    return path
+
+
 def validate_adapter_loss_contract(args: argparse.Namespace) -> None:
     direct_alignment_architecture = is_direct_alignment_architecture(args.adapter_architecture)
     if (
@@ -8271,6 +8295,100 @@ def save_adapter_checkpoint(
     atomic_torch_save(path, payload)
 
 
+def normalized_latent_contract_identity(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the immutable latent identity without host-specific path aliases."""
+    identity = copy.deepcopy(dict(contract))
+    # The same checkpoint can be mounted through different logical/physical
+    # paths after migration. Its verified SHA-256 is the immutable identity;
+    # the persisted path remains provenance but must not define compatibility.
+    checkpoint_path = str(identity.pop("alignment_checkpoint", "")).strip()
+    if not checkpoint_path:
+        raise ValueError("Latent contract is missing alignment_checkpoint provenance.")
+    checkpoint_sha = str(identity.get("alignment_checkpoint_sha256", "")).lower()
+    if len(checkpoint_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in checkpoint_sha
+    ):
+        raise ValueError("Latent contract has an invalid alignment_checkpoint_sha256.")
+    identity["alignment_checkpoint_sha256"] = checkpoint_sha
+    normalization = identity.get("encoder_input_normalization")
+    if isinstance(normalization, Mapping):
+        identity["encoder_input_normalization"] = canonical_normalization(normalization)
+    latent_shape = identity.get("latent_shape")
+    if isinstance(latent_shape, Sequence) and not isinstance(latent_shape, (str, bytes)):
+        identity["latent_shape"] = [int(value) for value in latent_shape]
+    return identity
+
+
+def validate_latent_contract_compatibility(
+    observed_contract: Mapping[str, Any],
+    expected_contract: Mapping[str, Any],
+) -> None:
+    observed_identity = normalized_latent_contract_identity(observed_contract)
+    expected_identity = normalized_latent_contract_identity(expected_contract)
+    missing = object()
+    differing_keys = sorted(
+        key
+        for key in set(observed_identity) | set(expected_identity)
+        if observed_identity.get(key, missing) != expected_identity.get(key, missing)
+    )
+    if differing_keys:
+        def display(mapping: Mapping[str, Any], key: str) -> Any:
+            return mapping[key] if key in mapping else "<missing>"
+
+        differences = "; ".join(
+            f"{key}: checkpoint={display(observed_identity, key)!r}, "
+            f"active={display(expected_identity, key)!r}"
+            for key in differing_keys
+        )
+        raise ValueError(
+            "Stage-2 adapter checkpoint was trained against a different latent/Stage-1 "
+            f"contract; differing_keys={differing_keys}; {differences}."
+        )
+
+
+def audit_stage2_warm_start_checkpoint(
+    path: str | Path,
+    expected_latent_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the warm-start envelope before loading the frozen LLM replicas."""
+    checkpoint_path = Path(path).expanduser().resolve()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Stage-2 warm-start checkpoint must contain a mapping payload.")
+    try:
+        llm_hidden_size = int(checkpoint.get("llm_hidden_size", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stage-2 warm-start checkpoint has an invalid LLM hidden width.") from exc
+    if llm_hidden_size <= 0:
+        raise ValueError("Stage-2 warm-start checkpoint has no positive LLM hidden width.")
+    expected_shape = expected_latent_contract.get("latent_shape")
+    if not isinstance(expected_shape, Sequence) or isinstance(expected_shape, (str, bytes)):
+        raise ValueError("Active latent contract has no valid latent_shape for warm-start audit.")
+    state_dict = validate_adapter_checkpoint_payload(
+        checkpoint,
+        expected_latent_shape=expected_shape,
+        expected_llm_hidden_size=llm_hidden_size,
+        expected_architecture="alignment_adapter",
+        expected_latent_contract=expected_latent_contract,
+    )
+    return {
+        "validated_before_llm_load": True,
+        "path": str(checkpoint_path),
+        "sha256": sha256_file(checkpoint_path),
+        "architecture": "alignment_adapter",
+        "latent_shape": [int(value) for value in expected_shape],
+        "llm_hidden_size": llm_hidden_size,
+        "parameter_tensors": sum(
+            int(isinstance(value, torch.Tensor)) for value in state_dict.values()
+        ),
+        "parameters": sum(
+            int(value.numel())
+            for value in state_dict.values()
+            if isinstance(value, torch.Tensor)
+        ),
+    }
+
+
 def validate_adapter_checkpoint_payload(
     checkpoint: Any,
     *,
@@ -8337,10 +8455,7 @@ def validate_adapter_checkpoint_payload(
     observed_contract = checkpoint.get("latent_contract")
     if not isinstance(observed_contract, Mapping):
         raise ValueError("Stage-2 adapter checkpoint is missing latent_contract provenance.")
-    if dict(observed_contract) != dict(expected_latent_contract):
-        raise ValueError(
-            "Stage-2 adapter checkpoint was trained against a different latent/Stage-1 contract."
-        )
+    validate_latent_contract_compatibility(observed_contract, expected_latent_contract)
     return state_dict
 
 
@@ -9034,6 +9149,7 @@ def log_wandb_on_rank_zero(
 def main() -> None:
     global _ACTIVE_RUN_LIFECYCLE
     args = parse_args()
+    validate_stage2_warm_start_file(args)
     if bool(args.require_disjoint_splits) and bool(args.structured_query_conditioning):
         raise ValueError(
             "Formal runs cannot enable adapter.structured_query_conditioning because it uses "
@@ -9083,6 +9199,29 @@ def main() -> None:
         lambda: atomic_dump_json(run_dir / "qa_metadata_audit.json", qa_metadata_audit),
         "QA metadata audit write",
     )
+    if str(args.adapter_architecture) == "grounded_evidence_adapter":
+        if latent_contract is None:
+            raise ValueError("Grounded Stage-2B requires a formal latent contract.")
+        warm_start_audit = run_on_rank_zero_and_broadcast(
+            lambda: audit_stage2_warm_start_checkpoint(
+                args.stage2_warm_start_checkpoint,
+                latent_contract,
+            ),
+            "Stage-2 warm-start checkpoint audit",
+        )
+        run_on_rank_zero_and_broadcast(
+            lambda: atomic_dump_json(
+                run_dir / "stage2_warm_start_audit.json",
+                warm_start_audit,
+            ),
+            "Stage-2 warm-start checkpoint audit write",
+        )
+        if is_main_process():
+            print(
+                "startup=stage2_warm_start_audit "
+                f"sha256={warm_start_audit['sha256']} "
+                f"parameters={warm_start_audit['parameters']}"
+            )
     if is_main_process():
         print("startup=dataset_index")
 

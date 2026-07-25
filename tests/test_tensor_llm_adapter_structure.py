@@ -29,6 +29,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     RunLifecycle,
     StateTaskGroupedBatchSampler,
     TensorReadoutQADataset,
+    audit_stage2_warm_start_checkpoint,
     _decoder_question_last_hidden,
     _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
@@ -70,6 +71,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     validate_stage1_alignment_checkpoint_phase,
     validate_stage1_model_identity,
     validate_stage1_teacher_supervision,
+    validate_stage2_warm_start_file,
 )
 from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  # noqa: E402
     ConvTokenAutoencoder2D,
@@ -140,6 +142,23 @@ def _stage1_checkpoint_payload(
 
 
 class TestAdapterLossContracts(unittest.TestCase):
+    def test_grounded_warm_start_file_is_required_before_model_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "adapter_best.pt"
+            args = SimpleNamespace(
+                adapter_architecture="grounded_evidence_adapter",
+                stage2_warm_start_checkpoint=str(checkpoint),
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "direct Stage-2 parent"):
+                validate_stage2_warm_start_file(args)
+
+            checkpoint.write_bytes(b"checkpoint-fixture")
+            resolved = validate_stage2_warm_start_file(args)
+
+            self.assertEqual(resolved, checkpoint.resolve())
+            self.assertEqual(args.stage2_warm_start_checkpoint, str(checkpoint.resolve()))
+
     def test_stage1_model_identity_accepts_hf_and_local_paths_for_the_same_model(self) -> None:
         validate_stage1_model_identity(
             {"model_name_or_path": "Qwen/Qwen2.5-14B-Instruct"},
@@ -495,8 +514,34 @@ class TestTrainingAudits(unittest.TestCase):
         )
         self.assertTrue(torch.equal(state["weight"], torch.ones(2, 2)))
 
+        migrated_contract = dict(
+            contract,
+            alignment_checkpoint="/root/autodl-tmp/run/alignment_best.pt",
+        )
+        migrated_state = validate_adapter_checkpoint_payload(
+            checkpoint,
+            expected_latent_shape=(3, 2, 2),
+            expected_llm_hidden_size=24,
+            expected_architecture="alignment_adapter",
+            expected_latent_contract=migrated_contract,
+        )
+        self.assertTrue(torch.equal(migrated_state["weight"], torch.ones(2, 2)))
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "adapter_best.pt"
+            torch.save(checkpoint, checkpoint_path)
+            audit = audit_stage2_warm_start_checkpoint(
+                checkpoint_path,
+                migrated_contract,
+            )
+            self.assertTrue(audit["validated_before_llm_load"])
+            self.assertEqual(audit["parameters"], 4)
+
         changed_contract = dict(contract, alignment_checkpoint_sha256="b" * 64)
-        with self.assertRaisesRegex(ValueError, "different latent/Stage-1 contract"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "differing_keys=\\['alignment_checkpoint_sha256'\\]",
+        ):
             validate_adapter_checkpoint_payload(
                 checkpoint,
                 expected_latent_shape=(3, 2, 2),
