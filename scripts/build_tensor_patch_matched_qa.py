@@ -663,7 +663,18 @@ def region_pair(
     )
 
 
-def verify_extreme_replay(record: Mapping[str, Any], values: torch.Tensor) -> None:
+def verify_extreme_replay(
+    record: Mapping[str, Any],
+    values: torch.Tensor,
+) -> dict[str, Any]:
+    """Validate a float32-source label against all tied extrema in stored FP16.
+
+    FP16 rounding is monotone, so the source float32 extremum must remain one of
+    the stored extrema, although nearby values can become exactly tied after
+    serialization.  Cross-quadrant ties therefore remain valid replays when the
+    source label names one of those quadrants; a label outside the tied set is a
+    genuine provenance failure.
+    """
     question = str(record.get("query") or record.get("question") or "")
     match = EXTREME_RE.search(question)
     if match is None:
@@ -672,10 +683,26 @@ def verify_extreme_replay(record: Mapping[str, Any], values: torch.Tensor) -> No
     extreme_value = float(values.max() if find_max else values.min())
     positions = torch.nonzero(values == extreme_value, as_tuple=False).tolist()
     quadrants = {quadrant(int(row), int(col), int(values.shape[0])) for row, col in positions}
-    if len(quadrants) != 1 or str(record.get("answer", "")) not in quadrants:
+    source_answer = str(record.get("answer", ""))
+    if source_answer not in quadrants:
         raise ValueError(
-            f"FP16 extreme replay is ambiguous or stale for {record.get('state_ref')}: {quadrants}."
+            "Stored-FP16 extrema do not support the source float32 replay label for "
+            f"{record.get('state_ref')}: source_answer={source_answer!r}, "
+            f"fp16_quadrants={sorted(quadrants)}, fp16_positions={len(positions)}."
         )
+    tie_scope = (
+        "unique_cell"
+        if len(positions) == 1
+        else "within_quadrant_tie"
+        if len(quadrants) == 1
+        else "cross_quadrant_tie"
+    )
+    return {
+        "extreme": "maximum" if find_max else "minimum",
+        "fp16_position_count": len(positions),
+        "fp16_quadrants": sorted(quadrants),
+        "tie_scope": tie_scope,
+    }
 
 
 def grounding_target_from_source(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -749,6 +776,7 @@ def build_state_records(
     region_size: int,
     decimal_places: int,
     spatial_family: str,
+    extreme_audit_counts: Counter[str] | None = None,
 ) -> list[dict[str, Any]]:
     state_ref = str(source["state_ref"])
     field = str(source["field"])
@@ -954,7 +982,14 @@ def build_state_records(
     else:
         raise ValueError(f"Unsupported spatial family: {spatial_family}")
 
-    verify_extreme_replay(extreme_source, values)
+    extreme_audit = verify_extreme_replay(extreme_source, values)
+    if extreme_audit_counts is not None:
+        extreme_audit_counts["records"] += 1
+        extreme_audit_counts[f"{extreme_audit['extreme']}_records"] += 1
+        extreme_audit_counts[f"{extreme_audit['tie_scope']}_records"] += 1
+        extreme_audit_counts["fp16_extreme_position_count"] += int(
+            extreme_audit["fp16_position_count"]
+        )
     extreme = copy.deepcopy(dict(extreme_source))
     extreme.pop("oracle", None)
     extreme["source_qa_id"] = str(extreme_source["qa_id"])
@@ -1088,6 +1123,7 @@ def main() -> None:
         output_counts: Counter[str] = Counter()
         output_answer_counts: dict[str, Counter[str]] = defaultdict(Counter)
         numeric_group_audits: list[dict[str, Any]] = []
+        extreme_replay_audit_counts: Counter[str] = Counter()
         with AtomicJsonlWriter(output_root / "train.jsonl") as writer:
             for state_ref in sorted(train_representatives):
                 source = train_representatives[state_ref]
@@ -1102,6 +1138,7 @@ def main() -> None:
                     region_size=int(args.region_size),
                     decimal_places=int(args.decimal_places),
                     spatial_family=family_by_state[state_ref],
+                    extreme_audit_counts=extreme_replay_audit_counts,
                 )
                 writer.write_many(records)
                 numeric_group_audits.extend(
@@ -1113,6 +1150,12 @@ def main() -> None:
                 output_counts.update(str(record["task_type"]) for record in records)
                 for record in records:
                     output_answer_counts[str(record["task_type"])][str(record["answer"])] += 1
+        if int(extreme_replay_audit_counts["records"]) != len(train_representatives):
+            raise RuntimeError(
+                "Extreme replay audit did not cover every train state: "
+                f"audited={extreme_replay_audit_counts['records']}, "
+                f"expected={len(train_representatives)}."
+            )
 
         for split in ("val", "test"):
             # The copied evaluation records remain part of the formal contract, so validate
@@ -1176,6 +1219,12 @@ def main() -> None:
                         for task, counts in sorted(output_answer_counts.items())
                     },
                     "numeric_rank_audit": numeric_rank_summary,
+                    "extreme_replay_audit": {
+                        "policy": (
+                            "source_float32_answer_must_belong_to_stored_fp16_tied_extreme_quadrants"
+                        ),
+                        "counts": dict(sorted(extreme_replay_audit_counts.items())),
+                    },
                     "source_by_task": source_task_counts,
                     "target_provenance": {
                         "train_numeric_and_compare": "preserved_input_channel_0_as_stored_float16",
@@ -1231,7 +1280,10 @@ def main() -> None:
 
     print(
         f"stage2b_qa_dir={output_root} train_states={len(train_representatives)} "
-        f"train_records={sum(output_counts.values())} latent_inventory={after_digest}"
+        f"train_records={sum(output_counts.values())} "
+        "extreme_cross_quadrant_ties="
+        f"{int(extreme_replay_audit_counts['cross_quadrant_tie_records'])} "
+        f"latent_inventory={after_digest}"
     )
 
 

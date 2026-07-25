@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections import Counter
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from scripts.build_tensor_patch_matched_qa import (
     grounding_target_from_source,
     numeric_group_rank_audit,
     separated_option_cells,
+    verify_extreme_replay,
 )
 from tensor_compression.downstream.patch_qa_contract import PATCH_LATENT_AUDIT_FORMAT
 
@@ -59,7 +61,10 @@ def _extreme_record(source: dict) -> dict:
     }
 
 
-def _build(spatial_family: str) -> list[dict]:
+def _build(
+    spatial_family: str,
+    extreme_audit_counts: Counter[str] | None = None,
+) -> list[dict]:
     source = _source_record()
     return build_state_records(
         source,
@@ -71,11 +76,13 @@ def _build(spatial_family: str) -> list[dict]:
         region_size=4,
         decimal_places=6,
         spatial_family=spatial_family,
+        extreme_audit_counts=extreme_audit_counts,
     )
 
 
 def test_matched_builder_emits_nine_atomic_records_without_numeric_shortcuts() -> None:
-    records = _build("point")
+    extreme_audit_counts: Counter[str] = Counter()
+    records = _build("point", extreme_audit_counts)
 
     assert len(records) == 9
     assert [record["task_type"] for record in records[:6]] == [
@@ -83,6 +90,12 @@ def test_matched_builder_emits_nine_atomic_records_without_numeric_shortcuts() -
     ] * 3 + ["raw_point_value_with_stats"] * 3
     assert len({record["matched_group"]["batch_group_id"] for record in records}) == 3
     assert all(record["matched_group"]["batch_group_size"] == 3 for record in records)
+    assert dict(extreme_audit_counts) == {
+        "records": 1,
+        "maximum_records": 1,
+        "unique_cell_records": 1,
+        "fp16_extreme_position_count": 1,
+    }
 
     normalized_specs = [record["matched_group"]["query_spec"] for record in records[:3]]
     raw_specs = [record["matched_group"]["query_spec"] for record in records[3:6]]
@@ -109,6 +122,25 @@ def test_matched_builder_emits_nine_atomic_records_without_numeric_shortcuts() -
         assert sorted(audit["correct_numeric_ranks_1_based"] + [
             audit["distractor_numeric_rank_1_based"]
         ]) == [1, 2, 3, 4]
+
+
+def test_extreme_replay_accepts_supported_cross_quadrant_fp16_tie() -> None:
+    source = _source_record()
+    record = {**_extreme_record(source), "answer": "C"}
+    values = torch.full((16, 16), -1.0, dtype=torch.float32)
+    values[12, 2] = 5.0
+    values[12, 12] = 5.0
+
+    audit = verify_extreme_replay(record, values)
+
+    assert audit == {
+        "extreme": "maximum",
+        "fp16_position_count": 2,
+        "fp16_quadrants": ["C", "D"],
+        "tie_scope": "cross_quadrant_tie",
+    }
+    with pytest.raises(ValueError, match="do not support the source float32 replay label"):
+        verify_extreme_replay({**record, "answer": "A"}, values)
 
 
 def test_point_and_region_role_swaps_reverse_targets_and_labels() -> None:
