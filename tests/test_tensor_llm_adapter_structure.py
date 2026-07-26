@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import runpy
 import sys
 import tempfile
 import unittest
@@ -145,6 +146,30 @@ class TestOptionalHdf5Dependency(unittest.TestCase):
                 "HDF5-backed Stage-1 patch alignment requires h5py",
             ):
                 require_h5py()
+
+    def test_pdebench_reports_h5py_only_when_hdf5_is_used(self) -> None:
+        original_import = __import__
+
+        def import_without_h5py(name: str, *args: object, **kwargs: object) -> object:
+            if name == "h5py":
+                raise ModuleNotFoundError("No module named 'h5py'", name="h5py")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=import_without_h5py):
+            module_globals = runpy.run_path(
+                str(
+                    PROJECT_ROOT
+                    / "src"
+                    / "tensor_compression"
+                    / "downstream"
+                    / "pdebench.py"
+                )
+            )
+            with self.assertRaisesRegex(
+                ImportError,
+                "HDF5-backed PDEBench operations require h5py",
+            ):
+                module_globals["require_h5py"]()
 
 
 def _stage1_checkpoint_payload(

@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,6 +21,21 @@ from tensor_compression.models import build_model
 
 COORDINATE_KEY_SUFFIX = "-coordinate"
 DEFAULT_COMPRESSIBLE_FIELDS = ("density", "pressure", "Vx", "Vy", "Vz")
+
+
+def require_h5py() -> Any:
+    """Import h5py only for code paths that actually access HDF5 files."""
+    try:
+        import h5py
+    except ModuleNotFoundError as exc:
+        if exc.name != "h5py":
+            raise
+        raise ImportError(
+            "HDF5-backed PDEBench operations require h5py. "
+            "Install the project-pinned dependency with: "
+            "python -m pip install h5py==3.12.1"
+        ) from exc
+    return h5py
 
 
 @dataclass(frozen=True)
@@ -428,12 +442,13 @@ def inspect_pdebench_fields(
     field_keys: Sequence[str] | None = None,
     include_scalar_2d: bool = True,
 ) -> list[PDEBenchField]:
+    h5py_module = require_h5py()
     path = Path(hdf5_path).expanduser()
     fields: list[PDEBenchField] = []
-    with h5py.File(path, "r") as handle:
+    with h5py_module.File(path, "r") as handle:
         selected = list(field_keys) if field_keys else discover_compressible_field_keys(handle)
         for key in selected:
-            if key not in handle or not isinstance(handle[key], h5py.Dataset):
+            if key not in handle or not isinstance(handle[key], h5py_module.Dataset):
                 raise KeyError(f"HDF5 dataset key {key!r} not found in {path}.")
             dataset = handle[key]
             if not np.issubdtype(dataset.dtype, np.number):
@@ -452,10 +467,13 @@ def inspect_pdebench_fields(
     return fields
 
 
-def discover_compressible_field_keys(handle: h5py.File) -> list[str]:
+def discover_compressible_field_keys(handle: Any) -> list[str]:
+    h5py_module = require_h5py()
     top_level_keys = list(handle.keys())
     preferred = [
-        key for key in DEFAULT_COMPRESSIBLE_FIELDS if key in handle and isinstance(handle[key], h5py.Dataset)
+        key
+        for key in DEFAULT_COMPRESSIBLE_FIELDS
+        if key in handle and isinstance(handle[key], h5py_module.Dataset)
     ]
     if preferred:
         return preferred
@@ -463,7 +481,7 @@ def discover_compressible_field_keys(handle: h5py.File) -> list[str]:
     fields: list[str] = []
 
     def visitor(name: str, obj) -> None:
-        if not isinstance(obj, h5py.Dataset):
+        if not isinstance(obj, h5py_module.Dataset):
             return
         if name.endswith(COORDINATE_KEY_SUFFIX) or name in {"t-coordinate"}:
             return
@@ -485,12 +503,13 @@ def read_pdebench_sample(
     time_slice: slice | None = None,
     spatial_stride: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    h5py_module = require_h5py()
     path = Path(hdf5_path).expanduser()
-    with h5py.File(path, "r") as handle:
+    with h5py_module.File(path, "r") as handle:
         arrays = []
         reference_shape: tuple[int, ...] | None = None
         for key in field_keys:
-            if key not in handle or not isinstance(handle[key], h5py.Dataset):
+            if key not in handle or not isinstance(handle[key], h5py_module.Dataset):
                 raise KeyError(f"HDF5 dataset key {key!r} not found in {path}.")
             dataset = handle[key]
             if dataset.ndim < 3:
@@ -526,7 +545,7 @@ def build_sample_indexer(
 
 
 def read_grid(
-    handle: h5py.File,
+    handle: Any,
     spatial_shape: Sequence[int],
     spatial_stride: int = 1,
 ) -> torch.Tensor | None:
@@ -543,7 +562,7 @@ def read_grid(
     return torch.stack(mesh, dim=-1)
 
 
-def read_time_coordinates(handle: h5py.File, time_slice: slice | None = None) -> torch.Tensor | None:
+def read_time_coordinates(handle: Any, time_slice: slice | None = None) -> torch.Tensor | None:
     if "t-coordinate" not in handle:
         return None
     values = np.asarray(handle["t-coordinate"][()], dtype=np.float32)
@@ -671,12 +690,13 @@ def export_reconstructed_hdf5(
     spatial_stride: int = 1,
     overwrite: bool = False,
 ) -> Path:
+    h5py_module = require_h5py()
     target_path = prepare_reconstructed_hdf5_output(
         hdf5_path=hdf5_path,
         output_path=output_path,
         overwrite=overwrite,
     )
-    with h5py.File(target_path, "r+") as target:
+    with h5py_module.File(target_path, "r+") as target:
         for record in records:
             write_reconstructed_record_to_hdf5(
                 target=target,
@@ -712,16 +732,17 @@ def prepare_reconstructed_hdf5_output(
 
 
 def write_reconstructed_record_to_hdf5(
-    target: h5py.File,
+    target: Any,
     record: PDEBenchRecord,
     field_keys: Sequence[str],
     time_slice: slice | None = None,
     spatial_stride: int = 1,
 ) -> None:
+    h5py_module = require_h5py()
     if spatial_stride <= 0:
         raise ValueError(f"spatial_stride must be positive, got {spatial_stride}")
     for key in field_keys:
-        if key not in target or not isinstance(target[key], h5py.Dataset):
+        if key not in target or not isinstance(target[key], h5py_module.Dataset):
             raise KeyError(f"HDF5 dataset key {key!r} not found in copied output.")
 
     if tuple(record.field_names) != tuple(field_keys):
