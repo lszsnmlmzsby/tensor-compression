@@ -1842,20 +1842,31 @@ class HybridGlobalLocalAdapter(nn.Module):
         question_embeds: torch.Tensor | None = None,
         question_mask: torch.Tensor | None = None,
         structured_query: torch.Tensor | None = None,
+        detach_global_for_local: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if question_embeds is None:
             raise ValueError("hybrid_local_qformer requires natural-language question embeddings.")
         # Frozen parameters do not require a no-grad graph. Preserve gradients
         # with respect to an explicitly differentiable latent for mechanism
         # diagnostics while retaining the cheaper training/eval path.
-        if self.freeze_global and not latent_map.requires_grad:
+        if (self.freeze_global or bool(detach_global_for_local)) and not latent_map.requires_grad:
             with torch.no_grad():
                 global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
         else:
             global_prompts = self.global_adapter.forward_soft_prompts(latent_map)
+        # In joint A/B training the global-only view owns every global-adapter
+        # gradient.  The hybrid B view may read the same aligned tokens, but it
+        # must see them as a fixed interface; otherwise its answer objective can
+        # rewrite the global representation underneath the local reader.
+        local_aligned_prompts = (
+            global_prompts.detach() if bool(detach_global_for_local) else global_prompts
+        )
+        visible_global_prompts = (
+            global_prompts.detach() if bool(detach_global_for_local) else global_prompts
+        )
         if bool(getattr(self.local_adapter, "requires_aligned_tokens", False)):
             conditioned_prompts = self.local_adapter.forward_from_aligned(
-                global_prompts,
+                local_aligned_prompts,
                 question_embeds,
                 question_mask,
                 structured_query,
@@ -1874,12 +1885,12 @@ class HybridGlobalLocalAdapter(nn.Module):
                     f"{tuple(conditioned_prompts.shape)} and {tuple(global_prompts.shape)}."
                 )
             local_prompts = self.local_adapter.gate.to(dtype=conditioned_prompts.dtype) * (
-                conditioned_prompts - global_prompts
+                conditioned_prompts - local_aligned_prompts
             )
             visible_global = (
-                torch.zeros_like(global_prompts)
+                torch.zeros_like(visible_global_prompts)
                 if self.training and self.drop_global_prompts_for_batch
-                else global_prompts
+                else visible_global_prompts
             )
             combined = visible_global + local_prompts
             self._last_global_prompts = visible_global
@@ -1889,6 +1900,7 @@ class HybridGlobalLocalAdapter(nn.Module):
             )
             return visible_global, local_prompts, combined
         local_prompts = conditioned_prompts
+        global_prompts = visible_global_prompts
         if self.training and self.drop_global_prompts_for_batch:
             global_prompts = torch.zeros_like(global_prompts)
         # Keeping local tokens first preserves the relative positions between global tokens and text.
@@ -2001,15 +2013,13 @@ def require_precomputed_grounded_attention_mask(
 ) -> None:
     """Reject a reused grounded prefix whose question-conditioned mask was discarded."""
 
-    if (
-        precomputed_soft_embeds is not None
-        and precomputed_soft_attention_mask is None
-        and _grounded_local_adapter(adapter) is not None
-        and bool(getattr(adapter, "mask_inactive_local_tokens", False))
+    if (precomputed_soft_embeds is None) != (
+        precomputed_soft_attention_mask is None
     ):
         raise RuntimeError(
-            "A precomputed grounded soft prefix must carry the attention mask captured "
-            "from the same adapter forward; reusing current gate logits can apply a stale mask."
+            "Precomputed soft embeddings and their attention mask must be provided together; "
+            "a reused grounded prefix must carry the attention mask captured from the same adapter "
+            "forward so current gate logits cannot supply a stale replacement."
         )
 
 
@@ -3008,6 +3018,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--matched-group-loss-weight", type=float, default=None)
     parser.add_argument("--matched-group-loss-margin", type=float, default=None)
     parser.add_argument(
+        "--joint-ab-training",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train global-only A and grounded hybrid B views with disjoint gradient ownership.",
+    )
+    parser.add_argument(
+        "--task-balanced-answer-loss",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--global-view-loss-weight", type=float, default=None)
+    parser.add_argument("--joint-no-harm-loss-weight", type=float, default=None)
+    parser.add_argument("--joint-no-harm-margin", type=float, default=None)
+    parser.add_argument("--joint-causal-loss-weight", type=float, default=None)
+    parser.add_argument("--joint-causal-margin", type=float, default=None)
+    parser.add_argument("--global-anchor-loss-weight", type=float, default=None)
+    parser.add_argument("--local-anchor-loss-weight", type=float, default=None)
+    parser.add_argument(
         "--swapped-question-max-records",
         type=int,
         default=None,
@@ -3174,6 +3202,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--console-progress", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save-step-metrics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--checkpoint-updates",
+        type=str,
+        default=None,
+        help="Comma-separated optimizer updates at which to screen and save adapter candidates.",
+    )
+    parser.add_argument(
+        "--checkpoint-fractions",
+        type=str,
+        default=None,
+        help="Batch-size-independent fractions of the optimizer budget to screen and save.",
+    )
+    parser.add_argument("--checkpoint-screening-records", type=int, default=None)
+    parser.add_argument("--checkpoint-full-eval-top-k", type=int, default=None)
+    parser.add_argument("--joint-min-causal-gain", type=float, default=None)
+    parser.add_argument("--joint-max-parent-regression", type=float, default=None)
+    parser.add_argument("--joint-min-no-harm-delta", type=float, default=None)
     parser.add_argument("--evaluate-test", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-every-epochs", type=int, default=None)
@@ -3202,6 +3247,7 @@ def parse_args() -> argparse.Namespace:
             "point_value_min_latent_gain",
             "point_value_min_grounded_gain",
             "point_value_min_causal_gain",
+            "joint_ab_worst_task_delta",
         ),
     )
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
@@ -3455,6 +3501,60 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "joint_ab_training",
+        first_nested(config, ["llm_training.joint_ab_training"]),
+        False,
+    )
+    set_default(
+        args,
+        "task_balanced_answer_loss",
+        first_nested(config, ["llm_training.task_balanced_answer_loss"]),
+        False,
+    )
+    set_default(
+        args,
+        "global_view_loss_weight",
+        first_nested(config, ["llm_training.global_view_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "joint_no_harm_loss_weight",
+        first_nested(config, ["llm_training.joint_no_harm_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "joint_no_harm_margin",
+        first_nested(config, ["llm_training.joint_no_harm_margin"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "joint_causal_loss_weight",
+        first_nested(config, ["llm_training.joint_causal_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "joint_causal_margin",
+        first_nested(config, ["llm_training.joint_causal_margin"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "global_anchor_loss_weight",
+        first_nested(config, ["llm_training.global_anchor_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "local_anchor_loss_weight",
+        first_nested(config, ["llm_training.local_anchor_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
         "swapped_question_max_records",
         first_nested(config, ["llm_training.swapped_question_max_records"]),
         8,
@@ -3595,6 +3695,48 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
     set_default(args, "console_progress", first_nested(config, ["llm_training.console_progress"]), False)
     set_default(args, "save_step_metrics", first_nested(config, ["llm_training.save_step_metrics"]), False)
+    set_default(
+        args,
+        "checkpoint_updates",
+        value_to_csv(first_nested(config, ["llm_training.checkpoint_updates"])),
+        "",
+    )
+    set_default(
+        args,
+        "checkpoint_fractions",
+        value_to_csv(first_nested(config, ["llm_training.checkpoint_fractions"])),
+        "",
+    )
+    set_default(
+        args,
+        "checkpoint_screening_records",
+        first_nested(config, ["llm_training.checkpoint_screening_records"]),
+        0,
+    )
+    set_default(
+        args,
+        "checkpoint_full_eval_top_k",
+        first_nested(config, ["llm_training.checkpoint_full_eval_top_k"]),
+        1,
+    )
+    set_default(
+        args,
+        "joint_min_causal_gain",
+        first_nested(config, ["llm_training.joint_min_causal_gain"]),
+        0.015,
+    )
+    set_default(
+        args,
+        "joint_max_parent_regression",
+        first_nested(config, ["llm_training.joint_max_parent_regression"]),
+        0.005,
+    )
+    set_default(
+        args,
+        "joint_min_no_harm_delta",
+        first_nested(config, ["llm_training.joint_min_no_harm_delta"]),
+        0.0,
+    )
     set_default(args, "evaluate_test", first_nested(config, ["llm_training.evaluate_test"]), True)
     set_default(args, "diagnostics_enabled", first_nested(config, ["llm_training.diagnostics.enabled"]), True)
     set_default(
@@ -3763,6 +3905,70 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             value = float(getattr(args, setting))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"llm_training.{setting} must be finite and in [0, 1].")
+        if bool(args.joint_ab_training):
+            if not str(args.stage2b_resume_checkpoint or "").strip():
+                raise ValueError("joint_ab_training requires adapter.stage2b_resume_checkpoint.")
+            if bool(args.freeze_global_adapter):
+                raise ValueError(
+                    "joint_ab_training requires adapter.freeze_global_adapter=false; only the "
+                    "global-only A view is allowed to update it."
+                )
+            if int(args.global_unfreeze_epoch) != 0:
+                raise ValueError("joint_ab_training trains global from update zero; global_unfreeze_epoch must be 0.")
+            if int(args.grounding_routing_warmup_epochs) != 0:
+                raise ValueError("joint_ab_training requires a previously audited reader and no routing warmup.")
+            if float(args.global_prompt_dropout) != 0.0:
+                raise ValueError("joint_ab_training requires global_prompt_dropout=0.")
+            if float(args.ranking_loss_weight) != 0.0 or float(args.swapped_question_loss_weight) != 0.0:
+                raise ValueError(
+                    "joint_ab_training disables legacy ranking and swapped-question objectives; "
+                    "use the explicit causal and no-harm views instead."
+                )
+            if float(args.ce_loss_weight) != 0.0:
+                raise ValueError(
+                    "joint_ab_training requires ce_loss_weight=0 so every answer term is "
+                    "task-balanced and no extra token-CE decoder graph is retained."
+                )
+            if not math.isfinite(float(args.choice_ce_loss_weight)) or float(
+                args.choice_ce_loss_weight
+            ) <= 0.0:
+                raise ValueError("joint_ab_training requires choice_ce_loss_weight > 0.")
+            if str(args.checkpoint_metric) != "joint_ab_worst_task_delta":
+                raise ValueError(
+                    "joint_ab_training requires checkpoint_metric=joint_ab_worst_task_delta."
+                )
+            if int(args.epochs) != 1:
+                raise ValueError(
+                    "The joint A/B screening schedule currently requires exactly one epoch."
+                )
+            if bool(args.evaluate_test):
+                raise ValueError(
+                    "The joint A/B small experiment must keep evaluate_test=false until a "
+                    "candidate passes full-validation admission."
+                )
+            if not bool(args.task_balanced_answer_loss):
+                raise ValueError("joint_ab_training requires task_balanced_answer_loss=true.")
+            for setting in (
+                "global_view_loss_weight",
+                "joint_no_harm_loss_weight",
+                "joint_causal_loss_weight",
+                "global_anchor_loss_weight",
+                "local_anchor_loss_weight",
+            ):
+                value = float(getattr(args, setting))
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(f"joint_ab_training requires llm_training.{setting} > 0.")
+            required = {"correct", "zero_local", "global_only", "shuffled"}
+            missing = sorted(required - set(parse_csv(args.eval_baselines)))
+            if missing:
+                raise ValueError(
+                    "joint_ab_training checkpoint screening is missing eval baselines: "
+                    f"{missing}."
+                )
+        elif not bool(args.freeze_global_adapter):
+            raise ValueError(
+                "grounded_evidence_adapter may unfreeze global only through joint_ab_training."
+            )
     elif int(args.grounding_routing_warmup_epochs) != 0:
         raise ValueError(
             "grounding_routing_warmup_epochs is only valid for grounded_evidence_adapter."
@@ -3803,9 +4009,25 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "grounding_gate_loss_weight",
         "matched_group_loss_weight",
         "matched_group_loss_margin",
+        "global_view_loss_weight",
+        "joint_no_harm_loss_weight",
+        "joint_no_harm_margin",
+        "joint_causal_loss_weight",
+        "joint_causal_margin",
+        "global_anchor_loss_weight",
+        "local_anchor_loss_weight",
     ):
-        if float(getattr(args, setting)) < 0.0:
+        value = float(getattr(args, setting))
+        if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"llm_training.{setting} must be non-negative.")
+    for setting in ("lr", "global_lr"):
+        value = float(getattr(args, setting))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{setting} must be finite and positive.")
+    for setting in ("weight_decay", "grad_clip_norm"):
+        value = float(getattr(args, setting))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"llm_training.{setting} must be finite and non-negative.")
     if not any(
         float(value) > 0.0
         for value in (
@@ -3849,9 +4071,59 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("matched_group_loss_weight requires a positive choice_ce_loss_weight.")
     if int(args.swapped_question_max_records) <= 0:
         raise ValueError("llm_training.swapped_question_max_records must be positive.")
-    if not 0.0 <= float(args.warmup_ratio) < 1.0:
+    checkpoint_updates = [int(value) for value in parse_csv(args.checkpoint_updates)]
+    if any(value <= 0 for value in checkpoint_updates) or len(checkpoint_updates) != len(
+        set(checkpoint_updates)
+    ):
+        raise ValueError("llm_training.checkpoint_updates must contain unique positive integers.")
+    args.checkpoint_updates = ",".join(str(value) for value in sorted(checkpoint_updates))
+    checkpoint_fractions = [float(value) for value in parse_csv(args.checkpoint_fractions)]
+    if checkpoint_fractions and (
+        any(
+            not math.isfinite(value) or value <= 0.0 or value > 1.0
+            for value in checkpoint_fractions
+        )
+        or len(checkpoint_fractions) != len(set(checkpoint_fractions))
+    ):
+        raise ValueError(
+            "llm_training.checkpoint_fractions must contain unique finite values in (0, 1]."
+        )
+    if checkpoint_updates and checkpoint_fractions:
+        raise ValueError("Configure checkpoint_updates or checkpoint_fractions, not both.")
+    args.checkpoint_fractions = ",".join(
+        f"{value:g}" for value in sorted(checkpoint_fractions)
+    )
+    if int(args.checkpoint_screening_records) < 0:
+        raise ValueError("llm_training.checkpoint_screening_records must be non-negative.")
+    if int(args.checkpoint_full_eval_top_k) <= 0:
+        raise ValueError("llm_training.checkpoint_full_eval_top_k must be positive.")
+    if bool(args.joint_ab_training):
+        if not (checkpoint_updates or checkpoint_fractions) or int(
+            args.checkpoint_screening_records
+        ) <= 0:
+            raise ValueError(
+                "joint_ab_training requires checkpoint fractions/updates and "
+                "checkpoint_screening_records > 0."
+            )
+        if checkpoint_fractions and 1.0 not in checkpoint_fractions:
+            raise ValueError("joint_ab_training checkpoint_fractions must include 1.0.")
+        if int(args.initial_eval_records) != int(args.checkpoint_screening_records):
+            raise ValueError(
+                "The parent audit and candidate screening must use the same fixed validation subset."
+            )
+        if not math.isfinite(float(args.joint_min_causal_gain)) or float(
+            args.joint_min_causal_gain
+        ) < 0.0:
+            raise ValueError("joint_min_causal_gain must be finite and non-negative.")
+        if not math.isfinite(float(args.joint_max_parent_regression)) or float(
+            args.joint_max_parent_regression
+        ) < 0.0:
+            raise ValueError("joint_max_parent_regression must be finite and non-negative.")
+        if not math.isfinite(float(args.joint_min_no_harm_delta)):
+            raise ValueError("joint_min_no_harm_delta must be finite.")
+    if not math.isfinite(float(args.warmup_ratio)) or not 0.0 <= float(args.warmup_ratio) < 1.0:
         raise ValueError("llm_training.warmup_ratio must be in [0, 1).")
-    if not 0.0 <= float(args.min_lr_ratio) <= 1.0:
+    if not math.isfinite(float(args.min_lr_ratio)) or not 0.0 <= float(args.min_lr_ratio) <= 1.0:
         raise ValueError("llm_training.min_lr_ratio must be in [0, 1].")
     if int(args.diagnostics_every_epochs) < 0 or int(args.diagnostics_records_per_task) <= 0:
         raise ValueError("Diagnostic cadence must be non-negative and records_per_task must be positive.")
@@ -3907,6 +4179,29 @@ def parse_csv(raw: str | Sequence[str] | None) -> list[str]:
     if isinstance(raw, Sequence) and not isinstance(raw, str):
         return [str(part).strip() for part in raw if str(part).strip()]
     return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def checkpoint_updates_from_fractions(
+    total_updates: int,
+    fractions: Sequence[float],
+) -> list[int]:
+    if int(total_updates) <= 0:
+        raise ValueError("total_updates must be positive.")
+    normalized = sorted({float(value) for value in fractions})
+    if not normalized or any(
+        not math.isfinite(value) or value <= 0.0 or value > 1.0
+        for value in normalized
+    ):
+        raise ValueError("Checkpoint fractions must be unique finite values in (0, 1].")
+    updates = sorted(
+        {
+            min(int(total_updates), max(1, int(math.ceil(value * int(total_updates)))))
+            for value in normalized
+        }
+    )
+    if updates[-1] != int(total_updates):
+        raise ValueError("Checkpoint fractions must include 1.0 so the final update is saved.")
+    return updates
 
 
 def validate_diagnostic_layers(llm, raw_layers: str | Sequence[str] | None) -> dict[str, Any]:
@@ -4996,6 +5291,7 @@ def contextual_adapter_soft_embeds(
     mode: str,
     prompt_template: str,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+    detach_global_for_local: bool = False,
 ) -> torch.Tensor | None:
     question_context = precomputed_question_context
     if question_context is None:
@@ -5020,6 +5316,7 @@ def contextual_adapter_soft_embeds(
         question_mask=question_mask,
         records=records,
         mode=mode,
+        detach_global_for_local=detach_global_for_local,
     )
 
 
@@ -5031,6 +5328,7 @@ def adapter_soft_embeds(
     question_mask: torch.Tensor | None,
     records: Sequence[Mapping[str, Any]] | None,
     mode: str,
+    detach_global_for_local: bool = False,
 ) -> torch.Tensor:
     structured_query = (
         structured_query_features(records, text_embeds.device)
@@ -5056,6 +5354,7 @@ def adapter_soft_embeds(
                 question_embeds=question_embeds,
                 question_mask=question_mask,
                 structured_query=structured_query,
+                detach_global_for_local=detach_global_for_local,
             )
             zero_local_prompts = (
                 global_prompts
@@ -5127,6 +5426,7 @@ def forward_loss(
     soft_prompt_mode: str = "correct",
     local_context_layer: int = 2,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+    detach_global_for_local: bool = False,
 ) -> torch.Tensor:
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -5156,6 +5456,7 @@ def forward_loss(
         mode=soft_prompt_mode,
         prompt_template=str(prompt_template),
         precomputed_question_context=precomputed_question_context,
+        detach_global_for_local=detach_global_for_local,
     )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -5166,6 +5467,7 @@ def forward_loss(
             question_mask=prompt_mask,
             records=records,
             mode=soft_prompt_mode,
+            detach_global_for_local=detach_global_for_local,
         )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
     soft_attention = grounded_soft_prompt_attention_mask(
@@ -5279,6 +5581,7 @@ def forward_answer_nll(
     precomputed_soft_embeds: torch.Tensor | None = None,
     precomputed_soft_attention_mask: torch.Tensor | None = None,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
+    detach_global_for_local: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     require_precomputed_grounded_attention_mask(
         adapter,
@@ -5315,6 +5618,7 @@ def forward_answer_nll(
             mode=soft_prompt_mode,
             prompt_template=str(prompt_template),
             precomputed_question_context=precomputed_question_context,
+            detach_global_for_local=detach_global_for_local,
         )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -5325,6 +5629,7 @@ def forward_answer_nll(
             question_mask=prompt_mask,
             records=records,
             mode=soft_prompt_mode,
+            detach_global_for_local=detach_global_for_local,
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
@@ -5403,6 +5708,7 @@ def single_token_choice_ce_loss(
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
     precomputed_soft_attention_mask: torch.Tensor | None = None,
+    detach_global_for_local: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     require_precomputed_grounded_attention_mask(
         adapter,
@@ -5439,6 +5745,7 @@ def single_token_choice_ce_loss(
             mode=soft_prompt_mode,
             prompt_template=str(args.prompt_template),
             precomputed_question_context=precomputed_question_context,
+            detach_global_for_local=detach_global_for_local,
         )
     if soft_embeds is None:
         soft_embeds = adapter_soft_embeds(
@@ -5449,6 +5756,7 @@ def single_token_choice_ce_loss(
             question_mask=prompt_mask,
             records=records,
             mode=soft_prompt_mode,
+            detach_global_for_local=detach_global_for_local,
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
@@ -5524,6 +5832,7 @@ def _sequence_choice_ce_loss(
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
     precomputed_soft_attention_mask: torch.Tensor | None = None,
+    detach_global_for_local: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     require_precomputed_grounded_attention_mask(
         adapter,
@@ -5566,6 +5875,7 @@ def _sequence_choice_ce_loss(
             mode=soft_prompt_mode,
             prompt_template=str(args.prompt_template),
             precomputed_question_context=precomputed_question_context,
+            detach_global_for_local=detach_global_for_local,
         )
     base_soft_attention_mask = None
     if base_soft_embeds is not None:
@@ -5619,6 +5929,7 @@ def _sequence_choice_ce_loss(
                 if candidate_soft_attention_masks is not None
                 else None
             ),
+            detach_global_for_local=detach_global_for_local,
         )
         nll_chunks.append(chunk_nll)
         count_chunks.append(chunk_counts)
@@ -5677,6 +5988,7 @@ def choice_ce_loss(
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
     precomputed_soft_attention_mask: torch.Tensor | None = None,
+    detach_global_for_local: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     choice_token_spec = single_token_choice_ids(records, tokenizer)
     scoring_mode = str(args.choice_scoring_mode)
@@ -5696,6 +6008,7 @@ def choice_ce_loss(
             precomputed_question_context=precomputed_question_context,
             precomputed_soft_embeds=precomputed_soft_embeds,
             precomputed_soft_attention_mask=precomputed_soft_attention_mask,
+            detach_global_for_local=detach_global_for_local,
         )
     elif scoring_mode == "label":
         raise ValueError("choice_scoring_mode=label requires every choice label to tokenize as one unique token.")
@@ -5711,6 +6024,7 @@ def choice_ce_loss(
         precomputed_question_context=precomputed_question_context,
         precomputed_soft_embeds=precomputed_soft_embeds,
         precomputed_soft_attention_mask=precomputed_soft_attention_mask,
+        detach_global_for_local=detach_global_for_local,
     )
 
 
@@ -5718,6 +6032,7 @@ def matched_coordinate_group_loss(
     records: Sequence[Mapping[str, Any]],
     candidate_log_probs: Sequence[torch.Tensor],
     margin: float,
+    task_weights: Mapping[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if len(candidate_log_probs) != len(records) or not records:
         raise ValueError("Matched-coordinate loss requires one candidate distribution per record.")
@@ -5810,11 +6125,17 @@ def matched_coordinate_group_loss(
                 gap = owner_probs[answer_index] - other_probs[answer_index]
                 gaps.append(gap)
                 owner_gaps.append(gap)
-            terms.append(
-                torch.stack(
-                    [F.relu(float(margin) - gap) for gap in owner_gaps]
-                ).mean()
-            )
+            owner_term = torch.stack(
+                [F.relu(float(margin) - gap) for gap in owner_gaps]
+            ).mean()
+            if task_weights:
+                owner_task = str(records[owner].get("task_type", "unknown"))
+                if owner_task not in task_weights:
+                    raise ValueError(
+                        f"No matched-group task weight was configured for {owner_task!r}."
+                    )
+                owner_term = owner_term * float(task_weights[owner_task])
+            terms.append(owner_term)
             group_correct = group_correct and (
                 int(torch.argmax(owner_probs.detach()).item()) == int(answer_index)
             )
@@ -6373,6 +6694,259 @@ def question_swapped_soft_prefixes(
     return swapped_embeds, swapped_masks
 
 
+STAGE2B_TASK_TYPES = (
+    "extreme_quadrant",
+    "normalized_point_value",
+    "point_compare",
+    "raw_point_value_with_stats",
+    "region_mean_compare",
+)
+
+
+def inverse_frequency_task_weights(
+    records: Sequence[Mapping[str, Any]],
+    expected_tasks: Sequence[str] | None = None,
+) -> dict[str, float]:
+    """Return record weights whose aggregate contribution is equal per task."""
+
+    counts: dict[str, int] = defaultdict(int)
+    for record in records:
+        counts[str(record.get("task_type", "unknown"))] += 1
+    tasks = tuple(str(task) for task in (expected_tasks or sorted(counts)))
+    if not records or not tasks:
+        raise ValueError("Task balancing requires at least one record and one task.")
+    missing = [task for task in tasks if counts.get(task, 0) <= 0]
+    unexpected = sorted(set(counts) - set(tasks)) if expected_tasks is not None else []
+    if missing or unexpected:
+        raise ValueError(
+            "Task-balanced answer training received an incomplete task set: "
+            f"missing={missing}, unexpected={unexpected}, counts={dict(sorted(counts.items()))}."
+        )
+    total = float(sum(counts[task] for task in tasks))
+    task_count = float(len(tasks))
+    weights = {
+        task: total / (task_count * float(counts[task]))
+        for task in tasks
+    }
+    weighted_total = sum(float(counts[task]) * weights[task] for task in tasks)
+    if not math.isclose(weighted_total, total, rel_tol=1.0e-9, abs_tol=1.0e-9):
+        raise RuntimeError(
+            "Inverse-frequency task weights do not preserve unit mean: "
+            f"weighted_total={weighted_total}, records={total}."
+        )
+    return weights
+
+
+def task_balanced_record_mean(
+    values: torch.Tensor,
+    records: Sequence[Mapping[str, Any]],
+    task_weights: Mapping[str, float] | None,
+) -> torch.Tensor:
+    """Average per-record values without renormalizing away task weights in a batch."""
+
+    flat = values.reshape(-1)
+    if int(flat.numel()) != len(records) or not records:
+        raise ValueError(
+            "Task-balanced mean requires one scalar per non-empty record: "
+            f"values={int(flat.numel())}, records={len(records)}."
+        )
+    if not task_weights:
+        return flat.mean()
+    weights: list[float] = []
+    for record in records:
+        task = str(record.get("task_type", "unknown"))
+        if task not in task_weights:
+            raise ValueError(f"No task-balance weight was configured for task_type={task!r}.")
+        weights.append(float(task_weights[task]))
+    weight_tensor = flat.new_tensor(weights)
+    return (flat * weight_tensor).mean()
+
+
+def correct_choice_margins(
+    candidate_log_probs: Sequence[torch.Tensor],
+    target_indices: Sequence[int],
+) -> torch.Tensor:
+    """Correct-option log-probability minus the strongest incorrect option."""
+
+    if len(candidate_log_probs) != len(target_indices) or not candidate_log_probs:
+        raise ValueError("Choice margins require one non-empty candidate distribution per target.")
+    margins: list[torch.Tensor] = []
+    for log_probs, raw_target in zip(candidate_log_probs, target_indices):
+        target = int(raw_target)
+        if log_probs.ndim != 1 or int(log_probs.numel()) < 2:
+            raise ValueError("Choice margins require at least two candidates per record.")
+        if target < 0 or target >= int(log_probs.numel()):
+            raise IndexError(
+                f"Choice target index {target} is outside {int(log_probs.numel())} candidates."
+            )
+        incorrect_mask = torch.ones_like(log_probs, dtype=torch.bool)
+        incorrect_mask[target] = False
+        margins.append(log_probs[target] - log_probs[incorrect_mask].max())
+    return torch.stack(margins)
+
+
+def margin_hinge_terms(
+    primary_margins: torch.Tensor,
+    baseline_margins: torch.Tensor,
+    required_gain: float,
+) -> torch.Tensor:
+    """Penalize records whose primary correct-choice margin lacks the required gain."""
+
+    if tuple(primary_margins.shape) != tuple(baseline_margins.shape):
+        raise ValueError(
+            "Margin hinge inputs must have identical shapes: "
+            f"primary={tuple(primary_margins.shape)}, "
+            f"baseline={tuple(baseline_margins.shape)}."
+        )
+    if not math.isfinite(float(required_gain)) or float(required_gain) < 0.0:
+        raise ValueError("required_gain must be finite and non-negative.")
+    return F.relu(
+        float(required_gain) - (primary_margins - baseline_margins.detach())
+    )
+
+
+def snapshot_global_adapter_parameters(
+    adapter: nn.Module,
+) -> dict[str, torch.Tensor]:
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("A global-parameter anchor requires HybridGlobalLocalAdapter.")
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in adapter.global_adapter.named_parameters()
+    }
+
+
+def snapshot_local_adapter_parameters(
+    adapter: nn.Module,
+) -> dict[str, torch.Tensor]:
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("A local-parameter anchor requires HybridGlobalLocalAdapter.")
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in adapter.local_adapter.named_parameters()
+    }
+
+
+def _module_parameter_anchor_loss(
+    module: nn.Module,
+    reference: Mapping[str, torch.Tensor] | None,
+    label: str,
+) -> torch.Tensor:
+    parameters = dict(module.named_parameters())
+    if not reference or set(reference) != set(parameters):
+        raise ValueError(
+            f"The {label} anchor must contain every current parameter exactly once."
+        )
+    squared_error: torch.Tensor | None = None
+    element_count = 0
+    for name, parameter in parameters.items():
+        parent = reference[name].to(device=parameter.device, dtype=torch.float32)
+        current = parameter.float()
+        if tuple(parent.shape) != tuple(current.shape):
+            raise ValueError(
+                f"{label.title()} anchor shape mismatch for {name}: "
+                f"parent={tuple(parent.shape)}, current={tuple(current.shape)}."
+            )
+        tensor_error = (current - parent).square().sum()
+        squared_error = tensor_error if squared_error is None else squared_error + tensor_error
+        element_count += int(current.numel())
+    if squared_error is None or element_count <= 0:
+        raise ValueError(f"The {label} module has no parameters to anchor.")
+    return squared_error / float(element_count)
+
+
+def global_parameter_anchor_loss(
+    adapter: nn.Module,
+    reference: Mapping[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    """Element-weighted mean-squared drift from the loaded parent global adapter."""
+
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("A global-parameter anchor requires HybridGlobalLocalAdapter.")
+    return _module_parameter_anchor_loss(adapter.global_adapter, reference, "global adapter")
+
+
+def local_parameter_anchor_loss(
+    adapter: nn.Module,
+    reference: Mapping[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("A local-parameter anchor requires HybridGlobalLocalAdapter.")
+    return _module_parameter_anchor_loss(adapter.local_adapter, reference, "local reader")
+
+
+def joint_global_view_training_loss(
+    llm,
+    adapter: TensorSoftPromptAdapter,
+    tokenizer,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    args: argparse.Namespace,
+    global_anchor_reference: Mapping[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+    """Stage-2A view: update only global parameters and return detached margins for B."""
+
+    records = batch["records"]
+    if not (
+        bool(getattr(args, "joint_ab_training", False))
+        and isinstance(adapter, HybridGlobalLocalAdapter)
+        and not adapter.freeze_global
+    ):
+        raise ValueError("The joint global view requires a trainable hybrid global adapter.")
+    latent_map = batch["latent_map"].to(device, non_blocking=True)
+    global_soft_embeds = adapter.global_adapter.forward_soft_prompts(latent_map).to(
+        dtype=llm.get_input_embeddings().weight.dtype
+    )
+    global_soft_attention_mask = _all_visible_soft_prompt_mask(global_soft_embeds)
+    (
+        _global_choice_mean,
+        _global_answer_ce,
+        global_choice_losses,
+        _global_soft_embeds,
+        global_choice_metrics,
+    ) = choice_ce_loss(
+        llm=llm,
+        adapter=adapter,
+        tokenizer=tokenizer,
+        records=records,
+        latent_map=latent_map,
+        device=device,
+        args=args,
+        soft_prompt_mode="global_only",
+        precomputed_soft_embeds=global_soft_embeds,
+        precomputed_soft_attention_mask=global_soft_attention_mask,
+    )
+    task_weights = (
+        getattr(args, "task_loss_weights", None)
+        if bool(getattr(args, "task_balanced_answer_loss", False))
+        else None
+    )
+    global_view_loss = task_balanced_record_mean(
+        global_choice_losses,
+        records,
+        task_weights,
+    )
+    anchor_loss = global_parameter_anchor_loss(adapter, global_anchor_reference)
+    weighted_global_view = float(args.global_view_loss_weight) * global_view_loss
+    weighted_anchor = float(args.global_anchor_loss_weight) * anchor_loss
+    total = weighted_global_view + weighted_anchor
+    target_indices = global_choice_metrics.get("candidate_target_indices")
+    candidate_log_probs = global_choice_metrics.get("candidate_log_probs")
+    if not isinstance(target_indices, Sequence) or not isinstance(
+        candidate_log_probs, Sequence
+    ):
+        raise RuntimeError("The joint global view did not return restricted-choice margins.")
+    margins = correct_choice_margins(candidate_log_probs, target_indices).detach()
+    return total, {
+        "loss": float(total.detach().cpu().item()),
+        "global_view_loss": float(global_view_loss.detach().cpu().item()),
+        "weighted_global_view_loss": float(weighted_global_view.detach().cpu().item()),
+        "global_view_accuracy": float(global_choice_metrics["choice_accuracy"]),
+        "global_anchor_loss": float(anchor_loss.detach().cpu().item()),
+        "weighted_global_anchor_loss": float(weighted_anchor.detach().cpu().item()),
+    }, margins
+
+
 def training_loss(
     llm,
     adapter: TensorSoftPromptAdapter,
@@ -6382,8 +6956,26 @@ def training_loss(
     device: torch.device,
     args: argparse.Namespace,
     routing_only: bool = False,
+    global_anchor_reference: Mapping[str, torch.Tensor] | None = None,
+    joint_global_margins: torch.Tensor | None = None,
+    joint_global_accuracy: float | None = None,
+    local_anchor_reference: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     records = batch["records"]
+    joint_ab_training = bool(getattr(args, "joint_ab_training", False))
+    if joint_ab_training and not (
+        isinstance(adapter, HybridGlobalLocalAdapter)
+        and _grounded_local_adapter(adapter) is not None
+        and not adapter.freeze_global
+    ):
+        raise ValueError(
+            "joint_ab_training requires a grounded evidence adapter with a trainable global branch."
+        )
+    task_weights = (
+        getattr(args, "task_loss_weights", None)
+        if bool(getattr(args, "task_balanced_answer_loss", False))
+        else None
+    )
     question_context = contextual_adapter_question_context(
         llm=llm,
         adapter=adapter,
@@ -6496,6 +7088,7 @@ def training_loss(
             args=args,
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
+            detach_global_for_local=joint_ab_training,
         )
     else:
         ce_loss = forward_loss(
@@ -6512,6 +7105,7 @@ def training_loss(
             prompt_template=str(args.prompt_template),
             local_context_layer=int(args.local_context_layer),
             precomputed_question_context=question_context,
+            detach_global_for_local=joint_ab_training,
         )
         choice_loss_value = ce_loss.new_zeros(())
         positive_choice_nll = None
@@ -6534,7 +7128,14 @@ def training_loss(
             args=args,
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
+            detach_global_for_local=joint_ab_training,
         )
+    unbalanced_choice_loss_value = positive_choice_nll.mean()
+    choice_loss_value = task_balanced_record_mean(
+        positive_choice_nll,
+        records,
+        task_weights,
+    )
     positive_soft_attention_mask = choice_metrics.get("soft_attention_mask")
     if positive_soft_embeds is not None and not isinstance(
         positive_soft_attention_mask, torch.Tensor
@@ -6553,6 +7154,7 @@ def training_loss(
         records=records,
         candidate_log_probs=candidate_log_probs,
         margin=float(args.matched_group_loss_margin),
+        task_weights=task_weights if joint_ab_training else None,
     )
     if _grounded_local_adapter(adapter) is not None:
         routing_loss, gate_loss, routing_metrics = grounded_routing_loss(adapter, records)
@@ -6571,6 +7173,98 @@ def training_loss(
             "routing_gate_active_fraction": 0.0,
             "routing_gate_target_active_fraction": 0.0,
         }
+    global_view_loss = positive_choice_nll.new_zeros(())
+    no_harm_loss = positive_choice_nll.new_zeros(())
+    causal_loss = positive_choice_nll.new_zeros(())
+    global_anchor_loss = positive_choice_nll.new_zeros(())
+    local_anchor_loss = positive_choice_nll.new_zeros(())
+    global_view_accuracy = 0.0
+    no_harm_margin_mean = 0.0
+    causal_margin_mean = 0.0
+    causal_active_records = 0.0
+    if joint_ab_training:
+        if joint_global_margins is None or int(joint_global_margins.numel()) != len(records):
+            raise ValueError(
+                "The local joint A/B view requires one detached global-only margin per record."
+            )
+        with torch.no_grad():
+            (
+                _zero_choice_mean,
+                _zero_answer_ce,
+                _zero_choice_losses,
+                _zero_soft_embeds,
+                zero_choice_metrics,
+            ) = choice_ce_loss(
+                llm=llm,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                records=records,
+                latent_map=batch["latent_map"],
+                device=device,
+                args=args,
+                soft_prompt_mode="zero_local",
+                precomputed_question_context=question_context,
+                detach_global_for_local=True,
+            )
+        positive_targets = choice_metrics.get("candidate_target_indices")
+        zero_targets = zero_choice_metrics.get("candidate_target_indices")
+        if not all(
+            isinstance(values, Sequence)
+            for values in (positive_targets, zero_targets)
+        ):
+            raise RuntimeError("Joint A/B choice scoring did not return target indices.")
+        positive_margins = correct_choice_margins(
+            candidate_log_probs,
+            positive_targets,
+        )
+        zero_margins = correct_choice_margins(
+            zero_choice_metrics["candidate_log_probs"],
+            zero_targets,
+        )
+        no_harm_gap = positive_margins - joint_global_margins.detach()
+        no_harm_terms = margin_hinge_terms(
+            positive_margins,
+            joint_global_margins,
+            float(args.joint_no_harm_margin),
+        )
+        no_harm_loss = task_balanced_record_mean(
+            no_harm_terms,
+            records,
+            task_weights,
+        )
+        active_local = positive_margins.new_tensor(
+            [
+                float(
+                    _GROUNDING_ACTIVE_ROLES_BY_TYPE[
+                        str(grounding_query_spec_for_record(record)["type"])
+                    ]
+                    > 0
+                )
+                for record in records
+            ]
+        )
+        causal_gap = positive_margins - zero_margins.detach()
+        causal_terms = margin_hinge_terms(
+            positive_margins,
+            zero_margins,
+            float(args.joint_causal_margin),
+        ) * active_local
+        causal_loss = task_balanced_record_mean(
+            causal_terms,
+            records,
+            task_weights,
+        )
+        local_anchor_loss = local_parameter_anchor_loss(
+            adapter,
+            local_anchor_reference,
+        )
+        global_view_accuracy = float(joint_global_accuracy or 0.0)
+        no_harm_margin_mean = float(no_harm_gap.detach().mean().cpu().item())
+        causal_margin_mean = float(
+            (causal_gap.detach() * active_local).sum().cpu().item()
+            / max(1.0, float(active_local.sum().cpu().item()))
+        )
+        causal_active_records = float(active_local.sum().detach().cpu().item())
     ranking_loss = positive_choice_nll.new_zeros(())
     ranking_margin_mean = 0.0
     swapped_loss = positive_choice_nll.new_zeros(())
@@ -6748,6 +7442,15 @@ def training_loss(
     weighted_routing_loss = routing_weight * routing_loss
     weighted_gate_loss = gate_weight * gate_loss
     weighted_matched_group_loss = matched_group_weight * matched_group_loss
+    weighted_global_view_loss = float(getattr(args, "global_view_loss_weight", 0.0)) * global_view_loss
+    weighted_no_harm_loss = float(getattr(args, "joint_no_harm_loss_weight", 0.0)) * no_harm_loss
+    weighted_causal_loss = float(getattr(args, "joint_causal_loss_weight", 0.0)) * causal_loss
+    weighted_global_anchor_loss = (
+        float(getattr(args, "global_anchor_loss_weight", 0.0)) * global_anchor_loss
+    )
+    weighted_local_anchor_loss = (
+        float(getattr(args, "local_anchor_loss_weight", 0.0)) * local_anchor_loss
+    )
     total_loss = (
         weighted_ce_loss
         + weighted_choice_ce_loss
@@ -6756,12 +7459,20 @@ def training_loss(
         + weighted_routing_loss
         + weighted_gate_loss
         + weighted_matched_group_loss
+        + weighted_global_view_loss
+        + weighted_no_harm_loss
+        + weighted_causal_loss
+        + weighted_global_anchor_loss
+        + weighted_local_anchor_loss
     )
     return total_loss, {
         "loss": float(total_loss.detach().cpu().item()),
         "ce_loss": float(ce_loss.detach().cpu().item()),
         "weighted_ce_loss": float(weighted_ce_loss.detach().cpu().item()),
         "choice_ce_loss": float(choice_loss_value.detach().cpu().item()),
+        "choice_ce_loss_unbalanced": float(
+            unbalanced_choice_loss_value.detach().cpu().item()
+        ),
         "weighted_choice_ce_loss": float(weighted_choice_ce_loss.detach().cpu().item()),
         "choice_accuracy": float(choice_metrics["choice_accuracy"]),
         "choice_01_loss": float(choice_metrics["choice_01_loss"]),
@@ -6777,6 +7488,20 @@ def training_loss(
         "weighted_routing_gate_loss": float(weighted_gate_loss.detach().cpu().item()),
         "matched_group_loss": float(matched_group_loss.detach().cpu().item()),
         "weighted_matched_group_loss": float(weighted_matched_group_loss.detach().cpu().item()),
+        "global_view_loss": float(global_view_loss.detach().cpu().item()),
+        "weighted_global_view_loss": float(weighted_global_view_loss.detach().cpu().item()),
+        "global_view_accuracy": global_view_accuracy,
+        "joint_no_harm_loss": float(no_harm_loss.detach().cpu().item()),
+        "weighted_joint_no_harm_loss": float(weighted_no_harm_loss.detach().cpu().item()),
+        "joint_no_harm_margin_mean": no_harm_margin_mean,
+        "joint_causal_loss": float(causal_loss.detach().cpu().item()),
+        "weighted_joint_causal_loss": float(weighted_causal_loss.detach().cpu().item()),
+        "joint_causal_margin_mean": causal_margin_mean,
+        "joint_causal_active_records": causal_active_records,
+        "global_anchor_loss": float(global_anchor_loss.detach().cpu().item()),
+        "weighted_global_anchor_loss": float(weighted_global_anchor_loss.detach().cpu().item()),
+        "local_anchor_loss": float(local_anchor_loss.detach().cpu().item()),
+        "weighted_local_anchor_loss": float(weighted_local_anchor_loss.detach().cpu().item()),
         **routing_metrics,
         **matched_group_metrics,
         **swapped_metrics,
@@ -9190,6 +9915,41 @@ def redacted_config_snapshot(config: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def validate_frozen_global_resume_state(
+    resume_state: Mapping[str, torch.Tensor],
+    direct_parent_state: Mapping[str, torch.Tensor],
+) -> dict[str, int]:
+    """Prove that a grounded child did not mutate its claimed frozen global parent."""
+
+    resume_keys = sorted(
+        str(key) for key in resume_state if str(key).startswith("global_adapter.")
+    )
+    parent_keys = sorted(
+        str(key) for key in direct_parent_state if str(key).startswith("global_adapter.")
+    )
+    if resume_keys != parent_keys:
+        raise ValueError(
+            "Stage-2B continuation global tensor keys differ from the audited direct parent."
+        )
+    changed = [
+        key
+        for key in parent_keys
+        if not torch.equal(
+            resume_state[key].detach().cpu(),
+            direct_parent_state[key].detach().cpu(),
+        )
+    ]
+    if changed:
+        raise ValueError(
+            "Stage-2B continuation rewrote tensors in its claimed frozen global parent: "
+            f"changed_keys={changed[:8]}."
+        )
+    return {
+        "verified_global_parameter_tensors": len(parent_keys),
+        "changed_global_parameter_tensors": 0,
+    }
+
+
 def load_compatible_hybrid_state(
     adapter: HybridGlobalLocalAdapter,
     state_dict: Mapping[str, Any],
@@ -9606,7 +10366,126 @@ def macro_latent_gain(metrics: Mapping[str, Any], baseline: str = "shuffled") ->
     return sum(gains) / len(gains) if gains else -math.inf
 
 
-def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
+def _mode_task_accuracies(
+    metrics: Mapping[str, Any],
+    mode: str,
+    tasks: Sequence[str] = STAGE2B_TASK_TYPES,
+) -> dict[str, float]:
+    mode_metrics = metrics.get(mode)
+    by_task = mode_metrics.get("by_task") if isinstance(mode_metrics, Mapping) else None
+    if not isinstance(by_task, Mapping):
+        raise ValueError(f"Validation metrics are missing {mode}.by_task.")
+    result: dict[str, float] = {}
+    for task in tasks:
+        task_metrics = by_task.get(task)
+        accuracy = task_metrics.get("accuracy") if isinstance(task_metrics, Mapping) else None
+        if not isinstance(accuracy, (int, float)) or not math.isfinite(float(accuracy)):
+            raise ValueError(f"Validation metrics are missing a finite {mode}/{task} accuracy.")
+        result[str(task)] = float(accuracy)
+    return result
+
+
+def joint_ab_checkpoint_metrics(
+    metrics: Mapping[str, Any],
+    parent_metrics: Mapping[str, Any],
+    *,
+    min_causal_gain: float = 0.015,
+    max_parent_regression: float = 0.005,
+    min_no_harm_delta: float = 0.0,
+) -> dict[str, Any]:
+    """Compute Pareto-first selection and fixed small-run acceptance diagnostics."""
+
+    current_hybrid = _mode_task_accuracies(metrics, "correct")
+    current_global = _mode_task_accuracies(metrics, "global_only")
+    current_zero = _mode_task_accuracies(metrics, "zero_local")
+    current_shuffled = _mode_task_accuracies(metrics, "shuffled")
+    parent_hybrid = _mode_task_accuracies(parent_metrics, "correct")
+    parent_global = _mode_task_accuracies(parent_metrics, "global_only")
+    hybrid_delta = {
+        task: current_hybrid[task] - parent_hybrid[task]
+        for task in STAGE2B_TASK_TYPES
+    }
+    global_delta = {
+        task: current_global[task] - parent_global[task]
+        for task in STAGE2B_TASK_TYPES
+    }
+    no_harm_delta = {
+        task: current_hybrid[task] - current_global[task]
+        for task in STAGE2B_TASK_TYPES
+    }
+    causal_gain = {
+        task: current_hybrid[task]
+        - max(current_zero[task], current_global[task], current_shuffled[task])
+        for task in ("normalized_point_value", "raw_point_value_with_stats")
+    }
+    worst_hybrid_delta = min(hybrid_delta.values())
+    worst_global_delta = min(global_delta.values())
+    worst_protected_delta = min(worst_hybrid_delta, worst_global_delta)
+    point_value_min_causal_gain = min(causal_gain.values())
+    protected_compare_delta = min(
+        no_harm_delta["point_compare"],
+        no_harm_delta["region_mean_compare"],
+    )
+    current_correct_metrics = metrics.get("correct")
+    parent_correct_metrics = parent_metrics.get("correct")
+    current_overall = (
+        current_correct_metrics.get("accuracy")
+        if isinstance(current_correct_metrics, Mapping)
+        else None
+    )
+    parent_overall = (
+        parent_correct_metrics.get("accuracy")
+        if isinstance(parent_correct_metrics, Mapping)
+        else None
+    )
+    if not isinstance(current_overall, (int, float)) or not isinstance(
+        parent_overall, (int, float)
+    ):
+        raise ValueError("Joint A/B selection requires current and parent overall correct accuracy.")
+    overall_delta = float(current_overall) - float(parent_overall)
+    acceptance = {
+        "point_value_causal_gain": point_value_min_causal_gain >= float(min_causal_gain),
+        "compare_no_harm": protected_compare_delta >= float(min_no_harm_delta),
+        "global_parent_preserved": worst_global_delta >= -float(max_parent_regression),
+        "hybrid_parent_preserved": worst_hybrid_delta >= -float(max_parent_regression),
+        "overall_improved": overall_delta > 0.0,
+    }
+    return {
+        "hybrid_delta_by_task": hybrid_delta,
+        "global_only_delta_by_task": global_delta,
+        "hybrid_minus_global_by_task": no_harm_delta,
+        "point_value_causal_gain_by_task": causal_gain,
+        "worst_hybrid_delta": worst_hybrid_delta,
+        "worst_global_only_delta": worst_global_delta,
+        "worst_protected_task_delta": worst_protected_delta,
+        "point_value_min_causal_gain": point_value_min_causal_gain,
+        "protected_compare_no_harm_delta": protected_compare_delta,
+        "overall_delta": overall_delta,
+        # Candidates are compared lexicographically. Preservation is deliberately
+        # first; aggregate accuracy cannot hide a regressed task.
+        "selection_key": [
+            worst_protected_delta,
+            point_value_min_causal_gain,
+            overall_delta,
+        ],
+        "acceptance": acceptance,
+        "accepted": all(acceptance.values()),
+    }
+
+
+def checkpoint_score(
+    metrics: Mapping[str, Any],
+    metric_name: str,
+    reference_metrics: Mapping[str, Any] | None = None,
+) -> float:
+    if metric_name == "joint_ab_worst_task_delta":
+        if reference_metrics is None:
+            return -math.inf
+        return float(
+            joint_ab_checkpoint_metrics(metrics, reference_metrics)[
+                "worst_protected_task_delta"
+            ]
+        )
     if metric_name == "macro_latent_gain":
         return macro_latent_gain(metrics)
     if metric_name == "correct_accuracy":
@@ -9750,6 +10629,10 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "adapter_parameters_total",
             "trainable_adapter_parameters",
             "frozen_llm_parameters",
+            "total_optimizer_updates",
+            "checkpoint_updates",
+            "checkpoint_fractions",
+            "task_loss_weights",
         )
         if key in raw_summary
     }
@@ -9849,6 +10732,15 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
             "matched_group_loss_weight": float(args.matched_group_loss_weight),
             "matched_group_loss_margin": float(args.matched_group_loss_margin),
+            "joint_ab_training": bool(args.joint_ab_training),
+            "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
+            "global_view_loss_weight": float(args.global_view_loss_weight),
+            "joint_no_harm_loss_weight": float(args.joint_no_harm_loss_weight),
+            "joint_no_harm_margin": float(args.joint_no_harm_margin),
+            "joint_causal_loss_weight": float(args.joint_causal_loss_weight),
+            "joint_causal_margin": float(args.joint_causal_margin),
+            "global_anchor_loss_weight": float(args.global_anchor_loss_weight),
+            "local_anchor_loss_weight": float(args.local_anchor_loss_weight),
             "swapped_question_max_records": int(args.swapped_question_max_records),
             "swapped_question_require_different_answer": bool(
                 args.swapped_question_require_different_answer
@@ -9864,6 +10756,14 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "log_interval": int(args.log_interval),
             "console_progress": bool(args.console_progress),
             "save_step_metrics": bool(args.save_step_metrics),
+            "checkpoint_updates": parse_csv(args.checkpoint_updates),
+            "checkpoint_fractions": parse_csv(args.checkpoint_fractions),
+            "checkpoint_screening_records": int(args.checkpoint_screening_records),
+            "checkpoint_full_eval_top_k": int(args.checkpoint_full_eval_top_k),
+            "joint_min_causal_gain": float(args.joint_min_causal_gain),
+            "joint_max_parent_regression": float(args.joint_max_parent_regression),
+            "joint_min_no_harm_delta": float(args.joint_min_no_harm_delta),
+            "task_loss_weights": dict(getattr(args, "task_loss_weights", {})),
             "evaluate_test": bool(args.evaluate_test),
             "group_questions_by_state": bool(args.group_questions_by_state),
             "questions_per_state_group": int(args.questions_per_state_group),
@@ -10002,6 +10902,13 @@ def main() -> None:
         latent_cache_size=int(args.latent_cache_size),
         latent_contract=latent_contract,
     )
+    if bool(args.joint_ab_training):
+        args.task_loss_weights = inverse_frequency_task_weights(
+            train_dataset.records,
+            expected_tasks=STAGE2B_TASK_TYPES,
+        )
+    else:
+        args.task_loss_weights = {}
     val_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.val_split),
         latent_dir=args.latent_dir,
@@ -10205,6 +11112,7 @@ def main() -> None:
     stage1_checkpoint_version = 0
     stage1_checkpoint_phase: str | None = None
     stage1_checkpoint_validation_mode: str | None = None
+    parent_validation_metrics: dict[str, Any] | None = None
     if str(args.adapter_architecture) in {
         "alignment_qformer",
         "alignment_adapter",
@@ -10506,7 +11414,7 @@ def main() -> None:
             adapter = HybridGlobalLocalAdapter(
                 global_adapter=global_adapter,
                 local_adapter=local_adapter,
-                freeze_global=True,
+                freeze_global=bool(args.freeze_global_adapter),
                 global_prompt_dropout=0.0,
                 combine_mode="concat",
             ).to(device)
@@ -10542,7 +11450,20 @@ def main() -> None:
                     ),
                     current_args=args,
                 )
+                current_state = adapter.state_dict()
+                frozen_global_audit = validate_frozen_global_resume_state(
+                    resume_state,
+                    current_state,
+                )
                 adapter.load_state_dict(resume_state, strict=True)
+                raw_parent_payload = resume_checkpoint.get("metrics")
+                raw_parent_val = (
+                    raw_parent_payload.get("val")
+                    if isinstance(raw_parent_payload, Mapping)
+                    else None
+                )
+                if isinstance(raw_parent_val, Mapping):
+                    parent_validation_metrics = copy.deepcopy(dict(raw_parent_val))
                 args.stage2b_resume_checkpoint = str(
                     Path(resume_path).expanduser().resolve()
                 )
@@ -10552,8 +11473,13 @@ def main() -> None:
                     "stage2b_resume_checkpoint": args.stage2b_resume_checkpoint,
                     "stage2b_resume_sha256": args.stage2b_resume_sha256,
                     "stage2b_resume_strict_load": True,
-                    "stage2b_resume_parent_epoch": resume_checkpoint.get("epoch"),
+                    "stage2b_resume_parent_epoch": (
+                        raw_parent_payload.get("epoch")
+                        if isinstance(raw_parent_payload, Mapping)
+                        else None
+                    ),
                     "stage2b_resume_contract": continuation_contract,
+                    "stage2b_resume_frozen_global_audit": frozen_global_audit,
                 }
                 initialization = "strict_grounded_stage2b_continuation"
                 del resume_args, resume_state, resume_checkpoint
@@ -10563,7 +11489,7 @@ def main() -> None:
                     "grounded_reader_parameters": sum(
                         int(parameter.numel()) for parameter in local_adapter.parameters()
                     ),
-                    "global_adapter_frozen": True,
+                    "global_adapter_frozen": bool(adapter.freeze_global),
                     **resume_report,
                 }
             )
@@ -10573,7 +11499,7 @@ def main() -> None:
             args.local_question_input_mode = "contextual_tokens"
             args.local_context_layer = int(max(context_layers))
             args.local_fusion_mode = str(local_adapter.fusion_mode)
-            args.freeze_global_adapter = True
+            args.freeze_global_adapter = bool(adapter.freeze_global)
             args.global_unfreeze_epoch = 0
             args.global_prompt_dropout = 0.0
             args.question_conditioning = True
@@ -10703,6 +11629,11 @@ def main() -> None:
     if isinstance(adapter, HybridGlobalLocalAdapter):
         adapter.mask_inactive_local_tokens = bool(args.mask_inactive_local_tokens)
     synchronize_module_from_rank_zero(adapter)
+    global_anchor_reference: dict[str, torch.Tensor] | None = None
+    local_anchor_reference: dict[str, torch.Tensor] | None = None
+    if bool(args.joint_ab_training):
+        global_anchor_reference = snapshot_global_adapter_parameters(adapter)
+        local_anchor_reference = snapshot_local_adapter_parameters(adapter)
     if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
         adapter.local_adapter, ResidualQuestionConditionedAdapter
     ):
@@ -10793,7 +11724,6 @@ def main() -> None:
             learning_rate=float(args.global_lr),
             weight_decay=float(args.weight_decay),
             name="global",
-            include_frozen=not adapter.residual_mode,
         )
         optimizer = torch.optim.AdamW(
             local_groups + global_groups,
@@ -10810,15 +11740,34 @@ def main() -> None:
     optimizer_audit = optimizer_parameter_audit(
         optimizer,
         adapter,
-        allow_frozen_parameters=(
-            isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.residual_mode
-        ),
+        allow_frozen_parameters=False,
     )
     local_groups = None
     global_groups = None
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
     total_optimizer_updates = max(1, updates_per_epoch * int(args.epochs))
+    checkpoint_updates = [int(value) for value in parse_csv(args.checkpoint_updates)]
+    checkpoint_fractions = [
+        float(value) for value in parse_csv(args.checkpoint_fractions)
+    ]
+    if checkpoint_fractions:
+        checkpoint_updates = checkpoint_updates_from_fractions(
+            total_optimizer_updates,
+            checkpoint_fractions,
+        )
+    if checkpoint_updates and max(checkpoint_updates) > total_optimizer_updates:
+        raise ValueError(
+            "A requested checkpoint update exceeds the configured training budget: "
+            f"updates={checkpoint_updates}, total_optimizer_updates={total_optimizer_updates}."
+        )
+    if bool(args.joint_ab_training) and (
+        not checkpoint_updates or checkpoint_updates[-1] != total_optimizer_updates
+    ):
+        raise ValueError(
+            "The joint small run must include its final optimizer update in its checkpoint schedule: "
+            f"updates={checkpoint_updates}, total={total_optimizer_updates}."
+        )
     lr_scheduler, warmup_updates = build_lr_scheduler(
         optimizer=optimizer,
         scheduler_name=str(args.lr_scheduler),
@@ -10929,6 +11878,15 @@ def main() -> None:
         "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
         "matched_group_loss_weight": float(args.matched_group_loss_weight),
         "matched_group_loss_margin": float(args.matched_group_loss_margin),
+        "joint_ab_training": bool(args.joint_ab_training),
+        "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
+        "global_view_loss_weight": float(args.global_view_loss_weight),
+        "joint_no_harm_loss_weight": float(args.joint_no_harm_loss_weight),
+        "joint_no_harm_margin": float(args.joint_no_harm_margin),
+        "joint_causal_loss_weight": float(args.joint_causal_loss_weight),
+        "joint_causal_margin": float(args.joint_causal_margin),
+        "global_anchor_loss_weight": float(args.global_anchor_loss_weight),
+        "local_anchor_loss_weight": float(args.local_anchor_loss_weight),
         "grounding_routing_warmup_epochs": int(args.grounding_routing_warmup_epochs),
         "grounding_warmup_thresholds": {
             "cell_top1": float(args.grounding_warmup_min_cell_top1),
@@ -10994,6 +11952,14 @@ def main() -> None:
         "lr_scheduler": str(args.lr_scheduler),
         "warmup_updates": int(warmup_updates),
         "total_optimizer_updates": int(total_optimizer_updates),
+        "checkpoint_updates": list(checkpoint_updates),
+        "checkpoint_fractions": list(checkpoint_fractions),
+        "checkpoint_screening_records": int(args.checkpoint_screening_records),
+        "checkpoint_full_eval_top_k": int(args.checkpoint_full_eval_top_k),
+        "joint_min_causal_gain": float(args.joint_min_causal_gain),
+        "joint_max_parent_regression": float(args.joint_max_parent_regression),
+        "joint_min_no_harm_delta": float(args.joint_min_no_harm_delta),
+        "task_loss_weights": dict(getattr(args, "task_loss_weights", {})),
         "min_lr_ratio": float(args.min_lr_ratio),
         "global_dropout": float(getattr(args, "global_dropout", args.dropout)),
         "global_soft_prompt_scale": float(
@@ -11075,8 +12041,12 @@ def main() -> None:
 
     best_val_score = -math.inf
     best_epoch = 0
+    selected_checkpoint_path = run_dir / "adapter_best.pt"
     history: dict[str, Any] = {}
     global_step = 0
+    screening_dataset: TensorReadoutQADataset | None = None
+    screening_parent_metrics: dict[str, Any] | None = None
+    joint_candidates: list[dict[str, Any]] = []
     try:
         initial_count = min(max(0, int(args.initial_eval_records)), len(val_dataset))
         if initial_count > 0:
@@ -11091,6 +12061,8 @@ def main() -> None:
                 latent_cache_size=int(args.latent_cache_size),
                 latent_contract=latent_contract,
             )
+            if bool(args.joint_ab_training):
+                screening_dataset = initial_dataset
             initial_metrics = evaluate_choice_accuracy(
                 llm=llm,
                 adapter=adapter,
@@ -11101,6 +12073,8 @@ def main() -> None:
                 baseline_modes=baseline_modes,
             )
             history["initial_eval"] = initial_metrics
+            if bool(args.joint_ab_training):
+                screening_parent_metrics = copy.deepcopy(initial_metrics)
             continuation_routing_audit: dict[str, Any] | None = None
             if (
                 str(args.adapter_architecture) == "grounded_evidence_adapter"
@@ -11155,6 +12129,74 @@ def main() -> None:
                 raise RuntimeError(
                     "The Stage-2B continuation failed its held-out routing/gate audit "
                     f"({failed}); no optimizer step was taken."
+                )
+            if bool(args.joint_ab_training):
+                if is_main_process():
+                    print(
+                        "joint_parent_full_eval=start "
+                        f"records={len(val_dataset)} baselines={','.join(baseline_modes)}"
+                    )
+                parent_validation_metrics = evaluate_choice_accuracy(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    dataset=val_dataset,
+                    device=device,
+                    args=args,
+                    baseline_modes=baseline_modes,
+                )
+                expected_task_counts: dict[str, int] = defaultdict(int)
+                for record in val_dataset.records:
+                    expected_task_counts[str(record.get("task_type", "unknown"))] += 1
+                for mode in baseline_modes:
+                    _mode_task_accuracies(parent_validation_metrics, mode)
+                    mode_metrics = parent_validation_metrics.get(mode)
+                    if not isinstance(mode_metrics, Mapping) or int(
+                        mode_metrics.get("total", -1)
+                    ) != len(val_dataset):
+                        raise RuntimeError(
+                            "Live parent validation did not cover the complete active split: "
+                            f"mode={mode}, expected={len(val_dataset)}."
+                        )
+                    by_task = mode_metrics.get("by_task")
+                    for task in STAGE2B_TASK_TYPES:
+                        task_metrics = (
+                            by_task.get(task) if isinstance(by_task, Mapping) else None
+                        )
+                        observed_total = (
+                            task_metrics.get("total")
+                            if isinstance(task_metrics, Mapping)
+                            else None
+                        )
+                        if int(observed_total or -1) != expected_task_counts[task]:
+                            raise RuntimeError(
+                                "Live parent validation task coverage mismatch: "
+                                f"mode={mode}, task={task}, observed={observed_total}, "
+                                f"expected={expected_task_counts[task]}."
+                            )
+                history["joint_parent_full_eval"] = parent_validation_metrics
+                summary["joint_parent_validation"] = {
+                    "source": "live_full_eval_before_optimizer",
+                    "records": len(val_dataset),
+                    "baselines": list(baseline_modes),
+                }
+                run_on_rank_zero_and_broadcast(
+                    lambda: atomic_dump_json(metrics_path, history),
+                    "joint parent full-validation metrics write",
+                )
+                log_wandb_on_rank_zero(
+                    wandb_logger,
+                    (
+                        flatten_numeric_metrics(
+                            "joint_parent_full_eval", parent_validation_metrics
+                        )
+                        if bool(args.wandb_detailed_metrics)
+                        else compact_accuracy_metrics(
+                            "joint_parent_full_eval", parent_validation_metrics
+                        )
+                    ),
+                    step=0,
+                    stage="joint parent full-validation W&B log",
                 )
             if bool(args.diagnostics_enabled):
                 pretrain_diagnostic_aggregate = run_on_rank_zero_and_broadcast(
@@ -11251,6 +12293,20 @@ def main() -> None:
             running_matched_group_pairs = 0.0
             running_matched_group_gap_sum = 0.0
             running_matched_group_satisfied = 0.0
+            running_global_view_loss = 0.0
+            running_weighted_global_view_loss = 0.0
+            running_global_view_accuracy = 0.0
+            running_joint_no_harm_loss = 0.0
+            running_weighted_joint_no_harm_loss = 0.0
+            running_joint_no_harm_margin = 0.0
+            running_joint_causal_loss = 0.0
+            running_weighted_joint_causal_loss = 0.0
+            running_joint_causal_margin = 0.0
+            running_joint_causal_active_records = 0.0
+            running_global_anchor_loss = 0.0
+            running_weighted_global_anchor_loss = 0.0
+            running_local_anchor_loss = 0.0
+            running_weighted_local_anchor_loss = 0.0
             running_record_count = 0
             running_total_grad_norm = 0.0
             running_post_clip_grad_norm = 0.0
@@ -11281,6 +12337,18 @@ def main() -> None:
                 "weighted_routing_gate_loss",
                 "matched_group_loss",
                 "weighted_matched_group_loss",
+                "global_view_loss",
+                "weighted_global_view_loss",
+                "global_view_accuracy",
+                "joint_no_harm_loss",
+                "weighted_joint_no_harm_loss",
+                "joint_no_harm_margin_mean",
+                "joint_causal_loss",
+                "weighted_joint_causal_loss",
+                "global_anchor_loss",
+                "weighted_global_anchor_loss",
+                "local_anchor_loss",
+                "weighted_local_anchor_loss",
             )
             update_sums = {
                 **{name: 0.0 for name in update_record_metric_names},
@@ -11303,6 +12371,8 @@ def main() -> None:
                 "matched_group_pairs": 0.0,
                 "matched_group_gap_sum": 0.0,
                 "matched_group_satisfied": 0.0,
+                "joint_causal_margin_sum": 0.0,
+                "joint_causal_active_records": 0.0,
             }
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(
@@ -11312,6 +12382,9 @@ def main() -> None:
             )
             accumulated_local_records = 0
             for step, batch in enumerate(progress, start=1):
+                batch_record_count = len(batch.get("records", ()))
+                if batch_record_count <= 0:
+                    raise RuntimeError(f"Training batch {step} contains no records.")
                 drop_global_for_batch = bool(
                     isinstance(adapter, HybridGlobalLocalAdapter)
                     and float(args.global_prompt_dropout) > 0.0
@@ -11319,28 +12392,65 @@ def main() -> None:
                 )
                 if isinstance(adapter, HybridGlobalLocalAdapter):
                     adapter.set_global_prompt_dropout_for_batch(drop_global_for_batch)
+                backward_complete = False
                 try:
-                    loss, loss_parts = training_loss(
-                        llm=llm,
-                        adapter=adapter,
-                        tokenizer=tokenizer,
-                        dataset=train_dataset,
-                        batch=batch,
-                        device=device,
-                        args=args,
-                        routing_only=routing_warmup_active,
-                    )
+                    if bool(args.joint_ab_training) and not routing_warmup_active:
+                        global_loss, global_loss_parts, global_choice_margins = (
+                            joint_global_view_training_loss(
+                                llm=llm,
+                                adapter=adapter,
+                                tokenizer=tokenizer,
+                                batch=batch,
+                                device=device,
+                                args=args,
+                                global_anchor_reference=global_anchor_reference,
+                            )
+                        )
+                        (global_loss * float(batch_record_count)).backward()
+                        del global_loss
+                        loss, loss_parts = training_loss(
+                            llm=llm,
+                            adapter=adapter,
+                            tokenizer=tokenizer,
+                            dataset=train_dataset,
+                            batch=batch,
+                            device=device,
+                            args=args,
+                            routing_only=False,
+                            joint_global_margins=global_choice_margins,
+                            joint_global_accuracy=float(
+                                global_loss_parts["global_view_accuracy"]
+                            ),
+                            local_anchor_reference=local_anchor_reference,
+                        )
+                        (loss * float(batch_record_count)).backward()
+                        loss = loss.detach()
+                        loss_parts["loss"] += float(global_loss_parts["loss"])
+                        for name, value in global_loss_parts.items():
+                            if name != "loss":
+                                loss_parts[name] = float(value)
+                        del global_choice_margins
+                        backward_complete = True
+                    else:
+                        loss, loss_parts = training_loss(
+                            llm=llm,
+                            adapter=adapter,
+                            tokenizer=tokenizer,
+                            dataset=train_dataset,
+                            batch=batch,
+                            device=device,
+                            args=args,
+                            routing_only=routing_warmup_active,
+                        )
                 finally:
                     if isinstance(adapter, HybridGlobalLocalAdapter):
                         adapter.set_global_prompt_dropout_for_batch(False)
                 running_global_dropout_batches += int(drop_global_for_batch)
-                batch_record_count = len(batch.get("records", ()))
-                if batch_record_count <= 0:
-                    raise RuntimeError(f"Training batch {step} contains no records.")
                 # training_loss is a per-record mean. Accumulate record sums so that
                 # variable grouped batches and a short final accumulation window do
                 # not change the effective gradient scale.
-                (loss * float(batch_record_count)).backward()
+                if not backward_complete:
+                    (loss * float(batch_record_count)).backward()
                 accumulated_local_records += int(batch_record_count)
                 current_loss = float(loss_parts["loss"])
                 running_loss += current_loss * batch_record_count
@@ -11404,9 +12514,28 @@ def main() -> None:
                 running_matched_group_pairs += matched_pairs
                 running_matched_group_gap_sum += float(loss_parts["matched_group_gap_mean"]) * matched_pairs
                 running_matched_group_satisfied += float(loss_parts["matched_group_satisfaction"]) * matched_pairs
+                running_global_view_loss += float(loss_parts.get("global_view_loss", 0.0)) * batch_record_count
+                running_weighted_global_view_loss += float(loss_parts.get("weighted_global_view_loss", 0.0)) * batch_record_count
+                running_global_view_accuracy += float(loss_parts.get("global_view_accuracy", 0.0)) * batch_record_count
+                running_joint_no_harm_loss += float(loss_parts.get("joint_no_harm_loss", 0.0)) * batch_record_count
+                running_weighted_joint_no_harm_loss += float(loss_parts.get("weighted_joint_no_harm_loss", 0.0)) * batch_record_count
+                running_joint_no_harm_margin += float(loss_parts.get("joint_no_harm_margin_mean", 0.0)) * batch_record_count
+                running_joint_causal_loss += float(loss_parts.get("joint_causal_loss", 0.0)) * batch_record_count
+                running_weighted_joint_causal_loss += float(loss_parts.get("weighted_joint_causal_loss", 0.0)) * batch_record_count
+                causal_active_records = float(
+                    loss_parts.get("joint_causal_active_records", 0.0)
+                )
+                running_joint_causal_margin += float(
+                    loss_parts.get("joint_causal_margin_mean", 0.0)
+                ) * causal_active_records
+                running_joint_causal_active_records += causal_active_records
+                running_global_anchor_loss += float(loss_parts.get("global_anchor_loss", 0.0)) * batch_record_count
+                running_weighted_global_anchor_loss += float(loss_parts.get("weighted_global_anchor_loss", 0.0)) * batch_record_count
+                running_local_anchor_loss += float(loss_parts.get("local_anchor_loss", 0.0)) * batch_record_count
+                running_weighted_local_anchor_loss += float(loss_parts.get("weighted_local_anchor_loss", 0.0)) * batch_record_count
                 running_record_count += int(batch_record_count)
                 for name in update_record_metric_names:
-                    update_sums[name] += float(loss_parts[name]) * batch_record_count
+                    update_sums[name] += float(loss_parts.get(name, 0.0)) * batch_record_count
                 update_sums["record_count"] += float(batch_record_count)
                 update_sums["batch_count"] += 1.0
                 update_sums["global_dropout_batches"] += float(drop_global_for_batch)
@@ -11423,6 +12552,10 @@ def main() -> None:
                 update_sums["matched_group_satisfied"] += (
                     float(loss_parts["matched_group_satisfaction"]) * matched_pairs
                 )
+                update_sums["joint_causal_margin_sum"] += float(
+                    loss_parts.get("joint_causal_margin_mean", 0.0)
+                ) * causal_active_records
+                update_sums["joint_causal_active_records"] += causal_active_records
 
                 if step % accumulation_steps == 0 or step == len(train_loader):
                     update_global_record_count = average_trainable_gradients_by_record_count(
@@ -11451,17 +12584,43 @@ def main() -> None:
                         )
                     post_clip_grad_norm = total_grad_norm
                     if float(args.grad_clip_norm) > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            adapter.parameters(),
-                            float(args.grad_clip_norm),
-                            error_if_nonfinite=True,
-                        )
-                        post_clip_grad_norm = gradient_l2_norm(adapter.parameters())
+                        if bool(args.joint_ab_training) and isinstance(
+                            adapter, HybridGlobalLocalAdapter
+                        ):
+                            # A large A-view gradient must not consume the B reader's
+                            # clipping budget (or vice versa); the branches have
+                            # separate objectives and learning rates.
+                            torch.nn.utils.clip_grad_norm_(
+                                adapter.local_adapter.parameters(),
+                                float(args.grad_clip_norm),
+                                error_if_nonfinite=True,
+                            )
+                            torch.nn.utils.clip_grad_norm_(
+                                adapter.global_adapter.parameters(),
+                                float(args.grad_clip_norm),
+                                error_if_nonfinite=True,
+                            )
+                            post_clip_grad_norm = math.hypot(
+                                gradient_l2_norm(adapter.local_adapter.parameters()),
+                                gradient_l2_norm(adapter.global_adapter.parameters()),
+                            )
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                adapter.parameters(),
+                                float(args.grad_clip_norm),
+                                error_if_nonfinite=True,
+                            )
+                            post_clip_grad_norm = gradient_l2_norm(adapter.parameters())
                     pre_clip_grad_norms.append(float(total_grad_norm))
                     post_clip_grad_norms.append(float(post_clip_grad_norm))
                     running_clipped_updates += int(
                         float(args.grad_clip_norm) > 0
-                        and total_grad_norm > float(args.grad_clip_norm)
+                        and (
+                            max(local_grad_norm, global_grad_norm)
+                            if bool(args.joint_ab_training)
+                            else total_grad_norm
+                        )
+                        > float(args.grad_clip_norm)
                     )
                     running_total_grad_norm += total_grad_norm
                     running_post_clip_grad_norm += post_clip_grad_norm
@@ -11487,7 +12646,12 @@ def main() -> None:
                             "global_grad_norm_sum": global_grad_norm,
                             "clipped_ranks": float(
                                 float(args.grad_clip_norm) > 0
-                                and total_grad_norm > float(args.grad_clip_norm)
+                                and (
+                                    max(local_grad_norm, global_grad_norm)
+                                    if bool(args.joint_ab_training)
+                                    else total_grad_norm
+                                )
+                                > float(args.grad_clip_norm)
                             ),
                             "contributing_ranks": 1.0,
                         },
@@ -11504,6 +12668,9 @@ def main() -> None:
                     update_gate_slots = max(1.0, update_totals["routing_gate_slots"])
                     update_groups = max(1.0, update_totals["matched_group_count"])
                     update_pairs = max(1.0, update_totals["matched_group_pairs"])
+                    update_active_local = max(
+                        1.0, update_totals["joint_causal_active_records"]
+                    )
                     update_ranks = max(1.0, update_totals["contributing_ranks"])
                     update_batches = max(1.0, update_totals["batch_count"])
                     update_payload = {
@@ -11606,6 +12773,30 @@ def main() -> None:
                         "train_matched_group_satisfaction": (
                             update_totals["matched_group_satisfied"] / update_pairs
                         ),
+                        **{
+                            f"train_{name}": update_totals[name] / update_records
+                            for name in (
+                                "global_view_loss",
+                                "weighted_global_view_loss",
+                                "global_view_accuracy",
+                                "joint_no_harm_loss",
+                                "weighted_joint_no_harm_loss",
+                                "joint_no_harm_margin_mean",
+                                "joint_causal_loss",
+                                "weighted_joint_causal_loss",
+                                "global_anchor_loss",
+                                "weighted_global_anchor_loss",
+                                "local_anchor_loss",
+                                "weighted_local_anchor_loss",
+                            )
+                        },
+                        "train_joint_causal_margin_mean": (
+                            update_totals["joint_causal_margin_sum"]
+                            / update_active_local
+                        ),
+                        "train_joint_causal_active_records": int(
+                            round(update_totals["joint_causal_active_records"])
+                        ),
                         "train_total_grad_norm": (
                             update_totals["grad_norm_pre_clip_sum"] / update_ranks
                         ),
@@ -11702,6 +12893,30 @@ def main() -> None:
                                 "train_step/matched_group_exact_accuracy": update_payload[
                                     "train_matched_group_exact_accuracy"
                                 ],
+                                "train_step/global_view_loss": update_payload[
+                                    "train_global_view_loss"
+                                ],
+                                "train_step/global_view_accuracy": update_payload[
+                                    "train_global_view_accuracy"
+                                ],
+                                "train_step/joint_no_harm_loss": update_payload[
+                                    "train_joint_no_harm_loss"
+                                ],
+                                "train_step/joint_no_harm_margin": update_payload[
+                                    "train_joint_no_harm_margin_mean"
+                                ],
+                                "train_step/joint_causal_loss": update_payload[
+                                    "train_joint_causal_loss"
+                                ],
+                                "train_step/joint_causal_margin": update_payload[
+                                    "train_joint_causal_margin_mean"
+                                ],
+                                "train_step/global_anchor_loss": update_payload[
+                                    "train_global_anchor_loss"
+                                ],
+                                "train_step/local_anchor_loss": update_payload[
+                                    "train_local_anchor_loss"
+                                ],
                                 "train_step/grad_norm_pre_clip": update_payload[
                                     "train_total_grad_norm"
                                 ],
@@ -11725,6 +12940,71 @@ def main() -> None:
                             step=global_step,
                             stage=f"epoch {epoch} update {global_step} W&B log",
                         )
+                    if bool(args.joint_ab_training) and global_step in checkpoint_updates:
+                        if screening_dataset is None or screening_parent_metrics is None:
+                            raise RuntimeError(
+                                "Joint checkpoint screening has no fixed parent validation subset."
+                            )
+                        screening_metrics = evaluate_choice_accuracy(
+                            llm=llm,
+                            adapter=adapter,
+                            tokenizer=tokenizer,
+                            dataset=screening_dataset,
+                            device=device,
+                            args=args,
+                            baseline_modes=baseline_modes,
+                        )
+                        screening_selection = joint_ab_checkpoint_metrics(
+                            screening_metrics,
+                            screening_parent_metrics,
+                            min_causal_gain=float(args.joint_min_causal_gain),
+                            max_parent_regression=float(args.joint_max_parent_regression),
+                            min_no_harm_delta=float(args.joint_min_no_harm_delta),
+                        )
+                        candidate_path = run_dir / f"adapter_step_{global_step:06d}.pt"
+                        candidate_payload = {
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "screening_records": len(screening_dataset),
+                            "screening_val": screening_metrics,
+                            "selection": screening_selection,
+                        }
+                        run_on_rank_zero_and_broadcast(
+                            lambda path=candidate_path, payload=candidate_payload: save_adapter_checkpoint(
+                                path,
+                                adapter=adapter,
+                                args=args,
+                                latent_shape=latent_shape,
+                                llm_hidden_size=llm_hidden_size,
+                                latent_contract=latent_contract or {},
+                                metrics=payload,
+                            ),
+                            f"update {global_step} candidate-checkpoint write",
+                        )
+                        joint_candidates.append(
+                            {
+                                "path": str(candidate_path),
+                                "epoch": int(epoch),
+                                "global_step": int(global_step),
+                                "screening_selection": screening_selection,
+                            }
+                        )
+                        history[f"screening_step_{global_step:06d}"] = candidate_payload
+                        run_on_rank_zero_and_broadcast(
+                            lambda: atomic_dump_json(run_dir / "metrics_latest.json", history),
+                            f"update {global_step} screening metrics write",
+                        )
+                        log_wandb_on_rank_zero(
+                            wandb_logger,
+                            flatten_numeric_metrics(
+                                "screening",
+                                screening_selection,
+                            ),
+                            step=global_step,
+                            stage=f"update {global_step} checkpoint screening W&B log",
+                        )
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
                     for name in update_sums:
                         update_sums[name] = 0.0
 
@@ -11818,6 +13098,20 @@ def main() -> None:
                     "matched_group_pairs": running_matched_group_pairs,
                     "matched_group_gap_sum": running_matched_group_gap_sum,
                     "matched_group_satisfied": running_matched_group_satisfied,
+                    "global_view_loss": running_global_view_loss,
+                    "weighted_global_view_loss": running_weighted_global_view_loss,
+                    "global_view_accuracy": running_global_view_accuracy,
+                    "joint_no_harm_loss": running_joint_no_harm_loss,
+                    "weighted_joint_no_harm_loss": running_weighted_joint_no_harm_loss,
+                    "joint_no_harm_margin": running_joint_no_harm_margin,
+                    "joint_causal_loss": running_joint_causal_loss,
+                    "weighted_joint_causal_loss": running_weighted_joint_causal_loss,
+                    "joint_causal_margin": running_joint_causal_margin,
+                    "joint_causal_active_records": running_joint_causal_active_records,
+                    "global_anchor_loss": running_global_anchor_loss,
+                    "weighted_global_anchor_loss": running_weighted_global_anchor_loss,
+                    "local_anchor_loss": running_local_anchor_loss,
+                    "weighted_local_anchor_loss": running_weighted_local_anchor_loss,
                     "total_grad_norm": running_total_grad_norm,
                     "post_clip_grad_norm": running_post_clip_grad_norm,
                     "clipped_updates": float(running_clipped_updates),
@@ -11905,6 +13199,36 @@ def main() -> None:
             train_matched_group_satisfaction = train_totals["matched_group_satisfied"] / max(
                 1.0, train_totals["matched_group_pairs"]
             )
+            train_global_view_loss = train_totals["global_view_loss"] / global_record_count
+            train_weighted_global_view_loss = (
+                train_totals["weighted_global_view_loss"] / global_record_count
+            )
+            train_global_view_accuracy = (
+                train_totals["global_view_accuracy"] / global_record_count
+            )
+            train_joint_no_harm_loss = train_totals["joint_no_harm_loss"] / global_record_count
+            train_weighted_joint_no_harm_loss = (
+                train_totals["weighted_joint_no_harm_loss"] / global_record_count
+            )
+            train_joint_no_harm_margin = (
+                train_totals["joint_no_harm_margin"] / global_record_count
+            )
+            train_joint_causal_loss = train_totals["joint_causal_loss"] / global_record_count
+            train_weighted_joint_causal_loss = (
+                train_totals["weighted_joint_causal_loss"] / global_record_count
+            )
+            train_joint_causal_margin = (
+                train_totals["joint_causal_margin"]
+                / max(1.0, train_totals["joint_causal_active_records"])
+            )
+            train_global_anchor_loss = train_totals["global_anchor_loss"] / global_record_count
+            train_weighted_global_anchor_loss = (
+                train_totals["weighted_global_anchor_loss"] / global_record_count
+            )
+            train_local_anchor_loss = train_totals["local_anchor_loss"] / global_record_count
+            train_weighted_local_anchor_loss = (
+                train_totals["weighted_local_anchor_loss"] / global_record_count
+            )
             train_total_grad_norm = train_totals["total_grad_norm"] / global_update_count
             train_post_clip_grad_norm = train_totals["post_clip_grad_norm"] / global_update_count
             train_clip_fraction = train_totals["clipped_updates"] / global_update_count
@@ -11913,16 +13237,28 @@ def main() -> None:
             train_global_dropout_rate = (
                 train_totals["global_dropout_batches"] / global_batch_count
             )
-            val_metrics = evaluate_choice_accuracy(
-                llm=llm,
-                adapter=adapter,
-                tokenizer=tokenizer,
-                dataset=val_dataset,
-                device=device,
-                args=args,
-                baseline_modes=["correct"] if routing_warmup_active else baseline_modes,
-                routing_only=routing_warmup_active,
-            )
+            if bool(args.joint_ab_training) and not routing_warmup_active:
+                final_screen = history.get(f"screening_step_{global_step:06d}")
+                if not isinstance(final_screen, Mapping) or not isinstance(
+                    final_screen.get("screening_val"), Mapping
+                ):
+                    raise RuntimeError(
+                        "The final joint optimizer update was not screened before epoch aggregation."
+                    )
+                val_metrics = copy.deepcopy(dict(final_screen["screening_val"]))
+                validation_scope = "screening"
+            else:
+                val_metrics = evaluate_choice_accuracy(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    dataset=val_dataset,
+                    device=device,
+                    args=args,
+                    baseline_modes=["correct"] if routing_warmup_active else baseline_modes,
+                    routing_only=routing_warmup_active,
+                )
+                validation_scope = "routing_warmup" if routing_warmup_active else "full"
             routing_warmup_audit: dict[str, Any] | None = None
             if routing_warmup_active and epoch == int(args.grounding_routing_warmup_epochs):
                 routing_warmup_audit = grounded_routing_warmup_audit(val_metrics, args)
@@ -11964,6 +13300,22 @@ def main() -> None:
                 "train_matched_group_exact_accuracy": train_matched_group_exact_accuracy,
                 "train_matched_group_gap_mean": train_matched_group_gap_mean,
                 "train_matched_group_satisfaction": train_matched_group_satisfaction,
+                "train_global_view_loss": train_global_view_loss,
+                "train_weighted_global_view_loss": train_weighted_global_view_loss,
+                "train_global_view_accuracy": train_global_view_accuracy,
+                "train_joint_no_harm_loss": train_joint_no_harm_loss,
+                "train_weighted_joint_no_harm_loss": train_weighted_joint_no_harm_loss,
+                "train_joint_no_harm_margin": train_joint_no_harm_margin,
+                "train_joint_causal_loss": train_joint_causal_loss,
+                "train_weighted_joint_causal_loss": train_weighted_joint_causal_loss,
+                "train_joint_causal_margin": train_joint_causal_margin,
+                "train_joint_causal_active_records": int(
+                    round(train_totals["joint_causal_active_records"])
+                ),
+                "train_global_anchor_loss": train_global_anchor_loss,
+                "train_weighted_global_anchor_loss": train_weighted_global_anchor_loss,
+                "train_local_anchor_loss": train_local_anchor_loss,
+                "train_weighted_local_anchor_loss": train_weighted_local_anchor_loss,
                 "train_total_grad_norm": train_total_grad_norm,
                 "train_post_clip_grad_norm": train_post_clip_grad_norm,
                 "train_clip_fraction": train_clip_fraction,
@@ -11977,8 +13329,12 @@ def main() -> None:
                 "train_global_grad_norm": train_global_grad_norm,
                 "train_global_prompt_dropout_rate": train_global_dropout_rate,
                 "grounded_reader_geometry": grounded_reader_geometry_metrics(adapter),
-                "val": val_metrics,
+                "validation_scope": validation_scope,
             }
+            if validation_scope == "screening":
+                epoch_payload["screening_val"] = val_metrics
+            else:
+                epoch_payload["val"] = val_metrics
             if routing_warmup_audit is not None:
                 epoch_payload["routing_warmup_audit"] = routing_warmup_audit
             history[f"epoch_{epoch:04d}"] = epoch_payload
@@ -12019,7 +13375,15 @@ def main() -> None:
             val_score = (
                 -math.inf
                 if routing_warmup_active
-                else checkpoint_score(val_metrics, str(args.checkpoint_metric))
+                else checkpoint_score(
+                    val_metrics,
+                    str(args.checkpoint_metric),
+                    reference_metrics=(
+                        screening_parent_metrics
+                        if bool(args.joint_ab_training)
+                        else None
+                    ),
+                )
             )
             wandb_payload = {
                 "epoch": float(epoch),
@@ -12071,6 +13435,32 @@ def main() -> None:
                 "train/matched_group_satisfaction": float(
                     train_matched_group_satisfaction
                 ),
+                "train/global_view_loss": float(train_global_view_loss),
+                "train/weighted_global_view_loss": float(
+                    train_weighted_global_view_loss
+                ),
+                "train/global_view_accuracy": float(train_global_view_accuracy),
+                "train/joint_no_harm_loss": float(train_joint_no_harm_loss),
+                "train/weighted_joint_no_harm_loss": float(
+                    train_weighted_joint_no_harm_loss
+                ),
+                "train/joint_no_harm_margin": float(train_joint_no_harm_margin),
+                "train/joint_causal_loss": float(train_joint_causal_loss),
+                "train/weighted_joint_causal_loss": float(
+                    train_weighted_joint_causal_loss
+                ),
+                "train/joint_causal_margin": float(train_joint_causal_margin),
+                "train/joint_causal_active_records": float(
+                    train_totals["joint_causal_active_records"]
+                ),
+                "train/global_anchor_loss": float(train_global_anchor_loss),
+                "train/weighted_global_anchor_loss": float(
+                    train_weighted_global_anchor_loss
+                ),
+                "train/local_anchor_loss": float(train_local_anchor_loss),
+                "train/weighted_local_anchor_loss": float(
+                    train_weighted_local_anchor_loss
+                ),
                 "train/total_grad_norm": float(train_total_grad_norm),
                 "train/post_clip_grad_norm": float(train_post_clip_grad_norm),
                 "train/clip_fraction": float(train_clip_fraction),
@@ -12121,12 +13511,16 @@ def main() -> None:
                 "global_trainable": float(
                     isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.freeze_global
                 ),
-                "val/macro_latent_gain": float(val_macro_latent_gain),
+                f"{validation_scope}_val/macro_latent_gain": float(
+                    val_macro_latent_gain
+                ),
             }
-            if not routing_warmup_active:
+            if not routing_warmup_active and not bool(args.joint_ab_training):
                 wandb_payload["best_val/checkpoint_score"] = float(
                     max(best_val_score, val_score)
                 )
+            elif bool(args.joint_ab_training):
+                wandb_payload["screening/checkpoint_score"] = float(val_score)
             if routing_warmup_audit is not None:
                 wandb_payload["routing_warmup/passed"] = float(
                     bool(routing_warmup_audit["passed"])
@@ -12138,11 +13532,15 @@ def main() -> None:
                     }
                 )
             wandb_payload.update(
-                flatten_numeric_metrics("val", val_metrics)
+                flatten_numeric_metrics(f"{validation_scope}_val", val_metrics)
                 if bool(args.wandb_detailed_metrics)
-                else compact_accuracy_metrics("val", val_metrics)
+                else compact_accuracy_metrics(f"{validation_scope}_val", val_metrics)
             )
-            if not routing_warmup_active and val_score > best_val_score:
+            if (
+                not routing_warmup_active
+                and not bool(args.joint_ab_training)
+                and val_score > best_val_score
+            ):
                 best_val_score = val_score
                 best_epoch = epoch
                 run_on_rank_zero_and_broadcast(
@@ -12231,7 +13629,7 @@ def main() -> None:
                     f"epoch={epoch:03d}/{int(args.epochs):03d} "
                     f"phase={training_phase} "
                     f"loss={train_loss:.4f} train_acc={train_choice_accuracy:.4f} "
-                    f"val={val_accuracy:.4f} "
+                    f"{validation_scope}_val={val_accuracy:.4f} "
                     f"shuffled={float(val_metrics.get('shuffled', {}).get('accuracy', 0.0)):.4f} "
                     f"macro_gain={val_macro_latent_gain:.4f} best_epoch={best_epoch}"
                     f"{diagnostic_suffix}"
@@ -12246,10 +13644,174 @@ def main() -> None:
                     "training was not started."
                 )
 
+        if bool(args.joint_ab_training):
+            if not joint_candidates or parent_validation_metrics is None:
+                raise RuntimeError("Joint A/B training produced no screenable step checkpoints.")
+            ranked_candidates = sorted(
+                joint_candidates,
+                key=lambda item: tuple(
+                    float(value)
+                    for value in item["screening_selection"]["selection_key"]
+                ),
+                reverse=True,
+            )
+            top_candidates = ranked_candidates[: int(args.checkpoint_full_eval_top_k)]
+            full_candidate_results: list[dict[str, Any]] = []
+            for candidate in top_candidates:
+                candidate_path = Path(str(candidate["path"]))
+                candidate_checkpoint = torch.load(
+                    candidate_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                candidate_state = validate_adapter_checkpoint_payload(
+                    candidate_checkpoint,
+                    expected_latent_shape=latent_shape,
+                    expected_llm_hidden_size=llm_hidden_size,
+                    expected_architecture=str(args.adapter_architecture),
+                    expected_latent_contract=latent_contract or {},
+                )
+                adapter.load_state_dict(candidate_state, strict=True)
+                del candidate_state, candidate_checkpoint
+                full_metrics = evaluate_choice_accuracy(
+                    llm=llm,
+                    adapter=adapter,
+                    tokenizer=tokenizer,
+                    dataset=val_dataset,
+                    device=device,
+                    args=args,
+                    baseline_modes=baseline_modes,
+                )
+                full_selection = joint_ab_checkpoint_metrics(
+                    full_metrics,
+                    parent_validation_metrics,
+                    min_causal_gain=float(args.joint_min_causal_gain),
+                    max_parent_regression=float(args.joint_max_parent_regression),
+                    min_no_harm_delta=float(args.joint_min_no_harm_delta),
+                )
+                routing_audit = grounded_routing_warmup_audit(full_metrics, args)
+                full_selection["routing_gate_audit"] = routing_audit
+                full_selection["acceptance"]["routing_gate_audit"] = bool(
+                    routing_audit["passed"]
+                )
+                full_selection["accepted"] = all(
+                    bool(value) for value in full_selection["acceptance"].values()
+                )
+                full_candidate_results.append(
+                    {
+                        **candidate,
+                        "full_val": full_metrics,
+                        "full_selection": full_selection,
+                    }
+                )
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            accepted_candidates = [
+                item
+                for item in full_candidate_results
+                if bool(item["full_selection"]["accepted"])
+            ]
+            final_pool = accepted_candidates or full_candidate_results
+            selected_candidate = max(
+                final_pool,
+                key=lambda item: tuple(
+                    float(value)
+                    for value in item["full_selection"]["selection_key"]
+                ),
+            )
+            selected_checkpoint = torch.load(
+                Path(str(selected_candidate["path"])),
+                map_location="cpu",
+                weights_only=True,
+            )
+            selected_state = validate_adapter_checkpoint_payload(
+                selected_checkpoint,
+                expected_latent_shape=latent_shape,
+                expected_llm_hidden_size=llm_hidden_size,
+                expected_architecture=str(args.adapter_architecture),
+                expected_latent_contract=latent_contract or {},
+            )
+            adapter.load_state_dict(selected_state, strict=True)
+            del selected_state, selected_checkpoint
+            best_epoch = int(selected_candidate["epoch"])
+            best_val_score = float(
+                selected_candidate["full_selection"]["worst_protected_task_delta"]
+            )
+            selected_accepted = bool(
+                selected_candidate["full_selection"]["accepted"]
+            )
+            selected_checkpoint_path = run_dir / (
+                "adapter_best.pt"
+                if selected_accepted
+                else "adapter_best_rejected.pt"
+            )
+            joint_selection_payload = {
+                "screened_candidate_count": len(joint_candidates),
+                "full_evaluated_candidate_count": len(full_candidate_results),
+                "accepted_candidate_count": len(accepted_candidates),
+                "selected_global_step": int(selected_candidate["global_step"]),
+                "selected_path": str(selected_candidate["path"]),
+                "selected_accepted": selected_accepted,
+                "selected_output_path": str(selected_checkpoint_path),
+                "selected_full_selection": selected_candidate["full_selection"],
+                "candidates": full_candidate_results,
+            }
+            history["joint_full_candidate_selection"] = joint_selection_payload
+
+            def write_joint_selection_outputs() -> None:
+                atomic_dump_json(run_dir / "metrics_latest.json", history)
+                save_adapter_checkpoint(
+                    selected_checkpoint_path,
+                    adapter=adapter,
+                    args=args,
+                    latent_shape=latent_shape,
+                    llm_hidden_size=llm_hidden_size,
+                    latent_contract=latent_contract or {},
+                    metrics={
+                        "epoch": best_epoch,
+                        "global_step": int(selected_candidate["global_step"]),
+                        "val": selected_candidate["full_val"],
+                        "joint_selection": selected_candidate["full_selection"],
+                    },
+                )
+
+            run_on_rank_zero_and_broadcast(
+                write_joint_selection_outputs,
+                "joint full-validation checkpoint selection write",
+            )
+            log_wandb_on_rank_zero(
+                wandb_logger,
+                {
+                    "joint_selection/selected_global_step": float(
+                        selected_candidate["global_step"]
+                    ),
+                    "joint_selection/selected_accepted": float(selected_accepted),
+                    "joint_selection/accepted_candidate_count": float(
+                        len(accepted_candidates)
+                    ),
+                    **flatten_numeric_metrics(
+                        "joint_selection/full",
+                        selected_candidate["full_selection"],
+                    ),
+                },
+                step=global_step,
+                stage="joint full-validation selection W&B log",
+            )
+            if is_main_process():
+                print(
+                    "joint_full_selection "
+                    f"step={int(selected_candidate['global_step'])} "
+                    f"accepted={selected_accepted} "
+                    f"checkpoint={selected_checkpoint_path.name} "
+                    f"worst_delta={best_val_score:.6f}"
+                )
+
         distributed_barrier()
-        best_checkpoint_path = run_dir / "adapter_best.pt"
+        best_checkpoint_path = selected_checkpoint_path
         if not best_checkpoint_path.exists():
-            raise FileNotFoundError("Training completed without producing adapter_best.pt.")
+            raise FileNotFoundError(
+                f"Training completed without producing {best_checkpoint_path.name}."
+            )
         best_checkpoint = torch.load(
             best_checkpoint_path,
             map_location="cpu",
@@ -12275,6 +13837,8 @@ def main() -> None:
         batch = None
         progress = None
         del optimizer, lr_scheduler, best_checkpoint
+        global_anchor_reference = None
+        local_anchor_reference = None
         global_adapter = None
         local_adapter = None
         local_groups = None
@@ -12322,10 +13886,41 @@ def main() -> None:
             print("test evaluation skipped by llm_training.evaluate_test=false")
 
         def write_final_outputs() -> None:
+            raw_joint_result = history.get("joint_full_candidate_selection")
+            joint_result = (
+                raw_joint_result if isinstance(raw_joint_result, Mapping) else {}
+            )
             summary["result"] = {
                 "best_epoch": int(best_epoch),
                 "best_val_score": float(best_val_score),
                 "checkpoint_metric": str(args.checkpoint_metric),
+                "selected_global_step": joint_result.get("selected_global_step"),
+                "joint_selected_accepted": joint_result.get("selected_accepted"),
+                "joint_screened_candidate_count": joint_result.get(
+                    "screened_candidate_count"
+                ),
+                "joint_full_evaluated_candidate_count": joint_result.get(
+                    "full_evaluated_candidate_count"
+                ),
+                "joint_accepted_candidate_count": joint_result.get(
+                    "accepted_candidate_count"
+                ),
+                "joint_selected_full_selection": joint_result.get(
+                    "selected_full_selection"
+                ),
+                "selected_checkpoint": selected_checkpoint_path.name,
+                "promotion_checkpoint": (
+                    selected_checkpoint_path.name
+                    if not bool(args.joint_ab_training)
+                    or bool(joint_result.get("selected_accepted", False))
+                    else None
+                ),
+                "rejected_diagnostic_checkpoint": (
+                    selected_checkpoint_path.name
+                    if bool(args.joint_ab_training)
+                    and not bool(joint_result.get("selected_accepted", False))
+                    else None
+                ),
                 "test_evaluated": bool(args.evaluate_test),
                 "test_correct_accuracy": (
                     float(test_metrics.get("correct", {}).get("accuracy", 0.0))

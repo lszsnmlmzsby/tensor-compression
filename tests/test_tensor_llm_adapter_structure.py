@@ -41,6 +41,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     build_distributed_run_dir,
     build_local_conditioning_prompt,
     checkpoint_score,
+    checkpoint_updates_from_fractions,
     choice_ce_loss,
     evaluate_choice_accuracy,
     frozen_llm_checkpoint_execution_active,
@@ -50,7 +51,10 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     grounded_routing_warmup_audit,
     grounding_query_spec_for_record,
     initialize_distributed_device,
+    inverse_frequency_task_weights,
+    joint_ab_checkpoint_metrics,
     log_wandb_on_rank_zero,
+    margin_hinge_terms,
     matched_coordinate_group_loss,
     parse_generated_choice,
     read_host_memory_snapshot,
@@ -72,6 +76,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     validate_adapter_loss_contract,
     validate_adapter_checkpoint_payload,
     validate_atomic_group_batch_size,
+    validate_frozen_global_resume_state,
     validate_qa_latent_contract,
     validate_stage1_alignment_checkpoint_phase,
     validate_stage1_model_identity,
@@ -749,6 +754,268 @@ class TestTrainingAudits(unittest.TestCase):
         self.assertTrue(frozen_llm_checkpoint_execution_active(model))
         model.eval()
         self.assertFalse(frozen_llm_checkpoint_execution_active(model))
+
+
+class TestJointABTrainingContracts(unittest.TestCase):
+    @staticmethod
+    def _joint_metrics(
+        *,
+        correct: dict[str, float],
+        global_only: dict[str, float],
+        zero_local: dict[str, float],
+        shuffled: dict[str, float],
+        overall: float,
+    ) -> dict[str, object]:
+        def mode(values: dict[str, float], accuracy: float | None = None) -> dict[str, object]:
+            return {
+                "accuracy": (
+                    float(accuracy)
+                    if accuracy is not None
+                    else sum(values.values()) / len(values)
+                ),
+                "by_task": {
+                    task: {"accuracy": float(value)} for task, value in values.items()
+                },
+            }
+
+        return {
+            "correct": mode(correct, overall),
+            "global_only": mode(global_only),
+            "zero_local": mode(zero_local),
+            "shuffled": mode(shuffled),
+        }
+
+    @staticmethod
+    def _assert_finite_gradients(parameters: list[nn.Parameter]) -> None:
+        for parameter in parameters:
+            if parameter.grad is None:
+                raise AssertionError("Expected every branch parameter to receive a gradient.")
+            if not bool(torch.isfinite(parameter.grad).all()):
+                raise AssertionError("Expected every branch gradient to be finite.")
+
+    def test_inverse_frequency_weights_equalize_tasks_and_preserve_unit_mean(self) -> None:
+        counts = {"task_a": 1, "task_b": 3, "task_c": 6}
+        records = [
+            {"task_type": task}
+            for task, count in counts.items()
+            for _ in range(count)
+        ]
+
+        weights = inverse_frequency_task_weights(
+            records,
+            expected_tasks=tuple(counts),
+        )
+        aggregate_by_task = {
+            task: count * weights[task] for task, count in counts.items()
+        }
+
+        self.assertAlmostEqual(
+            sum(aggregate_by_task.values()) / len(records),
+            1.0,
+        )
+        for aggregate in aggregate_by_task.values():
+            self.assertAlmostEqual(aggregate, len(records) / len(counts))
+
+    def test_checkpoint_fractions_follow_batch_dependent_update_budget(self) -> None:
+        fractions = (0.25, 0.5, 0.75, 1.0)
+        expected_total_updates = {3: 1200, 6: 600, 9: 400}
+
+        for per_device_batch_size, expected_total in expected_total_updates.items():
+            with self.subTest(per_device_batch_size=per_device_batch_size):
+                total_updates = math.ceil(
+                    14_400 / (4 * per_device_batch_size)
+                )
+                updates = checkpoint_updates_from_fractions(total_updates, fractions)
+
+                self.assertEqual(total_updates, expected_total)
+                self.assertEqual(updates, sorted(set(updates)))
+                self.assertEqual(updates[-1], total_updates)
+                self.assertTrue(all(1 <= update <= total_updates for update in updates))
+                self.assertEqual(
+                    updates,
+                    [math.ceil(fraction * total_updates) for fraction in fractions],
+                )
+
+    def test_joint_margin_hinge_rewards_only_sufficient_primary_gain(self) -> None:
+        primary = torch.tensor([0.3, 0.6, 0.9], requires_grad=True)
+        baseline = torch.tensor([0.4, 0.4, 0.4], requires_grad=True)
+
+        terms = margin_hinge_terms(primary, baseline, required_gain=0.1)
+
+        torch.testing.assert_close(terms, torch.tensor([0.2, 0.0, 0.0]))
+        terms.sum().backward()
+        torch.testing.assert_close(primary.grad, torch.tensor([-1.0, 0.0, 0.0]))
+        self.assertIsNone(baseline.grad)
+
+    def test_frozen_global_resume_validation_detects_tensor_rewrites(self) -> None:
+        direct_parent = {
+            "global_adapter.projection.weight": torch.arange(6).reshape(2, 3),
+            "global_adapter.projection.bias": torch.tensor([1.0, -1.0]),
+            "local_adapter.reader.weight": torch.zeros(1, 2),
+        }
+        unchanged_child = {
+            key: value.clone() for key, value in direct_parent.items()
+        }
+        unchanged_child["local_adapter.reader.weight"].fill_(4.0)
+
+        report = validate_frozen_global_resume_state(unchanged_child, direct_parent)
+
+        self.assertEqual(report["verified_global_parameter_tensors"], 2)
+        self.assertEqual(report["changed_global_parameter_tensors"], 0)
+        tampered_child = {key: value.clone() for key, value in unchanged_child.items()}
+        tampered_child["global_adapter.projection.weight"][0, 0] += 1
+        with self.assertRaisesRegex(ValueError, "rewrote tensors"):
+            validate_frozen_global_resume_state(tampered_child, direct_parent)
+
+    def test_joint_checkpoint_selection_prioritizes_preservation_and_acceptance(self) -> None:
+        tasks = (
+            "extreme_quadrant",
+            "normalized_point_value",
+            "point_compare",
+            "raw_point_value_with_stats",
+            "region_mean_compare",
+        )
+        parent_values = {task: 0.50 for task in tasks}
+        parent = self._joint_metrics(
+            correct=parent_values,
+            global_only=parent_values,
+            zero_local=parent_values,
+            shuffled=parent_values,
+            overall=0.50,
+        )
+        good = self._joint_metrics(
+            correct={
+                "extreme_quadrant": 0.51,
+                "normalized_point_value": 0.56,
+                "point_compare": 0.53,
+                "raw_point_value_with_stats": 0.57,
+                "region_mean_compare": 0.52,
+            },
+            global_only={task: 0.505 for task in tasks},
+            zero_local={task: 0.52 for task in tasks},
+            shuffled={task: 0.51 for task in tasks},
+            overall=0.53,
+        )
+
+        good_selection = joint_ab_checkpoint_metrics(good, parent)
+
+        self.assertTrue(good_selection["accepted"])
+        self.assertTrue(all(good_selection["acceptance"].values()))
+        self.assertAlmostEqual(good_selection["point_value_min_causal_gain"], 0.04)
+        regression_global = {task: 0.70 for task in tasks}
+        regression_global["extreme_quadrant"] = 0.49
+        regressed = self._joint_metrics(
+            correct={task: 0.70 for task in tasks},
+            global_only=regression_global,
+            zero_local=parent_values,
+            shuffled=parent_values,
+            overall=0.70,
+        )
+        regressed_selection = joint_ab_checkpoint_metrics(regressed, parent)
+
+        self.assertFalse(regressed_selection["acceptance"]["global_parent_preserved"])
+        self.assertFalse(regressed_selection["accepted"])
+        self.assertGreater(
+            good_selection["selection_key"],
+            regressed_selection["selection_key"],
+        )
+        no_harm_correct = {
+            "extreme_quadrant": 0.51,
+            "normalized_point_value": 0.56,
+            "point_compare": 0.50,
+            "raw_point_value_with_stats": 0.57,
+            "region_mean_compare": 0.52,
+        }
+        no_harm_failure = self._joint_metrics(
+            correct=no_harm_correct,
+            global_only={task: 0.505 for task in tasks},
+            zero_local={task: 0.52 for task in tasks},
+            shuffled={task: 0.51 for task in tasks},
+            overall=0.53,
+        )
+        no_harm_selection = joint_ab_checkpoint_metrics(no_harm_failure, parent)
+        self.assertFalse(no_harm_selection["acceptance"]["compare_no_harm"])
+
+    def test_joint_forward_components_keep_a_and_b_gradient_ownership_disjoint(self) -> None:
+        class TinyGlobalAdapter(nn.Module):
+            soft_prompt_tokens = 4
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.projection = nn.Linear(3, 6)
+
+            def forward_soft_prompts(self, latent_map: torch.Tensor) -> torch.Tensor:
+                tokens = latent_map.flatten(2).transpose(1, 2)
+                return self.projection(tokens)
+
+        class TinyLocalAdapter(nn.Module):
+            soft_prompt_tokens = 2
+            structured_query_conditioning = False
+            requires_aligned_tokens = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.projection = nn.Linear(6, 6)
+
+            def forward_from_aligned(
+                self,
+                aligned: torch.Tensor,
+                _question_embeds: torch.Tensor,
+                _question_mask: torch.Tensor | None,
+                _structured_query: torch.Tensor | None,
+            ) -> torch.Tensor:
+                return self.projection(aligned[:, : self.soft_prompt_tokens])
+
+        torch.manual_seed(71)
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=TinyGlobalAdapter(),
+            local_adapter=TinyLocalAdapter(),
+            freeze_global=False,
+            combine_mode="concat",
+        )
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 3, 6)
+        question_mask = torch.ones(2, 3, dtype=torch.bool)
+        global_parameters = list(adapter.global_adapter.parameters())
+        local_parameters = list(adapter.local_adapter.parameters())
+
+        adapter.zero_grad(set_to_none=True)
+        _, _, b_combined = adapter.forward_components(
+            latent,
+            question,
+            question_mask,
+            detach_global_for_local=True,
+        )
+        b_combined.square().mean().backward()
+        self.assertTrue(all(parameter.grad is None for parameter in global_parameters))
+        self._assert_finite_gradients(local_parameters)
+
+        adapter.zero_grad(set_to_none=True)
+        a_global, _, _ = adapter.forward_components(
+            latent,
+            question,
+            question_mask,
+        )
+        a_global.square().mean().backward()
+        self._assert_finite_gradients(global_parameters)
+        self.assertTrue(all(parameter.grad is None for parameter in local_parameters))
+
+        adapter.zero_grad(set_to_none=True)
+        a_global, _, _ = adapter.forward_components(
+            latent,
+            question,
+            question_mask,
+        )
+        a_global.square().mean().backward()
+        _, _, b_combined = adapter.forward_components(
+            latent,
+            question,
+            question_mask,
+            detach_global_for_local=True,
+        )
+        b_combined.square().mean().backward()
+        self._assert_finite_gradients(global_parameters)
+        self._assert_finite_gradients(local_parameters)
 
 
 class _DiagnosticDecoder(nn.Module):
@@ -2603,6 +2870,12 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 closed,
                 None,
             )
+        with self.assertRaisesRegex(RuntimeError, "provided together"):
+            adapter_training.require_precomputed_grounded_attention_mask(
+                adapter,
+                None,
+                closed_mask,
+            )
         adapter_training.require_precomputed_grounded_attention_mask(
             adapter,
             closed,
@@ -3227,7 +3500,12 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             soft_prompt_scale=0.05,
             grounded_gate_bias_init=-2.0,
         )
-        latent_contract = {"format": "test_latent_contract", "shape": [3, 2, 2]}
+        latent_contract = {
+            "format": PATCH_LATENT_FORMAT,
+            "alignment_checkpoint": "/data/run/alignment_best.pt",
+            "alignment_checkpoint_sha256": "a" * 64,
+            "latent_shape": [3, 2, 2],
+        }
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "adapter_routing_warmup.pt"
