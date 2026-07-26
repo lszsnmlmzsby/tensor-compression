@@ -43,6 +43,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     choice_ce_loss,
     evaluate_choice_accuracy,
     frozen_llm_checkpoint_execution_active,
+    generate_diagnostic_answer,
     grounded_reader_geometry_metrics,
     grounded_routing_loss,
     grounded_routing_warmup_audit,
@@ -58,9 +59,11 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     run_on_rank_zero_and_broadcast,
     save_validate_and_rebuild_adapter_checkpoint,
     optimizer_parameter_audit,
+    question_swapped_soft_prefixes,
     same_state_question_swap_indices,
     selective_answer_statistics,
     set_frozen_llm_execution_mode,
+    single_token_choice_ce_loss,
     single_token_choice_ids,
     structured_query_features_for_record,
     task_specific_instruction,
@@ -72,6 +75,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     validate_stage1_alignment_checkpoint_phase,
     validate_stage1_model_identity,
     validate_stage1_teacher_supervision,
+    validate_stage2b_continuation_contract,
     validate_stage2_warm_start_file,
 )
 from tensor_compression.models.compressors.conv_token_autoencoder_2d import (  # noqa: E402
@@ -102,6 +106,27 @@ def _record(state: str, task: str, field: str, question: str) -> dict[str, str]:
         "field": field,
         "query": question,
         "question": question,
+    }
+
+
+def _matched_record(
+    state: str,
+    task: str,
+    field: str,
+    question: str,
+    answer: str,
+    *,
+    group: str = "group-1",
+) -> dict[str, object]:
+    return {
+        **_record(state, task, field, question),
+        "answer": answer,
+        "choices": ["A", "B", "C", "D"],
+        "matched_group": {
+            "margin_group_id": group,
+            "option_set_sha256": f"options-{group}",
+            "coordinate_set_id": f"coordinates-{group}",
+        },
     }
 
 
@@ -335,6 +360,94 @@ class TestAdapterLossContracts(unittest.TestCase):
 
 
 class TestTrainingAudits(unittest.TestCase):
+    @staticmethod
+    def _stage2b_resume_contract_inputs() -> tuple[dict[str, object], SimpleNamespace]:
+        parent_sha = "a" * 64
+        resume_args: dict[str, object] = {
+            "adapter_init_checkpoint": "/old-mount/stage1.pt",
+            "stage2_warm_start_checkpoint": "/old-mount/direct-stage2.pt",
+            "stage2_warm_start_sha256": parent_sha,
+            "local_context_layers": "2,6",
+            "local_soft_prompt_tokens": 2,
+            "adapter_dim": 512,
+            "adapter_heads": 8,
+            "local_fusion_mode": "grounded_role_routing",
+            "soft_prompt_scale": 0.05,
+            "dropout": 0.0,
+            "mask_inactive_local_tokens": False,
+        }
+        current_args = SimpleNamespace(
+            adapter_init_checkpoint="/new-mount/stage1.pt",
+            stage2_warm_start_checkpoint="/new-mount/direct-stage2.pt",
+            stage2_warm_start_sha256=parent_sha,
+            local_context_layers="2,6",
+            local_soft_prompt_tokens=2,
+            adapter_dim=512,
+            adapter_heads=8,
+            local_fusion_mode="grounded_role_routing",
+            soft_prompt_scale=0.05,
+            dropout=0.0,
+            mask_inactive_local_tokens=True,
+        )
+        return resume_args, current_args
+
+    def test_stage2b_resume_uses_parent_sha_across_mount_aliases(self) -> None:
+        resume_args, current_args = self._stage2b_resume_contract_inputs()
+
+        report = validate_stage2b_continuation_contract(
+            resume_args,
+            resume_lineage=None,
+            current_args=current_args,
+        )
+
+        self.assertEqual(report["direct_parent_identity"], "sha256")
+        self.assertFalse(report["stage1_parent_paths_match"])
+        self.assertEqual(
+            report["inactive_local_token_mask_policy"],
+            "legacy_to_learned_gate_mask",
+        )
+
+    def test_stage2b_resume_rejects_different_parent_content(self) -> None:
+        resume_args, current_args = self._stage2b_resume_contract_inputs()
+        current_args.stage2_warm_start_sha256 = "b" * 64
+
+        with self.assertRaisesRegex(ValueError, "different direct Stage-2 checkpoint contents"):
+            validate_stage2b_continuation_contract(
+                resume_args,
+                resume_lineage=None,
+                current_args=current_args,
+            )
+
+    def test_stage2b_resume_cannot_disable_checkpoint_mask_policy(self) -> None:
+        resume_args, current_args = self._stage2b_resume_contract_inputs()
+        resume_args["mask_inactive_local_tokens"] = True
+        current_args.mask_inactive_local_tokens = False
+
+        with self.assertRaisesRegex(ValueError, "cannot disable"):
+            validate_stage2b_continuation_contract(
+                resume_args,
+                resume_lineage=None,
+                current_args=current_args,
+            )
+
+    def test_stage2b_resume_rejects_non_state_reader_semantic_changes(self) -> None:
+        resume_args, current_args = self._stage2b_resume_contract_inputs()
+        for setting, changed_value in (
+            ("local_context_layers", "1,6"),
+            ("adapter_heads", 4),
+            ("soft_prompt_scale", 0.1),
+        ):
+            with self.subTest(setting=setting), self.assertRaisesRegex(
+                ValueError, setting
+            ):
+                changed_args = SimpleNamespace(**vars(current_args))
+                setattr(changed_args, setting, changed_value)
+                validate_stage2b_continuation_contract(
+                    resume_args,
+                    resume_lineage=None,
+                    current_args=changed_args,
+                )
+
     def test_grounded_checkpoint_score_requires_evidence_and_correct_tensor(self) -> None:
         metrics = {
             "correct": {
@@ -360,6 +473,21 @@ class TestTrainingAudits(unittest.TestCase):
         self.assertAlmostEqual(
             checkpoint_score(metrics, "point_value_min_grounded_gain"),
             0.20,
+        )
+        metrics["zero_local"] = {
+            "by_task": {
+                "normalized_point_value": {"accuracy": 0.65},
+                "raw_point_value_with_stats": {"accuracy": 0.66},
+            }
+        }
+        self.assertAlmostEqual(
+            checkpoint_score(metrics, "point_value_min_causal_gain"),
+            0.04,
+        )
+        del metrics["zero_local"]
+        self.assertEqual(
+            checkpoint_score(metrics, "point_value_min_causal_gain"),
+            -math.inf,
         )
         del metrics["global_only"]
         self.assertEqual(
@@ -771,6 +899,42 @@ class TestDistributedSampling(unittest.TestCase):
             records = TensorReadoutQADataset._load_records(path, max_records=1)
 
             self.assertEqual(records, [{"state_ref": "first"}])
+
+    def test_hash_state_subset_is_deterministic_and_keeps_complete_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "records.jsonl"
+            source = [
+                {"state_ref": f"state-{state}", "member": member}
+                for state in range(5)
+                for member in range(3)
+            ]
+            with path.open("w", encoding="utf-8") as handle:
+                for record in source:
+                    handle.write(json.dumps(record) + "\n")
+
+            first = TensorReadoutQADataset._load_records(
+                path,
+                max_records=6,
+                subset_mode="hash_state",
+                subset_seed=17,
+            )
+            second = TensorReadoutQADataset._load_records(
+                path,
+                max_records=6,
+                subset_mode="hash_state",
+                subset_seed=17,
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 6)
+        selected_states = {str(record["state_ref"]) for record in first}
+        self.assertEqual(len(selected_states), 2)
+        self.assertTrue(
+            all(
+                sum(record["state_ref"] == state for record in first) == 3
+                for state in selected_states
+            )
+        )
 
     def test_worker_cache_capacity_divides_the_per_rank_budget(self) -> None:
         dataset = TensorReadoutQADataset.__new__(TensorReadoutQADataset)
@@ -1573,10 +1737,10 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
     def test_swap_indices_stay_within_state_task_and_field(self) -> None:
         records = [
-            _record("s1", "point", "Vx", "question one"),
-            _record("s1", "point", "Vx", "question two"),
-            _record("s1", "point", "Vy", "question three"),
-            _record("s2", "point", "Vx", "question four"),
+            _matched_record("s1", "point", "Vx", "question one", "A"),
+            _matched_record("s1", "point", "Vx", "question two", "B"),
+            _matched_record("s1", "point", "Vy", "question three", "C"),
+            _matched_record("s2", "point", "Vx", "question four", "D"),
         ]
 
         owners, swapped = same_state_question_swap_indices(records)
@@ -1586,9 +1750,9 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
     def test_grounding_swaps_skip_same_answer_pairs(self) -> None:
         records = [
-            {**_record("s1", "point", "Vx", "question one"), "answer": "A"},
-            {**_record("s1", "point", "Vx", "question two"), "answer": "A"},
-            {**_record("s1", "point", "Vx", "question three"), "answer": "B"},
+            _matched_record("s1", "point", "Vx", "question one", "A"),
+            _matched_record("s1", "point", "Vx", "question two", "A"),
+            _matched_record("s1", "point", "Vx", "question three", "B"),
         ]
 
         owners, swapped = same_state_question_swap_indices(
@@ -1604,6 +1768,237 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 for owner, source in zip(owners, swapped)
             )
         )
+
+    def test_grounding_swaps_require_the_same_matched_contract(self) -> None:
+        records = [
+            _matched_record("s1", "point", "Vx", "question one", "A", group="g1"),
+            _matched_record("s1", "point", "Vx", "question two", "B", group="g2"),
+        ]
+
+        owners, swapped = same_state_question_swap_indices(records)
+
+        self.assertEqual(owners, [])
+        self.assertEqual(swapped, [])
+
+    def test_grounding_swap_cap_applies_independently_per_matched_group(self) -> None:
+        records = [
+            *[
+                _matched_record(
+                    "s1", "point", "Vx", f"group one question {index}", answer, group="g1"
+                )
+                for index, answer in enumerate(("A", "B", "C"))
+            ],
+            *[
+                _matched_record(
+                    "s1", "point", "Vx", f"group two question {index}", answer, group="g2"
+                )
+                for index, answer in enumerate(("A", "B", "C"))
+            ],
+        ]
+
+        owners, swapped = same_state_question_swap_indices(
+            records,
+            max_records_per_group=2,
+        )
+
+        self.assertEqual(owners, [0, 1, 3, 4])
+        self.assertEqual(swapped, [1, 2, 4, 5])
+
+    def test_grounding_swap_keeps_owner_global_and_source_local_mask(self) -> None:
+        class StubGlobal(nn.Module):
+            soft_prompt_tokens = 3
+
+        class StubLocal(nn.Module):
+            soft_prompt_tokens = 2
+            structured_query_conditioning = False
+
+        adapter = HybridGlobalLocalAdapter(
+            StubGlobal(),
+            StubLocal(),
+            freeze_global=True,
+            combine_mode="concat",
+        )
+        local = torch.tensor(
+            [
+                [[10.0], [11.0]],
+                [[20.0], [21.0]],
+            ]
+        )
+        global_prompts = torch.tensor(
+            [
+                [[1.0], [2.0], [3.0]],
+                [[4.0], [5.0], [6.0]],
+            ]
+        )
+        combined = torch.cat([local, global_prompts], dim=1)
+        attention = torch.tensor(
+            [
+                [1, 0, 1, 0, 1],
+                [0, 1, 0, 1, 0],
+            ]
+        )
+
+        swapped, swapped_masks = question_swapped_soft_prefixes(
+            adapter,
+            positive_soft_embeds=combined,
+            positive_soft_attention_mask=attention,
+            positive_global_prompts=global_prompts,
+            positive_local_prompts=local,
+            owners=[0],
+            sources=[1],
+        )
+
+        torch.testing.assert_close(
+            swapped[0], torch.cat([local[1], global_prompts[0]], dim=0)
+        )
+        self.assertTrue(torch.equal(swapped_masks[0], torch.tensor([0, 1, 1, 0, 1])))
+
+    def test_label_choice_scoring_forwards_precomputed_soft_mask(self) -> None:
+        class TinyLLM(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding = nn.Embedding(16, 8)
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+        records = [
+            {"answer": "A", "choices": ["A", "B"]},
+            {"answer": "B", "choices": ["A", "B"]},
+        ]
+        text_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        text_mask = torch.ones(2, 3, dtype=torch.long)
+        text_labels = torch.tensor([[-100, -100, 1], [-100, -100, 2]])
+        soft = torch.randn(2, 4, 8)
+        soft_mask = torch.tensor([[1, 0, 1, 1], [0, 1, 1, 1]])
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_statistics(**kwargs):
+            captured["attention_mask"] = kwargs["attention_mask"].detach().clone()
+            return torch.ones(2), torch.ones(2), torch.zeros(2, 16)
+
+        args = SimpleNamespace(
+            max_prompt_tokens=16,
+            max_target_tokens=4,
+            append_eos=True,
+            prompt_template="task_specific",
+            local_context_layer=2,
+        )
+        with mock.patch.object(
+            adapter_training,
+            "build_text_tensors",
+            return_value=(text_ids, text_mask, text_labels),
+        ), mock.patch.object(
+            adapter_training,
+            "selective_answer_statistics",
+            side_effect=fake_statistics,
+        ):
+            single_token_choice_ce_loss(
+                llm=TinyLLM(),
+                adapter=nn.Identity(),
+                tokenizer=object(),
+                records=records,
+                latent_map=torch.randn(2, 3, 2, 2),
+                device=torch.device("cpu"),
+                args=args,
+                choice_token_spec=([[1, 2], [1, 2]], [0, 1]),
+                precomputed_soft_embeds=soft,
+                precomputed_soft_attention_mask=soft_mask,
+            )
+
+        self.assertTrue(torch.equal(captured["attention_mask"][:, :4], soft_mask))
+
+    def test_sequence_choice_expansion_repeats_owner_soft_masks(self) -> None:
+        records = [
+            {"answer": "A", "choices": ["A", "B"]},
+            {"answer": "C", "choices": ["A", "B", "C"]},
+        ]
+        soft = torch.randn(2, 3, 8)
+        soft_mask = torch.tensor([[1, 0, 1], [0, 1, 1]])
+        captured_masks: list[torch.Tensor] = []
+
+        def fake_forward_answer_nll(**kwargs):
+            captured_masks.append(kwargs["precomputed_soft_attention_mask"].detach().clone())
+            count = len(kwargs["records"])
+            return torch.arange(1, count + 1, dtype=torch.float32), torch.ones(count)
+
+        args = SimpleNamespace(
+            max_prompt_tokens=16,
+            max_target_tokens=4,
+            append_eos=True,
+            prompt_template="task_specific",
+            local_context_layer=2,
+            train_choice_batch_size=8,
+            choice_score="mean",
+        )
+        with mock.patch.object(
+            adapter_training,
+            "forward_answer_nll",
+            side_effect=fake_forward_answer_nll,
+        ):
+            _sequence_choice_ce_loss(
+                llm=object(),
+                adapter=nn.Identity(),
+                tokenizer=object(),
+                records=records,
+                latent_map=torch.randn(2, 3, 2, 2),
+                device=torch.device("cpu"),
+                args=args,
+                precomputed_soft_embeds=soft,
+                precomputed_soft_attention_mask=soft_mask,
+            )
+
+        expected = torch.stack(
+            [soft_mask[0], soft_mask[0], soft_mask[1], soft_mask[1], soft_mask[1]],
+            dim=0,
+        )
+        self.assertEqual(len(captured_masks), 1)
+        self.assertTrue(torch.equal(captured_masks[0], expected))
+
+    def test_diagnostic_generation_forwards_soft_attention_mask(self) -> None:
+        class TinyTokenizer:
+            eos_token_id = 0
+
+            def __call__(self, _text, **_kwargs):
+                return {"input_ids": [1, 2]}
+
+            def decode(self, _ids, **_kwargs):
+                return "A"
+
+        class TinyLLM(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding = nn.Embedding(8, 6)
+                self.attention_masks: list[torch.Tensor] = []
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def forward(self, *, inputs_embeds=None, attention_mask=None, **_kwargs):
+                self.attention_masks.append(attention_mask.detach().clone())
+                logits = torch.zeros(1, inputs_embeds.shape[1], 8)
+                logits[:, -1, 0] = 1.0
+                return SimpleNamespace(logits=logits, past_key_values=None)
+
+        llm = TinyLLM()
+        soft_mask = torch.tensor([[1, 0, 1]])
+        result = generate_diagnostic_answer(
+            llm=llm,
+            tokenizer=TinyTokenizer(),
+            record={
+                "question": "Choose one option. Options: A or B.",
+                "choices": ["A", "B"],
+            },
+            soft_embeds=torch.randn(1, 3, 6),
+            soft_attention_mask=soft_mask,
+            device=torch.device("cpu"),
+            prompt_template="task_specific",
+            max_prompt_tokens=16,
+            max_new_tokens=1,
+        )
+
+        self.assertEqual(result["parsed_choice"], "A")
+        self.assertTrue(torch.equal(llm.attention_masks[0][:, :3], soft_mask))
 
     def test_zero_text_gate_preserves_inherited_qformer_output(self) -> None:
         torch.manual_seed(7)
@@ -2021,6 +2416,173 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 1.0,
                 places=5,
             )
+
+    def test_zero_local_preserves_residual_adapter_token_length(self) -> None:
+        torch.manual_seed(41)
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = ResidualQuestionConditionedAdapter(
+            aligned_adapter=global_adapter,
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_heads=4,
+            dropout=0.0,
+            text_gate_init=1.0,
+            residual_gate_init=1.0,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter,
+            local,
+            freeze_global=True,
+            combine_mode="residual",
+        ).eval()
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 2, 5, 24)
+        question_mask = torch.ones(2, 5, dtype=torch.bool)
+
+        correct = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="correct",
+        )
+        zero_local = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="zero_local",
+        )
+        global_only = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="global_only",
+        )
+
+        self.assertEqual(tuple(zero_local.shape), tuple(correct.shape))
+        torch.testing.assert_close(zero_local, global_only)
+
+    def test_zero_local_keeps_global_suffix_and_learned_gate_mask(self) -> None:
+        torch.manual_seed(43)
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter,
+            local,
+            freeze_global=True,
+            combine_mode="concat",
+        ).eval()
+        adapter.mask_inactive_local_tokens = True
+        with torch.no_grad():
+            local.role_gate.weight.zero_()
+            local.role_gate.bias.fill_(2.0)
+        latent = torch.randn(2, 3, 2, 2)
+        question = torch.randn(2, 2, 5, 24)
+        question_mask = torch.ones(2, 5, dtype=torch.bool)
+
+        correct = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="correct",
+        )
+        correct_mask = adapter._last_soft_prompt_attention_mask.clone()
+        zero_local = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="zero_local",
+        )
+        zero_local_mask = adapter._last_soft_prompt_attention_mask.clone()
+
+        self.assertEqual(tuple(correct.shape), (2, 6, 24))
+        self.assertEqual(tuple(zero_local.shape), tuple(correct.shape))
+        torch.testing.assert_close(zero_local[:, :2], torch.zeros_like(zero_local[:, :2]))
+        torch.testing.assert_close(zero_local[:, 2:], correct[:, 2:])
+        torch.testing.assert_close(zero_local_mask, correct_mask)
+        self.assertTrue(torch.equal(correct_mask, torch.ones(2, 6, dtype=torch.long)))
+
+        with torch.no_grad():
+            local.role_gate.bias.fill_(-2.0)
+        closed = adapter_training.adapter_soft_embeds(
+            adapter,
+            latent,
+            question[:, 0],
+            question,
+            question_mask,
+            records=None,
+            mode="correct",
+        )
+        closed_mask = adapter._last_soft_prompt_attention_mask
+        self.assertTrue(torch.equal(closed[:, :2], torch.zeros_like(closed[:, :2])))
+        self.assertTrue(
+            torch.equal(
+                closed_mask,
+                torch.tensor([[0, 0, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1]]),
+            )
+        )
+
+        local.last_role_gate_logits = None
+        adapter._last_role_gate_logits = None
+        with self.assertRaisesRegex(RuntimeError, "missing or stale"):
+            adapter_training.grounded_soft_prompt_attention_mask(adapter, closed)
+        with self.assertRaisesRegex(RuntimeError, "must carry the attention mask"):
+            adapter_training.require_precomputed_grounded_attention_mask(
+                adapter,
+                closed,
+                None,
+            )
+        adapter_training.require_precomputed_grounded_attention_mask(
+            adapter,
+            closed,
+            closed_mask,
+        )
 
     def test_frozen_grounded_global_preserves_requested_latent_gradients(self) -> None:
         global_adapter = TensorPatchAlignmentAdapter(
@@ -2561,6 +3123,7 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
             freeze_global=True,
             combine_mode="concat",
         ).eval()
+        original.mask_inactive_local_tokens = True
         checkpoint = {
             "args": {
                 "adapter_architecture": "grounded_evidence_adapter",
@@ -2574,6 +3137,7 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
                 "dropout": 0.0,
                 "soft_prompt_scale": 0.05,
                 "grounded_gate_bias_init": -2.0,
+                "mask_inactive_local_tokens": True,
             },
             "adapter_state_dict": original.state_dict(),
         }
@@ -2587,6 +3151,7 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
         self.assertIsInstance(rebuilt, HybridGlobalLocalAdapter)
         self.assertIsInstance(rebuilt.local_adapter, GroundedEvidenceAdapter)
+        self.assertTrue(rebuilt.mask_inactive_local_tokens)
         torch.testing.assert_close(
             rebuilt(latent, question, mask),
             original(latent, question, mask),

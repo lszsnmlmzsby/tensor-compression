@@ -4,6 +4,7 @@ import argparse
 import atexit
 import copy
 import gc
+import hashlib
 import json
 import math
 import os
@@ -81,6 +82,10 @@ STRUCTURED_QUERY_FEATURE_DIM = 32
 SUPPORTED_BASELINE_MODES = {
     "correct",
     "global_only",
+    # Same-length grounded ablation: preserve the two local slots and global
+    # prefix, but remove the local evidence content.  This separates evidence
+    # gain from the positional/layout cost of adding local slots.
+    "zero_local",
     "local_only",
     "no_latent",
     "zero_latent",
@@ -325,6 +330,18 @@ def validate_stage2_warm_start_file(args: argparse.Namespace) -> Path | None:
     if path.stat().st_size <= 0:
         raise ValueError(f"Stage-2 warm-start checkpoint is empty: {path}")
     args.stage2_warm_start_checkpoint = str(path)
+    raw_resume = str(getattr(args, "stage2b_resume_checkpoint", None) or "").strip()
+    if raw_resume.lower() not in {"", "none", "null", "random"}:
+        resume_path = Path(raw_resume).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(
+                f"Grounded Stage-2B continuation checkpoint is missing: {resume_path}"
+            )
+        if resume_path.stat().st_size <= 0:
+            raise ValueError(f"Stage-2B continuation checkpoint is empty: {resume_path}")
+        args.stage2b_resume_checkpoint = str(resume_path)
+    else:
+        args.stage2b_resume_checkpoint = None
     return path
 
 
@@ -367,7 +384,8 @@ def validate_adapter_loss_contract(args: argparse.Namespace) -> None:
     if direct_alignment_architecture:
         for setting in ("eval_baselines", "final_eval_baselines"):
             unsupported = sorted(
-                set(parse_csv(getattr(args, setting, ""))) & {"global_only", "local_only"}
+                set(parse_csv(getattr(args, setting, "")))
+                & {"global_only", "zero_local", "local_only"}
             )
             if unsupported:
                 raise ValueError(
@@ -1780,6 +1798,13 @@ class HybridGlobalLocalAdapter(nn.Module):
         if not 0.0 <= self.global_prompt_dropout < 1.0:
             raise ValueError("global_prompt_dropout must be in [0, 1).")
         self.drop_global_prompts_for_batch = False
+        # Kept as a runtime contract rather than a learned parameter so old
+        # checkpoints remain loadable.  Stage-2B enables it from config.
+        self.mask_inactive_local_tokens = False
+        self._last_soft_prompt_attention_mask: torch.Tensor | None = None
+        self._last_global_prompts: torch.Tensor | None = None
+        self._last_local_prompts: torch.Tensor | None = None
+        self._last_role_gate_logits: torch.Tensor | None = None
         self.soft_prompt_tokens = int(
             global_adapter.soft_prompt_tokens
             if self.combine_mode == "residual"
@@ -1856,12 +1881,24 @@ class HybridGlobalLocalAdapter(nn.Module):
                 if self.training and self.drop_global_prompts_for_batch
                 else global_prompts
             )
-            return visible_global, local_prompts, visible_global + local_prompts
+            combined = visible_global + local_prompts
+            self._last_global_prompts = visible_global
+            self._last_local_prompts = local_prompts
+            self._last_role_gate_logits = getattr(
+                self.local_adapter, "last_role_gate_logits", None
+            )
+            return visible_global, local_prompts, combined
         local_prompts = conditioned_prompts
         if self.training and self.drop_global_prompts_for_batch:
             global_prompts = torch.zeros_like(global_prompts)
         # Keeping local tokens first preserves the relative positions between global tokens and text.
-        return global_prompts, local_prompts, torch.cat([local_prompts, global_prompts], dim=1)
+        combined = torch.cat([local_prompts, global_prompts], dim=1)
+        self._last_global_prompts = global_prompts
+        self._last_local_prompts = local_prompts
+        self._last_role_gate_logits = getattr(
+            self.local_adapter, "last_role_gate_logits", None
+        )
+        return global_prompts, local_prompts, combined
 
     def forward(
         self,
@@ -1873,12 +1910,117 @@ class HybridGlobalLocalAdapter(nn.Module):
         return self.forward_components(latent_map, question_embeds, question_mask, structured_query)[2]
 
 
+def _grounded_local_adapter(adapter: nn.Module) -> GroundedEvidenceAdapter | None:
+    if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
+        adapter.local_adapter, GroundedEvidenceAdapter
+    ):
+        return adapter.local_adapter
+    return None
+
+
+def _all_visible_soft_prompt_mask(
+    soft_embeds: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.long,
+) -> torch.Tensor:
+    return torch.ones(
+        (int(soft_embeds.shape[0]), int(soft_embeds.shape[1])),
+        dtype=dtype,
+        device=soft_embeds.device,
+    )
+
+
+def grounded_soft_prompt_attention_mask(
+    adapter: nn.Module,
+    soft_embeds: torch.Tensor,
+    mode: str = "correct",
+    *,
+    dtype: torch.dtype = torch.long,
+    gate_logits: torch.Tensor | None = None,
+    precomputed: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the visibility mask for a grounded soft-prefix tensor.
+
+    The mask is derived only from the learned question-conditioned role gate;
+    no parsed task/coordinate metadata is consulted.  A caller that reuses a
+    precomputed prefix must pass its captured mask because subsequent adapter
+    forwards overwrite ``last_role_gate_logits``.
+    """
+
+    if precomputed is not None:
+        mask = precomputed.to(device=soft_embeds.device, dtype=dtype)
+        if tuple(mask.shape) != tuple(soft_embeds.shape[:2]):
+            raise ValueError(
+                "Precomputed soft-prefix attention mask shape does not match embeddings: "
+                f"mask={tuple(mask.shape)}, embeds={tuple(soft_embeds.shape[:2])}."
+            )
+        return mask
+    local = _grounded_local_adapter(adapter)
+    if (
+        local is None
+        or not bool(getattr(adapter, "mask_inactive_local_tokens", False))
+        or str(mode) in {"global_only", "no_latent"}
+    ):
+        return _all_visible_soft_prompt_mask(soft_embeds, dtype=dtype)
+    logits = gate_logits
+    if logits is None:
+        logits = getattr(adapter, "_last_role_gate_logits", None)
+    if logits is None:
+        logits = local.last_role_gate_logits
+    local_tokens = int(local.soft_prompt_tokens)
+    global_tokens = int(adapter.global_adapter.soft_prompt_tokens)
+    expected_gate_shape = (int(soft_embeds.shape[0]), local_tokens)
+    if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != expected_gate_shape:
+        observed = tuple(logits.shape) if isinstance(logits, torch.Tensor) else None
+        raise RuntimeError(
+            "Grounded inactive-slot masking is enabled, but the learned gate logits are "
+            f"missing or stale: expected={expected_gate_shape}, observed={observed}, mode={mode!r}. "
+            "Carry the attention mask alongside every precomputed soft prefix."
+        )
+    local_visible = (logits.to(device=soft_embeds.device) >= 0.0).to(dtype=dtype)
+    if str(mode) == "local_only" or int(soft_embeds.shape[1]) == local_tokens:
+        return local_visible
+    expected_concat = local_tokens + global_tokens
+    if int(soft_embeds.shape[1]) != expected_concat:
+        raise RuntimeError(
+            "Grounded inactive-slot masking received an unexpected soft-prefix length: "
+            f"expected {expected_concat}, got {int(soft_embeds.shape[1])}, mode={mode!r}."
+        )
+    global_visible = torch.ones(
+        (int(soft_embeds.shape[0]), global_tokens),
+        dtype=dtype,
+        device=soft_embeds.device,
+    )
+    return torch.cat([local_visible, global_visible], dim=1)
+
+
+def require_precomputed_grounded_attention_mask(
+    adapter: nn.Module,
+    precomputed_soft_embeds: torch.Tensor | None,
+    precomputed_soft_attention_mask: torch.Tensor | None,
+) -> None:
+    """Reject a reused grounded prefix whose question-conditioned mask was discarded."""
+
+    if (
+        precomputed_soft_embeds is not None
+        and precomputed_soft_attention_mask is None
+        and _grounded_local_adapter(adapter) is not None
+        and bool(getattr(adapter, "mask_inactive_local_tokens", False))
+    ):
+        raise RuntimeError(
+            "A precomputed grounded soft prefix must carry the attention mask captured "
+            "from the same adapter forward; reusing current gate logits can apply a stale mask."
+        )
+
+
 class TensorReadoutQADataset(Dataset):
     def __init__(
         self,
         jsonl_path: str | Path,
         latent_dir: str | Path,
         max_records: int | None = None,
+        subset_mode: str = "prefix",
+        subset_seed: int = 42,
         prefer_record_latent_ref: bool = False,
         shuffle_seed: int = 42,
         latent_cache_size: int = 0,
@@ -1887,7 +2029,14 @@ class TensorReadoutQADataset(Dataset):
         self.jsonl_path = Path(jsonl_path)
         self.latent_dir = Path(latent_dir)
         self.prefer_record_latent_ref = bool(prefer_record_latent_ref)
-        self.records = self._load_records(self.jsonl_path, max_records=max_records)
+        self.subset_mode = str(subset_mode)
+        self.subset_seed = int(subset_seed)
+        self.records = self._load_records(
+            self.jsonl_path,
+            max_records=max_records,
+            subset_mode=self.subset_mode,
+            subset_seed=self.subset_seed,
+        )
         if not self.records:
             raise RuntimeError(f"No QA records found in {self.jsonl_path}.")
         self.latent_cache_size = max(0, int(latent_cache_size))
@@ -1899,12 +2048,23 @@ class TensorReadoutQADataset(Dataset):
         self._random_different_indices = self._build_random_different_indices(int(shuffle_seed))
 
     @staticmethod
-    def _load_records(path: Path, max_records: int | None = None) -> list[dict[str, Any]]:
+    def _load_records(
+        path: Path,
+        max_records: int | None = None,
+        subset_mode: str = "prefix",
+        subset_seed: int = 42,
+    ) -> list[dict[str, Any]]:
         record_limit = None if max_records is None else max(0, int(max_records))
         records: list[dict[str, Any]] = []
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
-                if record_limit is not None and len(records) >= record_limit:
+                # Preserve the historical early-stop behavior for the default
+                # prefix mode (including its useful malformed-tail test).
+                if (
+                    str(subset_mode) == "prefix"
+                    and record_limit is not None
+                    and len(records) >= record_limit
+                ):
                     break
                 stripped = line.strip()
                 if not stripped:
@@ -1915,7 +2075,44 @@ class TensorReadoutQADataset(Dataset):
                 # Oracle values are generation/debug metadata and never enter the training process.
                 payload.pop("oracle", None)
                 records.append(payload)
-        return records
+        if str(subset_mode) == "prefix" or record_limit is None:
+            return records if record_limit is None or str(subset_mode) != "prefix" else records[:record_limit]
+        if str(subset_mode) != "hash_state":
+            raise ValueError(f"Unsupported record subset mode: {subset_mode!r}.")
+        if record_limit <= 0:
+            return []
+
+        # Select complete state groups in a stable hash order, then restore the
+        # original JSONL order.  This avoids a prefix cap that can over-sample
+        # one field/sample while keeping matched question groups intact.
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for index, payload in enumerate(records):
+            state_ref = str(payload.get("state_ref") or "")
+            if not state_ref:
+                state_ref = f"__record_{index:012d}"
+            grouped[state_ref].append(index)
+        digest_order = sorted(
+            grouped,
+            key=lambda key: hashlib.sha256(
+                f"{int(subset_seed)}:{key}".encode("utf-8")
+            ).hexdigest(),
+        )
+        selected: set[int] = set()
+        selected_count = 0
+        for state_ref in digest_order:
+            indices = grouped[state_ref]
+            if selected_count + len(indices) > record_limit:
+                continue
+            selected.update(indices)
+            selected_count += len(indices)
+            if selected_count == record_limit:
+                break
+        if not selected and records and record_limit > 0:
+            smallest = min(grouped.values(), key=len)
+            if len(smallest) <= record_limit:
+                selected.update(smallest)
+                selected_count = len(smallest)
+        return [payload for index, payload in enumerate(records) if index in selected]
 
     def effective_latent_cache_size(self) -> int:
         """Treat latent_cache_size as a per-rank budget shared by its loader workers."""
@@ -2798,10 +2995,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swapped-question-loss-weight", type=float, default=None)
     parser.add_argument("--swapped-question-loss-margin", type=float, default=None)
     parser.add_argument("--grounding-routing-loss-weight", type=float, default=None)
+    parser.add_argument(
+        "--grounding-joint-routing-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Routing-loss weight after the grounded routing-only warmup. "
+            "Defaults to grounding-routing-loss-weight for backward compatibility."
+        ),
+    )
     parser.add_argument("--grounding-gate-loss-weight", type=float, default=None)
     parser.add_argument("--matched-group-loss-weight", type=float, default=None)
     parser.add_argument("--matched-group-loss-margin", type=float, default=None)
-    parser.add_argument("--swapped-question-max-records", type=int, default=None)
+    parser.add_argument(
+        "--swapped-question-max-records",
+        type=int,
+        default=None,
+        help="Maximum swapped owners per audited matched group, independent of outer batch size.",
+    )
     parser.add_argument(
         "--swapped-question-require-different-answer",
         action=argparse.BooleanOptionalAction,
@@ -2831,6 +3042,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--adapter-init-checkpoint", type=str, default=None)
     parser.add_argument("--stage2-warm-start-checkpoint", type=str, default=None)
+    parser.add_argument("--stage2b-resume-checkpoint", type=str, default=None)
     parser.add_argument("--adapter-dim", type=int, default=None)
     parser.add_argument("--adapter-layers", type=int, default=None)
     parser.add_argument("--adapter-heads", type=int, default=None)
@@ -2904,6 +3116,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-unfreeze-epoch", type=int, default=None)
     parser.add_argument("--global-lr", type=float, default=None)
     parser.add_argument("--global-prompt-dropout", type=float, default=None)
+    parser.add_argument(
+        "--mask-inactive-local-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Mask grounded role slots whose learned gate is closed before the frozen LLM attention.",
+    )
+    parser.add_argument(
+        "--record-subset-mode",
+        type=str,
+        default=None,
+        choices=("prefix", "hash_state"),
+        help="How max_*_records is applied; hash_state selects complete deterministic state groups.",
+    )
     parser.add_argument("--group-questions-by-state", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--questions-per-state-group", type=int, default=None)
     parser.add_argument("--soft-prompt-scale", type=float, default=None)
@@ -2922,7 +3147,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Comma-separated: correct,global_only,local_only,no_latent,zero_latent,"
+            "Comma-separated: correct,global_only,zero_local,local_only,no_latent,zero_latent,"
             "shuffled,random,shuffled_stats."
         ),
     )
@@ -2949,9 +3174,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--console-progress", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--save-step-metrics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--evaluate-test", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-every-epochs", type=int, default=None)
     parser.add_argument("--diagnostics-records-per-task", type=int, default=None)
+    parser.add_argument(
+        "--diagnostics-save-states",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Persist large raw diagnostic state tensors in addition to the JSON summaries.",
+    )
     parser.add_argument("--diagnostics-generation-max-new-tokens", type=int, default=None)
     parser.add_argument(
         "--diagnostics-layers",
@@ -2969,6 +3201,7 @@ def parse_args() -> argparse.Namespace:
             "normalized_point_latent_gain",
             "point_value_min_latent_gain",
             "point_value_min_grounded_gain",
+            "point_value_min_causal_gain",
         ),
     )
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=None)
@@ -3010,6 +3243,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "grounding_routing_loss_weight": first_nested(
             config, ["llm_training.grounding_routing_loss_weight"]
         ),
+        "grounding_joint_routing_loss_weight": first_nested(
+            config, ["llm_training.grounding_joint_routing_loss_weight"]
+        ),
         "grounding_gate_loss_weight": first_nested(
             config, ["llm_training.grounding_gate_loss_weight"]
         ),
@@ -3047,6 +3283,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "adapter_init_checkpoint": first_nested(config, ["adapter.init_checkpoint", "patch_qa.alignment_checkpoint"]),
         "stage2_warm_start_checkpoint": first_nested(
             config, ["adapter.stage2_warm_start_checkpoint"]
+        ),
+        "stage2b_resume_checkpoint": first_nested(
+            config, ["adapter.stage2b_resume_checkpoint"]
         ),
         "output_root": first_nested(config, ["llm_training.output_root", "storage.output_root"]),
         "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
@@ -3192,6 +3431,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "grounding_joint_routing_loss_weight",
+        configured_loss_fields["grounding_joint_routing_loss_weight"],
+        args.grounding_routing_loss_weight,
+    )
+    set_default(
+        args,
         "grounding_gate_loss_weight",
         configured_loss_fields["grounding_gate_loss_weight"],
         0.0,
@@ -3301,6 +3546,18 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "global_prompt_dropout", first_nested(config, ["adapter.global_prompt_dropout"]), 0.0)
     set_default(
         args,
+        "mask_inactive_local_tokens",
+        first_nested(config, ["adapter.mask_inactive_local_tokens"]),
+        False,
+    )
+    set_default(
+        args,
+        "record_subset_mode",
+        first_nested(config, ["llm_training.record_subset_mode"]),
+        "prefix",
+    )
+    set_default(
+        args,
         "group_questions_by_state",
         first_nested(config, ["llm_training.group_questions_by_state"]),
         False,
@@ -3338,6 +3595,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     set_default(args, "log_interval", first_nested(config, ["llm_training.log_interval"]), 20)
     set_default(args, "console_progress", first_nested(config, ["llm_training.console_progress"]), False)
     set_default(args, "save_step_metrics", first_nested(config, ["llm_training.save_step_metrics"]), False)
+    set_default(args, "evaluate_test", first_nested(config, ["llm_training.evaluate_test"]), True)
     set_default(args, "diagnostics_enabled", first_nested(config, ["llm_training.diagnostics.enabled"]), True)
     set_default(
         args,
@@ -3350,6 +3608,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "diagnostics_records_per_task",
         first_nested(config, ["llm_training.diagnostics.records_per_task"]),
         1,
+    )
+    set_default(
+        args,
+        "diagnostics_save_states",
+        first_nested(config, ["llm_training.diagnostics.save_states"]),
+        True,
     )
     set_default(
         args,
@@ -3455,6 +3719,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(
                 "Grounded evidence requires a positive grounding_routing_loss_weight."
             )
+        if float(args.grounding_joint_routing_loss_weight) < 0.0:
+            raise ValueError("grounding_joint_routing_loss_weight must be non-negative.")
         if int(args.questions_per_state_group) != 3:
             raise ValueError(
                 "Grounded Stage-2B requires questions_per_state_group=3 because that is the "
@@ -3477,6 +3743,16 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
                 "Grounded Stage-2B must retain at least one joint answer-training epoch after "
                 "the routing-only warmup."
             )
+        if (
+            float(args.swapped_question_loss_weight) > 0.0
+            and int(args.swapped_question_max_records)
+            < int(args.questions_per_state_group)
+        ):
+            raise ValueError(
+                "Grounded Stage-2B applies swapped_question_max_records per matched group; "
+                "set it to at least questions_per_state_group so changing the outer batch "
+                "size cannot silently bias supervision toward one member."
+            )
         for setting in (
             "grounding_warmup_min_cell_top1",
             "grounding_warmup_min_cell_top5",
@@ -3493,6 +3769,19 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         )
     if int(args.initial_eval_records) < 0:
         raise ValueError("llm_training.initial_eval_records must be non-negative.")
+    if (
+        str(args.adapter_architecture) == "grounded_evidence_adapter"
+        and str(args.stage2b_resume_checkpoint or "").strip().lower()
+        not in {"", "none", "null", "random"}
+        and int(args.grounding_routing_warmup_epochs) == 0
+        and int(args.initial_eval_records) <= 0
+    ):
+        raise ValueError(
+            "A grounded Stage-2B continuation with no routing warmup requires "
+            "initial_eval_records > 0 for its held-out routing/gate audit."
+        )
+    if str(args.record_subset_mode) not in {"prefix", "hash_state"}:
+        raise ValueError("llm_training.record_subset_mode must be 'prefix' or 'hash_state'.")
     if int(args.latent_cache_size) < 0 or int(args.num_workers) < 0:
         raise ValueError("llm_training.latent_cache_size and num_workers must be non-negative.")
     if (
@@ -3510,6 +3799,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "swapped_question_loss_weight",
         "swapped_question_loss_margin",
         "grounding_routing_loss_weight",
+        "grounding_joint_routing_loss_weight",
         "grounding_gate_loss_weight",
         "matched_group_loss_weight",
         "matched_group_loss_margin",
@@ -3581,6 +3871,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "normalized_point_latent_gain",
         "point_value_min_latent_gain",
         "point_value_min_grounded_gain",
+        "point_value_min_causal_gain",
     } and "shuffled" not in parse_csv(args.eval_baselines):
         raise ValueError(
             f"checkpoint_metric={args.checkpoint_metric} requires shuffled in llm_training.eval_baselines."
@@ -3593,6 +3884,14 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             "checkpoint_metric=point_value_min_grounded_gain requires global_only in "
             "llm_training.eval_baselines."
         )
+    if str(args.checkpoint_metric) == "point_value_min_causal_gain":
+        required_causal_baselines = {"zero_local", "global_only", "shuffled"}
+        missing = sorted(required_causal_baselines - set(parse_csv(args.eval_baselines)))
+        if missing:
+            raise ValueError(
+                "checkpoint_metric=point_value_min_causal_gain requires "
+                f"{', '.join(missing)} in llm_training.eval_baselines."
+            )
     if defaulted_loss_fields:
         print(
             "warning: config omits "
@@ -4744,8 +5043,13 @@ def adapter_soft_embeds(
                 global_prompts = adapter.global_adapter.forward_soft_prompts(latent_map)
         else:
             global_prompts = adapter.global_adapter.forward_soft_prompts(latent_map)
-        return global_prompts.to(dtype=text_embeds.dtype)
-    if mode in {"correct", "global_only", "local_only"}:
+        selected = global_prompts.to(dtype=text_embeds.dtype)
+        adapter._last_global_prompts = global_prompts
+        adapter._last_local_prompts = None
+        adapter._last_role_gate_logits = None
+        adapter._last_soft_prompt_attention_mask = _all_visible_soft_prompt_mask(selected)
+        return selected
+    if mode in {"correct", "global_only", "zero_local", "local_only"}:
         if isinstance(adapter, HybridGlobalLocalAdapter):
             global_prompts, local_prompts, combined_prompts = adapter.forward_components(
                 latent_map,
@@ -4753,28 +5057,58 @@ def adapter_soft_embeds(
                 question_mask=question_mask,
                 structured_query=structured_query,
             )
+            zero_local_prompts = (
+                global_prompts
+                if adapter.residual_mode
+                else torch.cat([torch.zeros_like(local_prompts), global_prompts], dim=1)
+            )
             selected = {
                 "correct": combined_prompts,
                 "global_only": global_prompts,
+                "zero_local": zero_local_prompts,
                 "local_only": local_prompts,
             }[mode]
-            return selected.to(dtype=text_embeds.dtype)
-        return adapter(
+            selected = selected.to(dtype=text_embeds.dtype)
+            adapter._last_soft_prompt_attention_mask = grounded_soft_prompt_attention_mask(
+                adapter,
+                selected,
+                mode=mode,
+                gate_logits=adapter._last_role_gate_logits,
+            )
+            return selected
+        selected = adapter(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
             structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
+        return torch.zeros_like(selected) if mode == "zero_local" else selected
     if mode == "no_latent":
         batch_size = latent_map.shape[0]
-        return text_embeds.new_zeros((batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1]))
+        selected = text_embeds.new_zeros(
+            (batch_size, adapter.soft_prompt_tokens, text_embeds.shape[-1])
+        )
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            adapter._last_global_prompts = None
+            adapter._last_local_prompts = None
+            adapter._last_role_gate_logits = None
+            adapter._last_soft_prompt_attention_mask = _all_visible_soft_prompt_mask(selected)
+        return selected
     if mode in {"shuffled", "random", "zero_latent"}:
-        return adapter(
+        selected = adapter(
             latent_map,
             question_embeds=question_embeds,
             question_mask=question_mask,
             structured_query=structured_query,
         ).to(dtype=text_embeds.dtype)
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            adapter._last_soft_prompt_attention_mask = grounded_soft_prompt_attention_mask(
+                adapter,
+                selected,
+                mode=mode,
+                gate_logits=adapter._last_role_gate_logits,
+            )
+        return selected
     raise ValueError(f"Unsupported soft prompt mode: {mode}")
 
 
@@ -4834,10 +5168,11 @@ def forward_loss(
             mode=soft_prompt_mode,
         )
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=soft_prompt_mode,
         dtype=text_attention_mask.dtype,
-        device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     soft_labels = torch.full(
@@ -4942,8 +5277,14 @@ def forward_answer_nll(
     return_target_counts: bool = False,
     local_context_layer: int = 2,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_soft_attention_mask: torch.Tensor | None = None,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    require_precomputed_grounded_attention_mask(
+        adapter,
+        precomputed_soft_embeds,
+        precomputed_soft_attention_mask,
+    )
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
         answers=answers,
@@ -4987,10 +5328,12 @@ def forward_answer_nll(
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=soft_prompt_mode,
         dtype=text_attention_mask.dtype,
-        device=device,
+        precomputed=precomputed_soft_attention_mask,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     soft_labels = torch.full(
@@ -5059,7 +5402,13 @@ def single_token_choice_ce_loss(
     choice_token_spec: tuple[list[list[int]], list[int]] | None = None,
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_soft_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+    require_precomputed_grounded_attention_mask(
+        adapter,
+        precomputed_soft_embeds,
+        precomputed_soft_attention_mask,
+    )
     answers = [str(record["answer"]) for record in records]
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
@@ -5103,10 +5452,12 @@ def single_token_choice_ce_loss(
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=soft_prompt_mode,
         dtype=text_attention_mask.dtype,
-        device=device,
+        precomputed=precomputed_soft_attention_mask,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     soft_labels = torch.full(
@@ -5156,6 +5507,7 @@ def single_token_choice_ce_loss(
             "choice_single_token_path": 1.0,
             "candidate_log_probs": candidate_log_probs,
             "candidate_target_indices": [int(value) for value in target_indices],
+            "soft_attention_mask": soft_attention,
         },
     )
 
@@ -5171,7 +5523,13 @@ def _sequence_choice_ce_loss(
     soft_prompt_mode: str = "correct",
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_soft_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+    require_precomputed_grounded_attention_mask(
+        adapter,
+        precomputed_soft_embeds,
+        precomputed_soft_attention_mask,
+    )
     candidate_records: list[Mapping[str, Any]] = []
     candidate_answers: list[str] = []
     candidate_latents: list[torch.Tensor] = []
@@ -5209,9 +5567,24 @@ def _sequence_choice_ce_loss(
             prompt_template=str(args.prompt_template),
             precomputed_question_context=precomputed_question_context,
         )
+    base_soft_attention_mask = None
+    if base_soft_embeds is not None:
+        base_soft_attention_mask = grounded_soft_prompt_attention_mask(
+            adapter,
+            base_soft_embeds,
+            mode=soft_prompt_mode,
+            precomputed=precomputed_soft_attention_mask,
+        )
     candidate_soft_embeds = (
         torch.stack([base_soft_embeds[index] for index in candidate_owners], dim=0)
         if base_soft_embeds is not None
+        else None
+    )
+    candidate_soft_attention_masks = (
+        torch.stack(
+            [base_soft_attention_mask[index] for index in candidate_owners], dim=0
+        )
+        if base_soft_attention_mask is not None
         else None
     )
 
@@ -5239,6 +5612,11 @@ def _sequence_choice_ce_loss(
             precomputed_soft_embeds=(
                 candidate_soft_embeds[start:end]
                 if candidate_soft_embeds is not None
+                else None
+            ),
+            precomputed_soft_attention_mask=(
+                candidate_soft_attention_masks[start:end]
+                if candidate_soft_attention_masks is not None
                 else None
             ),
         )
@@ -5283,6 +5661,7 @@ def _sequence_choice_ce_loss(
         "choice_single_token_path": 0.0,
         "candidate_log_probs": candidate_log_probs,
         "candidate_target_indices": [int(value) for value in target_indices],
+        "soft_attention_mask": base_soft_attention_mask,
     }
 
 
@@ -5297,6 +5676,7 @@ def choice_ce_loss(
     soft_prompt_mode: str = "correct",
     precomputed_question_context: tuple[torch.Tensor, torch.Tensor] | None = None,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_soft_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     choice_token_spec = single_token_choice_ids(records, tokenizer)
     scoring_mode = str(args.choice_scoring_mode)
@@ -5315,6 +5695,7 @@ def choice_ce_loss(
             choice_token_spec=choice_token_spec,
             precomputed_question_context=precomputed_question_context,
             precomputed_soft_embeds=precomputed_soft_embeds,
+            precomputed_soft_attention_mask=precomputed_soft_attention_mask,
         )
     elif scoring_mode == "label":
         raise ValueError("choice_scoring_mode=label requires every choice label to tokenize as one unique token.")
@@ -5329,6 +5710,7 @@ def choice_ce_loss(
         soft_prompt_mode=soft_prompt_mode,
         precomputed_question_context=precomputed_question_context,
         precomputed_soft_embeds=precomputed_soft_embeds,
+        precomputed_soft_attention_mask=precomputed_soft_attention_mask,
     )
 
 
@@ -5459,14 +5841,6 @@ def matched_coordinate_group_loss(
         ),
         "matched_group_exact_accuracy": group_exact / max(1, len(grouped)),
     }
-
-
-def _grounded_local_adapter(adapter: nn.Module) -> GroundedEvidenceAdapter | None:
-    if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
-        adapter.local_adapter, GroundedEvidenceAdapter
-    ):
-        return adapter.local_adapter
-    return None
 
 
 def _key_cosine_metrics(keys: torch.Tensor) -> dict[str, float]:
@@ -5872,13 +6246,35 @@ def routing_metric_weighted_totals(
 def same_state_question_swap_indices(
     records: Sequence[Mapping[str, Any]],
     require_different_answers: bool = False,
+    max_records_per_group: int | None = None,
 ) -> tuple[list[int], list[int]]:
-    grouped: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    if max_records_per_group is not None and int(max_records_per_group) <= 0:
+        raise ValueError("max_records_per_group must be positive when provided.")
+    grouped: dict[tuple[Any, ...], list[int]] = defaultdict(list)
     for index, record in enumerate(records):
+        matched = record.get("matched_group")
+        if not isinstance(matched, Mapping):
+            continue
+        margin_group_id = str(matched.get("margin_group_id") or "")
+        option_hash = str(matched.get("option_set_sha256") or "")
+        coordinate_set_id = str(matched.get("coordinate_set_id") or "")
+        choices = record.get("choices")
+        if (
+            not margin_group_id
+            or not option_hash
+            or not coordinate_set_id
+            or not isinstance(choices, Sequence)
+            or isinstance(choices, (str, bytes))
+        ):
+            continue
         key = (
             str(record.get("state_ref", "")),
             str(record.get("task_type", "")),
             str(record.get("field") or record.get("metadata", {}).get("field") or ""),
+            margin_group_id,
+            option_hash,
+            coordinate_set_id,
+            tuple(str(value) for value in choices),
         )
         grouped[key].append(index)
     owners: list[int] = []
@@ -5895,6 +6291,8 @@ def same_state_question_swap_indices(
         ]
         if len(distinct) < 2:
             continue
+        group_owners: list[int] = []
+        group_sources: list[int] = []
         for position, owner in enumerate(distinct):
             owner_question = str(records[owner].get("query") or records[owner].get("question") or "")
             owner_answer = str(records[owner].get("answer", ""))
@@ -5914,52 +6312,65 @@ def same_state_question_swap_indices(
             )
             if candidate is None:
                 continue
-            owners.append(owner)
-            swapped.append(candidate)
+            group_owners.append(owner)
+            group_sources.append(candidate)
+        if max_records_per_group is not None:
+            group_owners = group_owners[: int(max_records_per_group)]
+            group_sources = group_sources[: int(max_records_per_group)]
+        owners.extend(group_owners)
+        swapped.extend(group_sources)
     return owners, swapped
 
 
-def swapped_question_grounding_loss(
-    llm,
+def question_swapped_soft_prefixes(
     adapter: nn.Module,
-    tokenizer,
-    records: Sequence[Mapping[str, Any]],
-    latent_map: torch.Tensor,
-    positive_choice_nll: torch.Tensor,
-    soft_embeds: torch.Tensor | None,
-    device: torch.device,
-    args: argparse.Namespace,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    owners, swapped = same_state_question_swap_indices(
-        records,
-        require_different_answers=bool(args.swapped_question_require_different_answer),
-    )
-    max_records = int(args.swapped_question_max_records)
-    owners = owners[:max_records]
-    swapped = swapped[:max_records]
-    if not owners or soft_embeds is None:
-        zero = positive_choice_nll.new_zeros(())
-        return zero, {"swapped_question_pairs": 0.0, "swapped_question_margin_mean": 0.0}
-    swapped_soft = torch.stack([soft_embeds[index] for index in swapped], dim=0)
-    selected_records = [records[index] for index in owners]
-    _loss, _answer_ce, swapped_choice_nll, _soft, _metrics = choice_ce_loss(
-        llm=llm,
-        adapter=adapter,
-        tokenizer=tokenizer,
-        records=selected_records,
-        latent_map=torch.stack([latent_map[index] for index in owners], dim=0),
-        device=device,
-        args=args,
-        soft_prompt_mode="correct",
-        precomputed_soft_embeds=swapped_soft,
-    )
-    selected_positive = torch.stack([positive_choice_nll[index] for index in owners])
-    margin = swapped_choice_nll - selected_positive
-    loss = F.relu(float(args.swapped_question_loss_margin) - margin).mean()
-    return loss, {
-        "swapped_question_pairs": float(len(owners)),
-        "swapped_question_margin_mean": float(margin.detach().mean().cpu().item()),
-    }
+    *,
+    positive_soft_embeds: torch.Tensor,
+    positive_soft_attention_mask: torch.Tensor,
+    positive_global_prompts: torch.Tensor | None,
+    positive_local_prompts: torch.Tensor | None,
+    owners: Sequence[int],
+    sources: Sequence[int],
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Swap question-conditioned evidence while retaining each owner's global tensor prefix."""
+
+    if len(owners) != len(sources):
+        raise ValueError("Question-swap owner/source lists must have equal length.")
+    if tuple(positive_soft_attention_mask.shape) != tuple(positive_soft_embeds.shape[:2]):
+        raise ValueError("Question-swap soft embeddings and attention masks do not match.")
+    preserve_global = isinstance(adapter, HybridGlobalLocalAdapter) and not adapter.residual_mode
+    if preserve_global and not (
+        isinstance(positive_global_prompts, torch.Tensor)
+        and isinstance(positive_local_prompts, torch.Tensor)
+    ):
+        raise RuntimeError(
+            "A concatenated hybrid question swap is missing captured global/local prompts."
+        )
+
+    swapped_embeds: list[torch.Tensor] = []
+    swapped_masks: list[torch.Tensor] = []
+    for owner, source in zip(owners, sources):
+        if preserve_global:
+            local_count = int(adapter.local_adapter.soft_prompt_tokens)
+            swapped_embeds.append(
+                torch.cat(
+                    [positive_local_prompts[source], positive_global_prompts[owner]],
+                    dim=0,
+                )
+            )
+            swapped_masks.append(
+                torch.cat(
+                    [
+                        positive_soft_attention_mask[source, :local_count],
+                        positive_soft_attention_mask[owner, local_count:],
+                    ],
+                    dim=0,
+                )
+            )
+        else:
+            swapped_embeds.append(positive_soft_embeds[source])
+            swapped_masks.append(positive_soft_attention_mask[source])
+    return swapped_embeds, swapped_masks
 
 
 def training_loss(
@@ -5987,7 +6398,11 @@ def training_loss(
     choice_ce_weight = 0.0 if routing_only else float(args.choice_ce_loss_weight)
     ranking_weight = 0.0 if routing_only else float(args.ranking_loss_weight)
     swapped_weight = 0.0 if routing_only else float(args.swapped_question_loss_weight)
-    routing_weight = float(args.grounding_routing_loss_weight)
+    routing_weight = float(
+        args.grounding_routing_loss_weight
+        if routing_only
+        else args.grounding_joint_routing_loss_weight
+    )
     gate_weight = float(args.grounding_gate_loss_weight)
     matched_group_weight = 0.0 if routing_only else float(args.matched_group_loss_weight)
     choice_metrics = {
@@ -6120,6 +6535,17 @@ def training_loss(
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
         )
+    positive_soft_attention_mask = choice_metrics.get("soft_attention_mask")
+    if positive_soft_embeds is not None and not isinstance(
+        positive_soft_attention_mask, torch.Tensor
+    ):
+        positive_soft_attention_mask = grounded_soft_prompt_attention_mask(
+            adapter,
+            positive_soft_embeds,
+            mode="correct",
+        )
+    positive_global_prompts = getattr(adapter, "_last_global_prompts", None)
+    positive_local_prompts = getattr(adapter, "_last_local_prompts", None)
     candidate_log_probs = choice_metrics.get("candidate_log_probs")
     if not isinstance(candidate_log_probs, Sequence) or len(candidate_log_probs) != len(records):
         raise RuntimeError("Positive restricted-choice scoring did not return candidate log-probabilities.")
@@ -6152,6 +6578,7 @@ def training_loss(
     combined_records: list[Mapping[str, Any]] = []
     combined_latents: list[torch.Tensor] = []
     combined_soft_embeds: list[torch.Tensor] = []
+    combined_soft_attention_masks: list[torch.Tensor] = []
     ranking_count = 0
     negative_mode = str(args.ranking_loss_negative)
     if ranking_weight > 0.0:
@@ -6179,6 +6606,15 @@ def training_loss(
             mode=negative_mode,
             prompt_template=str(args.prompt_template),
             precomputed_question_context=question_context,
+        )
+        negative_soft_attention_mask = (
+            grounded_soft_prompt_attention_mask(
+                adapter,
+                negative_soft_embeds,
+                mode=negative_mode,
+            )
+            if negative_soft_embeds is not None
+            else None
         )
         if negative_soft_embeds is None:
             (
@@ -6210,22 +6646,49 @@ def training_loss(
             combined_records.extend(records)
             combined_latents.extend(negative_latents)
             combined_soft_embeds.extend(negative_soft_embeds)
+            if negative_soft_attention_mask is None:
+                raise RuntimeError("A precomputed ranking prefix is missing its attention mask.")
+            combined_soft_attention_masks.extend(negative_soft_attention_mask)
 
     swap_owners: list[int] = []
     if swapped_weight > 0.0 and positive_soft_embeds is not None:
         swap_owners, swap_sources = same_state_question_swap_indices(
             records,
             require_different_answers=bool(args.swapped_question_require_different_answer),
+            max_records_per_group=int(args.swapped_question_max_records),
         )
-        max_swap_records = int(args.swapped_question_max_records)
-        swap_owners = swap_owners[:max_swap_records]
-        swap_sources = swap_sources[:max_swap_records]
-        for owner, source in zip(swap_owners, swap_sources):
+        if not isinstance(positive_soft_attention_mask, torch.Tensor):
+            raise RuntimeError("A precomputed swapped prefix is missing its attention mask.")
+        swapped_soft_embeds, swapped_soft_masks = question_swapped_soft_prefixes(
+            adapter,
+            positive_soft_embeds=positive_soft_embeds,
+            positive_soft_attention_mask=positive_soft_attention_mask,
+            positive_global_prompts=(
+                positive_global_prompts
+                if isinstance(positive_global_prompts, torch.Tensor)
+                else None
+            ),
+            positive_local_prompts=(
+                positive_local_prompts
+                if isinstance(positive_local_prompts, torch.Tensor)
+                else None
+            ),
+            owners=swap_owners,
+            sources=swap_sources,
+        )
+        for owner, swapped_soft, swapped_mask in zip(
+            swap_owners, swapped_soft_embeds, swapped_soft_masks
+        ):
             combined_records.append(records[owner])
             combined_latents.append(batch["latent_map"][owner])
-            combined_soft_embeds.append(positive_soft_embeds[source])
+            combined_soft_embeds.append(swapped_soft)
+            combined_soft_attention_masks.append(swapped_mask)
 
     if combined_records:
+        if len(combined_soft_attention_masks) != len(combined_records):
+            raise RuntimeError(
+                "Every precomputed counterfactual prefix must carry its original attention mask."
+            )
         combined_choice_nll_chunks: list[torch.Tensor] = []
         grounding_batch_size = max(1, int(args.train_grounding_batch_size))
         for start in range(0, len(combined_records), grounding_batch_size):
@@ -6233,6 +6696,9 @@ def training_loss(
             chunk_records = combined_records[start:end]
             chunk_latents = torch.stack(combined_latents[start:end], dim=0)
             chunk_soft_embeds = torch.stack(combined_soft_embeds[start:end], dim=0)
+            chunk_soft_attention_mask = torch.stack(
+                combined_soft_attention_masks[start:end], dim=0
+            )
             (
                 _chunk_loss,
                 _chunk_ce,
@@ -6249,6 +6715,7 @@ def training_loss(
                 args=args,
                 soft_prompt_mode="correct",
                 precomputed_soft_embeds=chunk_soft_embeds,
+                precomputed_soft_attention_mask=chunk_soft_attention_mask,
             )
             combined_choice_nll_chunks.append(
                 chunk_choice_nll
@@ -6274,18 +6741,6 @@ def training_loss(
                 "swapped_question_pairs": float(len(swap_owners)),
                 "swapped_question_margin_mean": float(swap_margin.detach().mean().cpu().item()),
             }
-    elif swapped_weight > 0.0:
-        swapped_loss, swapped_metrics = swapped_question_grounding_loss(
-            llm=llm,
-            adapter=adapter,
-            tokenizer=tokenizer,
-            records=records,
-            latent_map=batch["latent_map"],
-            positive_choice_nll=positive_choice_nll,
-            soft_embeds=positive_soft_embeds,
-            device=device,
-            args=args,
-        )
     weighted_ce_loss = ce_weight * ce_loss
     weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
     weighted_ranking_loss = ranking_weight * ranking_loss
@@ -6345,7 +6800,13 @@ def score_candidate_batch(
     choice_score: str,
     local_context_layer: int = 2,
     precomputed_soft_embeds: torch.Tensor | None = None,
+    precomputed_soft_attention_mask: torch.Tensor | None = None,
 ) -> list[float]:
+    require_precomputed_grounded_attention_mask(
+        adapter,
+        precomputed_soft_embeds,
+        precomputed_soft_attention_mask,
+    )
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=records,
         answers=answers,
@@ -6388,10 +6849,12 @@ def score_candidate_batch(
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=soft_prompt_mode,
         dtype=text_attention_mask.dtype,
-        device=device,
+        precomputed=precomputed_soft_attention_mask,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     soft_labels = torch.full(
@@ -6447,6 +6910,7 @@ def generate_diagnostic_answer(
     tokenizer,
     record: Mapping[str, Any],
     soft_embeds: torch.Tensor,
+    soft_attention_mask: torch.Tensor | None,
     device: torch.device,
     prompt_template: str,
     max_prompt_tokens: int,
@@ -6460,7 +6924,20 @@ def generate_diagnostic_answer(
     text_embeds = llm.get_input_embeddings()(input_ids)
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+    soft_attention = (
+        torch.ones(soft_embeds.shape[:2], dtype=torch.long, device=device)
+        if soft_attention_mask is None
+        else soft_attention_mask.to(device=device, dtype=torch.long)
+    )
+    if tuple(soft_attention.shape) != tuple(soft_embeds.shape[:2]):
+        raise ValueError(
+            "Diagnostic soft-prefix mask does not match embeddings: "
+            f"mask={tuple(soft_attention.shape)}, embeds={tuple(soft_embeds.shape[:2])}."
+        )
+    attention_mask = torch.cat(
+        [soft_attention, torch.ones(input_ids.shape, dtype=torch.long, device=device)],
+        dim=1,
+    )
     outputs = llm(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
@@ -6546,10 +7023,11 @@ def prompt_choice_label_logits(
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=mode,
         dtype=text_attention_mask.dtype,
-        device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     decoder = _decoder_for_diagnostics(llm)
@@ -6637,8 +7115,22 @@ def collect_candidate_scores(
         mode=mode,
         prompt_template=str(args.prompt_template),
     )
+    base_soft_attention_mask = (
+        grounded_soft_prompt_attention_mask(
+            adapter,
+            base_soft_embeds,
+            mode=mode,
+        )
+        if base_soft_embeds is not None
+        else None
+    )
     candidate_soft_embeds = (
         [base_soft_embeds[index] for index in candidate_owner] if base_soft_embeds is not None else None
+    )
+    candidate_soft_attention_masks = (
+        [base_soft_attention_mask[index] for index in candidate_owner]
+        if base_soft_attention_mask is not None
+        else None
     )
 
     scores_by_record: list[list[float]] = [[] for _ in records]
@@ -6665,6 +7157,11 @@ def collect_candidate_scores(
                 if candidate_soft_embeds is not None
                 else None
             ),
+            precomputed_soft_attention_mask=(
+                torch.stack(candidate_soft_attention_masks[start:end], dim=0)
+                if candidate_soft_attention_masks is not None
+                else None
+            ),
         )
         for owner, score in zip(candidate_owner[start:end], scores):
             scores_by_record[owner].append(score)
@@ -6682,7 +7179,14 @@ def baseline_latents(
     dataset: TensorReadoutQADataset,
 ) -> torch.Tensor:
     latents = batch["latent_map"]
-    if mode in {"correct", "global_only", "local_only", "no_latent", "shuffled_stats"}:
+    if mode in {
+        "correct",
+        "global_only",
+        "zero_local",
+        "local_only",
+        "no_latent",
+        "shuffled_stats",
+    }:
         return latents
     if mode == "zero_latent":
         return torch.zeros_like(latents)
@@ -7263,6 +7767,7 @@ def _decoder_question_last_hidden(
     text_mask: torch.Tensor,
     prompt_mask: torch.Tensor,
     requested_layers: Sequence[int],
+    soft_attention_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     if soft_embeds.ndim != 3 or text_embeds.ndim != 3:
         raise ValueError(
@@ -7286,17 +7791,18 @@ def _decoder_question_last_hidden(
             "one unmasked natural-language token before the answer target."
         )
     inputs = torch.cat([soft_embeds, text_embeds], dim=1)
-    attention = torch.cat(
-        [
-            torch.ones(
-                (1, int(soft_embeds.shape[1])),
-                dtype=text_mask.dtype,
-                device=text_mask.device,
-            ),
-            text_mask,
-        ],
-        dim=1,
+    soft_attention = (
+        torch.ones(
+            (1, int(soft_embeds.shape[1])),
+            dtype=text_mask.dtype,
+            device=text_mask.device,
+        )
+        if soft_attention_mask is None
+        else soft_attention_mask.to(device=text_mask.device, dtype=text_mask.dtype)
     )
+    if tuple(soft_attention.shape) != tuple(soft_embeds.shape[:2]):
+        raise ValueError("Question-last soft attention mask does not match the soft embeddings.")
+    attention = torch.cat([soft_attention, text_mask], dim=1)
     outputs = decoder(
         inputs_embeds=inputs,
         attention_mask=attention,
@@ -7450,6 +7956,12 @@ def _adapter_forward_with_trace(
                 question_mask=prompt_mask,
                 structured_query=structured_query,
             )
+        soft_attention_mask = grounded_soft_prompt_attention_mask(
+            adapter,
+            soft,
+            mode="correct",
+        )
+        trace["soft_attention_mask"] = soft_attention_mask[0].detach().cpu()
     finally:
         if isinstance(adapter, HybridGlobalLocalAdapter):
             local_latent_blocks = (
@@ -7562,8 +8074,11 @@ def _run_embedded_diagnostics_impl(
             )
             soft = soft.to(dtype=text_embeds.dtype)
             inputs = torch.cat([soft, text_embeds], dim=1)
+            soft_attention = adapter_hidden.get("soft_attention_mask")
+            if not isinstance(soft_attention, torch.Tensor):
+                raise RuntimeError("Embedded diagnostics did not preserve the soft-prefix mask.")
             attention = torch.cat(
-                [torch.ones((1, soft.shape[1]), dtype=text_mask.dtype, device=device), text_mask],
+                [soft_attention.unsqueeze(0).to(device=device, dtype=text_mask.dtype), text_mask],
                 dim=1,
             )
             outputs = decoder(
@@ -7647,6 +8162,9 @@ def _run_embedded_diagnostics_impl(
                 tokenizer=tokenizer,
                 record=record,
                 soft_embeds=mode_states[mode]["soft_prompt"].unsqueeze(0),
+                soft_attention_mask=(
+                    mode_states[mode]["adapter_hidden"]["soft_attention_mask"].unsqueeze(0)
+                ),
                 device=device,
                 prompt_template=str(args.prompt_template),
                 max_prompt_tokens=int(args.max_prompt_tokens),
@@ -7894,6 +8412,7 @@ def _run_embedded_diagnostics_impl(
                 text_mask=alt_mask,
                 prompt_mask=alt_llm_prompt_mask,
                 requested_layers=requested_layers,
+                soft_attention_mask=alt_trace["soft_attention_mask"].unsqueeze(0),
             )
             same_latent_question_last = {
                 layer: _cosine_and_relative_l2(
@@ -7964,6 +8483,9 @@ def _run_embedded_diagnostics_impl(
                 choice_score=str(args.choice_score),
                 local_context_layer=int(args.local_context_layer),
                 precomputed_soft_embeds=same_soft.unsqueeze(0).repeat(len(choices), 1, 1),
+                precomputed_soft_attention_mask=same_trace[
+                    "soft_attention_mask"
+                ].unsqueeze(0).repeat(len(choices), 1),
             )
             target_index = choices.index(answer)
             swapped_wrong_scores = [
@@ -7994,15 +8516,16 @@ def _run_embedded_diagnostics_impl(
                 ),
             }
         qa_id = str(record.get("qa_id", f"index_{index}"))
-        tensor_payload["records"][qa_id] = {
-            "input_ids": input_ids[0].detach().cpu(),
-            "text_attention_mask": text_mask[0].detach().cpu(),
-            "text_labels": text_labels[0].detach().cpu(),
-            "prompt_mask": prompt_mask[0].detach().cpu(),
-            "local_input_ids": local_ids[0].detach().cpu() if local_ids is not None else None,
-            "local_attention_mask": local_mask[0].detach().cpu() if local_mask is not None else None,
-            "modes": mode_states,
-        }
+        if bool(args.diagnostics_save_states):
+            tensor_payload["records"][qa_id] = {
+                "input_ids": input_ids[0].detach().cpu(),
+                "text_attention_mask": text_mask[0].detach().cpu(),
+                "text_labels": text_labels[0].detach().cpu(),
+                "prompt_mask": prompt_mask[0].detach().cpu(),
+                "local_input_ids": local_ids[0].detach().cpu() if local_ids is not None else None,
+                "local_attention_mask": local_mask[0].detach().cpu() if local_mask is not None else None,
+                "modes": mode_states,
+            }
         summaries.append(
             {
                 "qa_id": qa_id,
@@ -8261,15 +8784,20 @@ def _run_embedded_diagnostics_impl(
         "stage": stage,
         "aggregate": aggregate,
         "records": summaries,
-        "state_file": str(diagnostic_dir / f"{stage}_states.pt"),
-        "state_float_dtype": "float16",
+        "state_file": (
+            str(diagnostic_dir / f"{stage}_states.pt")
+            if bool(args.diagnostics_save_states)
+            else None
+        ),
+        "state_float_dtype": "float16" if bool(args.diagnostics_save_states) else None,
         "structured_query_conditioning": bool(getattr(adapter, "structured_query_conditioning", False)),
     }
     atomic_dump_json(diagnostic_dir / f"{stage}_summary.json", summary)
-    atomic_torch_save(
-        diagnostic_dir / f"{stage}_states.pt",
-        compact_diagnostic_tensors(tensor_payload),
-    )
+    if bool(args.diagnostics_save_states):
+        atomic_torch_save(
+            diagnostic_dir / f"{stage}_states.pt",
+            compact_diagnostic_tensors(tensor_payload),
+        )
     return summary
 
 
@@ -8325,6 +8853,8 @@ def save_adapter_checkpoint(
         "lineage": {
             "stage2_warm_start_checkpoint": getattr(args, "stage2_warm_start_checkpoint", None),
             "stage2_warm_start_sha256": getattr(args, "stage2_warm_start_sha256", None),
+            "stage2b_resume_checkpoint": getattr(args, "stage2b_resume_checkpoint", None),
+            "stage2b_resume_sha256": getattr(args, "stage2b_resume_sha256", None),
         },
         "metrics": dict(metrics or {}),
     }
@@ -8495,6 +9025,156 @@ def validate_adapter_checkpoint_payload(
     return state_dict
 
 
+def _validated_optional_sha256(value: Any, *, label: str) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{label} is not a valid SHA-256 digest.")
+    return normalized
+
+
+def validate_stage2b_continuation_contract(
+    resume_args: Mapping[str, Any],
+    *,
+    resume_lineage: Mapping[str, Any] | None,
+    current_args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Validate continuation semantics that strict state loading cannot see."""
+
+    resume_direct_sha = _validated_optional_sha256(
+        resume_args.get("stage2_warm_start_sha256")
+        or (resume_lineage or {}).get("stage2_warm_start_sha256"),
+        label="Stage-2B continuation direct-parent SHA",
+    )
+    current_direct_sha = _validated_optional_sha256(
+        getattr(current_args, "stage2_warm_start_sha256", None),
+        label="Configured direct-parent SHA",
+    )
+    resume_direct_path = _configured_checkpoint_path(
+        resume_args.get("stage2_warm_start_checkpoint")
+        or (resume_lineage or {}).get("stage2_warm_start_checkpoint")
+    )
+    current_direct_path = _configured_checkpoint_path(
+        getattr(current_args, "stage2_warm_start_checkpoint", None)
+    )
+    if resume_direct_sha is not None and current_direct_sha is not None:
+        if resume_direct_sha != current_direct_sha:
+            raise ValueError(
+                "Stage-2B continuation and configured run reference different "
+                "direct Stage-2 checkpoint contents."
+            )
+        direct_parent_identity = "sha256"
+    else:
+        if (
+            resume_direct_path is None
+            or current_direct_path is None
+            or resume_direct_path != current_direct_path
+        ):
+            raise ValueError(
+                "Stage-2B continuation lacks a comparable direct-parent SHA and its "
+                "resolved direct Stage-2 parent path differs from the configured run."
+            )
+        direct_parent_identity = "legacy_resolved_path"
+
+    try:
+        resume_context_layers = tuple(
+            int(value) for value in parse_csv(resume_args.get("local_context_layers"))
+        )
+        current_context_layers = tuple(
+            int(value) for value in parse_csv(current_args.local_context_layers)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stage-2B continuation has an invalid local_context_layers contract.") from exc
+
+    exact_semantics = {
+        "local_context_layers": (resume_context_layers, current_context_layers),
+        "local_soft_prompt_tokens": (
+            int(resume_args.get("local_soft_prompt_tokens", -1)),
+            int(current_args.local_soft_prompt_tokens),
+        ),
+        "adapter_dim": (
+            int(resume_args.get("adapter_dim", -1)),
+            int(current_args.adapter_dim),
+        ),
+        "adapter_heads": (
+            int(resume_args.get("adapter_heads", -1)),
+            int(current_args.adapter_heads),
+        ),
+        "local_fusion_mode": (
+            str(resume_args.get("local_fusion_mode", "")),
+            str(current_args.local_fusion_mode),
+        ),
+    }
+    mismatches = {
+        name: values for name, values in exact_semantics.items() if values[0] != values[1]
+    }
+    float_semantics = {
+        "soft_prompt_scale": (
+            float(resume_args.get("soft_prompt_scale", math.nan)),
+            float(current_args.soft_prompt_scale),
+        ),
+        "dropout": (
+            float(resume_args.get("dropout", math.nan)),
+            float(current_args.dropout),
+        ),
+    }
+    mismatches.update(
+        {
+            name: values
+            for name, values in float_semantics.items()
+            if not all(math.isfinite(value) for value in values)
+            or not math.isclose(values[0], values[1], rel_tol=0.0, abs_tol=1.0e-12)
+        }
+    )
+    if mismatches:
+        rendered = "; ".join(
+            f"{name}: checkpoint={observed!r}, active={active!r}"
+            for name, (observed, active) in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "Stage-2B continuation changes non-state reader semantics; " + rendered
+        )
+
+    resume_inactive_mask = bool(resume_args.get("mask_inactive_local_tokens", False))
+    current_inactive_mask = bool(current_args.mask_inactive_local_tokens)
+    if resume_inactive_mask and not current_inactive_mask:
+        raise ValueError(
+            "Stage-2B continuation cannot disable the checkpoint's inactive local-token mask."
+        )
+    mask_policy = (
+        "legacy_to_learned_gate_mask"
+        if current_inactive_mask and not resume_inactive_mask
+        else "unchanged"
+    )
+
+    resume_stage1_path = _configured_checkpoint_path(
+        resume_args.get("adapter_init_checkpoint")
+    )
+    current_stage1_path = _configured_checkpoint_path(
+        getattr(current_args, "adapter_init_checkpoint", None)
+    )
+    return {
+        "direct_parent_identity": direct_parent_identity,
+        "direct_parent_sha256": resume_direct_sha or current_direct_sha,
+        "resume_direct_parent_path": (
+            str(resume_direct_path) if resume_direct_path is not None else None
+        ),
+        "configured_direct_parent_path": (
+            str(current_direct_path) if current_direct_path is not None else None
+        ),
+        # Stage-1 content identity is already enforced by latent-contract SHA.
+        "stage1_parent_paths_match": resume_stage1_path == current_stage1_path,
+        "inactive_local_token_mask_policy": mask_policy,
+        "semantic_contract": {
+            **{name: observed for name, (observed, _active) in exact_semantics.items()},
+            **{name: observed for name, (observed, _active) in float_semantics.items()},
+        },
+    }
+
+
 def redacted_args(args: argparse.Namespace) -> dict[str, Any]:
     payload = dict(vars(args))
     if payload.get("wandb_api_key"):
@@ -8659,6 +9339,9 @@ def adapter_from_checkpoint(
             global_prompt_dropout=0.0,
             combine_mode="concat",
         )
+        adapter.mask_inactive_local_tokens = bool(
+            ckpt_args.get("mask_inactive_local_tokens", False)
+        )
         adapter.load_state_dict(state_dict, strict=True)
         return adapter
 
@@ -8790,6 +9473,7 @@ def add_accuracy_deltas(prefix: str, metrics: Mapping[str, Any], payload: dict[s
     correct_accuracy = float(correct["accuracy"])
     for baseline in (
         "global_only",
+        "zero_local",
         "local_only",
         "no_latent",
         "zero_latent",
@@ -8838,6 +9522,30 @@ def compact_accuracy_metrics(prefix: str, metrics: Mapping[str, Any]) -> dict[st
                 ):
                     payload[f"{prefix}/task/{task}/latent_gain"] = float(correct_task["accuracy"]) - float(
                         shuffled_task["accuracy"]
+                    )
+    if isinstance(correct, Mapping) and isinstance(correct.get("by_task"), Mapping):
+        correct_tasks = correct["by_task"]
+        for baseline in ("zero_local", "global_only", "shuffled"):
+            baseline_metrics = metrics.get(baseline)
+            baseline_tasks = (
+                baseline_metrics.get("by_task")
+                if isinstance(baseline_metrics, Mapping)
+                else None
+            )
+            if not isinstance(baseline_tasks, Mapping):
+                continue
+            for task, correct_task in correct_tasks.items():
+                baseline_task = baseline_tasks.get(task)
+                if (
+                    isinstance(correct_task, Mapping)
+                    and isinstance(baseline_task, Mapping)
+                    and isinstance(correct_task.get("accuracy"), (int, float))
+                    and isinstance(baseline_task.get("accuracy"), (int, float))
+                ):
+                    payload[
+                        f"{prefix}/task/{task}/correct_minus_{baseline}_accuracy"
+                    ] = float(correct_task["accuracy"]) - float(
+                        baseline_task["accuracy"]
                     )
     add_accuracy_deltas(prefix, metrics, payload)
     return payload
@@ -8908,6 +9616,7 @@ def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
         "normalized_point_latent_gain",
         "point_value_min_latent_gain",
         "point_value_min_grounded_gain",
+        "point_value_min_causal_gain",
     }:
         correct = metrics.get("correct")
         shuffled = metrics.get("shuffled")
@@ -8918,13 +9627,21 @@ def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
         if not isinstance(correct_tasks, Mapping) or not isinstance(shuffled_tasks, Mapping):
             return -math.inf
         global_tasks: Mapping[str, Any] | None = None
-        if metric_name == "point_value_min_grounded_gain":
+        if metric_name in {"point_value_min_grounded_gain", "point_value_min_causal_gain"}:
             global_only = metrics.get("global_only")
             if not isinstance(global_only, Mapping) or not isinstance(
                 global_only.get("by_task"), Mapping
             ):
                 return -math.inf
             global_tasks = global_only["by_task"]
+        zero_local_tasks: Mapping[str, Any] | None = None
+        if metric_name == "point_value_min_causal_gain":
+            zero_local = metrics.get("zero_local")
+            if not isinstance(zero_local, Mapping) or not isinstance(
+                zero_local.get("by_task"), Mapping
+            ):
+                return -math.inf
+            zero_local_tasks = zero_local["by_task"]
 
         def gain(task: str) -> float:
             correct_task = correct_tasks.get(task)
@@ -8937,6 +9654,11 @@ def checkpoint_score(metrics: Mapping[str, Any], metric_name: str) -> float:
                 if not isinstance(global_task, Mapping):
                     return -math.inf
                 baselines.append(float(global_task.get("accuracy", math.inf)))
+            if zero_local_tasks is not None:
+                zero_local_task = zero_local_tasks.get(task)
+                if not isinstance(zero_local_task, Mapping):
+                    return -math.inf
+                baselines.append(float(zero_local_task.get("accuracy", math.inf)))
             return float(correct_task.get("accuracy", -math.inf)) - max(baselines)
 
         normalized_gain = gain("normalized_point_value")
@@ -9042,6 +9764,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "max_train_records": args.max_train_records,
             "max_val_records": args.max_val_records,
             "max_test_records": args.max_test_records,
+            "record_subset_mode": str(args.record_subset_mode),
             "initial_eval_records": int(args.initial_eval_records),
             "require_disjoint_splits": bool(args.require_disjoint_splits),
             "require_untruncated_prompts": bool(args.require_untruncated_prompts),
@@ -9056,6 +9779,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "architecture": str(args.adapter_architecture),
             "init_checkpoint": args.adapter_init_checkpoint,
             "stage2_warm_start_checkpoint": args.stage2_warm_start_checkpoint,
+            "stage2b_resume_checkpoint": args.stage2b_resume_checkpoint,
             "soft_prompt_tokens": int(args.soft_prompt_tokens),
             "adapter_dim": int(args.adapter_dim),
             "adapter_layers": int(args.adapter_layers),
@@ -9083,6 +9807,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "global_unfreeze_epoch": int(args.global_unfreeze_epoch),
             "global_lr": float(args.global_lr),
             "global_prompt_dropout": float(args.global_prompt_dropout),
+            "mask_inactive_local_tokens": bool(args.mask_inactive_local_tokens),
             "global_dropout": float(getattr(args, "global_dropout", args.dropout)),
             "global_soft_prompt_scale": float(
                 getattr(args, "global_soft_prompt_scale", args.soft_prompt_scale)
@@ -9118,6 +9843,9 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
             "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
             "grounding_routing_loss_weight": float(args.grounding_routing_loss_weight),
+            "grounding_joint_routing_loss_weight": float(
+                args.grounding_joint_routing_loss_weight
+            ),
             "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
             "matched_group_loss_weight": float(args.matched_group_loss_weight),
             "matched_group_loss_margin": float(args.matched_group_loss_margin),
@@ -9136,12 +9864,14 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "log_interval": int(args.log_interval),
             "console_progress": bool(args.console_progress),
             "save_step_metrics": bool(args.save_step_metrics),
+            "evaluate_test": bool(args.evaluate_test),
             "group_questions_by_state": bool(args.group_questions_by_state),
             "questions_per_state_group": int(args.questions_per_state_group),
             "diagnostics": {
                 "enabled": bool(args.diagnostics_enabled),
                 "every_epochs": int(args.diagnostics_every_epochs),
                 "records_per_task": int(args.diagnostics_records_per_task),
+                "save_states": bool(args.diagnostics_save_states),
                 "generation_max_new_tokens": int(args.diagnostics_generation_max_new_tokens),
                 "layers": parse_csv(args.diagnostics_layers),
             },
@@ -9265,6 +9995,8 @@ def main() -> None:
         qa_path(args.qa_dir, args.train_split),
         latent_dir=args.latent_dir,
         max_records=args.max_train_records,
+        subset_mode=str(args.record_subset_mode),
+        subset_seed=int(args.shuffle_seed),
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
@@ -9274,6 +10006,8 @@ def main() -> None:
         qa_path(args.qa_dir, args.val_split),
         latent_dir=args.latent_dir,
         max_records=args.max_val_records,
+        subset_mode=str(args.record_subset_mode),
+        subset_seed=int(args.shuffle_seed) + 1,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
@@ -9283,6 +10017,8 @@ def main() -> None:
         qa_path(args.qa_dir, args.test_split),
         latent_dir=args.latent_dir,
         max_records=args.max_test_records,
+        subset_mode=str(args.record_subset_mode),
+        subset_seed=int(args.shuffle_seed) + 2,
         prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
@@ -9774,13 +10510,61 @@ def main() -> None:
                 global_prompt_dropout=0.0,
                 combine_mode="concat",
             ).to(device)
+            resume_path = str(args.stage2b_resume_checkpoint or "").strip()
+            resume_report: dict[str, Any] = {}
+            grounded_reader_initialized = True
+            if resume_path:
+                resume_checkpoint = torch.load(
+                    Path(resume_path).expanduser(),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                resume_state = validate_adapter_checkpoint_payload(
+                    resume_checkpoint,
+                    expected_latent_shape=latent_shape,
+                    expected_llm_hidden_size=llm_hidden_size,
+                    expected_architecture="grounded_evidence_adapter",
+                    expected_latent_contract=latent_contract or {},
+                )
+                resume_args = resume_checkpoint.get("args")
+                if not isinstance(resume_args, Mapping):
+                    raise ValueError(
+                        "Stage-2B continuation checkpoint is missing its argument contract."
+                    )
+                validate_stage1_model_identity(resume_args, args.model_name_or_path)
+                raw_resume_lineage = resume_checkpoint.get("lineage")
+                continuation_contract = validate_stage2b_continuation_contract(
+                    resume_args,
+                    resume_lineage=(
+                        raw_resume_lineage
+                        if isinstance(raw_resume_lineage, Mapping)
+                        else None
+                    ),
+                    current_args=args,
+                )
+                adapter.load_state_dict(resume_state, strict=True)
+                args.stage2b_resume_checkpoint = str(
+                    Path(resume_path).expanduser().resolve()
+                )
+                args.stage2b_resume_sha256 = sha256_file(Path(resume_path).expanduser())
+                grounded_reader_initialized = False
+                resume_report = {
+                    "stage2b_resume_checkpoint": args.stage2b_resume_checkpoint,
+                    "stage2b_resume_sha256": args.stage2b_resume_sha256,
+                    "stage2b_resume_strict_load": True,
+                    "stage2b_resume_parent_epoch": resume_checkpoint.get("epoch"),
+                    "stage2b_resume_contract": continuation_contract,
+                }
+                initialization = "strict_grounded_stage2b_continuation"
+                del resume_args, resume_state, resume_checkpoint
             checkpoint_load_report.update(
                 {
-                    "grounded_reader_initialized": True,
+                    "grounded_reader_initialized": grounded_reader_initialized,
                     "grounded_reader_parameters": sum(
                         int(parameter.numel()) for parameter in local_adapter.parameters()
                     ),
                     "global_adapter_frozen": True,
+                    **resume_report,
                 }
             )
             args.soft_prompt_tokens = int(adapter.soft_prompt_tokens)
@@ -9916,6 +10700,8 @@ def main() -> None:
             soft_prompt_scale=float(args.soft_prompt_scale),
         ).to(device)
 
+    if isinstance(adapter, HybridGlobalLocalAdapter):
+        adapter.mask_inactive_local_tokens = bool(args.mask_inactive_local_tokens)
     synchronize_module_from_rank_zero(adapter)
     if isinstance(adapter, HybridGlobalLocalAdapter) and isinstance(
         adapter.local_adapter, ResidualQuestionConditionedAdapter
@@ -10127,6 +10913,7 @@ def main() -> None:
             "latent_cache_budget_scope": "per_rank_shared_across_workers",
         },
         "shuffle_seed": int(args.shuffle_seed),
+        "record_subset_mode": str(args.record_subset_mode),
         "shuffled_baseline_policy": "same_field_task_different_sample_then_fallback",
         "ce_loss_weight": float(args.ce_loss_weight),
         "choice_ce_loss_weight": float(args.choice_ce_loss_weight),
@@ -10136,6 +10923,9 @@ def main() -> None:
         "swapped_question_loss_weight": float(args.swapped_question_loss_weight),
         "swapped_question_loss_margin": float(args.swapped_question_loss_margin),
         "grounding_routing_loss_weight": float(args.grounding_routing_loss_weight),
+        "grounding_joint_routing_loss_weight": float(
+            args.grounding_joint_routing_loss_weight
+        ),
         "grounding_gate_loss_weight": float(args.grounding_gate_loss_weight),
         "matched_group_loss_weight": float(args.matched_group_loss_weight),
         "matched_group_loss_margin": float(args.matched_group_loss_margin),
@@ -10172,6 +10962,7 @@ def main() -> None:
         "local_fusion_mode": str(args.local_fusion_mode),
         "grounded_reader_geometry_initial": grounded_reader_geometry_metrics(adapter),
         "soft_prompt_scale": float(args.soft_prompt_scale),
+        "mask_inactive_local_tokens": bool(args.mask_inactive_local_tokens),
         "adapter_architecture": str(args.adapter_architecture),
         "global_adapter_type": str(getattr(args, "global_adapter_type", "legacy")),
         "adapter_initialization": initialization,
@@ -10180,6 +10971,10 @@ def main() -> None:
             str(args.stage2_warm_start_checkpoint) if args.stage2_warm_start_checkpoint else None
         ),
         "stage2_warm_start_sha256": getattr(args, "stage2_warm_start_sha256", None),
+        "stage2b_resume_checkpoint": (
+            str(args.stage2b_resume_checkpoint) if args.stage2b_resume_checkpoint else None
+        ),
+        "stage2b_resume_sha256": getattr(args, "stage2b_resume_sha256", None),
         "local_soft_prompt_tokens": int(args.local_soft_prompt_tokens),
         "local_adapter_layers": int(args.local_adapter_layers),
         "local_text_encoder_layers": int(args.local_text_encoder_layers),
@@ -10206,6 +11001,8 @@ def main() -> None:
         ),
         "checkpoint_metric": str(args.checkpoint_metric),
         "diagnostics_generation_max_new_tokens": int(args.diagnostics_generation_max_new_tokens),
+        "diagnostics_save_states": bool(args.diagnostics_save_states),
+        "evaluate_test": bool(args.evaluate_test),
         "checkpoint_load_report": checkpoint_load_report,
         "optimizer_parameter_audit": optimizer_audit,
         "qa_metadata_audit": qa_metadata_audit,
@@ -10287,6 +11084,8 @@ def main() -> None:
                 qa_path(args.qa_dir, args.val_split),
                 latent_dir=args.latent_dir,
                 max_records=initial_count,
+                subset_mode=str(args.record_subset_mode),
+                subset_seed=int(args.shuffle_seed) + 1,
                 prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
                 shuffle_seed=int(args.shuffle_seed),
                 latent_cache_size=int(args.latent_cache_size),
@@ -10302,6 +11101,17 @@ def main() -> None:
                 baseline_modes=baseline_modes,
             )
             history["initial_eval"] = initial_metrics
+            continuation_routing_audit: dict[str, Any] | None = None
+            if (
+                str(args.adapter_architecture) == "grounded_evidence_adapter"
+                and bool(args.stage2b_resume_checkpoint)
+                and int(args.grounding_routing_warmup_epochs) == 0
+            ):
+                continuation_routing_audit = grounded_routing_warmup_audit(
+                    initial_metrics,
+                    args,
+                )
+                history["continuation_routing_audit"] = continuation_routing_audit
             metrics_path = run_dir / "metrics_latest.json"
             run_on_rank_zero_and_broadcast(
                 lambda: atomic_dump_json(metrics_path, history),
@@ -10312,6 +11122,16 @@ def main() -> None:
                 if bool(args.wandb_detailed_metrics)
                 else compact_accuracy_metrics("initial_eval", initial_metrics)
             )
+            if continuation_routing_audit is not None:
+                initial_payload["continuation_routing_audit/passed"] = float(
+                    bool(continuation_routing_audit["passed"])
+                )
+                initial_payload.update(
+                    {
+                        f"continuation_routing_audit/{name}": float(value)
+                        for name, value in continuation_routing_audit["observed"].items()
+                    }
+                )
             log_wandb_on_rank_zero(
                 wandb_logger,
                 initial_payload,
@@ -10320,6 +11140,22 @@ def main() -> None:
             )
             if is_main_process():
                 print_evaluation_summary("initial_eval", initial_metrics, metrics_path)
+                if continuation_routing_audit is not None:
+                    print(
+                        "continuation_routing_audit="
+                        f"{'passed' if continuation_routing_audit['passed'] else 'failed'} "
+                        f"failed={','.join(continuation_routing_audit['failed']) or 'none'}"
+                    )
+            if continuation_routing_audit is not None and not bool(
+                continuation_routing_audit["passed"]
+            ):
+                failed = ",".join(
+                    str(value) for value in continuation_routing_audit["failed"]
+                )
+                raise RuntimeError(
+                    "The Stage-2B continuation failed its held-out routing/gate audit "
+                    f"({failed}); no optimizer step was taken."
+                )
             if bool(args.diagnostics_enabled):
                 pretrain_diagnostic_aggregate = run_on_rank_zero_and_broadcast(
                     lambda: run_embedded_diagnostics(
@@ -11448,47 +12284,58 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
         adapter = reloaded_adapter.to(device)
+        if isinstance(adapter, HybridGlobalLocalAdapter):
+            adapter.mask_inactive_local_tokens = bool(args.mask_inactive_local_tokens)
         del reloaded_adapter
-        if is_main_process():
-            print(
-                f"testing best checkpoint: epoch={best_epoch} "
-                f"{args.checkpoint_metric}={best_val_score:.6f}"
+        test_metrics: dict[str, Any] = {}
+        if bool(args.evaluate_test):
+            if is_main_process():
+                print(
+                    f"testing best checkpoint: epoch={best_epoch} "
+                    f"{args.checkpoint_metric}={best_val_score:.6f}"
+                )
+            test_metrics = evaluate_choice_accuracy(
+                llm=llm,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                dataset=test_dataset,
+                device=device,
+                args=args,
+                baseline_modes=final_baseline_modes,
             )
-        test_metrics = evaluate_choice_accuracy(
-            llm=llm,
-            adapter=adapter,
-            tokenizer=tokenizer,
-            dataset=test_dataset,
-            device=device,
-            args=args,
-            baseline_modes=final_baseline_modes,
-        )
-        run_on_rank_zero_and_broadcast(
-            lambda: atomic_dump_json(run_dir / "test_metrics.json", test_metrics),
-            "test metrics write",
-        )
-        test_payload = (
-            flatten_numeric_metrics("test", test_metrics)
-            if bool(args.wandb_detailed_metrics)
-            else compact_accuracy_metrics("test", test_metrics)
-        )
-        log_wandb_on_rank_zero(
-            wandb_logger,
-            test_payload,
-            step=global_step + 1,
-            stage="test evaluation W&B log",
-        )
+            run_on_rank_zero_and_broadcast(
+                lambda: atomic_dump_json(run_dir / "test_metrics.json", test_metrics),
+                "test metrics write",
+            )
+            test_payload = (
+                flatten_numeric_metrics("test", test_metrics)
+                if bool(args.wandb_detailed_metrics)
+                else compact_accuracy_metrics("test", test_metrics)
+            )
+            log_wandb_on_rank_zero(
+                wandb_logger,
+                test_payload,
+                step=global_step + 1,
+                stage="test evaluation W&B log",
+            )
+        elif is_main_process():
+            print("test evaluation skipped by llm_training.evaluate_test=false")
 
         def write_final_outputs() -> None:
             summary["result"] = {
                 "best_epoch": int(best_epoch),
                 "best_val_score": float(best_val_score),
                 "checkpoint_metric": str(args.checkpoint_metric),
-                "test_correct_accuracy": float(
-                    test_metrics.get("correct", {}).get("accuracy", 0.0)
+                "test_evaluated": bool(args.evaluate_test),
+                "test_correct_accuracy": (
+                    float(test_metrics.get("correct", {}).get("accuracy", 0.0))
+                    if bool(args.evaluate_test)
+                    else None
                 ),
-                "test_shuffled_accuracy": float(
-                    test_metrics.get("shuffled", {}).get("accuracy", 0.0)
+                "test_shuffled_accuracy": (
+                    float(test_metrics.get("shuffled", {}).get("accuracy", 0.0))
+                    if bool(args.evaluate_test)
+                    else None
                 ),
                 "test_correct_by_task": dict(
                     test_metrics.get("correct", {}).get("by_task", {})
@@ -11510,7 +12357,8 @@ def main() -> None:
         run_on_rank_zero_and_broadcast(write_final_outputs, "final run outputs write")
         if is_main_process():
             print(f"run_dir: {run_dir}")
-            print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
+            if bool(args.evaluate_test):
+                print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
     finally:
         wandb_logger.finish()
     distributed_barrier()

@@ -59,6 +59,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     audit_qa_metadata,
     build_prompt,
     contextual_adapter_soft_embeds,
+    grounded_soft_prompt_attention_mask,
     last_nonpadding_indices,
     load_tokenizer_and_llm,
     model_identifier_leaf,
@@ -664,10 +665,11 @@ def formal_candidate_logits(
         )
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (input_ids.shape[0], soft_embeds.shape[1]),
+    soft_attention = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode="correct",
         dtype=text_attention_mask.dtype,
-        device=device,
     )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     decoder = _decoder_for_diagnostics(llm)

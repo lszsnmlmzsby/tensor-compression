@@ -367,6 +367,9 @@ adapter:
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   # Warm-start the frozen global branch from the completed direct Stage-2 run.
   stage2_warm_start_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
+  # Small causal-reader experiment: continue from the latest grounded best checkpoint.
+  # The later formal run should use the same parent independently, not the small-run child checkpoint.
+  stage2b_resume_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260726_043915_tensor_patch_qa_stage2b_grounded_evidence_autodl/adapter_best.pt
   soft_prompt_tokens: 256
   adapter_dim: 512
   adapter_layers: 2
@@ -405,18 +408,23 @@ adapter:
   # Keep the frozen 256-token reference present in every formal Stage-2B forward.
   global_prompt_dropout: 0.0
   soft_prompt_scale: 0.05
+  # Visibility is predicted from the natural-language-conditioned learned gate only.
+  mask_inactive_local_tokens: true
 
 llm_training:
-  run_name: tensor_patch_qa_stage2b_grounded_evidence_autodl
+  run_name: tensor_patch_qa_stage2b_causal_reader_small_autodl
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
   test_split: test
-  max_train_records: null
+  # Deterministic complete-state subset (1600 states x 9 records) for the one required small run.
+  max_train_records: 14400
   max_val_records: null
   max_test_records: null
-  # Preflight the combined and exact global_only paths before training without paying for a full split.
-  initial_eval_records: 256
+  record_subset_mode: hash_state
+  # A fixed 2000-record (200-state, two variants per task) validation slice audits continuation routing
+  # before training. Epoch-end model selection still uses the complete validation split.
+  initial_eval_records: 2000
   # Formal train/val/test splits must not share PDEBench sample_index values.
   require_disjoint_splits: true
   # Fail instead of silently truncating any natural-language instruction or query.
@@ -440,15 +448,15 @@ llm_training:
   device: auto
   torch_dtype: bfloat16
   shuffle_seed: 42
-  # Epoch 1 trains only text-to-row/column routing through shallow frozen-Qwen layers. The
-  # expensive answer objective starts only after held-out routing passes the thresholds below.
-  epochs: 2
-  grounding_routing_warmup_epochs: 1
-  grounding_warmup_min_cell_top1: 0.90
-  grounding_warmup_min_cell_top5: 0.98
-  grounding_warmup_min_axis_top1: 0.95
-  grounding_warmup_min_target_mass: 0.50
-  grounding_warmup_min_gate_accuracy: 0.95
+  # The continuation checkpoint already passed held-out routing/gate audits; this run spends its
+  # single epoch on the answer objective. A fresh-reader run must restore one routing warmup epoch.
+  epochs: 1
+  grounding_routing_warmup_epochs: 0
+  grounding_warmup_min_cell_top1: 0.99
+  grounding_warmup_min_cell_top5: 0.99
+  grounding_warmup_min_axis_top1: 0.99
+  grounding_warmup_min_target_mass: 0.99
+  grounding_warmup_min_gate_accuracy: 0.99
   # Tunable per-GPU microbatch. Each matched task unit has three records, so use 3, 6, 9, ...;
   # the grouped sampler packs that many complete units without splitting one across forwards.
   batch_size: 3
@@ -469,9 +477,9 @@ llm_training:
   gradient_accumulation_steps: 1
   # Only the small grounded reader trains; Qwen and the direct global adapter remain frozen.
   lr: 5.0e-5
-  lr_scheduler: constant
-  warmup_ratio: 0.0
-  min_lr_ratio: 1.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.2
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
   ce_loss_weight: 0.02
@@ -479,31 +487,35 @@ llm_training:
   ranking_loss_weight: 0.0
   ranking_loss_margin: 0.1
   grounding_routing_loss_weight: 1.0
+  # Keep routing as a low-weight generalization anchor after its dedicated warmup has converged.
+  grounding_joint_routing_loss_weight: 0.1
   grounding_gate_loss_weight: 0.1
   matched_group_loss_weight: 0.2
   matched_group_loss_margin: 0.5
   # Compare the correct tensor prefix with a same-length zero-information prefix. A shuffled PDE tensor
   # is not a reliable negative: its answer can legitimately equal the current record's answer.
   ranking_loss_negative: no_latent
-  # Explicit matched-coordinate and role-swap groups provide the counterfactual supervision;
-  # disable the generic swap objective to avoid duplicating expensive frozen-Qwen forwards.
-  swapped_question_loss_weight: 0.0
+  # Small-run-only probe: swap local evidence within an audited matched coordinate group while
+  # preserving the owner's frozen global prefix. Disable in the formal run if gain does not justify cost.
+  swapped_question_loss_weight: 0.1
   swapped_question_loss_margin: 0.1
   # Same-label swaps are semantically ambiguous, especially for balanced binary tasks.
   swapped_question_require_different_answer: true
-  # Bound the extra frozen-LLM scoring graph to the current same-tensor group.
+  # Per matched group, independent of the tunable outer microbatch size.
   swapped_question_max_records: 3
   prompt_template: task_specific
   max_prompt_tokens: 512
   max_target_tokens: 8
   append_eos: true
-  # Keep per-epoch evaluation cheap; run the full baseline set once on the final best checkpoint.
+  # Keep epoch-end validation focused; the accepted formal run uses the full final baseline set on test.
   eval_baselines:
     - correct
+    - zero_local
     - global_only
     - shuffled
   final_eval_baselines:
     - correct
+    - zero_local
     - global_only
     - no_latent
     - zero_latent
@@ -515,17 +527,23 @@ llm_training:
   # Group different natural-language questions for the same tensor and operation inside each batch.
   group_questions_by_state: true
   questions_per_state_group: 3
-  # Select the weaker point task and require the grounded path to beat both the frozen
-  # global-only branch and a same-query shuffled tensor.
-  checkpoint_metric: point_value_min_grounded_gain
+  # Select the weaker point task and require correct evidence to beat the same-length
+  # zero-local control, frozen global-only branch, and same-query shuffled tensor.
+  # Promote this recipe only when both point-task causal gains are positive and no
+  # non-point validation task drops by more than 1 percentage point versus its parent.
+  checkpoint_metric: point_value_min_causal_gain
   log_interval: 20
   # Preserve local curves even when W&B is unavailable on the training server.
   console_progress: false
   save_step_metrics: true
+  # Model selection uses validation only; reserve test for the accepted formal configuration.
+  evaluate_test: false
   diagnostics:
     enabled: true
     every_epochs: 1
     records_per_task: 4
+    # JSON summaries retain all decision metrics; raw hidden snapshots previously cost ~1 GiB/run.
+    save_states: false
     # Greedy free generation is diagnostic only; candidate NLL remains the formal accuracy metric.
     generation_max_new_tokens: 8
     layers: [0, 2, 8, 14, -1]

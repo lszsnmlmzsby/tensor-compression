@@ -32,6 +32,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     apply_runtime_environment,
     build_text_tensors,
     contextual_adapter_soft_embeds,
+    grounded_soft_prompt_attention_mask,
     load_tokenizer_and_llm,
     qa_path,
     score_candidate_batch,
@@ -190,7 +191,7 @@ def soft_prompt_for_record(
     args: argparse.Namespace,
     device: torch.device,
     mode: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     answer = str(record["answer"])
     input_ids, text_attention_mask, text_labels = build_text_tensors(
         records=[record],
@@ -228,23 +229,34 @@ def soft_prompt_for_record(
             records=[record],
             mode=mode,
         )
-    return soft_embeds, text_embeds, text_attention_mask, text_labels
+    soft_attention_mask = grounded_soft_prompt_attention_mask(
+        adapter,
+        soft_embeds,
+        mode=mode,
+        dtype=text_attention_mask.dtype,
+    )
+    return soft_embeds, soft_attention_mask, text_embeds, text_attention_mask, text_labels
 
 
 @torch.no_grad()
 def hidden_state_summary(
     llm,
     soft_embeds: torch.Tensor,
+    soft_attention_mask: torch.Tensor,
     text_embeds: torch.Tensor,
     text_attention_mask: torch.Tensor,
     layer_indices: Sequence[int],
 ) -> dict[str, Any]:
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = torch.ones(
-        (text_attention_mask.shape[0], soft_embeds.shape[1]),
-        dtype=text_attention_mask.dtype,
+    soft_attention = soft_attention_mask.to(
         device=text_attention_mask.device,
+        dtype=text_attention_mask.dtype,
     )
+    if tuple(soft_attention.shape) != tuple(soft_embeds.shape[:2]):
+        raise ValueError(
+            "Diagnostic soft-prefix mask does not match embeddings: "
+            f"mask={tuple(soft_attention.shape)}, embeds={tuple(soft_embeds.shape[:2])}."
+        )
     attention_mask = torch.cat([soft_attention, text_attention_mask], dim=1)
     outputs = llm(
         inputs_embeds=inputs_embeds,
@@ -358,7 +370,13 @@ def main() -> None:
             shuffled_record = dataset.shuffled_record_for_index(index)
             shuffled_latent = dataset.load_latent_for_record(shuffled_record)
 
-            correct_soft, text_embeds, text_attention_mask, _text_labels = soft_prompt_for_record(
+            (
+                correct_soft,
+                correct_soft_attention_mask,
+                text_embeds,
+                text_attention_mask,
+                _text_labels,
+            ) = soft_prompt_for_record(
                 llm=llm,
                 adapter=adapter,
                 tokenizer=tokenizer,
@@ -368,7 +386,13 @@ def main() -> None:
                 device=device,
                 mode="correct",
             )
-            shuffled_soft, _text_embeds, _mask, _labels = soft_prompt_for_record(
+            (
+                shuffled_soft,
+                _soft_mask,
+                _text_embeds,
+                _mask,
+                _labels,
+            ) = soft_prompt_for_record(
                 llm=llm,
                 adapter=adapter,
                 tokenizer=tokenizer,
@@ -378,7 +402,13 @@ def main() -> None:
                 device=device,
                 mode="shuffled",
             )
-            zero_soft, _text_embeds, _mask, _labels = soft_prompt_for_record(
+            (
+                zero_soft,
+                _soft_mask,
+                _text_embeds,
+                _mask,
+                _labels,
+            ) = soft_prompt_for_record(
                 llm=llm,
                 adapter=adapter,
                 tokenizer=tokenizer,
@@ -396,6 +426,7 @@ def main() -> None:
                 hidden_summary = hidden_state_summary(
                     llm=llm,
                     soft_embeds=correct_soft,
+                    soft_attention_mask=correct_soft_attention_mask,
                     text_embeds=text_embeds,
                     text_attention_mask=text_attention_mask,
                     layer_indices=layer_indices,
