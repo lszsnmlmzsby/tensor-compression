@@ -2898,6 +2898,50 @@ def audit_qa_datasets(
     return summary
 
 
+JOINT_RUN_SCOPES = ("screening", "formal")
+
+
+def apply_joint_run_scope_overrides(
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Resolve the joint small/formal profile before normal config defaults.
+
+    The formal profile lives beside the screening configuration so every model,
+    loss, and data-contract setting remains shared.  Only explicitly listed
+    ``formal_overrides`` are replaced, including an explicit YAML ``null`` used
+    to select the complete training split.
+    """
+
+    raw_training = config.get("llm_training")
+    training = raw_training if isinstance(raw_training, Mapping) else {}
+    requested = str(
+        getattr(args, "joint_run_scope", None)
+        or training.get("joint_run_scope")
+        or "screening"
+    )
+    if requested not in JOINT_RUN_SCOPES:
+        raise ValueError(
+            "llm_training.joint_run_scope must be one of "
+            f"{', '.join(JOINT_RUN_SCOPES)}, got {requested!r}."
+        )
+    resolved = copy.deepcopy(dict(config))
+    resolved_training = copy.deepcopy(dict(training))
+    if requested == "formal":
+        overrides = training.get("formal_overrides")
+        if not isinstance(overrides, Mapping) or not overrides:
+            raise ValueError(
+                "joint_run_scope=formal requires a non-empty "
+                "llm_training.formal_overrides mapping."
+            )
+        for name, value in overrides.items():
+            resolved_training[str(name)] = copy.deepcopy(value)
+    resolved_training["joint_run_scope"] = requested
+    resolved["llm_training"] = resolved_training
+    args.joint_run_scope = requested
+    return resolved
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a soft-prompt adapter from cached tensor latents into a frozen causal LM."
@@ -3022,6 +3066,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Train global-only A and grounded hybrid B views with disjoint gradient ownership.",
+    )
+    parser.add_argument(
+        "--joint-run-scope",
+        choices=JOINT_RUN_SCOPES,
+        default=None,
+        help=(
+            "Use the fixed-subset screening profile or the full-data formal profile. "
+            "Formal mode evaluates test only after validation admission."
+        ),
     )
     parser.add_argument(
         "--task-balanced-answer-loss",
@@ -3273,7 +3326,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    config = load_yaml_mapping(args.config)
+    config = apply_joint_run_scope_overrides(load_yaml_mapping(args.config), args)
     configured_architecture = str(
         args.adapter_architecture
         or first_nested(config, ["adapter.architecture"])
@@ -3906,6 +3959,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"llm_training.{setting} must be finite and in [0, 1].")
         if bool(args.joint_ab_training):
+            joint_run_scope = str(args.joint_run_scope)
             if not str(args.stage2b_resume_checkpoint or "").strip():
                 raise ValueError("joint_ab_training requires adapter.stage2b_resume_checkpoint.")
             if bool(args.freeze_global_adapter):
@@ -3939,13 +3993,43 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
                 )
             if int(args.epochs) != 1:
                 raise ValueError(
-                    "The joint A/B screening schedule currently requires exactly one epoch."
+                    "The joint A/B large-data/small-epoch schedule requires exactly one epoch."
                 )
-            if bool(args.evaluate_test):
-                raise ValueError(
-                    "The joint A/B small experiment must keep evaluate_test=false until a "
-                    "candidate passes full-validation admission."
-                )
+            if joint_run_scope == "screening":
+                if bool(args.evaluate_test):
+                    raise ValueError(
+                        "The joint A/B screening experiment must keep evaluate_test=false."
+                    )
+                if args.max_train_records is None or int(args.max_train_records) <= 0:
+                    raise ValueError(
+                        "joint_run_scope=screening requires a positive max_train_records subset."
+                    )
+            elif joint_run_scope == "formal":
+                if not bool(args.evaluate_test):
+                    raise ValueError(
+                        "joint_run_scope=formal requires evaluate_test=true; test is still "
+                        "gated on full-validation admission."
+                    )
+                if any(
+                    value is not None
+                    for value in (
+                        args.max_train_records,
+                        args.max_val_records,
+                        args.max_test_records,
+                    )
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires complete train/val/test splits "
+                        "(all max_*_records values must be null)."
+                    )
+                if not bool(args.require_disjoint_splits) or not bool(
+                    args.require_untruncated_prompts
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires disjoint splits and untruncated prompts."
+                    )
+            else:  # pragma: no cover - resolved before defaults
+                raise ValueError(f"Unsupported joint_run_scope={joint_run_scope!r}.")
             if not bool(args.task_balanced_answer_loss):
                 raise ValueError("joint_ab_training requires task_balanced_answer_loss=true.")
             for setting in (
@@ -3969,6 +4053,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(
                 "grounded_evidence_adapter may unfreeze global only through joint_ab_training."
             )
+        elif str(args.joint_run_scope) == "formal":
+            raise ValueError("joint_run_scope=formal requires joint_ab_training=true.")
     elif int(args.grounding_routing_warmup_epochs) != 0:
         raise ValueError(
             "grounding_routing_warmup_epochs is only valid for grounded_evidence_adapter."
@@ -10473,6 +10559,21 @@ def joint_ab_checkpoint_metrics(
     }
 
 
+def resolve_test_evaluation_policy(
+    *,
+    requested: bool,
+    joint_ab_training: bool,
+    joint_selected_accepted: bool | None,
+) -> tuple[bool, str | None]:
+    """Gate formal test access on validation-only joint admission."""
+
+    if not bool(requested):
+        return False, "evaluate_test_disabled"
+    if bool(joint_ab_training) and joint_selected_accepted is not True:
+        return False, "full_validation_admission_rejected"
+    return True, None
+
+
 def checkpoint_score(
     metrics: Mapping[str, Any],
     metric_name: str,
@@ -10633,6 +10734,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "checkpoint_updates",
             "checkpoint_fractions",
             "task_loss_weights",
+            "joint_run_scope",
         )
         if key in raw_summary
     }
@@ -10698,6 +10800,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "soft_prompt_scale": float(args.soft_prompt_scale),
         },
         "llm_training": {
+            "joint_run_scope": str(args.joint_run_scope),
             "prompt_template": str(args.prompt_template),
             "epochs": int(args.epochs),
             "grounding_routing_warmup_epochs": int(args.grounding_routing_warmup_epochs),
@@ -11879,6 +11982,7 @@ def main() -> None:
         "matched_group_loss_weight": float(args.matched_group_loss_weight),
         "matched_group_loss_margin": float(args.matched_group_loss_margin),
         "joint_ab_training": bool(args.joint_ab_training),
+        "joint_run_scope": str(args.joint_run_scope),
         "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
         "global_view_loss_weight": float(args.global_view_loss_weight),
         "joint_no_harm_loss_weight": float(args.joint_no_harm_loss_weight),
@@ -12042,6 +12146,7 @@ def main() -> None:
     best_val_score = -math.inf
     best_epoch = 0
     selected_checkpoint_path = run_dir / "adapter_best.pt"
+    joint_selected_accepted: bool | None = None
     history: dict[str, Any] = {}
     global_step = 0
     screening_dataset: TensorReadoutQADataset | None = None
@@ -13740,6 +13845,7 @@ def main() -> None:
             selected_accepted = bool(
                 selected_candidate["full_selection"]["accepted"]
             )
+            joint_selected_accepted = selected_accepted
             selected_checkpoint_path = run_dir / (
                 "adapter_best.pt"
                 if selected_accepted
@@ -13852,7 +13958,12 @@ def main() -> None:
             adapter.mask_inactive_local_tokens = bool(args.mask_inactive_local_tokens)
         del reloaded_adapter
         test_metrics: dict[str, Any] = {}
-        if bool(args.evaluate_test):
+        test_evaluated, test_skip_reason = resolve_test_evaluation_policy(
+            requested=bool(args.evaluate_test),
+            joint_ab_training=bool(args.joint_ab_training),
+            joint_selected_accepted=joint_selected_accepted,
+        )
+        if test_evaluated:
             if is_main_process():
                 print(
                     f"testing best checkpoint: epoch={best_epoch} "
@@ -13882,8 +13993,9 @@ def main() -> None:
                 step=global_step + 1,
                 stage="test evaluation W&B log",
             )
-        elif is_main_process():
-            print("test evaluation skipped by llm_training.evaluate_test=false")
+        else:
+            if is_main_process():
+                print(f"test evaluation skipped: {test_skip_reason}")
 
         def write_final_outputs() -> None:
             raw_joint_result = history.get("joint_full_candidate_selection")
@@ -13921,15 +14033,17 @@ def main() -> None:
                     and not bool(joint_result.get("selected_accepted", False))
                     else None
                 ),
-                "test_evaluated": bool(args.evaluate_test),
+                "test_requested": bool(args.evaluate_test),
+                "test_evaluated": bool(test_evaluated),
+                "test_skip_reason": test_skip_reason,
                 "test_correct_accuracy": (
                     float(test_metrics.get("correct", {}).get("accuracy", 0.0))
-                    if bool(args.evaluate_test)
+                    if test_evaluated
                     else None
                 ),
                 "test_shuffled_accuracy": (
                     float(test_metrics.get("shuffled", {}).get("accuracy", 0.0))
-                    if bool(args.evaluate_test)
+                    if test_evaluated
                     else None
                 ),
                 "test_correct_by_task": dict(
@@ -13952,7 +14066,7 @@ def main() -> None:
         run_on_rank_zero_and_broadcast(write_final_outputs, "final run outputs write")
         if is_main_process():
             print(f"run_dir: {run_dir}")
-            if bool(args.evaluate_test):
+            if test_evaluated:
                 print_evaluation_summary("test", test_metrics, run_dir / "test_metrics.json")
     finally:
         wandb_logger.finish()

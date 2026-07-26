@@ -4,6 +4,7 @@ import json
 import math
 import os
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
     average_trainable_gradients_by_record_count,
+    apply_joint_run_scope_overrides,
     append_jsonl,
     adapter_from_checkpoint,
     audit_qa_datasets,
@@ -58,6 +60,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     matched_coordinate_group_loss,
     parse_generated_choice,
     read_host_memory_snapshot,
+    resolve_test_evaluation_policy,
     reset_grounded_evidence_optimizer_state,
     routing_metric_weighted_totals,
     run_embedded_diagnostics,
@@ -137,6 +140,59 @@ def _matched_record(
 
 
 class TestOptionalHdf5Dependency(unittest.TestCase):
+    def test_stage2_import_path_does_not_eagerly_require_h5py(self) -> None:
+        python_path = os.pathsep.join(
+            [
+                str(PROJECT_ROOT),
+                str(PROJECT_ROOT / "src"),
+                os.environ.get("PYTHONPATH", ""),
+            ]
+        )
+        script = """
+import builtins
+import sys
+import types
+
+original_import = builtins.__import__
+def import_without_h5py(name, *args, **kwargs):
+    if name == 'h5py':
+        raise ModuleNotFoundError("No module named 'h5py'", name='h5py')
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = import_without_h5py
+transformers = types.ModuleType('transformers')
+class UnavailableAuto:
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        raise RuntimeError('import-only transformers stub must not load models')
+transformers.AutoModel = UnavailableAuto
+transformers.AutoModelForCausalLM = UnavailableAuto
+transformers.AutoTokenizer = UnavailableAuto
+transformers.logging = types.SimpleNamespace(set_verbosity_error=lambda: None)
+sys.modules['transformers'] = transformers
+
+import scripts.train_tensor_llm_adapter
+assert 'h5py' not in sys.modules
+assert 'tensor_compression.data.builders' not in sys.modules
+assert 'tensor_compression.data.datasets' not in sys.modules
+"""
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = python_path
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+
     def test_shared_stage1_utilities_report_h5py_only_when_hdf5_is_used(self) -> None:
         original_import = __import__
 
@@ -835,6 +891,75 @@ class TestJointABTrainingContracts(unittest.TestCase):
                     updates,
                     [math.ceil(fraction * total_updates) for fraction in fractions],
                 )
+
+    def test_autodl_config_resolves_screening_and_formal_profiles(self) -> None:
+        config_path = PROJECT_ROOT / "configs" / "tensor_llm_adapter_pipeline_autodl.yaml"
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["train_tensor_llm_adapter.py", "--config", str(config_path)],
+        ):
+            screening = adapter_training.parse_args()
+        self.assertEqual(screening.joint_run_scope, "screening")
+        self.assertEqual(screening.max_train_records, 14_400)
+        self.assertFalse(screening.evaluate_test)
+        self.assertIn("small", screening.run_name)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "train_tensor_llm_adapter.py",
+                "--config",
+                str(config_path),
+                "--joint-run-scope",
+                "formal",
+                "--batch-size",
+                "6",
+            ],
+        ):
+            formal = adapter_training.parse_args()
+        self.assertEqual(formal.joint_run_scope, "formal")
+        self.assertIsNone(formal.max_train_records)
+        self.assertIsNone(formal.max_val_records)
+        self.assertIsNone(formal.max_test_records)
+        self.assertTrue(formal.evaluate_test)
+        self.assertEqual(formal.batch_size, 6)
+        self.assertIn("formal", formal.run_name)
+
+    def test_formal_test_policy_requires_joint_validation_admission(self) -> None:
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=False,
+                joint_ab_training=True,
+                joint_selected_accepted=True,
+            ),
+            (False, "evaluate_test_disabled"),
+        )
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=True,
+                joint_ab_training=True,
+                joint_selected_accepted=False,
+            ),
+            (False, "full_validation_admission_rejected"),
+        )
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=True,
+                joint_ab_training=True,
+                joint_selected_accepted=True,
+            ),
+            (True, None),
+        )
+
+    def test_formal_profile_requires_explicit_overrides(self) -> None:
+        args = SimpleNamespace(joint_run_scope="formal")
+        with self.assertRaisesRegex(ValueError, "formal_overrides"):
+            apply_joint_run_scope_overrides(
+                {"llm_training": {"joint_run_scope": "screening"}},
+                args,
+            )
 
     def test_joint_margin_hinge_rewards_only_sufficient_primary_gain(self) -> None:
         primary = torch.tensor([0.3, 0.6, 0.9], requires_grad=True)

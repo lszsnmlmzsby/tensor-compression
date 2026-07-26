@@ -413,6 +413,18 @@ adapter:
 
 llm_training:
   run_name: tensor_patch_qa_stage2b_joint_ab_small_autodl
+  # Default command runs the required subset experiment. Passing
+  # --joint-run-scope formal applies only the overrides below while sharing the
+  # exact same model, losses, optimizer, validation, and checkpoint contract.
+  joint_run_scope: screening
+  formal_overrides:
+    run_name: tensor_patch_qa_stage2b_joint_ab_formal_autodl
+    max_train_records: null
+    max_val_records: null
+    max_test_records: null
+    # The trainer scores test only when the selected full-validation candidate
+    # passes every admission check; rejected formal runs still skip test.
+    evaluate_test: true
   output_root: /data/wyx/tensor_llm_outputs/runs
   train_split: train
   val_split: val
