@@ -66,11 +66,11 @@ Student: [p_1, ..., p_256, q]
 Teacher: [Tokenize(serialize(z)), q]
 ```
 
-二者经过共享且冻结的 Qwen 前两层。设 `a_S`、`a_T` 分别是两条序列中最后一个 probe token 的位置，则：
+二者经过共享且冻结的 Qwen，并读取第 `\ell` 个 Transformer block 后最后一个 probe token 的 hidden state。设 `a_f`、`a_t` 分别是两条序列中最后一个 probe token 的位置，则：
 
 ```text
-h_S = Qwen_1:2([P, q])[a_S]
-h_T = Qwen_1:2([Tokenize(serialize(z)), q])[a_T]
+h_i^f = Qwen_1:ell([P_i, q])[a_f]
+h_i^t = Qwen_1:ell([Tokenize(serialize(X_i)), q])[a_t]
 ```
 
 这里对齐的是“语义角色相同的最后一个 probe token”，不是两条不同长度序列中数值相同的绝对 index。probe 后不附加答案，也没有答案词表、LM-head CE 或 teacher-logit distillation。
@@ -138,12 +138,12 @@ L_stage2 = 1.00 * L_choice-CE
 | Spatial adapter | trainable | trainable, Stage-1 init |
 | 2D position encoding | fixed buffer, scale=1 | fixed buffer, scale=1 |
 | Per-cell residual scale | fixed buffer, scale=1 | fixed buffer, scale=1 |
-| Qwen | frozen，只执行前 2 层 | frozen，执行完整模型 |
+| Qwen | frozen，执行至第 `\ell` 层 | frozen，执行完整模型 |
 | Whitening `W` | fixed, loss-only | 不存在 |
 
 ## SVG 修改入口
 
-源文件是 `figures/tensor_to_llm_architecture.svg`，画布为 `1800 x 1080`。SVG 顶部 `<style>` 中可统一修改字体、颜色、边框和箭头。
+源文件是 `figures/tensor_to_llm_architecture.svg`，画布为 `1800 x 1210`。SVG 顶部 `<style>` 中可统一修改字体、颜色、边框和箭头。
 
 主要 CSS class：
 
@@ -156,20 +156,22 @@ L_stage2 = 1.00 * L_choice-CE
 
 主要 SVG group ID：
 
+为避免 Stage 1 过度拥挤，当前图面把显式 `Normalize` 节点和 reconstruction 分支省略了；这只是绘图层面的简化，不改变上文所述的训练实现与损失定义。
+
 | ID | 内容 |
 |---|---|
 | `header`, `legend` | 标题与图例 |
 | `stage1` | Stage 1 总面板 |
-| `stage1-input-grid` | 输入 tensor 示意 |
-| `normalization-stage1` | z-score |
+| `stage1-input-grid`, `input-split-stage1` | 共享输入 `X` 与上下分支 |
 | `value-preserving-encoder` | 不降采样 encoder |
-| `stage1-latent-grid` | `8 x 16 x 16` latent |
-| `spatial-adapter-stage1` | 256-token spatial adapter |
-| `student-input-sequence` | Student 的 continuous prefix + probe |
-| `teacher-branch` | Teacher 的数值文本路径 |
-| `shared-shallow-qwen` | 共享冻结 Qwen 前两层 |
-| `stage1-alignment-loss` | Whitening 与 alignment objective |
-| `training-only-reconstruction` | AE reconstruction 正则 |
+| `stage1-latent-grid` | `8 x 16 x 16` latent 输出 |
+| `spatial-adapter-stage1` | 精简后的 256-token spatial adapter |
+| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 `Probe` |
+| `qwen-tokenizer-stage1` | 冻结 Qwen tokenizer |
+| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 `Probe` |
+| `shared-shallow-qwen`, `student-shallow-qwen`, `teacher-shallow-qwen` | 上下对齐的共享冻结 Qwen 第 `\ell` 层 readout |
+| `student-hidden-vector`, `teacher-hidden-vector` | Qwen 输出向量示意 |
+| `stage1-alignment-loss`, `contrastive-matrix` | 带 `F_i`/`T_i` 配对序列和对角正样本的 contrastive alignment 矩阵 |
 | `stage1-checkpoint-transfer`, `stage-transfer` | 两阶段参数转移 |
 | `stage2` | Stage 2 总面板 |
 | `stage2-input-sequence` | 直接 `inputs_embeds` 拼接 |

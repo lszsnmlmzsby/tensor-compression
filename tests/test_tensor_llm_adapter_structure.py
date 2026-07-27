@@ -33,6 +33,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     TensorReadoutQADataset,
     audit_stage2_warm_start_checkpoint,
     audit_evidence_only_optimizer_boundary,
+    audit_full_grounded_local_optimizer_boundary,
     _decoder_question_last_hidden,
     _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
@@ -47,6 +48,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     checkpoint_updates_from_fractions,
     choice_ce_loss,
     configure_evidence_only_training,
+    configure_full_grounded_local_training,
     evaluate_choice_accuracy,
     frozen_llm_checkpoint_execution_active,
     generate_diagnostic_answer,
@@ -78,6 +80,8 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     set_frozen_llm_execution_mode,
     single_token_choice_ce_loss,
     single_token_choice_ids,
+    select_admitted_stage2b_candidate,
+    stage2b_full_validation_candidates,
     structured_query_features_for_record,
     task_specific_instruction,
     training_loss,
@@ -909,7 +913,8 @@ class TestJointABTrainingContracts(unittest.TestCase):
         self.assertEqual(screening.max_train_records, 14_400)
         self.assertFalse(screening.evaluate_test)
         self.assertIn("screening", screening.run_name)
-        self.assertTrue(screening.point_reader_training)
+        self.assertFalse(screening.point_reader_training)
+        self.assertTrue(screening.full_local_reader_training)
         self.assertFalse(screening.joint_ab_training)
         self.assertTrue(screening.freeze_global_adapter)
         self.assertAlmostEqual(screening.lr, 5.0e-5)
@@ -937,6 +942,13 @@ class TestJointABTrainingContracts(unittest.TestCase):
         self.assertEqual(formal.batch_size, 6)
         self.assertAlmostEqual(formal.lr, 1.0e-5)
         self.assertEqual(formal.checkpoint_full_eval_top_k, 7)
+        self.assertEqual(
+            tuple(
+                float(value)
+                for value in adapter_training.parse_csv(formal.checkpoint_fractions)
+            ),
+            (0.025, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0),
+        )
         self.assertIn("formal", formal.run_name)
 
     def test_formal_test_policy_requires_joint_validation_admission(self) -> None:
@@ -992,6 +1004,16 @@ class TestJointABTrainingContracts(unittest.TestCase):
                 joint_selected_accepted=True,
             ),
             (True, None),
+        )
+
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=True,
+                joint_ab_training=False,
+                full_local_reader_training=True,
+                joint_selected_accepted=False,
+            ),
+            (False, "full_validation_admission_rejected"),
         )
 
     def test_formal_profile_requires_explicit_overrides(self) -> None:
@@ -1130,6 +1152,116 @@ class TestJointABTrainingContracts(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "only the shared evidence transform"):
             audit_evidence_only_optimizer_boundary(bad_optimizer, adapter)
+
+    def test_full_local_reader_boundary_freezes_only_global(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=4,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local_adapter = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local_adapter,
+            freeze_global=False,
+        )
+
+        report = configure_full_grounded_local_training(adapter)
+        expected = sorted(
+            f"local_adapter.{name}" for name, _ in local_adapter.named_parameters()
+        )
+        self.assertEqual(report["mode"], "full_grounded_local_reader")
+        self.assertEqual(report["trainable_parameter_names"], expected)
+        self.assertEqual(
+            sorted(name for name, value in adapter.named_parameters() if value.requires_grad),
+            expected,
+        )
+        self.assertTrue(adapter.freeze_global)
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in adapter.parameters() if parameter.requires_grad],
+            lr=1.0e-5,
+        )
+        audit = audit_full_grounded_local_optimizer_boundary(optimizer, adapter)
+        self.assertTrue(audit["validated"])
+        self.assertEqual(audit["optimizer_tensor_count"], len(expected))
+
+    def test_full_local_reader_validates_every_child_checkpoint(self) -> None:
+        candidates = [
+            {
+                "global_step": 0,
+                "is_parent": True,
+                "screening_selection": {"selection_key": [0.0]},
+            },
+            *[
+                {
+                    "global_step": step,
+                    "is_parent": False,
+                    "screening_selection": {"selection_key": [float(score)]},
+                }
+                for step, score in ((10, 0.1), (20, 0.3), (30, 0.2))
+            ],
+        ]
+
+        selected = stage2b_full_validation_candidates(
+            candidates,
+            full_local_reader_training=True,
+            top_k=1,
+        )
+
+        self.assertEqual({item["global_step"] for item in selected}, {0, 10, 20, 30})
+
+    def test_stage2b_promotion_selects_only_admitted_children(self) -> None:
+        parent = {
+            "global_step": 0,
+            "is_parent": True,
+            "full_selection": {
+                "accepted": True,
+                "eligible_for_promotion": False,
+                "selection_key": [100.0],
+            },
+        }
+        rejected = {
+            "global_step": 10,
+            "is_parent": False,
+            "full_selection": {"accepted": False, "selection_key": [10.0]},
+        }
+        admitted = {
+            "global_step": 20,
+            "is_parent": False,
+            "full_selection": {"accepted": True, "selection_key": [1.0]},
+        }
+
+        selected, admitted_children, promoted = select_admitted_stage2b_candidate(
+            [parent, rejected, admitted]
+        )
+
+        self.assertIs(selected, admitted)
+        self.assertEqual(admitted_children, [admitted])
+        self.assertTrue(promoted)
+
+        selected, admitted_children, promoted = select_admitted_stage2b_candidate(
+            [parent, rejected]
+        )
+        self.assertIs(selected, parent)
+        self.assertEqual(admitted_children, [])
+        self.assertFalse(promoted)
 
     def test_joint_checkpoint_selection_prioritizes_preservation_and_acceptance(self) -> None:
         tasks = (

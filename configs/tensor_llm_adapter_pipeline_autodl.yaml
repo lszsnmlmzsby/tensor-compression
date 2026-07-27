@@ -361,14 +361,14 @@ patch_alignment:
 
 adapter:
   # Start from the successful 256-token prefix plus the two-token factorized row/column
-  # reader. Final Stage-2B treats global and routing as frozen interfaces.
+  # reader. Final Stage-2B keeps the global interface frozen and refines the complete
+  # language-grounded local reader under explicit routing/gate supervision.
   architecture: grounded_evidence_adapter
   # This must be byte-for-byte the same Stage-1 checkpoint used by patch_qa.
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   # Warm-start the global branch from the completed direct Stage-2 run.
   stage2_warm_start_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
-  # Start from the only pilot that improved both held-out point-value tasks. The final
-  # phase freezes its audited router/global tensors and updates only evidence_down/up.
+  # Start from the only pilot that improved both held-out point-value tasks.
   stage2b_resume_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260726_203443_tensor_patch_qa_stage2b_causal_reader_small_autodl/adapter_best.pt
   soft_prompt_tokens: 256
   adapter_dim: 512
@@ -405,24 +405,27 @@ adapter:
   global_unfreeze_epoch: 0
   # Retained for checkpoint compatibility; the final optimizer excludes global parameters.
   global_lr: 1.0e-6
-  # Keep all 256 current-global tokens present; the B view detaches them before backpropagation.
+  # Keep all 256 global tokens present as the fixed context seen by the trainable local reader.
   global_prompt_dropout: 0.0
   soft_prompt_scale: 0.05
   # Visibility is predicted from the natural-language-conditioned learned gate only.
   mask_inactive_local_tokens: true
 
 llm_training:
-  run_name: tensor_patch_qa_stage2b_point_reader_final_screening_autodl
-  # Default command runs the final evidence-only subset check. Passing
+  run_name: tensor_patch_qa_stage2b_full_local_reader_screening_autodl
+  # Default command retains a short profile for reproducibility. Passing
   # --joint-run-scope formal applies only the overrides below while sharing the
   # exact same model, losses, optimizer, validation, and checkpoint contract.
   joint_run_scope: screening
   formal_overrides:
-    run_name: tensor_patch_qa_stage2b_point_reader_final_formal_autodl
+    run_name: tensor_patch_qa_stage2b_full_local_reader_formal_autodl
     max_train_records: null
     max_val_records: null
     max_test_records: null
     lr: 1.0e-5
+    # Full-data Stage-2B has about 12k updates; seven candidates plus the step-0
+    # parent are all evaluated on complete validation before any test access.
+    checkpoint_fractions: [0.025, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
     checkpoint_full_eval_top_k: 7
     # The trainer scores test only when the selected full-validation candidate
     # passes every admission check; rejected formal runs still skip test.
@@ -503,9 +506,10 @@ llm_training:
   ranking_loss_weight: 0.0
   ranking_loss_margin: 0.1
   grounding_routing_loss_weight: 1.0
-  # Routing and gates are evaluated but frozen; answer loss cannot rewrite geometry.
-  grounding_joint_routing_loss_weight: 0.0
-  grounding_gate_loss_weight: 0.0
+  # These low-weight auxiliary terms retain the successful pilot's geometric supervision
+  # while the complete question-conditioned reader adapts to the full dataset.
+  grounding_joint_routing_loss_weight: 0.1
+  grounding_gate_loss_weight: 0.1
   matched_group_loss_weight: 0.2
   matched_group_loss_margin: 0.5
   # Compare the correct tensor prefix with a same-length zero-information prefix. A shuffled PDE tensor
@@ -518,22 +522,23 @@ llm_training:
   swapped_question_require_different_answer: true
   # Per matched group, independent of the tunable outer microbatch size.
   swapped_question_max_records: 3
-  # Final point-reader mode: positive hybrid plus one frozen zero-local reference.
-  # Natural record frequencies allocate 2/3 of answer updates to point-value tasks.
+  # Final generic-reader mode: no task IDs, raw-specific heads, parsed coordinates, or
+  # frozen-reference hinges. Natural frequencies allocate 2/3 of answer examples to point values.
   joint_ab_training: false
-  point_reader_training: true
+  point_reader_training: false
+  full_local_reader_training: true
   task_balanced_answer_loss: false
   global_view_loss_weight: 0.0
   joint_no_harm_loss_weight: 0.0
   joint_no_harm_margin: 0.0
   joint_causal_loss_weight: 0.0
   joint_causal_margin: 0.1
-  point_causal_loss_weight: 0.5
+  point_causal_loss_weight: 0.0
   point_causal_margin: 0.1
   point_causal_tasks:
     - normalized_point_value
     - raw_point_value_with_stats
-  nonpoint_no_harm_loss_weight: 0.1
+  nonpoint_no_harm_loss_weight: 0.0
   nonpoint_no_harm_margin: 0.0
   global_anchor_loss_weight: 0.0
   local_anchor_loss_weight: 0.0
@@ -561,8 +566,8 @@ llm_training:
   # Group different natural-language questions for the same tensor and operation inside each batch.
   group_questions_by_state: true
   questions_per_state_group: 3
-  # Early checkpoints matter because the full-data evidence transform can converge quickly.
-  # Point deltas own ranking; the other tasks are bounded validation guardrails.
+  # Include early candidates and step 0. Formal mode evaluates every candidate on the
+  # complete validation split; only an admitted child may replace the parent or access test.
   checkpoint_fractions: [0.025, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
   checkpoint_screening_records: 2000
   checkpoint_full_eval_top_k: 3

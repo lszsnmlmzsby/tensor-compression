@@ -1983,6 +1983,36 @@ def configure_evidence_only_training(adapter: nn.Module) -> dict[str, Any]:
     }
 
 
+def configure_full_grounded_local_training(adapter: nn.Module) -> dict[str, Any]:
+    """Freeze the global interface and train every parameter of the grounded reader."""
+
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("Full local-reader training requires HybridGlobalLocalAdapter.")
+    local = _grounded_local_adapter(adapter)
+    if local is None:
+        raise TypeError("Full local-reader training requires GroundedEvidenceAdapter.")
+    adapter.set_global_trainable(False)
+    for parameter in local.parameters():
+        parameter.requires_grad_(True)
+    trainable = sorted(
+        name for name, parameter in adapter.named_parameters() if parameter.requires_grad
+    )
+    expected = sorted(f"local_adapter.{name}" for name, _ in local.named_parameters())
+    if trainable != expected:
+        raise RuntimeError(
+            "Full local-reader trainable boundary mismatch: "
+            f"observed={trainable}, expected={expected}."
+        )
+    return {
+        "mode": "full_grounded_local_reader",
+        "trainable_parameter_names": trainable,
+        "trainable_parameters": sum(parameter.numel() for parameter in local.parameters()),
+        "frozen_global_parameters": sum(
+            parameter.numel() for parameter in adapter.global_adapter.parameters()
+        ),
+    }
+
+
 def audit_evidence_only_optimizer_boundary(
     optimizer: torch.optim.Optimizer,
     adapter: nn.Module,
@@ -2022,6 +2052,41 @@ def audit_evidence_only_optimizer_boundary(
             for group in optimizer.param_groups
             for parameter in group.get("params", [])
         ),
+    }
+
+
+def audit_full_grounded_local_optimizer_boundary(
+    optimizer: torch.optim.Optimizer,
+    adapter: nn.Module,
+) -> dict[str, Any]:
+    """Fail if the final optimizer contains anything outside the complete local reader."""
+
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("Full local-reader optimizer audit requires a hybrid adapter.")
+    local = _grounded_local_adapter(adapter)
+    if local is None:
+        raise TypeError("Full local-reader optimizer audit requires grounded evidence.")
+    expected = {id(parameter) for parameter in local.parameters()}
+    observed = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group.get("params", [])
+    }
+    trainable_names = sorted(
+        name for name, parameter in adapter.named_parameters() if parameter.requires_grad
+    )
+    expected_names = sorted(f"local_adapter.{name}" for name, _ in local.named_parameters())
+    if observed != expected or trainable_names != expected_names:
+        raise RuntimeError(
+            "Final Stage-2B must optimize the complete grounded local reader only: "
+            f"trainable={trainable_names}, expected={expected_names}, "
+            f"optimizer_tensors={len(observed)}."
+        )
+    return {
+        "validated": True,
+        "trainable_parameter_names": trainable_names,
+        "optimizer_tensor_count": len(observed),
+        "optimizer_parameters": sum(parameter.numel() for parameter in local.parameters()),
     }
 
 
@@ -3172,6 +3237,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--full-local-reader-training",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Freeze the LLM/global adapter and continue the complete grounded reader with "
+            "the validated answer, routing, gate, group, and question-swap objectives."
+        ),
+    )
+    parser.add_argument(
         "--joint-run-scope",
         choices=JOINT_RUN_SCOPES,
         default=None,
@@ -3683,6 +3757,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "full_local_reader_training",
+        first_nested(config, ["llm_training.full_local_reader_training"]),
+        False,
+    )
+    set_default(
+        args,
         "task_balanced_answer_loss",
         first_nested(config, ["llm_training.task_balanced_answer_loss"]),
         False,
@@ -4129,9 +4209,18 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             value = float(getattr(args, setting))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"llm_training.{setting} must be finite and in [0, 1].")
-        if bool(args.joint_ab_training) and bool(args.point_reader_training):
+        enabled_final_modes = sum(
+            int(bool(value))
+            for value in (
+                args.joint_ab_training,
+                args.point_reader_training,
+                args.full_local_reader_training,
+            )
+        )
+        if enabled_final_modes > 1:
             raise ValueError(
-                "joint_ab_training and point_reader_training are mutually exclusive."
+                "joint_ab_training, point_reader_training, and full_local_reader_training "
+                "are mutually exclusive."
             )
         if bool(args.joint_ab_training):
             joint_run_scope = str(args.joint_run_scope)
@@ -4331,13 +4420,136 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
                     )
             else:  # pragma: no cover - resolved before defaults
                 raise ValueError(f"Unsupported joint_run_scope={point_run_scope!r}.")
+        elif bool(args.full_local_reader_training):
+            if not str(args.stage2b_resume_checkpoint or "").strip():
+                raise ValueError(
+                    "full_local_reader_training requires adapter.stage2b_resume_checkpoint."
+                )
+            if not bool(args.freeze_global_adapter) or int(args.global_unfreeze_epoch) != 0:
+                raise ValueError(
+                    "full_local_reader_training permanently freezes the global adapter."
+                )
+            if int(args.grounding_routing_warmup_epochs) != 0:
+                raise ValueError(
+                    "full_local_reader_training starts from an audited reader and requires no routing warmup."
+                )
+            if float(args.global_prompt_dropout) != 0.0:
+                raise ValueError("full_local_reader_training requires global_prompt_dropout=0.")
+            if bool(args.task_balanced_answer_loss):
+                raise ValueError(
+                    "full_local_reader_training uses the validated natural task ratio."
+                )
+            if int(args.epochs) != 1:
+                raise ValueError(
+                    "The final full local-reader large-data/small-epoch schedule requires one epoch."
+                )
+            if str(args.checkpoint_metric) != "point_value_min_causal_gain":
+                raise ValueError(
+                    "full_local_reader_training requires checkpoint_metric=point_value_min_causal_gain."
+                )
+            for setting in (
+                "global_view_loss_weight",
+                "joint_no_harm_loss_weight",
+                "joint_causal_loss_weight",
+                "point_causal_loss_weight",
+                "nonpoint_no_harm_loss_weight",
+                "global_anchor_loss_weight",
+                "local_anchor_loss_weight",
+            ):
+                if float(getattr(args, setting)) != 0.0:
+                    raise ValueError(
+                        "full_local_reader_training disables reference/anchor objectives; "
+                        f"llm_training.{setting} must be zero."
+                    )
+            if float(args.choice_ce_loss_weight) <= 0.0:
+                raise ValueError(
+                    "full_local_reader_training requires choice_ce_loss_weight > 0."
+                )
+            if float(args.matched_group_loss_weight) <= 0.0 or float(
+                args.swapped_question_loss_weight
+            ) <= 0.0:
+                raise ValueError(
+                    "full_local_reader_training retains positive matched-group and "
+                    "swapped-question supervision."
+                )
+            required_recipe = {
+                "ce_loss_weight": 0.02,
+                "choice_ce_loss_weight": 1.0,
+                "ranking_loss_weight": 0.0,
+                "matched_group_loss_weight": 0.2,
+                "matched_group_loss_margin": 0.5,
+                "swapped_question_loss_weight": 0.1,
+                "swapped_question_loss_margin": 0.1,
+                "grounding_joint_routing_loss_weight": 0.1,
+                "grounding_gate_loss_weight": 0.1,
+            }
+            mismatched_recipe = {
+                name: {"observed": float(getattr(args, name)), "required": required}
+                for name, required in required_recipe.items()
+                if not math.isclose(
+                    float(getattr(args, name)), required, rel_tol=0.0, abs_tol=1.0e-12
+                )
+            }
+            if mismatched_recipe:
+                raise ValueError(
+                    "full_local_reader_training must reproduce the successful causal-reader "
+                    f"objective recipe; mismatches={mismatched_recipe}."
+                )
+            if float(args.grounding_joint_routing_loss_weight) <= 0.0 or float(
+                args.grounding_gate_loss_weight
+            ) <= 0.0:
+                raise ValueError(
+                    "full_local_reader_training requires positive routing and gate supervision."
+                )
+            required = {"correct", "zero_local", "global_only", "shuffled"}
+            missing = sorted(required - set(parse_csv(args.eval_baselines)))
+            if missing:
+                raise ValueError(
+                    "full_local_reader_training checkpoint screening is missing eval baselines: "
+                    f"{missing}."
+                )
+            point_run_scope = str(args.joint_run_scope)
+            if point_run_scope == "screening":
+                if bool(args.evaluate_test):
+                    raise ValueError(
+                        "The full local-reader screening experiment must keep evaluate_test=false."
+                    )
+                if args.max_train_records is None or int(args.max_train_records) <= 0:
+                    raise ValueError(
+                        "joint_run_scope=screening requires a positive max_train_records subset."
+                    )
+            elif point_run_scope == "formal":
+                if not bool(args.evaluate_test):
+                    raise ValueError(
+                        "joint_run_scope=formal requires evaluate_test=true; test remains "
+                        "gated on full-validation admission."
+                    )
+                if any(
+                    value is not None
+                    for value in (
+                        args.max_train_records,
+                        args.max_val_records,
+                        args.max_test_records,
+                    )
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires complete train/val/test splits."
+                    )
+                if not bool(args.require_disjoint_splits) or not bool(
+                    args.require_untruncated_prompts
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires disjoint splits and untruncated prompts."
+                    )
+            else:  # pragma: no cover - resolved before defaults
+                raise ValueError(f"Unsupported joint_run_scope={point_run_scope!r}.")
         elif not bool(args.freeze_global_adapter):
             raise ValueError(
                 "grounded_evidence_adapter may unfreeze global only through joint_ab_training."
             )
         elif str(args.joint_run_scope) == "formal":
             raise ValueError(
-                "joint_run_scope=formal requires joint_ab_training or point_reader_training."
+                "joint_run_scope=formal requires a screened Stage-2B training mode."
             )
     elif int(args.grounding_routing_warmup_epochs) != 0:
         raise ValueError(
@@ -4496,7 +4708,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("joint_max_parent_regression must be finite and non-negative.")
         if not math.isfinite(float(args.joint_min_no_harm_delta)):
             raise ValueError("joint_min_no_harm_delta must be finite.")
-    if bool(args.point_reader_training):
+    if bool(args.point_reader_training) or bool(args.full_local_reader_training):
         for setting in (
             "point_reader_min_parent_delta",
             "point_reader_min_causal_gain",
@@ -7133,6 +7345,7 @@ def uses_screened_stage2b_training(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "joint_ab_training", False)
         or getattr(args, "point_reader_training", False)
+        or getattr(args, "full_local_reader_training", False)
     )
 
 
@@ -11047,7 +11260,9 @@ def screened_stage2b_checkpoint_metrics(
     parent_metrics: Mapping[str, Any],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    if bool(getattr(args, "point_reader_training", False)):
+    if bool(getattr(args, "point_reader_training", False)) or bool(
+        getattr(args, "full_local_reader_training", False)
+    ):
         return point_reader_checkpoint_metrics(
             metrics,
             parent_metrics,
@@ -11066,19 +11281,71 @@ def screened_stage2b_checkpoint_metrics(
     )
 
 
+def stage2b_full_validation_candidates(
+    candidates: Sequence[dict[str, Any]],
+    *,
+    full_local_reader_training: bool,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """Keep the parent and choose the trained checkpoints that receive full validation."""
+
+    ranked = sorted(
+        candidates,
+        key=lambda item: tuple(
+            float(value) for value in item["screening_selection"]["selection_key"]
+        ),
+        reverse=True,
+    )
+    parents = [item for item in candidates if bool(item.get("is_parent", False))]
+    trained = [item for item in ranked if not bool(item.get("is_parent", False))]
+    if full_local_reader_training:
+        return parents + trained
+    return parents + trained[: int(top_k)]
+
+
+def select_admitted_stage2b_candidate(
+    candidates: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """Promote the best admitted child, or retain the unique step-zero parent."""
+
+    parents = [item for item in candidates if bool(item.get("is_parent", False))]
+    if len(parents) != 1:
+        raise RuntimeError(
+            "Screened Stage-2B selection requires exactly one step-zero parent."
+        )
+    accepted_children = [
+        item
+        for item in candidates
+        if not bool(item.get("is_parent", False))
+        and bool(item["full_selection"].get("accepted", False))
+        and bool(item["full_selection"].get("eligible_for_promotion", True))
+    ]
+    selected = max(
+        accepted_children or parents,
+        key=lambda item: tuple(
+            float(value) for value in item["full_selection"]["selection_key"]
+        ),
+    )
+    promoted = any(selected is item for item in accepted_children)
+    return selected, accepted_children, promoted
+
+
 def resolve_test_evaluation_policy(
     *,
     requested: bool,
     joint_ab_training: bool,
     joint_selected_accepted: bool | None,
     point_reader_training: bool = False,
+    full_local_reader_training: bool = False,
 ) -> tuple[bool, str | None]:
     """Gate formal test access on validation-only screened admission."""
 
     if not bool(requested):
         return False, "evaluate_test_disabled"
     if (
-        bool(joint_ab_training) or bool(point_reader_training)
+        bool(joint_ab_training)
+        or bool(point_reader_training)
+        or bool(full_local_reader_training)
     ) and joint_selected_accepted is not True:
         return False, "full_validation_admission_rejected"
     return True, None
@@ -11347,6 +11614,7 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "matched_group_loss_margin": float(args.matched_group_loss_margin),
             "joint_ab_training": bool(args.joint_ab_training),
             "point_reader_training": bool(args.point_reader_training),
+            "full_local_reader_training": bool(args.full_local_reader_training),
             "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
             "global_view_loss_weight": float(args.global_view_loss_weight),
             "joint_no_harm_loss_weight": float(args.joint_no_harm_loss_weight),
@@ -12257,10 +12525,17 @@ def main() -> None:
         ).to(device)
 
     evidence_only_boundary: dict[str, Any] | None = None
+    full_local_reader_boundary: dict[str, Any] | None = None
     if bool(args.point_reader_training):
         evidence_only_boundary = configure_evidence_only_training(adapter)
         checkpoint_load_report["evidence_only_training_boundary"] = dict(
             evidence_only_boundary
+        )
+        args.freeze_global_adapter = True
+    elif bool(args.full_local_reader_training):
+        full_local_reader_boundary = configure_full_grounded_local_training(adapter)
+        checkpoint_load_report["full_local_reader_training_boundary"] = dict(
+            full_local_reader_boundary
         )
         args.freeze_global_adapter = True
     if isinstance(adapter, HybridGlobalLocalAdapter):
@@ -12382,6 +12657,11 @@ def main() -> None:
     evidence_only_optimizer_audit = (
         audit_evidence_only_optimizer_boundary(optimizer, adapter)
         if bool(args.point_reader_training)
+        else None
+    )
+    full_local_reader_optimizer_audit = (
+        audit_full_grounded_local_optimizer_boundary(optimizer, adapter)
+        if bool(args.full_local_reader_training)
         else None
     )
     local_groups = None
@@ -12522,6 +12802,7 @@ def main() -> None:
         "matched_group_loss_margin": float(args.matched_group_loss_margin),
         "joint_ab_training": bool(args.joint_ab_training),
         "point_reader_training": bool(args.point_reader_training),
+        "full_local_reader_training": bool(args.full_local_reader_training),
         "joint_run_scope": str(args.joint_run_scope),
         "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
         "global_view_loss_weight": float(args.global_view_loss_weight),
@@ -12629,6 +12910,8 @@ def main() -> None:
         "optimizer_parameter_audit": optimizer_audit,
         "evidence_only_training_boundary": evidence_only_boundary,
         "evidence_only_optimizer_audit": evidence_only_optimizer_audit,
+        "full_local_reader_training_boundary": full_local_reader_boundary,
+        "full_local_reader_optimizer_audit": full_local_reader_optimizer_audit,
         "qa_metadata_audit": qa_metadata_audit,
         "data_audit": data_audit,
         "prompt_audit": prompt_audit,
@@ -12857,6 +13140,58 @@ def main() -> None:
                     step=0,
                     stage="joint parent full-validation W&B log",
                 )
+                # Step 0 is a deployment fallback, not a trained child candidate.
+                # Saving the live state here makes the selection result self-contained.
+                parent_path = run_dir / "adapter_step_000000.pt"
+                parent_selection = screened_stage2b_checkpoint_metrics(
+                    parent_validation_metrics,
+                    parent_validation_metrics,
+                    args,
+                )
+                parent_routing_audit = grounded_routing_warmup_audit(
+                    parent_validation_metrics,
+                    args,
+                )
+                parent_selection["routing_gate_audit"] = parent_routing_audit
+                parent_selection["acceptance"]["routing_gate_audit"] = bool(
+                    parent_routing_audit["passed"]
+                )
+                parent_selection["accepted"] = all(
+                    bool(value) for value in parent_selection["acceptance"].values()
+                )
+                parent_selection["eligible_for_promotion"] = False
+                run_on_rank_zero_and_broadcast(
+                    lambda: save_adapter_checkpoint(
+                        parent_path,
+                        adapter=adapter,
+                        args=args,
+                        latent_shape=latent_shape,
+                        llm_hidden_size=llm_hidden_size,
+                        latent_contract=latent_contract or {},
+                        metrics={
+                            "epoch": 0,
+                            "global_step": 0,
+                            "val": parent_validation_metrics,
+                            "selection": parent_selection,
+                        },
+                    ),
+                    "step-zero parent checkpoint write",
+                )
+                joint_candidates.append(
+                    {
+                        "path": str(parent_path),
+                        "epoch": 0,
+                        "global_step": 0,
+                        "is_parent": True,
+                        "screening_selection": screened_stage2b_checkpoint_metrics(
+                            screening_parent_metrics,
+                            screening_parent_metrics,
+                            args,
+                        ),
+                        "full_val": copy.deepcopy(parent_validation_metrics),
+                        "full_selection": parent_selection,
+                    }
+                )
             if bool(args.diagnostics_enabled):
                 pretrain_diagnostic_aggregate = run_on_rank_zero_and_broadcast(
                     lambda: run_embedded_diagnostics(
@@ -12896,7 +13231,11 @@ def main() -> None:
                 else (
                     "point_evidence"
                     if bool(args.point_reader_training)
-                    else "joint_answer"
+                    else (
+                        "full_local_reader"
+                        if bool(args.full_local_reader_training)
+                        else "joint_answer"
+                    )
                 )
             )
             evidence_optimizer_states_cleared = 0
@@ -14312,17 +14651,22 @@ def main() -> None:
         if uses_screened_stage2b_training(args):
             if not joint_candidates or parent_validation_metrics is None:
                 raise RuntimeError("Stage-2B training produced no screenable step checkpoints.")
-            ranked_candidates = sorted(
+            top_candidates = stage2b_full_validation_candidates(
                 joint_candidates,
-                key=lambda item: tuple(
-                    float(value)
-                    for value in item["screening_selection"]["selection_key"]
-                ),
-                reverse=True,
+                full_local_reader_training=bool(args.full_local_reader_training),
+                top_k=int(args.checkpoint_full_eval_top_k),
             )
-            top_candidates = ranked_candidates[: int(args.checkpoint_full_eval_top_k)]
+            if bool(args.full_local_reader_training) and len(top_candidates) != len(
+                joint_candidates
+            ):
+                raise RuntimeError(
+                    "Full local-reader selection must evaluate every saved candidate."
+                )
             full_candidate_results: list[dict[str, Any]] = []
             for candidate in top_candidates:
+                if bool(candidate.get("is_parent", False)):
+                    full_candidate_results.append(dict(candidate))
+                    continue
                 candidate_path = Path(str(candidate["path"]))
                 candidate_checkpoint = torch.load(
                     candidate_path,
@@ -14360,6 +14704,7 @@ def main() -> None:
                 full_selection["accepted"] = all(
                     bool(value) for value in full_selection["acceptance"].values()
                 )
+                full_selection["eligible_for_promotion"] = True
                 full_candidate_results.append(
                     {
                         **candidate,
@@ -14369,18 +14714,14 @@ def main() -> None:
                 )
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-            accepted_candidates = [
-                item
-                for item in full_candidate_results
-                if bool(item["full_selection"]["accepted"])
-            ]
-            final_pool = accepted_candidates or full_candidate_results
-            selected_candidate = max(
-                final_pool,
-                key=lambda item: tuple(
-                    float(value)
-                    for value in item["full_selection"]["selection_key"]
-                ),
+            # A child must clear every admission guardrail before it can replace the
+            # current best model. Otherwise retain the live, fully evaluated parent.
+            (
+                selected_candidate,
+                accepted_candidates,
+                selected_promoted,
+            ) = select_admitted_stage2b_candidate(
+                full_candidate_results,
             )
             selected_checkpoint = torch.load(
                 Path(str(selected_candidate["path"])),
@@ -14401,23 +14742,27 @@ def main() -> None:
                 selected_candidate["full_selection"][
                     "point_value_min_causal_gain"
                     if bool(args.point_reader_training)
+                    or bool(args.full_local_reader_training)
                     else "worst_protected_task_delta"
                 ]
             )
-            selected_accepted = bool(
-                selected_candidate["full_selection"]["accepted"]
-            )
+            selected_accepted = bool(selected_promoted)
             joint_selected_accepted = selected_accepted
             selected_checkpoint_path = run_dir / (
                 "adapter_best.pt"
                 if selected_accepted
-                else "adapter_best_rejected.pt"
+                else (
+                    "adapter_parent_retained.pt"
+                    if bool(selected_candidate.get("is_parent", False))
+                    else "adapter_best_rejected.pt"
+                )
             )
             joint_selection_payload = {
                 "screened_candidate_count": len(joint_candidates),
                 "full_evaluated_candidate_count": len(full_candidate_results),
                 "accepted_candidate_count": len(accepted_candidates),
                 "selected_global_step": int(selected_candidate["global_step"]),
+                "selected_is_parent": bool(selected_candidate.get("is_parent", False)),
                 "selected_path": str(selected_candidate["path"]),
                 "selected_accepted": selected_accepted,
                 "selected_output_path": str(selected_checkpoint_path),
@@ -14525,6 +14870,7 @@ def main() -> None:
             joint_ab_training=bool(args.joint_ab_training),
             joint_selected_accepted=joint_selected_accepted,
             point_reader_training=bool(args.point_reader_training),
+            full_local_reader_training=bool(args.full_local_reader_training),
         )
         if test_evaluated:
             if is_main_process():
@@ -14570,6 +14916,7 @@ def main() -> None:
                 "best_val_score": float(best_val_score),
                 "checkpoint_metric": str(args.checkpoint_metric),
                 "selected_global_step": joint_result.get("selected_global_step"),
+                "selected_is_parent": joint_result.get("selected_is_parent"),
                 "joint_selected_accepted": joint_result.get("selected_accepted"),
                 "joint_screened_candidate_count": joint_result.get(
                     "screened_candidate_count"
@@ -14594,6 +14941,12 @@ def main() -> None:
                     selected_checkpoint_path.name
                     if uses_screened_stage2b_training(args)
                     and not bool(joint_result.get("selected_accepted", False))
+                    and not bool(joint_result.get("selected_is_parent", False))
+                    else None
+                ),
+                "retained_parent_checkpoint": (
+                    selected_checkpoint_path.name
+                    if bool(joint_result.get("selected_is_parent", False))
                     else None
                 ),
                 "test_requested": bool(args.evaluate_test),
