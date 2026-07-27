@@ -352,15 +352,15 @@ patch_alignment:
 
 adapter:
   # Start from the successful 256-token prefix plus the two-token factorized row/column
-  # reader. The A view may refine global; B sees a detached current-global interface.
+  # reader. Final Stage-2B treats global and routing as frozen interfaces.
   architecture: grounded_evidence_adapter
   # This must be byte-for-byte the same Stage-1 checkpoint used by patch_qa.
   init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
   # Warm-start the global branch from the completed direct Stage-2 run.
   stage2_warm_start_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
-  # Joint A/B small experiment: continue from the latest grounded best checkpoint.
-  # The later formal run should restart from this parent, not continue the small-run child.
-  stage2b_resume_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260726_043915_tensor_patch_qa_stage2b_grounded_evidence_autodl/adapter_best.pt
+  # Start from the only pilot that improved both held-out point-value tasks. The final
+  # phase freezes its audited router/global tensors and updates only evidence_down/up.
+  stage2b_resume_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260726_203443_tensor_patch_qa_stage2b_causal_reader_small_autodl/adapter_best.pt
   soft_prompt_tokens: 256
   adapter_dim: 512
   adapter_layers: 2
@@ -391,10 +391,10 @@ adapter:
   local_residual_gate_trainable: false
   zero_init_local_text_attention: true
   freeze_conditioned_backbone: true
-  # Joint A/B small run: only the explicit global-only view may update this branch.
-  freeze_global_adapter: false
+  # Stage-2B final keeps the direct tensor representation bitwise fixed.
+  freeze_global_adapter: true
   global_unfreeze_epoch: 0
-  # Ten-times smaller than the local reader LR; an L2 parent anchor further limits drift.
+  # Retained for checkpoint compatibility; the final optimizer excludes global parameters.
   global_lr: 1.0e-6
   # Keep all 256 current-global tokens present; the B view detaches them before backpropagation.
   global_prompt_dropout: 0.0
@@ -403,16 +403,18 @@ adapter:
   mask_inactive_local_tokens: true
 
 llm_training:
-  run_name: tensor_patch_qa_stage2b_joint_ab_small
-  # Default command runs the required subset experiment. Passing
+  run_name: tensor_patch_qa_stage2b_point_reader_final_screening
+  # Default command runs the final evidence-only subset check. Passing
   # --joint-run-scope formal applies only the overrides below while sharing the
   # exact same model, losses, optimizer, validation, and checkpoint contract.
   joint_run_scope: screening
   formal_overrides:
-    run_name: tensor_patch_qa_stage2b_joint_ab_formal
+    run_name: tensor_patch_qa_stage2b_point_reader_final_formal
     max_train_records: null
     max_val_records: null
     max_test_records: null
+    lr: 1.0e-5
+    checkpoint_full_eval_top_k: 7
     # The trainer scores test only when the selected full-validation candidate
     # passes every admission check; rejected formal runs still skip test.
     evaluate_test: true
@@ -425,8 +427,8 @@ llm_training:
   max_val_records: null
   max_test_records: null
   record_subset_mode: hash_state
-  # A fixed 2000-record (200-state, two variants per task) validation slice audits continuation routing
-  # and screens quarter-epoch candidates. The top two are then compared on the complete validation split.
+  # A fixed 2000-record validation slice audits continuation routing and screens candidates.
+  # Screening fully checks the top three; formal_overrides checks every saved candidate.
   initial_eval_records: 2000
   # Formal train/val/test splits must not share PDEBench sample_index values.
   require_disjoint_splits: true
@@ -469,7 +471,7 @@ llm_training:
   eval_choice_batch_size: 4
   # Used only by the sequence-likelihood fallback; auto single-token scoring uses one forward directly.
   train_choice_batch_size: 12
-  # Legacy ranking/swap chunk size; both objectives are disabled in this joint experiment.
+  # Chunk size for the retained swapped-question anti-shortcut objective.
   train_grounding_batch_size: 8
   # Non-reentrant checkpointing retains gradients to the tensor prefix without storing every Qwen activation.
   llm_gradient_checkpointing: true
@@ -477,51 +479,60 @@ llm_training:
   # In general: effective batch = batch_size x 4 ranks x gradient_accumulation_steps.
   # For a single-GPU fallback, pass --gradient-accumulation-steps 5.
   gradient_accumulation_steps: 1
-  # Local reader LR. The global-only A view uses adapter.global_lr above.
-  lr: 2.0e-5
+  # The short screening run uses the already validated pilot LR; formal_overrides
+  # lowers it fivefold for the roughly ten-times longer full-data schedule.
+  lr: 5.0e-5
   lr_scheduler: cosine
   warmup_ratio: 0.03
   min_lr_ratio: 0.2
   weight_decay: 1.0e-4
   grad_clip_norm: 1.0
-  # Restricted-choice CE is the answer objective; token CE would bypass per-task balancing.
-  ce_loss_weight: 0.0
+  # Restricted-choice CE is primary. Retain the successful pilot's tiny full-vocabulary
+  # label/EOS term as a format regularizer; the natural task ratio is intentional here.
+  ce_loss_weight: 0.02
   choice_ce_loss_weight: 1.0
   ranking_loss_weight: 0.0
   ranking_loss_margin: 0.1
   grounding_routing_loss_weight: 1.0
-  # Keep routing as a low-weight generalization anchor after its dedicated warmup has converged.
-  grounding_joint_routing_loss_weight: 0.1
-  grounding_gate_loss_weight: 0.1
+  # Routing and gates are evaluated but frozen; answer loss cannot rewrite geometry.
+  grounding_joint_routing_loss_weight: 0.0
+  grounding_gate_loss_weight: 0.0
   matched_group_loss_weight: 0.2
   matched_group_loss_margin: 0.5
   # Compare the correct tensor prefix with a same-length zero-information prefix. A shuffled PDE tensor
   # is not a reliable negative: its answer can legitimately equal the current record's answer.
   ranking_loss_negative: no_latent
-  # The joint run replaces the old swap probe with explicit same-question causal/no-harm views.
-  swapped_question_loss_weight: 0.0
+  # Preserve the matched-question anti-shortcut objective from the successful pilot.
+  swapped_question_loss_weight: 0.1
   swapped_question_loss_margin: 0.1
   # Same-label swaps are semantically ambiguous, especially for balanced binary tasks.
   swapped_question_require_different_answer: true
   # Per matched group, independent of the tunable outer microbatch size.
   swapped_question_max_records: 3
-  # Same clean Stage-2B records supply three views. A and B are backpropagated sequentially
-  # before one optimizer step, so the two frozen-14B graphs never coexist in memory.
-  joint_ab_training: true
-  task_balanced_answer_loss: true
-  global_view_loss_weight: 1.0
-  joint_no_harm_loss_weight: 0.25
+  # Final point-reader mode: positive hybrid plus one frozen zero-local reference.
+  # Natural record frequencies allocate 2/3 of answer updates to point-value tasks.
+  joint_ab_training: false
+  point_reader_training: true
+  task_balanced_answer_loss: false
+  global_view_loss_weight: 0.0
+  joint_no_harm_loss_weight: 0.0
   joint_no_harm_margin: 0.0
-  joint_causal_loss_weight: 0.25
+  joint_causal_loss_weight: 0.0
   joint_causal_margin: 0.1
-  global_anchor_loss_weight: 0.01
-  # Preserve the grounded parent's generic reader while validation decides whether new gains are real.
-  local_anchor_loss_weight: 0.01
+  point_causal_loss_weight: 0.5
+  point_causal_margin: 0.1
+  point_causal_tasks:
+    - normalized_point_value
+    - raw_point_value_with_stats
+  nonpoint_no_harm_loss_weight: 0.1
+  nonpoint_no_harm_margin: 0.0
+  global_anchor_loss_weight: 0.0
+  local_anchor_loss_weight: 0.0
   prompt_template: task_specific
   max_prompt_tokens: 512
   max_target_tokens: 8
   append_eos: true
-  # Candidate screening uses these four causal views; the top two also use them on full validation.
+  # Candidate screening and full admission use the same four causal views.
   eval_baselines:
     - correct
     - zero_local
@@ -541,16 +552,16 @@ llm_training:
   # Group different natural-language questions for the same tensor and operation inside each batch.
   group_questions_by_state: true
   questions_per_state_group: 3
-  # Save quarter-epoch candidates, screen all on one fixed subset, then fully evaluate only
-  # the best two. Selection protects the worst per-task delta before considering aggregate gain.
-  # Fractions are converted after batch/world-size/accumulation determine the true update budget.
-  checkpoint_fractions: [0.25, 0.5, 0.75, 1.0]
+  # Early checkpoints matter because the full-data evidence transform can converge quickly.
+  # Point deltas own ranking; the other tasks are bounded validation guardrails.
+  checkpoint_fractions: [0.025, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
   checkpoint_screening_records: 2000
-  checkpoint_full_eval_top_k: 2
-  joint_min_causal_gain: 0.015
-  joint_max_parent_regression: 0.005
-  joint_min_no_harm_delta: 0.0
-  checkpoint_metric: joint_ab_worst_task_delta
+  checkpoint_full_eval_top_k: 3
+  # Admission is point-first; non-point tasks are a bounded generalization guardrail.
+  point_reader_min_parent_delta: 0.005
+  point_reader_min_causal_gain: 0.03
+  point_reader_max_nonpoint_regression: 0.03
+  checkpoint_metric: point_value_min_causal_gain
   log_interval: 20
   # Preserve local curves even when W&B is unavailable on the training server.
   console_progress: false

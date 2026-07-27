@@ -1930,6 +1930,101 @@ def _grounded_local_adapter(adapter: nn.Module) -> GroundedEvidenceAdapter | Non
     return None
 
 
+EVIDENCE_TRANSFORM_PARAMETER_NAMES = frozenset(
+    {
+        "evidence_down.weight",
+        "evidence_up.weight",
+    }
+)
+
+
+def configure_evidence_only_training(adapter: nn.Module) -> dict[str, Any]:
+    """Freeze the deployed reader except for its shared evidence transform."""
+
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("Evidence-only training requires HybridGlobalLocalAdapter.")
+    local = _grounded_local_adapter(adapter)
+    if local is None:
+        raise TypeError("Evidence-only training requires GroundedEvidenceAdapter.")
+    adapter.set_global_trainable(False)
+    observed_names = {name for name, _parameter in local.named_parameters()}
+    missing = sorted(EVIDENCE_TRANSFORM_PARAMETER_NAMES - observed_names)
+    if missing:
+        raise RuntimeError(
+            "Grounded evidence transform parameters are missing: " + ", ".join(missing)
+        )
+    for name, parameter in local.named_parameters():
+        parameter.requires_grad_(name in EVIDENCE_TRANSFORM_PARAMETER_NAMES)
+    trainable = sorted(
+        f"local_adapter.{name}"
+        for name, parameter in local.named_parameters()
+        if parameter.requires_grad
+    )
+    expected = sorted(
+        f"local_adapter.{name}" for name in EVIDENCE_TRANSFORM_PARAMETER_NAMES
+    )
+    if trainable != expected:
+        raise RuntimeError(
+            "Evidence-only trainable boundary mismatch: "
+            f"observed={trainable}, expected={expected}."
+        )
+    return {
+        "mode": "evidence_transform_only",
+        "trainable_parameter_names": trainable,
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in local.parameters() if parameter.requires_grad
+        ),
+        "frozen_router_parameters": sum(
+            parameter.numel() for parameter in local.parameters() if not parameter.requires_grad
+        ),
+        "frozen_global_parameters": sum(
+            parameter.numel() for parameter in adapter.global_adapter.parameters()
+        ),
+    }
+
+
+def audit_evidence_only_optimizer_boundary(
+    optimizer: torch.optim.Optimizer,
+    adapter: nn.Module,
+) -> dict[str, Any]:
+    """Fail loudly if a final Stage-2B optimizer can update anything else."""
+
+    if not isinstance(adapter, HybridGlobalLocalAdapter):
+        raise TypeError("Evidence-only optimizer audit requires a hybrid adapter.")
+    expected = {
+        id(parameter)
+        for name, parameter in adapter.local_adapter.named_parameters()
+        if name in EVIDENCE_TRANSFORM_PARAMETER_NAMES
+    }
+    observed = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group.get("params", [])
+    }
+    trainable_names = sorted(
+        name for name, parameter in adapter.named_parameters() if parameter.requires_grad
+    )
+    expected_names = sorted(
+        f"local_adapter.{name}" for name in EVIDENCE_TRANSFORM_PARAMETER_NAMES
+    )
+    if observed != expected or trainable_names != expected_names:
+        raise RuntimeError(
+            "Final Stage-2B must optimize only the shared evidence transform: "
+            f"trainable={trainable_names}, expected={expected_names}, "
+            f"optimizer_tensors={len(observed)}."
+        )
+    return {
+        "validated": True,
+        "trainable_parameter_names": trainable_names,
+        "optimizer_tensor_count": len(observed),
+        "optimizer_parameters": sum(
+            parameter.numel()
+            for group in optimizer.param_groups
+            for parameter in group.get("params", [])
+        ),
+    }
+
+
 def _all_visible_soft_prompt_mask(
     soft_embeds: torch.Tensor,
     *,
@@ -3068,6 +3163,15 @@ def parse_args() -> argparse.Namespace:
         help="Train global-only A and grounded hybrid B views with disjoint gradient ownership.",
     )
     parser.add_argument(
+        "--point-reader-training",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Freeze global/routing parameters and train only the shared grounded evidence "
+            "transform with point-causal and non-point preservation references."
+        ),
+    )
+    parser.add_argument(
         "--joint-run-scope",
         choices=JOINT_RUN_SCOPES,
         default=None,
@@ -3086,6 +3190,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-no-harm-margin", type=float, default=None)
     parser.add_argument("--joint-causal-loss-weight", type=float, default=None)
     parser.add_argument("--joint-causal-margin", type=float, default=None)
+    parser.add_argument("--point-causal-loss-weight", type=float, default=None)
+    parser.add_argument("--point-causal-margin", type=float, default=None)
+    parser.add_argument(
+        "--point-causal-tasks",
+        type=str,
+        default=None,
+        help="Comma-separated task types receiving the zero-local causal hinge.",
+    )
+    parser.add_argument("--nonpoint-no-harm-loss-weight", type=float, default=None)
+    parser.add_argument("--nonpoint-no-harm-margin", type=float, default=None)
     parser.add_argument("--global-anchor-loss-weight", type=float, default=None)
     parser.add_argument("--local-anchor-loss-weight", type=float, default=None)
     parser.add_argument(
@@ -3272,6 +3386,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-min-causal-gain", type=float, default=None)
     parser.add_argument("--joint-max-parent-regression", type=float, default=None)
     parser.add_argument("--joint-min-no-harm-delta", type=float, default=None)
+    parser.add_argument("--point-reader-min-parent-delta", type=float, default=None)
+    parser.add_argument("--point-reader-min-causal-gain", type=float, default=None)
+    parser.add_argument("--point-reader-max-nonpoint-regression", type=float, default=None)
     parser.add_argument("--evaluate-test", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-every-epochs", type=int, default=None)
@@ -3560,6 +3677,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     )
     set_default(
         args,
+        "point_reader_training",
+        first_nested(config, ["llm_training.point_reader_training"]),
+        False,
+    )
+    set_default(
+        args,
         "task_balanced_answer_loss",
         first_nested(config, ["llm_training.task_balanced_answer_loss"]),
         False,
@@ -3592,6 +3715,36 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args,
         "joint_causal_margin",
         first_nested(config, ["llm_training.joint_causal_margin"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "point_causal_loss_weight",
+        first_nested(config, ["llm_training.point_causal_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "point_causal_margin",
+        first_nested(config, ["llm_training.point_causal_margin"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "point_causal_tasks",
+        value_to_csv(first_nested(config, ["llm_training.point_causal_tasks"])),
+        "normalized_point_value,raw_point_value_with_stats",
+    )
+    set_default(
+        args,
+        "nonpoint_no_harm_loss_weight",
+        first_nested(config, ["llm_training.nonpoint_no_harm_loss_weight"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "nonpoint_no_harm_margin",
+        first_nested(config, ["llm_training.nonpoint_no_harm_margin"]),
         0.0,
     )
     set_default(
@@ -3790,6 +3943,24 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         first_nested(config, ["llm_training.joint_min_no_harm_delta"]),
         0.0,
     )
+    set_default(
+        args,
+        "point_reader_min_parent_delta",
+        first_nested(config, ["llm_training.point_reader_min_parent_delta"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "point_reader_min_causal_gain",
+        first_nested(config, ["llm_training.point_reader_min_causal_gain"]),
+        0.0,
+    )
+    set_default(
+        args,
+        "point_reader_max_nonpoint_regression",
+        first_nested(config, ["llm_training.point_reader_max_nonpoint_regression"]),
+        0.03,
+    )
     set_default(args, "evaluate_test", first_nested(config, ["llm_training.evaluate_test"]), True)
     set_default(args, "diagnostics_enabled", first_nested(config, ["llm_training.diagnostics.enabled"]), True)
     set_default(
@@ -3958,6 +4129,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             value = float(getattr(args, setting))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"llm_training.{setting} must be finite and in [0, 1].")
+        if bool(args.joint_ab_training) and bool(args.point_reader_training):
+            raise ValueError(
+                "joint_ab_training and point_reader_training are mutually exclusive."
+            )
         if bool(args.joint_ab_training):
             joint_run_scope = str(args.joint_run_scope)
             if not str(args.stage2b_resume_checkpoint or "").strip():
@@ -4049,12 +4224,121 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
                     "joint_ab_training checkpoint screening is missing eval baselines: "
                     f"{missing}."
                 )
+        elif bool(args.point_reader_training):
+            point_tasks = tuple(parse_csv(args.point_causal_tasks))
+            if set(point_tasks) != set(POINT_VALUE_TASK_TYPES) or len(point_tasks) != len(
+                POINT_VALUE_TASK_TYPES
+            ):
+                raise ValueError(
+                    "point_reader_training requires point_causal_tasks to contain exactly "
+                    f"{list(POINT_VALUE_TASK_TYPES)}."
+                )
+            if not str(args.stage2b_resume_checkpoint or "").strip():
+                raise ValueError(
+                    "point_reader_training requires adapter.stage2b_resume_checkpoint."
+                )
+            if not bool(args.freeze_global_adapter):
+                raise ValueError(
+                    "point_reader_training requires adapter.freeze_global_adapter=true."
+                )
+            if int(args.global_unfreeze_epoch) != 0:
+                raise ValueError(
+                    "point_reader_training permanently freezes global; global_unfreeze_epoch must be 0."
+                )
+            if int(args.grounding_routing_warmup_epochs) != 0:
+                raise ValueError(
+                    "point_reader_training starts from an audited router and requires no routing warmup."
+                )
+            if float(args.global_prompt_dropout) != 0.0:
+                raise ValueError("point_reader_training requires global_prompt_dropout=0.")
+            if float(args.global_view_loss_weight) != 0.0:
+                raise ValueError("point_reader_training disables the trainable global view.")
+            if any(
+                float(getattr(args, setting)) != 0.0
+                for setting in (
+                    "joint_no_harm_loss_weight",
+                    "joint_causal_loss_weight",
+                    "global_anchor_loss_weight",
+                    "local_anchor_loss_weight",
+                    "grounding_joint_routing_loss_weight",
+                    "grounding_gate_loss_weight",
+                )
+            ):
+                raise ValueError(
+                    "point_reader_training requires legacy joint, anchor, routing, and gate "
+                    "loss weights to be zero."
+                )
+            if float(args.point_causal_loss_weight) <= 0.0:
+                raise ValueError(
+                    "point_reader_training requires point_causal_loss_weight > 0."
+                )
+            if float(args.nonpoint_no_harm_loss_weight) <= 0.0:
+                raise ValueError(
+                    "point_reader_training requires nonpoint_no_harm_loss_weight > 0."
+                )
+            if bool(args.task_balanced_answer_loss):
+                raise ValueError(
+                    "point_reader_training uses the validated natural 3:3:1:1:1 task ratio; "
+                    "task_balanced_answer_loss must be false."
+                )
+            if int(args.epochs) != 1:
+                raise ValueError(
+                    "The final point-reader large-data/small-epoch schedule requires one epoch."
+                )
+            if str(args.checkpoint_metric) != "point_value_min_causal_gain":
+                raise ValueError(
+                    "point_reader_training requires checkpoint_metric=point_value_min_causal_gain."
+                )
+            required = {"correct", "zero_local", "global_only", "shuffled"}
+            missing = sorted(required - set(parse_csv(args.eval_baselines)))
+            if missing:
+                raise ValueError(
+                    "point_reader_training checkpoint screening is missing eval baselines: "
+                    f"{missing}."
+                )
+            point_run_scope = str(args.joint_run_scope)
+            if point_run_scope == "screening":
+                if bool(args.evaluate_test):
+                    raise ValueError(
+                        "The point-reader screening experiment must keep evaluate_test=false."
+                    )
+                if args.max_train_records is None or int(args.max_train_records) <= 0:
+                    raise ValueError(
+                        "joint_run_scope=screening requires a positive max_train_records subset."
+                    )
+            elif point_run_scope == "formal":
+                if not bool(args.evaluate_test):
+                    raise ValueError(
+                        "joint_run_scope=formal requires evaluate_test=true; test remains "
+                        "gated on full-validation admission."
+                    )
+                if any(
+                    value is not None
+                    for value in (
+                        args.max_train_records,
+                        args.max_val_records,
+                        args.max_test_records,
+                    )
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires complete train/val/test splits."
+                    )
+                if not bool(args.require_disjoint_splits) or not bool(
+                    args.require_untruncated_prompts
+                ):
+                    raise ValueError(
+                        "joint_run_scope=formal requires disjoint splits and untruncated prompts."
+                    )
+            else:  # pragma: no cover - resolved before defaults
+                raise ValueError(f"Unsupported joint_run_scope={point_run_scope!r}.")
         elif not bool(args.freeze_global_adapter):
             raise ValueError(
                 "grounded_evidence_adapter may unfreeze global only through joint_ab_training."
             )
         elif str(args.joint_run_scope) == "formal":
-            raise ValueError("joint_run_scope=formal requires joint_ab_training=true.")
+            raise ValueError(
+                "joint_run_scope=formal requires joint_ab_training or point_reader_training."
+            )
     elif int(args.grounding_routing_warmup_epochs) != 0:
         raise ValueError(
             "grounding_routing_warmup_epochs is only valid for grounded_evidence_adapter."
@@ -4100,6 +4384,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "joint_no_harm_margin",
         "joint_causal_loss_weight",
         "joint_causal_margin",
+        "point_causal_loss_weight",
+        "point_causal_margin",
+        "nonpoint_no_harm_loss_weight",
+        "nonpoint_no_harm_margin",
         "global_anchor_loss_weight",
         "local_anchor_loss_weight",
     ):
@@ -4183,20 +4471,21 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("llm_training.checkpoint_screening_records must be non-negative.")
     if int(args.checkpoint_full_eval_top_k) <= 0:
         raise ValueError("llm_training.checkpoint_full_eval_top_k must be positive.")
-    if bool(args.joint_ab_training):
+    if uses_screened_stage2b_training(args):
         if not (checkpoint_updates or checkpoint_fractions) or int(
             args.checkpoint_screening_records
         ) <= 0:
             raise ValueError(
-                "joint_ab_training requires checkpoint fractions/updates and "
+                "Screened Stage-2B training requires checkpoint fractions/updates and "
                 "checkpoint_screening_records > 0."
             )
         if checkpoint_fractions and 1.0 not in checkpoint_fractions:
-            raise ValueError("joint_ab_training checkpoint_fractions must include 1.0.")
+            raise ValueError("Screened Stage-2B checkpoint_fractions must include 1.0.")
         if int(args.initial_eval_records) != int(args.checkpoint_screening_records):
             raise ValueError(
                 "The parent audit and candidate screening must use the same fixed validation subset."
             )
+    if bool(args.joint_ab_training):
         if not math.isfinite(float(args.joint_min_causal_gain)) or float(
             args.joint_min_causal_gain
         ) < 0.0:
@@ -4207,6 +4496,15 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("joint_max_parent_regression must be finite and non-negative.")
         if not math.isfinite(float(args.joint_min_no_harm_delta)):
             raise ValueError("joint_min_no_harm_delta must be finite.")
+    if bool(args.point_reader_training):
+        for setting in (
+            "point_reader_min_parent_delta",
+            "point_reader_min_causal_gain",
+            "point_reader_max_nonpoint_regression",
+        ):
+            value = float(getattr(args, setting))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"llm_training.{setting} must be finite and non-negative.")
     if not math.isfinite(float(args.warmup_ratio)) or not 0.0 <= float(args.warmup_ratio) < 1.0:
         raise ValueError("llm_training.warmup_ratio must be in [0, 1).")
     if not math.isfinite(float(args.min_lr_ratio)) or not 0.0 <= float(args.min_lr_ratio) <= 1.0:
@@ -6729,6 +7027,43 @@ def same_state_question_swap_indices(
     return owners, swapped
 
 
+def matched_group_owner_mean(
+    values: torch.Tensor,
+    owners: Sequence[int],
+    records: Sequence[Mapping[str, Any]],
+) -> torch.Tensor:
+    """Average owner values per matched group, then equally across groups."""
+
+    flat = values.reshape(-1)
+    if int(flat.numel()) != len(owners) or not owners:
+        raise ValueError(
+            "Matched-group owner mean requires one value per non-empty owner list: "
+            f"values={int(flat.numel())}, owners={len(owners)}."
+        )
+    grouped: dict[tuple[str, str], list[torch.Tensor]] = defaultdict(list)
+    for value, raw_owner in zip(flat, owners):
+        owner = int(raw_owner)
+        if owner < 0 or owner >= len(records):
+            raise IndexError(
+                f"Matched-group owner index {owner} is outside {len(records)} records."
+            )
+        record = records[owner]
+        spec = record.get("matched_group")
+        margin_group_id = (
+            str(spec.get("margin_group_id") or "")
+            if isinstance(spec, Mapping)
+            else ""
+        )
+        if not margin_group_id:
+            raise ValueError(
+                f"Swap owner {record.get('qa_id', owner)!r} has no margin_group_id."
+            )
+        grouped[(str(record.get("state_ref", "")), margin_group_id)].append(value)
+    return torch.stack(
+        [torch.stack(group_values).mean() for group_values in grouped.values()]
+    ).mean()
+
+
 def question_swapped_soft_prefixes(
     adapter: nn.Module,
     *,
@@ -6788,6 +7123,18 @@ STAGE2B_TASK_TYPES = (
     "region_mean_compare",
 )
 
+POINT_VALUE_TASK_TYPES = (
+    "normalized_point_value",
+    "raw_point_value_with_stats",
+)
+
+
+def uses_screened_stage2b_training(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "joint_ab_training", False)
+        or getattr(args, "point_reader_training", False)
+    )
+
 
 def inverse_frequency_task_weights(
     records: Sequence[Mapping[str, Any]],
@@ -6846,6 +7193,22 @@ def task_balanced_record_mean(
         weights.append(float(task_weights[task]))
     weight_tensor = flat.new_tensor(weights)
     return (flat * weight_tensor).mean()
+
+
+def masked_record_mean(values: torch.Tensor, active_mask: torch.Tensor) -> torch.Tensor:
+    """Zero inactive tasks while preserving the outer per-record loss scale."""
+
+    flat = values.reshape(-1)
+    mask = active_mask.reshape(-1).to(device=flat.device, dtype=flat.dtype)
+    if tuple(flat.shape) != tuple(mask.shape):
+        raise ValueError(
+            "Masked record mean requires identical value/mask shapes: "
+            f"values={tuple(flat.shape)}, mask={tuple(mask.shape)}."
+        )
+    active = mask.sum()
+    if float(active.detach().cpu().item()) <= 0.0:
+        return flat.sum() * 0.0
+    return (flat * mask).mean()
 
 
 def correct_choice_margins(
@@ -7049,6 +7412,8 @@ def training_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     records = batch["records"]
     joint_ab_training = bool(getattr(args, "joint_ab_training", False))
+    point_reader_training = bool(getattr(args, "point_reader_training", False))
+    reference_training = joint_ab_training or point_reader_training
     if joint_ab_training and not (
         isinstance(adapter, HybridGlobalLocalAdapter)
         and _grounded_local_adapter(adapter) is not None
@@ -7056,6 +7421,14 @@ def training_loss(
     ):
         raise ValueError(
             "joint_ab_training requires a grounded evidence adapter with a trainable global branch."
+        )
+    if point_reader_training and not (
+        isinstance(adapter, HybridGlobalLocalAdapter)
+        and _grounded_local_adapter(adapter) is not None
+        and adapter.freeze_global
+    ):
+        raise ValueError(
+            "point_reader_training requires grounded evidence with a frozen global branch."
         )
     task_weights = (
         getattr(args, "task_loss_weights", None)
@@ -7174,7 +7547,7 @@ def training_loss(
             args=args,
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
-            detach_global_for_local=joint_ab_training,
+            detach_global_for_local=reference_training,
         )
     else:
         ce_loss = forward_loss(
@@ -7191,7 +7564,7 @@ def training_loss(
             prompt_template=str(args.prompt_template),
             local_context_layer=int(args.local_context_layer),
             precomputed_question_context=question_context,
-            detach_global_for_local=joint_ab_training,
+            detach_global_for_local=reference_training,
         )
         choice_loss_value = ce_loss.new_zeros(())
         positive_choice_nll = None
@@ -7214,7 +7587,7 @@ def training_loss(
             args=args,
             soft_prompt_mode="correct",
             precomputed_question_context=question_context,
-            detach_global_for_local=joint_ab_training,
+            detach_global_for_local=reference_training,
         )
     unbalanced_choice_loss_value = positive_choice_nll.mean()
     choice_loss_value = task_balanced_record_mean(
@@ -7240,7 +7613,7 @@ def training_loss(
         records=records,
         candidate_log_probs=candidate_log_probs,
         margin=float(args.matched_group_loss_margin),
-        task_weights=task_weights if joint_ab_training else None,
+        task_weights=task_weights,
     )
     if _grounded_local_adapter(adapter) is not None:
         routing_loss, gate_loss, routing_metrics = grounded_routing_loss(adapter, records)
@@ -7268,8 +7641,11 @@ def training_loss(
     no_harm_margin_mean = 0.0
     causal_margin_mean = 0.0
     causal_active_records = 0.0
-    if joint_ab_training:
-        if joint_global_margins is None or int(joint_global_margins.numel()) != len(records):
+    if reference_training:
+        if joint_ab_training and (
+            joint_global_margins is None
+            or int(joint_global_margins.numel()) != len(records)
+        ):
             raise ValueError(
                 "The local joint A/B view requires one detached global-only margin per record."
             )
@@ -7298,7 +7674,7 @@ def training_loss(
             isinstance(values, Sequence)
             for values in (positive_targets, zero_targets)
         ):
-            raise RuntimeError("Joint A/B choice scoring did not return target indices.")
+            raise RuntimeError("Reference choice scoring did not return target indices.")
         positive_margins = correct_choice_margins(
             candidate_log_probs,
             positive_targets,
@@ -7307,45 +7683,73 @@ def training_loss(
             zero_choice_metrics["candidate_log_probs"],
             zero_targets,
         )
-        no_harm_gap = positive_margins - joint_global_margins.detach()
-        no_harm_terms = margin_hinge_terms(
-            positive_margins,
-            joint_global_margins,
-            float(args.joint_no_harm_margin),
-        )
-        no_harm_loss = task_balanced_record_mean(
-            no_harm_terms,
-            records,
-            task_weights,
-        )
-        active_local = positive_margins.new_tensor(
-            [
-                float(
-                    _GROUNDING_ACTIVE_ROLES_BY_TYPE[
-                        str(grounding_query_spec_for_record(record)["type"])
-                    ]
-                    > 0
-                )
-                for record in records
-            ]
-        )
-        causal_gap = positive_margins - zero_margins.detach()
-        causal_terms = margin_hinge_terms(
-            positive_margins,
-            zero_margins,
-            float(args.joint_causal_margin),
-        ) * active_local
-        causal_loss = task_balanced_record_mean(
-            causal_terms,
-            records,
-            task_weights,
-        )
-        local_anchor_loss = local_parameter_anchor_loss(
-            adapter,
-            local_anchor_reference,
-        )
-        global_view_accuracy = float(joint_global_accuracy or 0.0)
-        no_harm_margin_mean = float(no_harm_gap.detach().mean().cpu().item())
+        if point_reader_training:
+            point_tasks = set(parse_csv(args.point_causal_tasks))
+            point_mask = positive_margins.new_tensor(
+                [float(str(record.get("task_type", "")) in point_tasks) for record in records]
+            )
+            nonpoint_mask = 1.0 - point_mask
+            causal_gap = positive_margins - zero_margins.detach()
+            causal_terms = margin_hinge_terms(
+                positive_margins,
+                zero_margins,
+                float(args.point_causal_margin),
+            )
+            causal_loss = masked_record_mean(causal_terms, point_mask)
+            no_harm_terms = margin_hinge_terms(
+                positive_margins,
+                zero_margins,
+                float(args.nonpoint_no_harm_margin),
+            )
+            no_harm_loss = masked_record_mean(no_harm_terms, nonpoint_mask)
+            no_harm_gap = positive_margins - zero_margins.detach()
+            no_harm_active = float(nonpoint_mask.sum().detach().cpu().item())
+            no_harm_margin_mean = float(
+                (no_harm_gap.detach() * nonpoint_mask).sum().cpu().item()
+                / max(1.0, no_harm_active)
+            )
+            active_local = point_mask
+        else:
+            assert joint_global_margins is not None
+            no_harm_gap = positive_margins - joint_global_margins.detach()
+            no_harm_terms = margin_hinge_terms(
+                positive_margins,
+                joint_global_margins,
+                float(args.joint_no_harm_margin),
+            )
+            no_harm_loss = task_balanced_record_mean(
+                no_harm_terms,
+                records,
+                task_weights,
+            )
+            active_local = positive_margins.new_tensor(
+                [
+                    float(
+                        _GROUNDING_ACTIVE_ROLES_BY_TYPE[
+                            str(grounding_query_spec_for_record(record)["type"])
+                        ]
+                        > 0
+                    )
+                    for record in records
+                ]
+            )
+            causal_gap = positive_margins - zero_margins.detach()
+            causal_terms = margin_hinge_terms(
+                positive_margins,
+                zero_margins,
+                float(args.joint_causal_margin),
+            ) * active_local
+            causal_loss = task_balanced_record_mean(
+                causal_terms,
+                records,
+                task_weights,
+            )
+            local_anchor_loss = local_parameter_anchor_loss(
+                adapter,
+                local_anchor_reference,
+            )
+            global_view_accuracy = float(joint_global_accuracy or 0.0)
+            no_harm_margin_mean = float(no_harm_gap.detach().mean().cpu().item())
         causal_margin_mean = float(
             (causal_gap.detach() * active_local).sum().cpu().item()
             / max(1.0, float(active_local.sum().cpu().item()))
@@ -7516,10 +7920,20 @@ def training_loss(
             ]
             selected_positive = torch.stack([positive_choice_nll[index] for index in swap_owners])
             swap_margin = swapped_choice_nll - selected_positive
-            swapped_loss = F.relu(float(args.swapped_question_loss_margin) - swap_margin).mean()
+            swapped_loss = matched_group_owner_mean(
+                F.relu(float(args.swapped_question_loss_margin) - swap_margin),
+                swap_owners,
+                records,
+            )
             swapped_metrics = {
                 "swapped_question_pairs": float(len(swap_owners)),
-                "swapped_question_margin_mean": float(swap_margin.detach().mean().cpu().item()),
+                "swapped_question_margin_mean": float(
+                    matched_group_owner_mean(
+                        swap_margin.detach(),
+                        swap_owners,
+                        records,
+                    ).cpu().item()
+                ),
             }
     weighted_ce_loss = ce_weight * ce_loss
     weighted_choice_ce_loss = choice_ce_weight * choice_loss_value
@@ -7529,8 +7943,18 @@ def training_loss(
     weighted_gate_loss = gate_weight * gate_loss
     weighted_matched_group_loss = matched_group_weight * matched_group_loss
     weighted_global_view_loss = float(getattr(args, "global_view_loss_weight", 0.0)) * global_view_loss
-    weighted_no_harm_loss = float(getattr(args, "joint_no_harm_loss_weight", 0.0)) * no_harm_loss
-    weighted_causal_loss = float(getattr(args, "joint_causal_loss_weight", 0.0)) * causal_loss
+    no_harm_weight = float(
+        getattr(args, "nonpoint_no_harm_loss_weight", 0.0)
+        if point_reader_training
+        else getattr(args, "joint_no_harm_loss_weight", 0.0)
+    )
+    causal_weight = float(
+        getattr(args, "point_causal_loss_weight", 0.0)
+        if point_reader_training
+        else getattr(args, "joint_causal_loss_weight", 0.0)
+    )
+    weighted_no_harm_loss = no_harm_weight * no_harm_loss
+    weighted_causal_loss = causal_weight * causal_loss
     weighted_global_anchor_loss = (
         float(getattr(args, "global_anchor_loss_weight", 0.0)) * global_anchor_loss
     )
@@ -7727,6 +8151,10 @@ def generate_diagnostic_answer(
     max_prompt_tokens: int,
     max_new_tokens: int,
 ) -> dict[str, Any]:
+    if soft_attention_mask is None:
+        raise ValueError(
+            "Diagnostic generation requires the attention mask captured with its soft prefix."
+        )
     prompt = build_prompt(record, prompt_template=prompt_template)
     prompt_ids = tokenizer(prompt, add_special_tokens=True, truncation=False)["input_ids"]
     if len(prompt_ids) > int(max_prompt_tokens):
@@ -7735,11 +8163,7 @@ def generate_diagnostic_answer(
     text_embeds = llm.get_input_embeddings()(input_ids)
     soft_embeds = soft_embeds.to(device=device, dtype=text_embeds.dtype)
     inputs_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
-    soft_attention = (
-        torch.ones(soft_embeds.shape[:2], dtype=torch.long, device=device)
-        if soft_attention_mask is None
-        else soft_attention_mask.to(device=device, dtype=torch.long)
-    )
+    soft_attention = soft_attention_mask.to(device=device, dtype=torch.long)
     if tuple(soft_attention.shape) != tuple(soft_embeds.shape[:2]):
         raise ValueError(
             "Diagnostic soft-prefix mask does not match embeddings: "
@@ -10559,17 +10983,103 @@ def joint_ab_checkpoint_metrics(
     }
 
 
+def point_reader_checkpoint_metrics(
+    metrics: Mapping[str, Any],
+    parent_metrics: Mapping[str, Any],
+    *,
+    min_parent_delta: float = 0.0,
+    min_causal_gain: float = 0.0,
+    max_nonpoint_regression: float = 0.03,
+) -> dict[str, Any]:
+    """Rank evidence-only checkpoints by point gains with auxiliary guardrails."""
+
+    current = _mode_task_accuracies(metrics, "correct")
+    parent = _mode_task_accuracies(parent_metrics, "correct")
+    current_zero = _mode_task_accuracies(metrics, "zero_local")
+    current_global = _mode_task_accuracies(metrics, "global_only")
+    current_shuffled = _mode_task_accuracies(metrics, "shuffled")
+    delta = {task: current[task] - parent[task] for task in STAGE2B_TASK_TYPES}
+    point_delta = {task: delta[task] for task in POINT_VALUE_TASK_TYPES}
+    nonpoint_delta = {
+        task: delta[task]
+        for task in STAGE2B_TASK_TYPES
+        if task not in POINT_VALUE_TASK_TYPES
+    }
+    causal_gain = {
+        task: current[task]
+        - max(current_zero[task], current_global[task], current_shuffled[task])
+        for task in POINT_VALUE_TASK_TYPES
+    }
+    min_point_delta = min(point_delta.values())
+    mean_point_delta = sum(point_delta.values()) / len(point_delta)
+    min_point_causal_gain = min(causal_gain.values())
+    worst_nonpoint_delta = min(nonpoint_delta.values())
+    acceptance = {
+        "point_parent_delta": min_point_delta >= float(min_parent_delta),
+        "point_causal_gain": min_point_causal_gain >= float(min_causal_gain),
+        "nonpoint_parent_guardrail": worst_nonpoint_delta
+        >= -float(max_nonpoint_regression),
+    }
+    return {
+        "hybrid_delta_by_task": delta,
+        "point_parent_delta_by_task": point_delta,
+        "nonpoint_parent_delta_by_task": nonpoint_delta,
+        "point_value_causal_gain_by_task": causal_gain,
+        "point_value_min_parent_delta": min_point_delta,
+        "point_value_mean_parent_delta": mean_point_delta,
+        "point_value_min_causal_gain": min_point_causal_gain,
+        "worst_nonpoint_parent_delta": worst_nonpoint_delta,
+        # Point-value improvement owns selection. Auxiliary tasks are guardrails,
+        # not co-equal objectives that can hide a failed Stage-2B reader.
+        "selection_key": [
+            min_point_delta,
+            min_point_causal_gain,
+            mean_point_delta,
+            worst_nonpoint_delta,
+        ],
+        "acceptance": acceptance,
+        "accepted": all(acceptance.values()),
+    }
+
+
+def screened_stage2b_checkpoint_metrics(
+    metrics: Mapping[str, Any],
+    parent_metrics: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if bool(getattr(args, "point_reader_training", False)):
+        return point_reader_checkpoint_metrics(
+            metrics,
+            parent_metrics,
+            min_parent_delta=float(args.point_reader_min_parent_delta),
+            min_causal_gain=float(args.point_reader_min_causal_gain),
+            max_nonpoint_regression=float(
+                args.point_reader_max_nonpoint_regression
+            ),
+        )
+    return joint_ab_checkpoint_metrics(
+        metrics,
+        parent_metrics,
+        min_causal_gain=float(args.joint_min_causal_gain),
+        max_parent_regression=float(args.joint_max_parent_regression),
+        min_no_harm_delta=float(args.joint_min_no_harm_delta),
+    )
+
+
 def resolve_test_evaluation_policy(
     *,
     requested: bool,
     joint_ab_training: bool,
     joint_selected_accepted: bool | None,
+    point_reader_training: bool = False,
 ) -> tuple[bool, str | None]:
-    """Gate formal test access on validation-only joint admission."""
+    """Gate formal test access on validation-only screened admission."""
 
     if not bool(requested):
         return False, "evaluate_test_disabled"
-    if bool(joint_ab_training) and joint_selected_accepted is not True:
+    if (
+        bool(joint_ab_training) or bool(point_reader_training)
+    ) and joint_selected_accepted is not True:
         return False, "full_validation_admission_rejected"
     return True, None
 
@@ -10836,12 +11346,20 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "matched_group_loss_weight": float(args.matched_group_loss_weight),
             "matched_group_loss_margin": float(args.matched_group_loss_margin),
             "joint_ab_training": bool(args.joint_ab_training),
+            "point_reader_training": bool(args.point_reader_training),
             "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
             "global_view_loss_weight": float(args.global_view_loss_weight),
             "joint_no_harm_loss_weight": float(args.joint_no_harm_loss_weight),
             "joint_no_harm_margin": float(args.joint_no_harm_margin),
             "joint_causal_loss_weight": float(args.joint_causal_loss_weight),
             "joint_causal_margin": float(args.joint_causal_margin),
+            "point_causal_loss_weight": float(args.point_causal_loss_weight),
+            "point_causal_margin": float(args.point_causal_margin),
+            "point_causal_tasks": parse_csv(args.point_causal_tasks),
+            "nonpoint_no_harm_loss_weight": float(
+                args.nonpoint_no_harm_loss_weight
+            ),
+            "nonpoint_no_harm_margin": float(args.nonpoint_no_harm_margin),
             "global_anchor_loss_weight": float(args.global_anchor_loss_weight),
             "local_anchor_loss_weight": float(args.local_anchor_loss_weight),
             "swapped_question_max_records": int(args.swapped_question_max_records),
@@ -10866,6 +11384,15 @@ def build_wandb_config(args: argparse.Namespace, summary: Mapping[str, Any] | No
             "joint_min_causal_gain": float(args.joint_min_causal_gain),
             "joint_max_parent_regression": float(args.joint_max_parent_regression),
             "joint_min_no_harm_delta": float(args.joint_min_no_harm_delta),
+            "point_reader_min_parent_delta": float(
+                args.point_reader_min_parent_delta
+            ),
+            "point_reader_min_causal_gain": float(
+                args.point_reader_min_causal_gain
+            ),
+            "point_reader_max_nonpoint_regression": float(
+                args.point_reader_max_nonpoint_regression
+            ),
             "task_loss_weights": dict(getattr(args, "task_loss_weights", {})),
             "evaluate_test": bool(args.evaluate_test),
             "group_questions_by_state": bool(args.group_questions_by_state),
@@ -11005,7 +11532,7 @@ def main() -> None:
         latent_cache_size=int(args.latent_cache_size),
         latent_contract=latent_contract,
     )
-    if bool(args.joint_ab_training):
+    if bool(args.task_balanced_answer_loss):
         args.task_loss_weights = inverse_frequency_task_weights(
             train_dataset.records,
             expected_tasks=STAGE2B_TASK_TYPES,
@@ -11729,6 +12256,13 @@ def main() -> None:
             soft_prompt_scale=float(args.soft_prompt_scale),
         ).to(device)
 
+    evidence_only_boundary: dict[str, Any] | None = None
+    if bool(args.point_reader_training):
+        evidence_only_boundary = configure_evidence_only_training(adapter)
+        checkpoint_load_report["evidence_only_training_boundary"] = dict(
+            evidence_only_boundary
+        )
+        args.freeze_global_adapter = True
     if isinstance(adapter, HybridGlobalLocalAdapter):
         adapter.mask_inactive_local_tokens = bool(args.mask_inactive_local_tokens)
     synchronize_module_from_rank_zero(adapter)
@@ -11845,6 +12379,11 @@ def main() -> None:
         adapter,
         allow_frozen_parameters=False,
     )
+    evidence_only_optimizer_audit = (
+        audit_evidence_only_optimizer_boundary(optimizer, adapter)
+        if bool(args.point_reader_training)
+        else None
+    )
     local_groups = None
     global_groups = None
     accumulation_steps = max(1, int(args.gradient_accumulation_steps))
@@ -11864,11 +12403,11 @@ def main() -> None:
             "A requested checkpoint update exceeds the configured training budget: "
             f"updates={checkpoint_updates}, total_optimizer_updates={total_optimizer_updates}."
         )
-    if bool(args.joint_ab_training) and (
+    if uses_screened_stage2b_training(args) and (
         not checkpoint_updates or checkpoint_updates[-1] != total_optimizer_updates
     ):
         raise ValueError(
-            "The joint small run must include its final optimizer update in its checkpoint schedule: "
+            "The screened Stage-2B run must include its final optimizer update in its checkpoint schedule: "
             f"updates={checkpoint_updates}, total={total_optimizer_updates}."
         )
     lr_scheduler, warmup_updates = build_lr_scheduler(
@@ -11982,6 +12521,7 @@ def main() -> None:
         "matched_group_loss_weight": float(args.matched_group_loss_weight),
         "matched_group_loss_margin": float(args.matched_group_loss_margin),
         "joint_ab_training": bool(args.joint_ab_training),
+        "point_reader_training": bool(args.point_reader_training),
         "joint_run_scope": str(args.joint_run_scope),
         "task_balanced_answer_loss": bool(args.task_balanced_answer_loss),
         "global_view_loss_weight": float(args.global_view_loss_weight),
@@ -11989,6 +12529,13 @@ def main() -> None:
         "joint_no_harm_margin": float(args.joint_no_harm_margin),
         "joint_causal_loss_weight": float(args.joint_causal_loss_weight),
         "joint_causal_margin": float(args.joint_causal_margin),
+        "point_causal_loss_weight": float(args.point_causal_loss_weight),
+        "point_causal_margin": float(args.point_causal_margin),
+        "point_causal_tasks": parse_csv(args.point_causal_tasks),
+        "nonpoint_no_harm_loss_weight": float(
+            args.nonpoint_no_harm_loss_weight
+        ),
+        "nonpoint_no_harm_margin": float(args.nonpoint_no_harm_margin),
         "global_anchor_loss_weight": float(args.global_anchor_loss_weight),
         "local_anchor_loss_weight": float(args.local_anchor_loss_weight),
         "grounding_routing_warmup_epochs": int(args.grounding_routing_warmup_epochs),
@@ -12063,6 +12610,11 @@ def main() -> None:
         "joint_min_causal_gain": float(args.joint_min_causal_gain),
         "joint_max_parent_regression": float(args.joint_max_parent_regression),
         "joint_min_no_harm_delta": float(args.joint_min_no_harm_delta),
+        "point_reader_min_parent_delta": float(args.point_reader_min_parent_delta),
+        "point_reader_min_causal_gain": float(args.point_reader_min_causal_gain),
+        "point_reader_max_nonpoint_regression": float(
+            args.point_reader_max_nonpoint_regression
+        ),
         "task_loss_weights": dict(getattr(args, "task_loss_weights", {})),
         "min_lr_ratio": float(args.min_lr_ratio),
         "global_dropout": float(getattr(args, "global_dropout", args.dropout)),
@@ -12075,6 +12627,8 @@ def main() -> None:
         "evaluate_test": bool(args.evaluate_test),
         "checkpoint_load_report": checkpoint_load_report,
         "optimizer_parameter_audit": optimizer_audit,
+        "evidence_only_training_boundary": evidence_only_boundary,
+        "evidence_only_optimizer_audit": evidence_only_optimizer_audit,
         "qa_metadata_audit": qa_metadata_audit,
         "data_audit": data_audit,
         "prompt_audit": prompt_audit,
@@ -12166,7 +12720,7 @@ def main() -> None:
                 latent_cache_size=int(args.latent_cache_size),
                 latent_contract=latent_contract,
             )
-            if bool(args.joint_ab_training):
+            if uses_screened_stage2b_training(args):
                 screening_dataset = initial_dataset
             initial_metrics = evaluate_choice_accuracy(
                 llm=llm,
@@ -12178,7 +12732,7 @@ def main() -> None:
                 baseline_modes=baseline_modes,
             )
             history["initial_eval"] = initial_metrics
-            if bool(args.joint_ab_training):
+            if uses_screened_stage2b_training(args):
                 screening_parent_metrics = copy.deepcopy(initial_metrics)
             continuation_routing_audit: dict[str, Any] | None = None
             if (
@@ -12235,10 +12789,10 @@ def main() -> None:
                     "The Stage-2B continuation failed its held-out routing/gate audit "
                     f"({failed}); no optimizer step was taken."
                 )
-            if bool(args.joint_ab_training):
+            if uses_screened_stage2b_training(args):
                 if is_main_process():
                     print(
-                        "joint_parent_full_eval=start "
+                        "stage2b_parent_full_eval=start "
                         f"records={len(val_dataset)} baselines={','.join(baseline_modes)}"
                     )
                 parent_validation_metrics = evaluate_choice_accuracy(
@@ -12336,7 +12890,15 @@ def main() -> None:
                 str(args.adapter_architecture) == "grounded_evidence_adapter"
                 and epoch <= int(args.grounding_routing_warmup_epochs)
             )
-            training_phase = "routing_warmup" if routing_warmup_active else "joint_answer"
+            training_phase = (
+                "routing_warmup"
+                if routing_warmup_active
+                else (
+                    "point_evidence"
+                    if bool(args.point_reader_training)
+                    else "joint_answer"
+                )
+            )
             evidence_optimizer_states_cleared = 0
             if (
                 str(args.adapter_architecture) == "grounded_evidence_adapter"
@@ -13045,7 +13607,7 @@ def main() -> None:
                             step=global_step,
                             stage=f"epoch {epoch} update {global_step} W&B log",
                         )
-                    if bool(args.joint_ab_training) and global_step in checkpoint_updates:
+                    if uses_screened_stage2b_training(args) and global_step in checkpoint_updates:
                         if screening_dataset is None or screening_parent_metrics is None:
                             raise RuntimeError(
                                 "Joint checkpoint screening has no fixed parent validation subset."
@@ -13059,12 +13621,10 @@ def main() -> None:
                             args=args,
                             baseline_modes=baseline_modes,
                         )
-                        screening_selection = joint_ab_checkpoint_metrics(
+                        screening_selection = screened_stage2b_checkpoint_metrics(
                             screening_metrics,
                             screening_parent_metrics,
-                            min_causal_gain=float(args.joint_min_causal_gain),
-                            max_parent_regression=float(args.joint_max_parent_regression),
-                            min_no_harm_delta=float(args.joint_min_no_harm_delta),
+                            args,
                         )
                         candidate_path = run_dir / f"adapter_step_{global_step:06d}.pt"
                         candidate_payload = {
@@ -13342,7 +13902,7 @@ def main() -> None:
             train_global_dropout_rate = (
                 train_totals["global_dropout_batches"] / global_batch_count
             )
-            if bool(args.joint_ab_training) and not routing_warmup_active:
+            if uses_screened_stage2b_training(args) and not routing_warmup_active:
                 final_screen = history.get(f"screening_step_{global_step:06d}")
                 if not isinstance(final_screen, Mapping) or not isinstance(
                     final_screen.get("screening_val"), Mapping
@@ -13485,7 +14045,7 @@ def main() -> None:
                     str(args.checkpoint_metric),
                     reference_metrics=(
                         screening_parent_metrics
-                        if bool(args.joint_ab_training)
+                        if uses_screened_stage2b_training(args)
                         else None
                     ),
                 )
@@ -13620,11 +14180,11 @@ def main() -> None:
                     val_macro_latent_gain
                 ),
             }
-            if not routing_warmup_active and not bool(args.joint_ab_training):
+            if not routing_warmup_active and not uses_screened_stage2b_training(args):
                 wandb_payload["best_val/checkpoint_score"] = float(
                     max(best_val_score, val_score)
                 )
-            elif bool(args.joint_ab_training):
+            elif uses_screened_stage2b_training(args):
                 wandb_payload["screening/checkpoint_score"] = float(val_score)
             if routing_warmup_audit is not None:
                 wandb_payload["routing_warmup/passed"] = float(
@@ -13643,7 +14203,7 @@ def main() -> None:
             )
             if (
                 not routing_warmup_active
-                and not bool(args.joint_ab_training)
+                and not uses_screened_stage2b_training(args)
                 and val_score > best_val_score
             ):
                 best_val_score = val_score
@@ -13749,9 +14309,9 @@ def main() -> None:
                     "training was not started."
                 )
 
-        if bool(args.joint_ab_training):
+        if uses_screened_stage2b_training(args):
             if not joint_candidates or parent_validation_metrics is None:
-                raise RuntimeError("Joint A/B training produced no screenable step checkpoints.")
+                raise RuntimeError("Stage-2B training produced no screenable step checkpoints.")
             ranked_candidates = sorted(
                 joint_candidates,
                 key=lambda item: tuple(
@@ -13787,12 +14347,10 @@ def main() -> None:
                     args=args,
                     baseline_modes=baseline_modes,
                 )
-                full_selection = joint_ab_checkpoint_metrics(
+                full_selection = screened_stage2b_checkpoint_metrics(
                     full_metrics,
                     parent_validation_metrics,
-                    min_causal_gain=float(args.joint_min_causal_gain),
-                    max_parent_regression=float(args.joint_max_parent_regression),
-                    min_no_harm_delta=float(args.joint_min_no_harm_delta),
+                    args,
                 )
                 routing_audit = grounded_routing_warmup_audit(full_metrics, args)
                 full_selection["routing_gate_audit"] = routing_audit
@@ -13840,7 +14398,11 @@ def main() -> None:
             del selected_state, selected_checkpoint
             best_epoch = int(selected_candidate["epoch"])
             best_val_score = float(
-                selected_candidate["full_selection"]["worst_protected_task_delta"]
+                selected_candidate["full_selection"][
+                    "point_value_min_causal_gain"
+                    if bool(args.point_reader_training)
+                    else "worst_protected_task_delta"
+                ]
             )
             selected_accepted = bool(
                 selected_candidate["full_selection"]["accepted"]
@@ -13905,11 +14467,11 @@ def main() -> None:
             )
             if is_main_process():
                 print(
-                    "joint_full_selection "
+                    "stage2b_full_selection "
                     f"step={int(selected_candidate['global_step'])} "
                     f"accepted={selected_accepted} "
                     f"checkpoint={selected_checkpoint_path.name} "
-                    f"worst_delta={best_val_score:.6f}"
+                    f"selection_score={best_val_score:.6f}"
                 )
 
         distributed_barrier()
@@ -13962,6 +14524,7 @@ def main() -> None:
             requested=bool(args.evaluate_test),
             joint_ab_training=bool(args.joint_ab_training),
             joint_selected_accepted=joint_selected_accepted,
+            point_reader_training=bool(args.point_reader_training),
         )
         if test_evaluated:
             if is_main_process():
@@ -14023,13 +14586,13 @@ def main() -> None:
                 "selected_checkpoint": selected_checkpoint_path.name,
                 "promotion_checkpoint": (
                     selected_checkpoint_path.name
-                    if not bool(args.joint_ab_training)
+                    if not uses_screened_stage2b_training(args)
                     or bool(joint_result.get("selected_accepted", False))
                     else None
                 ),
                 "rejected_diagnostic_checkpoint": (
                     selected_checkpoint_path.name
-                    if bool(args.joint_ab_training)
+                    if uses_screened_stage2b_training(args)
                     and not bool(joint_result.get("selected_accepted", False))
                     else None
                 ),
@@ -14054,7 +14617,7 @@ def main() -> None:
             if bool(args.wandb_log_model):
                 log_adapter_artifact(
                     wandb_logger,
-                    run_dir / "adapter_best.pt",
+                    selected_checkpoint_path,
                     f"{args.run_name}-best",
                 )
                 log_adapter_artifact(

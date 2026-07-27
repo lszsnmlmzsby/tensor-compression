@@ -32,6 +32,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     StateTaskGroupedBatchSampler,
     TensorReadoutQADataset,
     audit_stage2_warm_start_checkpoint,
+    audit_evidence_only_optimizer_boundary,
     _decoder_question_last_hidden,
     _resolved_diagnostic_layers,
     _sequence_choice_ce_loss,
@@ -45,6 +46,7 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     checkpoint_score,
     checkpoint_updates_from_fractions,
     choice_ce_loss,
+    configure_evidence_only_training,
     evaluate_choice_accuracy,
     frozen_llm_checkpoint_execution_active,
     generate_diagnostic_answer,
@@ -57,8 +59,11 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     joint_ab_checkpoint_metrics,
     log_wandb_on_rank_zero,
     margin_hinge_terms,
+    masked_record_mean,
+    matched_group_owner_mean,
     matched_coordinate_group_loss,
     parse_generated_choice,
+    point_reader_checkpoint_metrics,
     read_host_memory_snapshot,
     resolve_test_evaluation_policy,
     reset_grounded_evidence_optimizer_state,
@@ -903,7 +908,12 @@ class TestJointABTrainingContracts(unittest.TestCase):
         self.assertEqual(screening.joint_run_scope, "screening")
         self.assertEqual(screening.max_train_records, 14_400)
         self.assertFalse(screening.evaluate_test)
-        self.assertIn("small", screening.run_name)
+        self.assertIn("screening", screening.run_name)
+        self.assertTrue(screening.point_reader_training)
+        self.assertFalse(screening.joint_ab_training)
+        self.assertTrue(screening.freeze_global_adapter)
+        self.assertAlmostEqual(screening.lr, 5.0e-5)
+        self.assertEqual(screening.checkpoint_full_eval_top_k, 3)
 
         with mock.patch.object(
             sys,
@@ -925,6 +935,8 @@ class TestJointABTrainingContracts(unittest.TestCase):
         self.assertIsNone(formal.max_test_records)
         self.assertTrue(formal.evaluate_test)
         self.assertEqual(formal.batch_size, 6)
+        self.assertAlmostEqual(formal.lr, 1.0e-5)
+        self.assertEqual(formal.checkpoint_full_eval_top_k, 7)
         self.assertIn("formal", formal.run_name)
 
     def test_formal_test_policy_requires_joint_validation_admission(self) -> None:
@@ -953,6 +965,35 @@ class TestJointABTrainingContracts(unittest.TestCase):
             (True, None),
         )
 
+    def test_formal_test_policy_requires_point_reader_validation_admission(self) -> None:
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=False,
+                joint_ab_training=False,
+                point_reader_training=True,
+                joint_selected_accepted=True,
+            ),
+            (False, "evaluate_test_disabled"),
+        )
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=True,
+                joint_ab_training=False,
+                point_reader_training=True,
+                joint_selected_accepted=False,
+            ),
+            (False, "full_validation_admission_rejected"),
+        )
+        self.assertEqual(
+            resolve_test_evaluation_policy(
+                requested=True,
+                joint_ab_training=False,
+                point_reader_training=True,
+                joint_selected_accepted=True,
+            ),
+            (True, None),
+        )
+
     def test_formal_profile_requires_explicit_overrides(self) -> None:
         args = SimpleNamespace(joint_run_scope="formal")
         with self.assertRaisesRegex(ValueError, "formal_overrides"):
@@ -971,6 +1012,40 @@ class TestJointABTrainingContracts(unittest.TestCase):
         terms.sum().backward()
         torch.testing.assert_close(primary.grad, torch.tensor([-1.0, 0.0, 0.0]))
         self.assertIsNone(baseline.grad)
+
+    def test_masked_reference_loss_preserves_outer_record_mean_scale(self) -> None:
+        values = torch.tensor([2.0, 4.0, 6.0, 8.0], requires_grad=True)
+        active = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+        loss = masked_record_mean(values, active)
+        loss.backward()
+
+        self.assertAlmostEqual(float(loss.item()), 1.5)
+        torch.testing.assert_close(
+            values.grad,
+            torch.tensor([0.25, 0.25, 0.0, 0.0]),
+        )
+
+    def test_swap_loss_is_invariant_to_mixed_matched_group_packing(self) -> None:
+        records = [
+            {
+                "state_ref": "state_a" if index < 3 else "state_b",
+                "matched_group": {
+                    "margin_group_id": "group_a" if index < 3 else "group_b"
+                },
+            }
+            for index in range(5)
+        ]
+        values = torch.tensor([1.0, 2.0, 3.0, 10.0, 20.0], requires_grad=True)
+
+        mixed = matched_group_owner_mean(values, [0, 1, 2, 3, 4], records)
+        separately_packed = (
+            matched_group_owner_mean(values[:3], [0, 1, 2], records) * 3
+            + matched_group_owner_mean(values[3:], [3, 4], records) * 3
+        ) / 6
+
+        torch.testing.assert_close(mixed, torch.tensor(8.5))
+        torch.testing.assert_close(mixed, separately_packed)
 
     def test_frozen_global_resume_validation_detects_tensor_rewrites(self) -> None:
         direct_parent = {
@@ -991,6 +1066,70 @@ class TestJointABTrainingContracts(unittest.TestCase):
         tampered_child["global_adapter.projection.weight"][0, 0] += 1
         with self.assertRaisesRegex(ValueError, "rewrote tensors"):
             validate_frozen_global_resume_state(tampered_child, direct_parent)
+
+    def test_evidence_only_training_freezes_everything_except_shared_transform(self) -> None:
+        global_adapter = TensorPatchAlignmentAdapter(
+            latent_channels=3,
+            latent_grid=(2, 2),
+            adapter_dim=16,
+            projection_dim=24,
+            dropout=0.0,
+            adapter_type="spatial_transformer",
+            query_tokens=4,
+            adapter_layers=1,
+            adapter_heads=4,
+            soft_prompt_scale=0.05,
+        )
+        local_adapter = GroundedEvidenceAdapter(
+            latent_grid=(2, 2),
+            llm_hidden_size=24,
+            context_layers=(1, 2),
+            adapter_dim=16,
+            adapter_heads=4,
+            dropout=0.0,
+            evidence_tokens=2,
+            soft_prompt_scale=0.05,
+            gate_bias_init=-2.0,
+        )
+        adapter = HybridGlobalLocalAdapter(
+            global_adapter=global_adapter,
+            local_adapter=local_adapter,
+            freeze_global=False,
+        )
+
+        report = configure_evidence_only_training(adapter)
+
+        expected = [
+            "local_adapter.evidence_down.weight",
+            "local_adapter.evidence_up.weight",
+        ]
+        trainable = sorted(
+            name for name, parameter in adapter.named_parameters() if parameter.requires_grad
+        )
+        self.assertEqual(trainable, expected)
+        self.assertEqual(report["trainable_parameter_names"], expected)
+        self.assertEqual(report["mode"], "evidence_transform_only")
+        self.assertTrue(adapter.freeze_global)
+        self.assertFalse(
+            any(parameter.requires_grad for parameter in adapter.global_adapter.parameters())
+        )
+
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in adapter.parameters() if parameter.requires_grad],
+            lr=1.0e-5,
+        )
+        audit = audit_evidence_only_optimizer_boundary(optimizer, adapter)
+        self.assertTrue(audit["validated"])
+        self.assertEqual(audit["trainable_parameter_names"], expected)
+        self.assertEqual(audit["optimizer_tensor_count"], 2)
+
+        local_adapter.role_gate.weight.requires_grad_(True)
+        bad_optimizer = torch.optim.AdamW(
+            [parameter for parameter in adapter.parameters() if parameter.requires_grad],
+            lr=1.0e-5,
+        )
+        with self.assertRaisesRegex(RuntimeError, "only the shared evidence transform"):
+            audit_evidence_only_optimizer_boundary(bad_optimizer, adapter)
 
     def test_joint_checkpoint_selection_prioritizes_preservation_and_acceptance(self) -> None:
         tasks = (
@@ -1060,6 +1199,119 @@ class TestJointABTrainingContracts(unittest.TestCase):
         )
         no_harm_selection = joint_ab_checkpoint_metrics(no_harm_failure, parent)
         self.assertFalse(no_harm_selection["acceptance"]["compare_no_harm"])
+
+    def test_point_reader_checkpoint_selection_prioritizes_both_point_tasks(self) -> None:
+        tasks = (
+            "extreme_quadrant",
+            "normalized_point_value",
+            "point_compare",
+            "raw_point_value_with_stats",
+            "region_mean_compare",
+        )
+        parent_values = {task: 0.50 for task in tasks}
+        parent = self._joint_metrics(
+            correct=parent_values,
+            global_only=parent_values,
+            zero_local=parent_values,
+            shuffled=parent_values,
+            overall=0.50,
+        )
+        point_first = self._joint_metrics(
+            correct={
+                "extreme_quadrant": 0.48,
+                "normalized_point_value": 0.58,
+                "point_compare": 0.49,
+                "raw_point_value_with_stats": 0.56,
+                "region_mean_compare": 0.48,
+            },
+            global_only={task: 0.50 for task in tasks},
+            zero_local={task: 0.52 for task in tasks},
+            shuffled={task: 0.51 for task in tasks},
+            overall=0.518,
+        )
+        auxiliary_first = self._joint_metrics(
+            correct={
+                "extreme_quadrant": 0.62,
+                "normalized_point_value": 0.54,
+                "point_compare": 0.62,
+                "raw_point_value_with_stats": 0.53,
+                "region_mean_compare": 0.62,
+            },
+            global_only={task: 0.50 for task in tasks},
+            zero_local={task: 0.51 for task in tasks},
+            shuffled={task: 0.50 for task in tasks},
+            overall=0.586,
+        )
+
+        point_selection = point_reader_checkpoint_metrics(
+            point_first,
+            parent,
+            min_parent_delta=0.05,
+            min_causal_gain=0.03,
+            max_nonpoint_regression=0.03,
+        )
+        auxiliary_selection = point_reader_checkpoint_metrics(
+            auxiliary_first,
+            parent,
+            min_parent_delta=0.0,
+            min_causal_gain=0.0,
+            max_nonpoint_regression=0.03,
+        )
+
+        self.assertTrue(point_selection["accepted"])
+        self.assertAlmostEqual(point_selection["point_value_min_parent_delta"], 0.06)
+        self.assertAlmostEqual(point_selection["point_value_min_causal_gain"], 0.04)
+        self.assertGreater(
+            point_selection["selection_key"],
+            auxiliary_selection["selection_key"],
+        )
+
+    def test_point_reader_auxiliary_regression_guardrail_is_configurable(self) -> None:
+        tasks = (
+            "extreme_quadrant",
+            "normalized_point_value",
+            "point_compare",
+            "raw_point_value_with_stats",
+            "region_mean_compare",
+        )
+        parent_values = {task: 0.50 for task in tasks}
+        parent = self._joint_metrics(
+            correct=parent_values,
+            global_only=parent_values,
+            zero_local=parent_values,
+            shuffled=parent_values,
+            overall=0.50,
+        )
+        candidate = self._joint_metrics(
+            correct={
+                "extreme_quadrant": 0.46,
+                "normalized_point_value": 0.58,
+                "point_compare": 0.48,
+                "raw_point_value_with_stats": 0.57,
+                "region_mean_compare": 0.49,
+            },
+            global_only={task: 0.50 for task in tasks},
+            zero_local={task: 0.52 for task in tasks},
+            shuffled={task: 0.51 for task in tasks},
+            overall=0.516,
+        )
+
+        strict = point_reader_checkpoint_metrics(
+            candidate,
+            parent,
+            max_nonpoint_regression=0.03,
+        )
+        relaxed = point_reader_checkpoint_metrics(
+            candidate,
+            parent,
+            max_nonpoint_regression=0.05,
+        )
+
+        self.assertAlmostEqual(strict["worst_nonpoint_parent_delta"], -0.04)
+        self.assertFalse(strict["acceptance"]["nonpoint_parent_guardrail"])
+        self.assertFalse(strict["accepted"])
+        self.assertTrue(relaxed["acceptance"]["nonpoint_parent_guardrail"])
+        self.assertTrue(relaxed["accepted"])
 
     def test_joint_forward_components_keep_a_and_b_gradient_ownership_disjoint(self) -> None:
         class TinyGlobalAdapter(nn.Module):
@@ -2399,6 +2651,21 @@ class TestQuestionConditionedAdapter(unittest.TestCase):
 
         llm = TinyLLM()
         soft_mask = torch.tensor([[1, 0, 1]])
+        with self.assertRaisesRegex(ValueError, "requires the attention mask"):
+            generate_diagnostic_answer(
+                llm=llm,
+                tokenizer=TinyTokenizer(),
+                record={
+                    "question": "Choose one option. Options: A or B.",
+                    "choices": ["A", "B"],
+                },
+                soft_embeds=torch.randn(1, 3, 6),
+                soft_attention_mask=None,
+                device=torch.device("cpu"),
+                prompt_template="task_specific",
+                max_prompt_tokens=16,
+                max_new_tokens=1,
+            )
         result = generate_diagnostic_answer(
             llm=llm,
             tokenizer=TinyTokenizer(),
