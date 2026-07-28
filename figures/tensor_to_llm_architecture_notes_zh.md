@@ -166,20 +166,20 @@ L_stage2 = 1.00 * L_choice-CE
 | `value-preserving-encoder` | 不降采样 encoder |
 | `stage1-latent-grid` | `8 x 16 x 16` latent 输出 |
 | `spatial-adapter-stage1` | 精简后的 256-token spatial adapter |
-| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 `Probe` |
+| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 tokenized probe |
 | `qwen-tokenizer-stage1` | 冻结 Qwen tokenizer |
-| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 `Probe` |
+| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 tokenized probe |
 | `shared-shallow-qwen`, `student-shallow-qwen`, `teacher-shallow-qwen` | 上下对齐的共享冻结 Qwen 第 `\ell` 层 readout |
 | `student-hidden-vector`, `teacher-hidden-vector` | Qwen 输出向量示意 |
 | `stage1-alignment-loss`, `contrastive-matrix` | 带 `F_i`/`T_i` 配对序列和对角正样本的 contrastive alignment 矩阵 |
-| `stage1-checkpoint-transfer`, `stage-transfer` | 两阶段参数转移 |
 | `stage2` | Stage 2 总面板 |
-| `stage2-input-sequence` | 直接 `inputs_embeds` 拼接 |
-| `full-frozen-qwen` | 完整冻结 Qwen2.5-14B |
-| `natural-language-question` | 自然语言问题与选项 |
-| `answer-output` | A/B/C/D restricted answer |
-| `stage2-loss` | QA objective |
-| `grounding-audit` | tensor 依赖评估 |
+| `stage2-input-sequence` | 256 spatial embeddings 与 question embeddings 的直接拼接 |
+| `stage2-question-tokenization` | 自然语言问题经过 Qwen tokenizer 和冻结 token embedding 后形成 question embeddings |
+| `full-frozen-qwen` | 完整冻结 Qwen |
+| `natural-language-question` | 自然语言问题 |
+| `answer-output` | 模型回答 |
+| `stage2-loss` | 仅用于训练损失计算的 QA objective，本身没有可训练参数 |
+| `grounding-audit` | 不参与反向传播的 tensor 依赖评估 |
 
 可直接用 Inkscape、Illustrator 或 Figma 导入 SVG。修改时应保留三条关键视觉关系：
 
