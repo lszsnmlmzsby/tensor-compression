@@ -645,6 +645,49 @@ def autocast_context(device: torch.device, model_dtype: torch.dtype):
     return contextlib.nullcontext()
 
 
+def validate_relocated_qa_latent_contract(
+    metadata: Mapping[str, Any],
+    configured_alignment_checkpoint: str | Path | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Accept a relocated Stage-1 file only when its immutable hash still matches."""
+
+    declared_checkpoint = str(metadata.get("alignment_checkpoint", "")).strip()
+    configured_checkpoint = str(configured_alignment_checkpoint or "").strip()
+    declared_path = canonical_path(declared_checkpoint) if declared_checkpoint else None
+    configured_path = canonical_path(configured_checkpoint) if configured_checkpoint else None
+    relocated = bool(
+        declared_path
+        and configured_path
+        and declared_path != configured_path
+    )
+
+    validation_metadata = dict(metadata)
+    if relocated:
+        # The shared validator checks both the formal metadata contract and the
+        # configured file's SHA-256. Only replace the host-specific path alias.
+        validation_metadata["alignment_checkpoint"] = configured_checkpoint
+    validated = validate_qa_latent_contract(
+        validation_metadata,
+        configured_alignment_checkpoint=configured_alignment_checkpoint,
+        require_formal_contract=True,
+    )
+    if not isinstance(validated, Mapping):
+        raise RuntimeError("Formal matched QA did not produce an immutable latent contract.")
+    contract = dict(validated)
+    if relocated:
+        # Latent payloads retain the build-time path and audit it separately
+        # from the immutable hash. Keep that declared alias in their contract.
+        contract["alignment_checkpoint"] = declared_path
+    resolution = {
+        "identity": "sha256",
+        "declared_path": declared_path,
+        "configured_path": configured_path,
+        "path_relocated": relocated,
+        "verified_sha256": str(contract.get("alignment_checkpoint_sha256", "")),
+    }
+    return contract, resolution
+
+
 def load_metadata_and_contract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata_path = Path(args.qa_dir) / "metadata.json"
     if not metadata_path.exists():
@@ -666,14 +709,13 @@ def load_metadata_and_contract(args: argparse.Namespace) -> tuple[dict[str, Any]
             "training.questions_per_state_group must match metadata.stage2b.batch_group_size: "
             f"configured={args.questions_per_state_group}, metadata={group_size}."
         )
-    latent_contract = validate_qa_latent_contract(
+    latent_contract, checkpoint_resolution = validate_relocated_qa_latent_contract(
         metadata,
-        configured_alignment_checkpoint=args.qa_alignment_checkpoint,
-        require_formal_contract=True,
+        args.qa_alignment_checkpoint,
     )
-    if not isinstance(latent_contract, Mapping):
-        raise RuntimeError("Formal matched QA did not produce an immutable latent contract.")
-    return dict(metadata), dict(latent_contract)
+    resolved_metadata = dict(metadata)
+    resolved_metadata["runtime_alignment_checkpoint_resolution"] = checkpoint_resolution
+    return resolved_metadata, latent_contract
 
 
 def audit_general_qa_datasets(
@@ -2123,6 +2165,9 @@ def main() -> None:
                 "prompt_contract": str(metadata.get("prompt_contract", "")),
                 "split_mode": str(metadata.get("split_mode", "")),
                 "stage2b": copy.deepcopy(dict(metadata.get("stage2b", {}))),
+                "alignment_checkpoint_resolution": copy.deepcopy(
+                    dict(metadata.get("runtime_alignment_checkpoint_resolution", {}))
+                ),
             },
             "install": install_report,
             "parameters": parameter_report,
