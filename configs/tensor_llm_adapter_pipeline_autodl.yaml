@@ -592,6 +592,18 @@ llm_training:
     generation_max_new_tokens: 8
     layers: [0, 2, 8, 14, -1]
 
+# Frozen-Qwen baseline with the complete preserved 16x16 z matrix serialized as text.
+# These settings are independent of Stage-2 adapter evaluation because the text context is much longer.
+qwen_tensor_baseline:
+  batch_size: 4
+  num_workers: 2
+  max_prompt_tokens: 8192
+  # Six significant decimal digits round-trip every finite FP16 value; the evaluator verifies this per matrix.
+  matrix_significant_digits: 6
+  # Validation and test contain 1001 and 1007 unique states, so both split-local caches fit completely.
+  matrix_cache_size: 2048
+  console_progress: true
+
 wandb:
   # The audited instance could not reach external HTTPS reliably. Local JSON/JSONL
   # metrics remain enabled, and W&B can be re-enabled explicitly after a network test.

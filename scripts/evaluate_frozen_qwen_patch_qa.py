@@ -7,9 +7,10 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,9 +31,15 @@ for search_path in (PROJECT_ROOT, SRC_ROOT):
 
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     MATCHED_GROUP_FORMAT,
+    PATCH_LATENT_AUDIT_FORMAT,
+    PATCH_LATENT_FORMAT,
     PATCH_MATCHED_QA_FORMAT,
     PATCH_QA_BUILD_MARKER,
     PATCH_QA_PROMPT_CONTRACT,
+    canonical_normalization,
+    latent_identity_from_record,
+    latent_qa_stats_from_record,
+    validate_patch_latent_payload,
 )
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
@@ -52,8 +59,14 @@ except ImportError as exc:  # pragma: no cover - dependency error on the executi
     ) from exc
 
 
-BASELINE_NAME = "frozen_qwen_text_only_no_tensor"
-RESULT_FORMAT = "frozen_qwen_patch_qa_baseline_v1"
+BASELINE_NAME = "frozen_qwen_serialized_tensor"
+RESULT_FORMAT = "frozen_qwen_serialized_tensor_patch_qa_baseline_v2"
+PRESERVED_Z_CHANNEL = 0
+PRESERVED_Z_MEAN_ATOL = 1.0e-1
+PRESERVED_Z_STD_ATOL = 5.0e-3
+PRESERVED_Z_STD_RTOL = 2.0e-2
+EXPECTED_PATCH_SIZE = 16
+EXTREME_OPERATION_RE = re.compile(r"\b(maximum|minimum)\b", re.IGNORECASE)
 EXPECTED_TASKS = frozenset(
     {
         "extreme_quadrant",
@@ -213,12 +226,14 @@ def parse_splits(raw: str) -> list[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a completely frozen Qwen on Stage-2B patch QA using question text only. "
-            "No tensor adapter, tensor latent, or adapter checkpoint is constructed or loaded."
+            "Evaluate a completely frozen Qwen on Stage-2B patch QA with the full 16x16 "
+            "standardized tensor matrix serialized as text. No tensor adapter or adapter "
+            "checkpoint is constructed or loaded."
         )
     )
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--qa-dir", type=str, default=None)
+    parser.add_argument("--latent-dir", type=str, default=None)
     parser.add_argument("--model-name-or-path", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--hf-home", type=str, default=None)
@@ -234,6 +249,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None, help="Per-rank evaluation batch size.")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
+    parser.add_argument("--matrix-significant-digits", type=int, default=None)
+    parser.add_argument("--matrix-cache-size", type=int, default=None)
     parser.add_argument("--prompt-template", choices=("task_specific",), default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
@@ -263,6 +280,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
     path_defaults = {
         "qa_dir": first_nested(config, ["patch_qa.stage2b_qa_dir"]),
+        "latent_dir": first_nested(config, ["patch_qa.latent_dir"]),
         "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
         "hf_home": first_nested(config, ["storage.hf_home"]),
         "output_root": first_nested(config, ["llm_training.output_root", "storage.output_root"]),
@@ -275,13 +293,35 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     test_split = str(first_nested(config, ["llm_training.test_split"], "test"))
     set_default(args, "run_name", None, BASELINE_NAME)
     set_default(args, "splits", None, f"{val_split},{test_split}")
-    set_default(args, "batch_size", first_nested(config, ["llm_training.eval_batch_size"]), 8)
-    set_default(args, "num_workers", first_nested(config, ["llm_training.num_workers"]), 0)
+    set_default(
+        args,
+        "batch_size",
+        first_nested(config, ["qwen_tensor_baseline.batch_size"]),
+        4,
+    )
+    set_default(
+        args,
+        "num_workers",
+        first_nested(config, ["qwen_tensor_baseline.num_workers", "llm_training.num_workers"]),
+        2,
+    )
     set_default(
         args,
         "max_prompt_tokens",
-        first_nested(config, ["llm_training.max_prompt_tokens"]),
-        512,
+        first_nested(config, ["qwen_tensor_baseline.max_prompt_tokens"]),
+        8192,
+    )
+    set_default(
+        args,
+        "matrix_significant_digits",
+        first_nested(config, ["qwen_tensor_baseline.matrix_significant_digits"]),
+        6,
+    )
+    set_default(
+        args,
+        "matrix_cache_size",
+        first_nested(config, ["qwen_tensor_baseline.matrix_cache_size"]),
+        2048,
     )
     set_default(
         args,
@@ -322,12 +362,17 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         1800.0,
     )
     set_default(args, "require_formal_contract", None, True)
-    set_default(args, "console_progress", first_nested(config, ["llm_training.console_progress"]), False)
+    set_default(
+        args,
+        "console_progress",
+        first_nested(config, ["qwen_tensor_baseline.console_progress", "llm_training.console_progress"]),
+        False,
+    )
     set_default(args, "seed", first_nested(config, ["runtime.seed", "llm_training.shuffle_seed"]), 42)
 
     missing = [
         name
-        for name in ("qa_dir", "model_name_or_path", "output_root")
+        for name in ("qa_dir", "latent_dir", "model_name_or_path", "output_root")
         if getattr(args, name, None) in {None, ""}
     ]
     if missing:
@@ -339,6 +384,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--num-workers must be non-negative.")
     if int(args.max_prompt_tokens) <= 0:
         raise ValueError("--max-prompt-tokens must be positive.")
+    if int(args.matrix_significant_digits) < 5 or int(args.matrix_significant_digits) > 12:
+        raise ValueError("--matrix-significant-digits must be between 5 and 12.")
+    if int(args.matrix_cache_size) < 0:
+        raise ValueError("--matrix-cache-size must be non-negative.")
     if args.max_records is not None and int(args.max_records) <= 0:
         raise ValueError("--max-records must be positive when provided.")
     if float(args.min_host_memory_available_gib) < 0.0:
@@ -367,8 +416,149 @@ def qa_path(qa_dir: str | Path, split: str) -> Path:
     return path
 
 
+def audit_latent_contract(
+    metadata: Mapping[str, Any],
+    latent_dir: str | Path,
+    require_formal_contract: bool,
+) -> dict[str, Any]:
+    configured_dir = Path(latent_dir).expanduser()
+    if not configured_dir.is_dir():
+        raise FileNotFoundError(f"Serialized-tensor baseline latent directory not found: {configured_dir}")
+
+    nested_contract = metadata.get("latent_contract")
+    nested_contract = nested_contract if isinstance(nested_contract, Mapping) else {}
+    # Current QA builders persist this contract as top-level metadata fields.
+    # Accept a future nested copy only as a fallback, never as the primary schema.
+    raw_contract = {
+        "format": metadata.get("latent_format", nested_contract.get("format")),
+        "latent_audit_format": metadata.get(
+            "latent_audit_format", nested_contract.get("latent_audit_format")
+        ),
+        "latent_shape": metadata.get("latent_shape", nested_contract.get("latent_shape")),
+        "storage_dtype": metadata.get("storage_dtype", nested_contract.get("storage_dtype")),
+        "encoder_input_normalization": metadata.get(
+            "encoder_input_normalization",
+            nested_contract.get("encoder_input_normalization"),
+        ),
+        "alignment_checkpoint": metadata.get(
+            "alignment_checkpoint", nested_contract.get("alignment_checkpoint")
+        ),
+        "alignment_checkpoint_sha256": metadata.get(
+            "alignment_checkpoint_sha256",
+            nested_contract.get("alignment_checkpoint_sha256"),
+        ),
+    }
+
+    shape_value = raw_contract.get("latent_shape")
+    shape = (
+        [int(value) for value in shape_value]
+        if isinstance(shape_value, Sequence) and not isinstance(shape_value, (str, bytes))
+        else []
+    )
+    normalization_value = raw_contract.get("encoder_input_normalization")
+    normalization = (
+        canonical_normalization(normalization_value)
+        if isinstance(normalization_value, Mapping)
+        else {}
+    )
+    observed = {
+        "format": str(raw_contract.get("format", "")),
+        "latent_audit_format": str(raw_contract.get("latent_audit_format", "")),
+        "latent_shape": shape,
+        "storage_dtype": str(raw_contract.get("storage_dtype", "")),
+        "encoder_input_normalization": normalization,
+        "alignment_checkpoint": str(raw_contract.get("alignment_checkpoint", "")),
+        "alignment_checkpoint_sha256": str(
+            raw_contract.get("alignment_checkpoint_sha256", "")
+        ).lower(),
+    }
+    expected_normalization = canonical_normalization({"mode": "zscore", "scope": "channel"})
+    mismatches: dict[str, Any] = {}
+    if observed["format"] != PATCH_LATENT_FORMAT:
+        mismatches["format"] = {
+            "expected": PATCH_LATENT_FORMAT,
+            "observed": observed["format"],
+        }
+    if observed["latent_audit_format"] != PATCH_LATENT_AUDIT_FORMAT:
+        mismatches["latent_audit_format"] = {
+            "expected": PATCH_LATENT_AUDIT_FORMAT,
+            "observed": observed["latent_audit_format"],
+        }
+    patch_size = int(metadata.get("patch_size", -1))
+    if patch_size != EXPECTED_PATCH_SIZE:
+        mismatches["patch_size"] = {
+            "expected": EXPECTED_PATCH_SIZE,
+            "observed": patch_size,
+        }
+    if len(shape) != 3 or shape[0] <= PRESERVED_Z_CHANNEL or shape[1:] != [patch_size, patch_size]:
+        mismatches["latent_shape"] = {
+            "expected": [">=1 channel", patch_size, patch_size],
+            "observed": shape,
+        }
+    if observed["storage_dtype"] != "float16":
+        mismatches["storage_dtype"] = {
+            "expected": "float16",
+            "observed": observed["storage_dtype"],
+        }
+    if normalization != expected_normalization:
+        mismatches["encoder_input_normalization"] = {
+            "expected": expected_normalization,
+            "observed": normalization,
+        }
+    if not observed["alignment_checkpoint"]:
+        mismatches["alignment_checkpoint"] = {"expected": "non-empty", "observed": ""}
+    checkpoint_sha = str(observed["alignment_checkpoint_sha256"])
+    if len(checkpoint_sha) != 64 or any(char not in "0123456789abcdef" for char in checkpoint_sha):
+        mismatches["alignment_checkpoint_sha256"] = {
+            "expected": "64 lowercase hexadecimal characters",
+            "observed": checkpoint_sha,
+        }
+
+    declared_dir_value = metadata.get("latent_dir")
+    declared_dir = Path(str(declared_dir_value)).expanduser() if declared_dir_value else None
+    paths_match = bool(
+        declared_dir is not None
+        and configured_dir.resolve() == declared_dir.resolve()
+    )
+    if require_formal_contract and not paths_match:
+        mismatches["latent_dir"] = {
+            "expected": str(declared_dir) if declared_dir is not None else "metadata.latent_dir",
+            "observed": str(configured_dir),
+        }
+
+    stage2b = metadata.get("stage2b")
+    target_provenance = (
+        stage2b.get("target_provenance") if isinstance(stage2b, Mapping) else None
+    )
+    preserved_source = (
+        str(target_provenance.get("train_numeric_and_compare", ""))
+        if isinstance(target_provenance, Mapping)
+        else ""
+    )
+    if require_formal_contract and preserved_source != "preserved_input_channel_0_as_stored_float16":
+        mismatches["preserved_value_source"] = {
+            "expected": "preserved_input_channel_0_as_stored_float16",
+            "observed": preserved_source,
+        }
+    if mismatches:
+        raise ValueError(f"Serialized-tensor latent contract mismatch: {mismatches}")
+
+    return {
+        "available": True,
+        **observed,
+        "configured_latent_dir": str(configured_dir.resolve()),
+        "declared_latent_dir": str(declared_dir.resolve()) if declared_dir is not None else None,
+        "configured_matches_metadata": paths_match,
+        "preserved_value_channel": PRESERVED_Z_CHANNEL,
+        "preserved_value_source": preserved_source,
+        "payload_validation_required": True,
+        "stage1_checkpoint_opened": False,
+    }
+
+
 def audit_qa_metadata(
     qa_dir: str | Path,
+    latent_dir: str | Path,
     splits: Sequence[str],
     require_formal_contract: bool,
 ) -> dict[str, Any]:
@@ -438,6 +628,7 @@ def audit_qa_metadata(
             "matches_declared_sha256": bool(declared_hash and actual_hash == declared_hash),
         }
 
+    latent_contract = audit_latent_contract(metadata, latent_dir, require_formal_contract)
     summary = metadata.get("summary", {})
     summary_splits = summary.get("splits", {}) if isinstance(summary, Mapping) else {}
     declared_records = {
@@ -458,7 +649,8 @@ def audit_qa_metadata(
         "formal_contract_required": bool(require_formal_contract),
         "formal_contract_passed": bool(require_formal_contract),
         "stage1_checkpoint_opened": False,
-        "latent_contract_evaluated": False,
+        "latent_contract_evaluated": True,
+        "latent_contract": latent_contract,
     }
 
 
@@ -482,18 +674,235 @@ def load_qa_records(path: str | Path, max_records: int | None = None) -> tuple[l
     return records, source_oracle_records
 
 
+def validate_preserved_z_matrix(
+    values: torch.Tensor,
+    qa_stats: Mapping[str, float],
+    path: str | Path,
+) -> None:
+    if values.ndim != 2 or not bool(torch.isfinite(values).all()):
+        raise ValueError(
+            f"Preserved tensor channel must be one finite 2D matrix, got {tuple(values.shape)} at {path}."
+        )
+    observed_mean = float(values.float().mean().item())
+    observed_std = float(values.float().std(unbiased=False).item())
+    raw_std = float(qa_stats["std"])
+    scale = float(qa_stats["scale"])
+    expected_scale = float((torch.tensor(raw_std, dtype=torch.float32) + 1.0e-6).item())
+    if not math.isclose(scale, expected_scale, rel_tol=5.0e-7, abs_tol=5.0e-12):
+        raise ValueError(
+            f"Latent z-score scale is stale at {path}: raw_std={raw_std}, "
+            f"scale={scale}, expected={expected_scale}."
+        )
+    expected_std = raw_std / scale
+    std_tolerance = max(PRESERVED_Z_STD_ATOL, PRESERVED_Z_STD_RTOL * abs(expected_std))
+    if raw_std == 0.0 and int(torch.count_nonzero(values).item()) != 0:
+        raise ValueError(f"Constant-patch metadata requires an exactly-zero preserved channel: {path}")
+    if expected_std > 2.0**-24 and observed_std == 0.0:
+        raise ValueError(
+            f"Preserved channel is constant despite non-degenerate metadata at {path}: "
+            f"expected_std={expected_std}."
+        )
+    if abs(observed_mean) > PRESERVED_Z_MEAN_ATOL or abs(observed_std - expected_std) > std_tolerance:
+        raise ValueError(
+            f"Preserved channel no longer matches per-patch z-score metadata at {path}: "
+            f"mean={observed_mean}, std={observed_std}, expected_std={expected_std}."
+        )
+
+
+def serialize_standardized_matrix(values: torch.Tensor, significant_digits: int) -> str:
+    if values.ndim != 2:
+        raise ValueError(f"Expected a 2D standardized matrix, got {tuple(values.shape)}.")
+    if not bool(torch.isfinite(values).all()):
+        raise FloatingPointError("Cannot serialize a matrix containing NaN or infinity.")
+    digits = int(significant_digits)
+    if digits < 5 or digits > 12:
+        raise ValueError("Matrix significant digits must be between 5 and 12.")
+
+    serialized_rows: list[list[str]] = []
+    for row in values.detach().cpu():
+        serialized_rows.append([f"{float(value):.{digits}g}" for value in row])
+
+    parsed = torch.tensor(
+        [[float(value) for value in row] for row in serialized_rows],
+        dtype=torch.float16,
+    )
+    source_fp16 = values.detach().cpu().to(dtype=torch.float16)
+    if not torch.equal(parsed, source_fp16):
+        mismatch = torch.nonzero(parsed != source_fp16, as_tuple=False)[0].tolist()
+        row, col = (int(value) for value in mismatch)
+        raise ValueError(
+            "Matrix text precision does not round-trip the stored FP16 value at "
+            f"row={row + 1}, col={col + 1}: source={float(source_fp16[row, col])}, "
+            f"text={serialized_rows[row][col]!r}. Increase --matrix-significant-digits."
+        )
+
+    height, width = (int(value) for value in source_fp16.shape)
+    lines = [
+        f"shape: {height} rows x {width} columns",
+        "column indices: " + ", ".join(str(index) for index in range(1, width + 1)),
+    ]
+    lines.extend(
+        f"row {row_index}: [" + ", ".join(row) + "]"
+        for row_index, row in enumerate(serialized_rows, start=1)
+    )
+    return "\n".join(lines)
+
+
+def matrix_extreme_support(values: torch.Tensor) -> dict[str, dict[str, Any]]:
+    if values.ndim != 2:
+        raise ValueError(f"Extreme support expects a 2D matrix, got {tuple(values.shape)}.")
+    height, width = (int(value) for value in values.shape)
+
+    def quadrant(row: int, col: int) -> str:
+        top = int(row) < height / 2.0
+        left = int(col) < width / 2.0
+        if top and left:
+            return "A"
+        if top:
+            return "B"
+        if left:
+            return "C"
+        return "D"
+
+    output: dict[str, dict[str, Any]] = {}
+    for operation, extreme_value in (("maximum", values.max()), ("minimum", values.min())):
+        positions = torch.nonzero(values == extreme_value, as_tuple=False).tolist()
+        labels = sorted({quadrant(int(row), int(col)) for row, col in positions})
+        tie_scope = (
+            "unique_cell"
+            if len(positions) == 1
+            else "within_quadrant_tie"
+            if len(labels) == 1
+            else "cross_quadrant_tie"
+        )
+        output[operation] = {
+            "acceptable_labels": labels,
+            "position_count": len(positions),
+            "tie_scope": tie_scope,
+        }
+    return output
+
+
+def requested_extreme_operation(record: Mapping[str, Any]) -> str:
+    query = str(record.get("query") or record.get("question") or "").casefold()
+    operations = {match.group(1).casefold() for match in EXTREME_OPERATION_RE.finditer(query)}
+    if len(operations) != 1:
+        raise ValueError(
+            f"Extreme QA record must declare exactly one of maximum/minimum: {record.get('qa_id')}"
+        )
+    return next(iter(operations))
+
+
 class FrozenQwenQADataset(Dataset):
-    def __init__(self, path: str | Path, max_records: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        latent_dir: str | Path,
+        latent_contract: Mapping[str, Any],
+        matrix_significant_digits: int,
+        matrix_cache_size: int,
+        max_records: int | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.latent_dir = Path(latent_dir)
+        self.latent_contract = dict(latent_contract)
+        self.matrix_significant_digits = int(matrix_significant_digits)
+        self.matrix_cache_size = max(0, int(matrix_cache_size))
         self.records, self.source_oracle_records = load_qa_records(self.path, max_records)
         if not self.records:
             raise RuntimeError(f"No QA records found in {self.path}.")
+        self._matrix_cache: OrderedDict[
+            str, tuple[str, dict[str, Any], dict[str, float], dict[str, dict[str, Any]]]
+        ] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return {"index": int(index), "record": self.records[index]}
+        record = self.records[index]
+        matrix_text, extreme_support = self.serialized_tensor_for_record(record)
+        metric_contract = self.metric_contract_for_record(record, extreme_support)
+        return {
+            "index": int(index),
+            "record": record,
+            "matrix_text": matrix_text,
+            **metric_contract,
+        }
+
+    def latent_path_for_record(self, record: Mapping[str, Any]) -> Path:
+        state_ref = str(record.get("state_ref") or "")
+        if not state_ref:
+            raise ValueError(f"QA record has no state_ref: {record.get('qa_id', '<unknown>')}")
+        return self.latent_dir / f"{state_ref}.pt"
+
+    def serialized_tensor_for_record(
+        self,
+        record: Mapping[str, Any],
+    ) -> tuple[str, dict[str, dict[str, Any]]]:
+        path = self.latent_path_for_record(record)
+        identity = latent_identity_from_record(record)
+        qa_stats = latent_qa_stats_from_record(record)
+        cache_key = str(path.resolve())
+        cached = self._matrix_cache.get(cache_key)
+        if cached is not None:
+            text, cached_identity, cached_stats, extreme_support = cached
+            if cached_identity != identity or cached_stats != qa_stats:
+                raise ValueError(
+                    f"QA records map incompatible identity/statistics to one tensor file: {path}"
+                )
+            self._matrix_cache.move_to_end(cache_key)
+            return text, extreme_support
+        if not path.is_file():
+            raise FileNotFoundError(f"Tensor latent file not found: {path}")
+
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        latent = validate_patch_latent_payload(
+            payload,
+            path=path,
+            expected_identity=identity,
+            expected_alignment_checkpoint=self.latent_contract["alignment_checkpoint"],
+            expected_alignment_sha256=self.latent_contract["alignment_checkpoint_sha256"],
+            expected_normalization=self.latent_contract["encoder_input_normalization"],
+            expected_shape=self.latent_contract["latent_shape"],
+            expected_storage_dtype=self.latent_contract["storage_dtype"],
+            expected_qa_stats=qa_stats,
+        )
+        values = latent[PRESERVED_Z_CHANNEL].contiguous()
+        validate_preserved_z_matrix(values, qa_stats, path)
+        text = serialize_standardized_matrix(values, self.matrix_significant_digits)
+        extreme_support = matrix_extreme_support(values)
+        if self.matrix_cache_size > 0:
+            self._matrix_cache[cache_key] = (text, identity, qa_stats, extreme_support)
+            self._matrix_cache.move_to_end(cache_key)
+            while len(self._matrix_cache) > self.matrix_cache_size:
+                self._matrix_cache.popitem(last=False)
+        return text, extreme_support
+
+    def matrix_text_for_record(self, record: Mapping[str, Any]) -> str:
+        return self.serialized_tensor_for_record(record)[0]
+
+    @staticmethod
+    def metric_contract_for_record(
+        record: Mapping[str, Any],
+        extreme_support: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        answer = str(record.get("answer", ""))
+        if str(record.get("task_type", "")) != "extreme_quadrant":
+            return {"acceptable_answers": [answer], "extreme_tie_scope": "not_extreme"}
+        operation = requested_extreme_operation(record)
+        support = extreme_support[operation]
+        acceptable = [str(label) for label in support["acceptable_labels"]]
+        if answer not in acceptable:
+            raise ValueError(
+                "Stored FP16 matrix does not support the source extreme label for "
+                f"{record.get('qa_id')}: answer={answer}, acceptable={acceptable}."
+            )
+        return {
+            "acceptable_answers": acceptable,
+            "extreme_tie_scope": str(support["tie_scope"]),
+            "extreme_position_count": int(support["position_count"]),
+            "extreme_operation": operation,
+        }
 
 
 class ExactDistributedEvalSampler(Sampler[int]):
@@ -519,6 +928,9 @@ def collate_records(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "indices": [int(item["index"]) for item in items],
         "records": [item["record"] for item in items],
+        "matrix_texts": [str(item["matrix_text"]) for item in items],
+        "acceptable_answers": [list(item["acceptable_answers"]) for item in items],
+        "extreme_tie_scopes": [str(item["extreme_tie_scope"]) for item in items],
     }
 
 
@@ -533,8 +945,39 @@ def prompt_only_record(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def render_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
-    return build_prompt(prompt_only_record(record), prompt_template=prompt_template)
+def adapt_task_prompt_to_matrix(task_prompt: str) -> str:
+    """Change only the input-representation wording in the shared task prompt."""
+
+    prefix, separator, task_suffix = str(task_prompt).partition("\n\nQuery:")
+    if not separator:
+        raise ValueError("The shared task prompt no longer contains its formal Query boundary.")
+    prefix = prefix.replace(
+        "Tensor soft tokens before this text encode the tensor state.",
+        "The standardized matrix z above encodes the tensor state.",
+    )
+    prefix = prefix.replace("the tensor soft tokens", "the standardized matrix z above")
+    prefix = prefix.replace("tensor soft tokens", "standardized matrix z above")
+    if "soft token" in prefix.casefold():
+        raise ValueError("The matrix baseline prompt retained a soft-token instruction.")
+    return prefix + separator + task_suffix
+
+
+def render_prompt(
+    record: Mapping[str, Any],
+    prompt_template: str,
+    matrix_text: str,
+) -> str:
+    shared_task_prompt = build_prompt(
+        prompt_only_record(record), prompt_template=prompt_template
+    )
+    task_prompt = adapt_task_prompt_to_matrix(shared_task_prompt)
+    return (
+        "The complete per-patch standardized tensor matrix z is provided below as ordinary text. "
+        "Rows and columns are explicitly labeled with 1-based indices.\n"
+        "Standardized matrix z:\n"
+        f"{matrix_text}\n\n"
+        f"{task_prompt}"
+    )
 
 
 def record_field(record: Mapping[str, Any]) -> str:
@@ -591,14 +1034,24 @@ def audit_qa_records(
             if not query:
                 raise ValueError(f"Record {qa_id} has an empty query.")
 
-            prompt = render_prompt(record, "task_specific")
-            if prompt != build_prompt(record, prompt_template="task_specific"):
-                raise RuntimeError(f"Prompt-only projection changed the formal prompt for {qa_id}.")
+            audit_matrix = "shape: 1 rows x 1 columns\ncolumn indices: 1\nrow 1: [0]"
+            prompt = render_prompt(record, "task_specific", audit_matrix)
+            formal_task_prompt = adapt_task_prompt_to_matrix(
+                build_prompt(prompt_only_record(record), prompt_template="task_specific")
+            )
+            if not prompt.endswith(formal_task_prompt):
+                raise RuntimeError(
+                    f"Tensor serialization changed more than the input representation for {qa_id}."
+                )
             mutated = dict(record)
             mutated["answer"] = "__FORBIDDEN_ANSWER_SENTINEL__"
             mutated["oracle"] = "__FORBIDDEN_ORACLE_SENTINEL__"
-            if render_prompt(mutated, "task_specific") != prompt:
-                raise RuntimeError(f"Answer/oracle changed the model prompt for {qa_id}.")
+            mutated["latent_ref"] = "__FORBIDDEN_LATENT_REF_SENTINEL__"
+            mutated["grounding_target"] = "__FORBIDDEN_GROUNDING_SENTINEL__"
+            mutated["matched_group"] = "__FORBIDDEN_MATCHED_GROUP_SENTINEL__"
+            mutated["prompt_data"] = "__FORBIDDEN_PROMPT_DATA_SENTINEL__"
+            if render_prompt(mutated, "task_specific", audit_matrix) != prompt:
+                raise RuntimeError(f"A non-prompt QA field changed the model prompt for {qa_id}.")
 
             tasks[task] += 1
             fields[field] += 1
@@ -672,12 +1125,75 @@ def audit_qa_records(
         "prompt_projection_excludes": [
             "answer",
             "oracle",
-            "latent_ref",
             "latent_path",
             "grounding_target",
             "matched_group",
             "prompt_data",
         ],
+        "latent_lookup": "latent_dir/state_ref.pt; record latent_ref is ignored and never enters the prompt",
+    }
+
+
+def audit_tensor_inputs(
+    datasets: Mapping[str, FrozenQwenQADataset],
+) -> dict[str, Any]:
+    split_summaries: dict[str, Any] = {}
+    combined_digest = hashlib.sha256()
+    total_unique_files = 0
+    for split, dataset in datasets.items():
+        path_to_state: dict[str, str] = {}
+        matrix_digests: dict[str, str] = {}
+        extreme_tie_scopes: Counter[str] = Counter()
+        extreme_position_count = 0
+        for record in dataset.records:
+            state_ref = str(record.get("state_ref") or "")
+            path = str(dataset.latent_path_for_record(record).resolve())
+            previous_state = path_to_state.get(path)
+            if previous_state is not None and previous_state != state_ref:
+                raise ValueError(
+                    f"Different state_ref values map to one tensor file: {previous_state}, {state_ref}, {path}"
+                )
+            path_to_state[path] = state_ref
+            matrix_text, extreme_support = dataset.serialized_tensor_for_record(record)
+            metric_contract = dataset.metric_contract_for_record(record, extreme_support)
+            if str(record.get("task_type", "")) == "extreme_quadrant":
+                extreme_tie_scopes[str(metric_contract["extreme_tie_scope"])] += 1
+                extreme_position_count += int(metric_contract["extreme_position_count"])
+            digest = hashlib.sha256(matrix_text.encode("utf-8")).hexdigest()
+            previous_digest = matrix_digests.get(state_ref)
+            if previous_digest is not None and previous_digest != digest:
+                raise RuntimeError(f"One state_ref produced different serialized matrices: {state_ref}")
+            matrix_digests[state_ref] = digest
+
+        for state_ref in sorted(matrix_digests):
+            combined_digest.update(
+                f"{split}|{state_ref}|{matrix_digests[state_ref]}\n".encode("utf-8")
+            )
+        total_unique_files += len(path_to_state)
+        split_summaries[split] = {
+            "records_checked": len(dataset),
+            "unique_tensor_files_opened_and_validated": len(path_to_state),
+            "unique_states": len(matrix_digests),
+            "all_records_resolved_to_tensor": True,
+            "all_payload_contracts_valid": True,
+            "all_preserved_z_statistics_valid": True,
+            "all_serialized_values_round_trip_to_stored_fp16": True,
+            "all_source_extreme_labels_supported_by_stored_fp16": True,
+            "extreme_tie_scope": dict(sorted(extreme_tie_scopes.items())),
+            "extreme_position_count": extreme_position_count,
+        }
+    return {
+        "input_representation": "complete_16x16_standardized_matrix_serialized_as_text",
+        "expected_patch_size": EXPECTED_PATCH_SIZE,
+        "latent_payload_shape": datasets[next(iter(datasets))].latent_contract["latent_shape"],
+        "source_channel": PRESERVED_Z_CHANNEL,
+        "source_channel_semantics": "exact preserved per-patch z-score matrix",
+        "learned_latent_channels_in_prompt": [],
+        "matrix_value_order": "row-major with explicit 1-based row and column labels",
+        "matrix_significant_digits": datasets[next(iter(datasets))].matrix_significant_digits,
+        "validated_unique_tensor_files": total_unique_files,
+        "serialized_input_sha256": combined_digest.hexdigest(),
+        "splits": split_summaries,
     }
 
 
@@ -698,7 +1214,8 @@ def audit_prompt_tokenization(
             lambda: {"records": 0, "total_tokens": 0, "max_tokens": 0}
         )
         for record in dataset.records:
-            prompt = render_prompt(record, prompt_template)
+            matrix_text = dataset.matrix_text_for_record(record)
+            prompt = render_prompt(record, prompt_template, matrix_text)
             token_ids = tokenizer(
                 prompt,
                 add_special_tokens=True,
@@ -1009,6 +1526,7 @@ def empty_metric_payload() -> dict[str, Any]:
     return {
         "total": 0,
         "correct": 0,
+        "tie_aware_correct": 0,
         "restricted_nll_sum": 0.0,
         "target_probability_sum": 0.0,
         "prediction_confidence_sum": 0.0,
@@ -1017,6 +1535,7 @@ def empty_metric_payload() -> dict[str, Any]:
         "prompt_token_max": 0,
         "task_total": defaultdict(int),
         "task_correct": defaultdict(int),
+        "task_tie_aware_correct": defaultdict(int),
         "field_total": defaultdict(int),
         "field_correct": defaultdict(int),
         "task_field_total": defaultdict(int),
@@ -1026,6 +1545,9 @@ def empty_metric_payload() -> dict[str, Any]:
         "task_prediction_label_total": defaultdict(int),
         "confusion_total": defaultdict(int),
         "candidate_count_total": defaultdict(int),
+        "extreme_tie_scope_total": defaultdict(int),
+        "extreme_tie_scope_strict_correct": defaultdict(int),
+        "extreme_tie_scope_tie_aware_correct": defaultdict(int),
         "indices": [],
     }
 
@@ -1035,6 +1557,8 @@ def update_metric_payload(
     record: Mapping[str, Any],
     scored: Mapping[str, Any],
     index: int,
+    acceptable_answers: Sequence[str] | None = None,
+    extreme_tie_scope: str | None = None,
 ) -> None:
     answer = str(record["answer"])
     prediction = str(scored["prediction"])
@@ -1048,9 +1572,21 @@ def update_metric_payload(
     field = record_field(record)
     task_field = f"{task}/{field}"
     choices = [str(choice) for choice in record["choices"]]
+    acceptable = (
+        {str(label) for label in acceptable_answers}
+        if acceptable_answers is not None
+        else {answer}
+    )
+    if not acceptable or answer not in acceptable or not acceptable.issubset(set(choices)):
+        raise ValueError(
+            f"Invalid tie-aware answer set for {record.get('qa_id')}: "
+            f"answer={answer}, acceptable={sorted(acceptable)}, choices={choices}."
+        )
+    tie_aware_hit = int(prediction in acceptable)
 
     payload["total"] += 1
     payload["correct"] += hit
+    payload["tie_aware_correct"] += tie_aware_hit
     payload["restricted_nll_sum"] += -math.log(max(target_probability, 1.0e-30))
     payload["target_probability_sum"] += target_probability
     payload["prediction_confidence_sum"] += prediction_probability
@@ -1059,6 +1595,7 @@ def update_metric_payload(
     payload["prompt_token_max"] = max(payload["prompt_token_max"], int(scored["prompt_tokens"]))
     payload["task_total"][task] += 1
     payload["task_correct"][task] += hit
+    payload["task_tie_aware_correct"][task] += tie_aware_hit
     payload["field_total"][field] += 1
     payload["field_correct"][field] += hit
     payload["task_field_total"][task_field] += 1
@@ -1068,6 +1605,13 @@ def update_metric_payload(
     payload["task_prediction_label_total"][f"{task}/{prediction}"] += 1
     payload["confusion_total"][f"{answer}/{prediction}"] += 1
     payload["candidate_count_total"][str(len(choices))] += 1
+    if task == "extreme_quadrant":
+        scope = "unique_cell" if extreme_tie_scope is None else str(extreme_tie_scope)
+        if scope not in {"unique_cell", "within_quadrant_tie", "cross_quadrant_tie"}:
+            raise ValueError(f"Invalid FP16 extreme tie scope for {record.get('qa_id')}: {scope}")
+        payload["extreme_tie_scope_total"][scope] += 1
+        payload["extreme_tie_scope_strict_correct"][scope] += hit
+        payload["extreme_tie_scope_tie_aware_correct"][scope] += tie_aware_hit
     payload["indices"].append(int(index))
 
 
@@ -1082,7 +1626,7 @@ def merge_metric_payloads(
     payloads: Sequence[Mapping[str, Any]],
     expected_total: int,
 ) -> dict[str, Any]:
-    scalar_ints = ("total", "correct", "prompt_token_sum")
+    scalar_ints = ("total", "correct", "tie_aware_correct", "prompt_token_sum")
     scalar_floats = (
         "restricted_nll_sum",
         "target_probability_sum",
@@ -1092,6 +1636,7 @@ def merge_metric_payloads(
     map_names = (
         "task_total",
         "task_correct",
+        "task_tie_aware_correct",
         "field_total",
         "field_correct",
         "task_field_total",
@@ -1101,6 +1646,9 @@ def merge_metric_payloads(
         "task_prediction_label_total",
         "confusion_total",
         "candidate_count_total",
+        "extreme_tie_scope_total",
+        "extreme_tie_scope_strict_correct",
+        "extreme_tie_scope_tie_aware_correct",
     )
     merged: dict[str, Any] = {name: 0 for name in scalar_ints}
     merged.update({name: 0.0 for name in scalar_floats})
@@ -1172,11 +1720,36 @@ def nested_distribution(flat: Mapping[str, int]) -> dict[str, dict[str, int]]:
 def finalize_metrics(merged: Mapping[str, Any]) -> dict[str, Any]:
     total = int(merged["total"])
     by_task = grouped_accuracy(merged["task_total"], merged["task_correct"])
+    tie_aware_by_task = grouped_accuracy(
+        merged["task_total"], merged["task_tie_aware_correct"]
+    )
+    for task, metrics in by_task.items():
+        tie_metrics = tie_aware_by_task[task]
+        metrics["tie_aware_accuracy"] = float(tie_metrics["accuracy"])
+        metrics["tie_aware_correct"] = int(tie_metrics["correct"])
+    extreme_tie_metrics = {}
+    for scope, scope_total in sorted(merged["extreme_tie_scope_total"].items()):
+        strict_correct = int(merged["extreme_tie_scope_strict_correct"].get(scope, 0))
+        tie_correct = int(merged["extreme_tie_scope_tie_aware_correct"].get(scope, 0))
+        extreme_tie_metrics[str(scope)] = {
+            "total": int(scope_total),
+            "strict_correct": strict_correct,
+            "strict_accuracy": strict_correct / max(1, int(scope_total)),
+            "tie_aware_correct": tie_correct,
+            "tie_aware_accuracy": tie_correct / max(1, int(scope_total)),
+        }
     return {
         "accuracy": int(merged["correct"]) / max(1, total),
         "correct": int(merged["correct"]),
+        "accuracy_is_primary_strict_source_label_metric": True,
+        "tie_aware_accuracy": int(merged["tie_aware_correct"]) / max(1, total),
+        "tie_aware_correct": int(merged["tie_aware_correct"]),
         "total": total,
         "macro_task_accuracy": sum(item["accuracy"] for item in by_task.values())
+        / max(1, len(by_task)),
+        "macro_task_tie_aware_accuracy": sum(
+            item["tie_aware_accuracy"] for item in by_task.values()
+        )
         / max(1, len(by_task)),
         "uniform_random_expected_accuracy": float(merged["uniform_chance_sum"]) / max(1, total),
         "mean_restricted_nll": float(merged["restricted_nll_sum"]) / max(1, total),
@@ -1200,6 +1773,7 @@ def finalize_metrics(merged: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "target_prediction_confusion": nested_distribution(merged["confusion_total"]),
         "candidate_count_distribution": dict(sorted(merged["candidate_count_total"].items())),
+        "extreme_fp16_tie_metrics": extreme_tie_metrics,
         "distributed_shard_audit": {
             "exact_no_padding_no_repeat": True,
             "indices_sha256": str(merged["indices_sha256"]),
@@ -1249,7 +1823,10 @@ def evaluate_split(
     )
     for batch in iterator:
         records = batch["records"]
-        prompts = [render_prompt(record, str(args.prompt_template)) for record in records]
+        prompts = [
+            render_prompt(record, str(args.prompt_template), matrix_text)
+            for record, matrix_text in zip(records, batch["matrix_texts"], strict=True)
+        ]
         choices_by_record = [[str(choice) for choice in record["choices"]] for record in records]
         scored = score_prompt_batch(
             model=model,
@@ -1260,14 +1837,39 @@ def evaluate_split(
             device=device,
             max_prompt_tokens=int(args.max_prompt_tokens),
         )
-        for index, record, result in zip(batch["indices"], records, scored):
-            update_metric_payload(local, record, result, index)
+        for index, record, result, acceptable, tie_scope in zip(
+            batch["indices"],
+            records,
+            scored,
+            batch["acceptable_answers"],
+            batch["extreme_tie_scopes"],
+            strict=True,
+        ):
+            update_metric_payload(
+                local,
+                record,
+                result,
+                index,
+                acceptable_answers=acceptable,
+                extreme_tie_scope=tie_scope,
+            )
 
     local_serializable = serializable_metric_payload(local)
     if distributed_is_initialized():
         gathered: list[Mapping[str, Any] | None] = [None] * distributed_world_size()
         dist.all_gather_object(gathered, local_serializable)
-        payloads = [payload for payload in gathered if payload is not None]
+        invalid_ranks = [
+            rank for rank, payload in enumerate(gathered) if not isinstance(payload, Mapping)
+        ]
+        if invalid_ranks:
+            raise RuntimeError(
+                f"Distributed evaluation returned invalid metric payloads from ranks {invalid_ranks}."
+            )
+        payloads = [dict(payload) for payload in gathered if isinstance(payload, Mapping)]
+        if len(payloads) != distributed_world_size():
+            raise RuntimeError(
+                "Distributed evaluation did not receive exactly one metric payload per rank."
+            )
     else:
         payloads = [local_serializable]
     merged = merge_metric_payloads(payloads, expected_total=len(dataset))
@@ -1297,17 +1899,32 @@ def runtime_contract() -> dict[str, Any]:
         "adapter_instantiated": False,
         "adapter_checkpoint_loaded": False,
         "stage1_checkpoint_loaded": False,
-        "latent_files_opened": False,
-        "tensor_serialized_into_text": False,
+        "latent_files_opened": True,
+        "latent_payload_channel_used": PRESERVED_Z_CHANNEL,
+        "tensor_serialized_into_text": True,
+        "tensor_input": "complete 16x16 per-patch standardized matrix z",
+        "learned_latent_channels_used": [],
         "soft_prefix_tokens": 0,
         "forward_model_inputs": ["input_ids", "attention_mask"],
         "prompt_record_fields": ["task_type", "query", "question", "choices"],
-        "answer_used_by_model_forward": False,
-        "answer_used_after_forward_for_metrics_only": True,
+        "prompt_tensor_source": "validated latent_map[0], serialized with no answer-dependent transform",
+        "task_prompt_contract": (
+            "shared Stage-2B task prompt with input-representation wording changed before "
+            "the Query boundary; query, choices, and output contract remain unchanged"
+        ),
+        "answer_in_model_prompt_or_forward_inputs": False,
+        "answer_used_pre_forward_for_input_integrity_only": (
+            "extreme-task source labels are checked against all extrema in the stored FP16 matrix"
+        ),
+        "answer_used_after_forward_for_metrics": True,
         "scoring": "next-token logits restricted to each record's displayed choice labels",
+        "primary_accuracy": "strict match to the original float32-source QA label",
+        "secondary_accuracy": (
+            "tie-aware only for cross-quadrant extrema made ambiguous by stored-FP16 quantization"
+        ),
         "interpretation": (
-            "No-tensor language/label-prior lower baseline; it is not information-equivalent to the "
-            "tensor-adapter model."
+            "Frozen-Qwen tensor-text baseline on the identical QA records. Qwen receives the complete "
+            "standardized value matrix as ordinary text instead of learned adapter soft tokens."
         ),
     }
 
@@ -1319,6 +1936,7 @@ def print_split_metrics(split: str, metrics: Mapping[str, Any]) -> None:
     )
     print(
         f"split={split} accuracy={float(metrics['accuracy']):.4f} "
+        f"tie_aware={float(metrics['tie_aware_accuracy']):.4f} "
         f"correct={int(metrics['correct'])}/{int(metrics['total'])} tasks[{task_text}]",
         flush=True,
     )
@@ -1352,6 +1970,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         metadata_audit = run_on_rank_zero_and_broadcast(
             lambda: audit_qa_metadata(
                 args.qa_dir,
+                args.latent_dir,
                 splits,
                 require_formal_contract=bool(args.require_formal_contract),
             ),
@@ -1360,6 +1979,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         datasets = {
             split: FrozenQwenQADataset(
                 qa_path(args.qa_dir, split),
+                latent_dir=args.latent_dir,
+                latent_contract=metadata_audit["latent_contract"],
+                matrix_significant_digits=int(args.matrix_significant_digits),
+                matrix_cache_size=int(args.matrix_cache_size),
                 max_records=args.max_records,
             )
             for split in splits
@@ -1378,6 +2001,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 run_dir / "qa_only_audit.json",
                 {"metadata": metadata_audit, "records": qa_audit},
             )
+
+        tensor_input_audit = run_on_rank_zero_and_broadcast(
+            lambda: audit_tensor_inputs(datasets),
+            "serialized tensor input audit",
+        )
+        if is_main_process():
+            atomic_dump_json(run_dir / "tensor_input_audit.json", tensor_input_audit)
 
         tokenizer = load_tokenizer(args)
         prompt_audit = run_on_rank_zero_and_broadcast(
@@ -1434,12 +2064,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "runtime_contract": runtime_contract(),
             "qa_metadata_audit": metadata_audit,
             "qa_record_audit": qa_audit,
+            "tensor_input_audit": tensor_input_audit,
             "prompt_tokenization_audit": prompt_audit,
             "splits": split_metrics,
         }
         if is_main_process():
-            atomic_dump_json(run_dir / "frozen_qwen_results.json", result)
-            print(f"results={run_dir / 'frozen_qwen_results.json'}", flush=True)
+            atomic_dump_json(run_dir / "frozen_qwen_tensor_results.json", result)
+            print(f"results={run_dir / 'frozen_qwen_tensor_results.json'}", flush=True)
         distributed_barrier()
     finally:
         if distributed_is_initialized():

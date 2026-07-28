@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1210" viewBox="0 0 1800 1210" role="img" aria-labelledby="figure-title figure-desc">
   <title id="figure-title">Spatially grounded tensor-to-LLM interface</title>
-  <desc id="figure-desc">A two-stage architecture. In Stage 1, shared input X branches to a value-preserving encoder and a frozen Qwen tokenizer; the paired outputs are read after tokenized probes at frozen Qwen layer ell and aligned with a field-text contrastive matrix. Stage 2 tokenizes and embeds a natural-language question, then places its text embeddings directly after the same 256 spatial tokens in a frozen Qwen model.</desc>
+  <desc id="figure-desc">A two-stage architecture. In Stage 1, shared input X branches to a value-preserving encoder and a frozen Qwen tokenizer; the paired outputs are read after probes at frozen Qwen layer ell and aligned with a field-text contrastive matrix. Stage 2 tokenizes and embeds a natural-language question, then places its text embeddings directly after the same 256 spatial tokens in a frozen Qwen model.</desc>
 
   <defs>
     <marker id="arrow-dark" markerWidth="11" markerHeight="11" refX="10" refY="5.5" orient="auto" markerUnits="userSpaceOnUse">
@@ -16,9 +16,7 @@
     <style>
       text { font-family: Arial, Helvetica, sans-serif; fill: #1f2a33; letter-spacing: 0; }
       .title { font-size: 36px; font-weight: 700; }
-      .subtitle { font-size: 20px; fill: #56636e; }
       .panel-title { font-size: 28px; font-weight: 700; }
-      .panel-note { font-size: 19px; fill: #60707c; }
       .lane { font-size: 21px; font-weight: 700; fill: #33424f; }
       .box-title { font-size: 22px; font-weight: 700; }
       .box-text { font-size: 19px; fill: #35434e; }
@@ -28,7 +26,6 @@
       .panel { fill: #f8fafb; stroke: #c8d2d9; stroke-width: 2; }
       .trainable { fill: #fbe5de; stroke: #bd543e; stroke-width: 2.5; }
       .frozen { fill: #e9eef2; stroke: #526879; stroke-width: 2.5; }
-      .fixed { fill: #e4f0fb; stroke: #47789b; stroke-width: 2.5; }
       .tensor { fill: #dff0e8; stroke: #3f7c65; stroke-width: 2.5; }
       .textual { fill: #fff2c9; stroke: #9b7930; stroke-width: 2.5; }
       .loss-only { fill: #f0e8f4; stroke: #76528b; stroke-width: 2.5; stroke-dasharray: 8 6; }
@@ -50,17 +47,14 @@
 
   <g id="header">
     <text x="48" y="47" class="title">Spatially Grounded Tensor-to-LLM Interface</text>
-    <text x="50" y="78" class="subtitle">One spatial token per grid cell; alignment first, natural-language grounding second</text>
 
     <g id="legend" transform="translate(1025,24)">
       <rect x="0" y="0" width="28" height="22" rx="4" class="trainable"/>
       <text x="38" y="18" class="small">trainable</text>
       <rect x="145" y="0" width="28" height="22" rx="4" class="frozen"/>
       <text x="183" y="18" class="small">frozen</text>
-      <rect x="286" y="0" width="28" height="22" rx="4" class="fixed"/>
-      <text x="324" y="18" class="small">fixed / cached</text>
-      <rect x="486" y="0" width="28" height="22" rx="4" class="loss-only"/>
-      <text x="524" y="18" class="small">training-loss only</text>
+      <rect x="286" y="0" width="28" height="22" rx="4" class="loss-only"/>
+      <text x="324" y="18" class="small">training-loss only</text>
       <rect x="0" y="34" width="28" height="18" rx="3" class="tensor"/>
       <text x="38" y="49" class="small">tensor embedding</text>
       <rect x="205" y="34" width="28" height="18" rx="3" class="textual"/>
@@ -73,7 +67,6 @@
     <circle cx="70" cy="137" r="18" fill="#33424f"/>
     <text x="64" y="145" font-size="23" font-weight="700" fill="#ffffff">1</text>
     <text x="100" y="146" class="panel-title">Representation alignment</text>
-    <text x="1728" y="144" text-anchor="end" class="panel-note">shared input X, paired tokenized probes, shared shallow Qwen</text>
 
     <text x="268" y="171" class="lane">Tensor branch (student)</text>
     <text x="268" y="381" class="lane">Text branch (teacher)</text>
@@ -149,8 +142,7 @@
       <text x="750" y="354" text-anchor="middle" font-size="18" font-weight="700">256 spatial tokens</text>
       <text x="890" y="342" text-anchor="middle" font-size="32" font-weight="700">+</text>
       <rect x="910" y="290" width="96" height="74" rx="6" class="textual"/>
-      <text x="958" y="319" text-anchor="middle" font-size="17" font-weight="700">Tokenized</text>
-      <text x="958" y="344" text-anchor="middle" font-size="19" font-weight="700">probe</text>
+      <text x="958" y="334" text-anchor="middle" class="box-title">Probe</text>
     </g>
 
     <path d="M1006 327 H1022 V215 H1038" class="arrow"/>
@@ -169,8 +161,7 @@
         <text x="755" y="544" text-anchor="middle" class="box-title">numeric text tokens</text>
         <text x="890" y="552" text-anchor="middle" font-size="32" font-weight="700">+</text>
         <rect x="910" y="500" width="96" height="74" rx="6" class="textual"/>
-        <text x="958" y="529" text-anchor="middle" font-size="17" font-weight="700">Tokenized</text>
-        <text x="958" y="554" text-anchor="middle" font-size="19" font-weight="700">probe</text>
+        <text x="958" y="544" text-anchor="middle" class="box-title">Probe</text>
       </g>
 
       <path d="M1006 537 H1022 V425 H1038" class="arrow"/>
@@ -262,7 +253,6 @@
     <circle cx="70" cy="632" r="18" fill="#33424f"/>
     <text x="64" y="640" font-size="23" font-weight="700" fill="#ffffff">2</text>
     <text x="100" y="641" class="panel-title">Natural-language grounding</text>
-    <text x="1728" y="639" text-anchor="end" class="panel-note">direct prefix; tensor-text fusion inside frozen Qwen</text>
 
     <g id="stage2-input-grid" transform="translate(60,664)">
       <rect x="0" y="0" width="112" height="112" rx="6" class="neutral"/>
@@ -373,12 +363,6 @@
     <g id="answer-output">
       <rect x="1530" y="690" width="180" height="60" rx="6" class="neutral"/>
       <text x="1620" y="728" text-anchor="middle" class="box-title">Answer</text>
-    </g>
-
-    <g id="grounding-audit">
-      <rect x="1210" y="883" width="260" height="64" rx="6" class="fixed"/>
-      <text x="1340" y="911" text-anchor="middle" class="box-title">Grounding audit</text>
-      <text x="1340" y="936" text-anchor="middle" class="small">evaluation only</text>
     </g>
 
     <g id="stage2-loss">

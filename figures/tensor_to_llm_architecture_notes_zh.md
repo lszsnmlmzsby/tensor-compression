@@ -119,9 +119,9 @@ L_stage2 = 1.00 * L_choice-CE
 
 `margin=0.1`。no-latent ranking 用同长度的零信息 prefix 作为负例；不把随机或 shuffled tensor 当作监督负例，因为错误 tensor 也可能恰好对应同一正确答案。
 
-### 3. Grounding audit
+### 3. Grounding audit（当前图中省略）
 
-图中的 audit 不是额外训练模块，而是验证模型是否真的使用 tensor 的评估：
+Grounding audit 不是额外训练模块，而是验证模型是否真的使用 tensor 的评估；为保持主图简洁，当前图中不再显示该流程：
 
 - `correct`：正确 tensor；
 - `shuffled`：来自其他样本的 tensor；
@@ -149,7 +149,6 @@ L_stage2 = 1.00 * L_choice-CE
 
 - `.trainable`：橙红色，训练参数；
 - `.frozen`：灰蓝色，冻结模块；
-- `.fixed`：浅蓝色，固定操作或缓存；
 - `.tensor`：绿色，tensor/continuous embedding；
 - `.textual`：黄色，自然语言 token；
 - `.loss-only`：紫色虚线，仅训练 objective 使用。
@@ -166,9 +165,9 @@ L_stage2 = 1.00 * L_choice-CE
 | `value-preserving-encoder` | 不降采样 encoder |
 | `stage1-latent-grid` | `8 x 16 x 16` latent 输出 |
 | `spatial-adapter-stage1` | 精简后的 256-token spatial adapter |
-| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 tokenized probe |
+| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 Probe |
 | `qwen-tokenizer-stage1` | 冻结 Qwen tokenizer |
-| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 tokenized probe |
+| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 Probe |
 | `shared-shallow-qwen`, `student-shallow-qwen`, `teacher-shallow-qwen` | 上下对齐的共享冻结 Qwen 第 `\ell` 层 readout |
 | `student-hidden-vector`, `teacher-hidden-vector` | Qwen 输出向量示意 |
 | `stage1-alignment-loss`, `contrastive-matrix` | 带 `F_i`/`T_i` 配对序列和对角正样本的 contrastive alignment 矩阵 |
@@ -179,7 +178,6 @@ L_stage2 = 1.00 * L_choice-CE
 | `natural-language-question` | 自然语言问题 |
 | `answer-output` | 模型回答 |
 | `stage2-loss` | 仅用于训练损失计算的 QA objective，本身没有可训练参数 |
-| `grounding-audit` | 不参与反向传播的 tensor 依赖评估 |
 
 可直接用 Inkscape、Illustrator 或 Figma 导入 SVG。修改时应保留三条关键视觉关系：
 
