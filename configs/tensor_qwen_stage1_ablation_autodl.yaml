@@ -1,0 +1,40 @@
+# Isolated ablation: remove only Stage-1 tensor/text alignment initialization.
+# Neither production trainer nor either production config consumes this file.
+
+ablation:
+  seed: 42
+  source_stage1_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
+
+direct:
+  base_config: configs/tensor_llm_adapter_pipeline_autodl.yaml
+  # Reconstruct the original direct-QA warm start while changing only the
+  # in-memory Stage-1 adapter weights. Paths remain tied to the same latents.
+  arg_overrides:
+    adapter_architecture: alignment_adapter
+    qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_v3_direct
+    latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256_14b_v3_direct
+    run_name: tensor_stage1_ablation_direct_qa_autodl
+    stage2_warm_start_checkpoint: null
+    stage2b_resume_checkpoint: null
+    max_train_records: 138240
+    max_val_records: 1020
+    max_test_records: 1020
+    epochs: 1
+    batch_size: 3
+    gradient_accumulation_steps: 1
+    lr: 2.0e-5
+    ce_loss_weight: 0.05
+    choice_ce_loss_weight: 1.0
+    ranking_loss_weight: 0.1
+    ranking_loss_margin: 0.1
+    checkpoint_metric: macro_latent_gain
+    checkpoint_updates: ""
+    checkpoint_fractions: ""
+    evaluate_test: true
+    diagnostics_enabled: true
+    console_progress: true
+
+dense:
+  # All architecture, data, loss, optimizer, screening, and wall-clock settings
+  # are inherited unchanged. The CLI supplies the ablated direct-QA checkpoint.
+  base_config: configs/tensor_qwen_cross_attention_8h_autodl.yaml

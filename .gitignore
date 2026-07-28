@@ -36,6 +36,9 @@ wandb/
 # Local writing drafts
 docs/
 
+# Generated paper figures and rendering artifacts
+figures/
+
 # Local data
 PDEBench_code/
 

@@ -1551,12 +1551,16 @@ def atomic_dump_jsonl(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> No
 
 
 def clear_method_cache(dataset) -> None:
-    matrix_cache = getattr(dataset, "_matrix_cache", None)
-    if isinstance(matrix_cache, dict):
-        matrix_cache.clear()
-    latent_cache = getattr(dataset, "_latent_cache", None)
-    if isinstance(latent_cache, dict):
-        latent_cache.clear()
+    for name in (
+        "_matrix_cache",
+        "_latent_cache",
+        "_latent_path_cache",
+        "_latent_identity_cache",
+        "_latent_qa_stats_cache",
+    ):
+        cache = getattr(dataset, name, None)
+        if isinstance(cache, dict):
+            cache.clear()
     gc.collect()
 
 
@@ -1643,6 +1647,8 @@ def load_dense_interface(
     gates = sidecar.gate_values()
     checkpoint_sha256 = sha256_file(checkpoint_path)
     checkpoint_bytes = checkpoint_path.stat().st_size
+    initializer_path = Path(str(initializer_provenance["path"]))
+    initializer_bytes = initializer_path.stat().st_size
     elapsed_seconds = time.perf_counter() - started
     report = {
         "elapsed_seconds": elapsed_seconds,
@@ -1656,6 +1662,11 @@ def load_dense_interface(
         "architecture_from_checkpoint": observed_architecture,
         "validated_architecture": expected_architecture,
         "initializer": initializer_provenance,
+        "deployment_checkpoint_storage": {
+            "dense_trainable_checkpoint_bytes": checkpoint_bytes,
+            "spatial_initializer_checkpoint_bytes": initializer_bytes,
+            "combined_bytes": checkpoint_bytes + initializer_bytes,
+        },
         "install": install_report,
         "state_load": load_report,
         "parameters": {
@@ -1841,6 +1852,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "scope": "disabled",
                 }
             )
+            # File prewarming may resolve paths on rank 0. Keep every method's
+            # timed dataset-side caches empty while retaining the shared OS cache.
+            clear_method_cache(dataset)
             distributed_barrier()
             metrics, predictions, end_to_end_cost = run_end_to_end(
                 method=method,
