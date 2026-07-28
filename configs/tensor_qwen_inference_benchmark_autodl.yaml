@@ -1,0 +1,74 @@
+# Same-run inference benchmark for the paper's two tensor interfaces.
+# Paths use the current migrated AutoDL mount. CLI flags can override the
+# checkpoint, batch size, record cap, timing workload, and output directory.
+
+storage:
+  hf_home: /root/autodl-tmp/wyx/hf_cache
+  output_root: /root/autodl-tmp/wyx/tensor_llm_outputs/runs
+
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: /root/autodl-tmp/wyx/tensor_llm_assets/models/Qwen2.5-14B-Instruct
+  torch_dtype: bfloat16
+  trust_remote_code: false
+
+data:
+  qa_dir: /root/autodl-tmp/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_stage2b_matched_v1
+  latent_dir: /root/autodl-tmp/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256_14b_v3_direct
+  alignment_checkpoint: /root/autodl-tmp/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
+  prefer_record_latent_ref: false
+  latent_cache_size: 8192
+  num_workers: 2
+
+memory:
+  init_checkpoint: /root/autodl-tmp/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
+
+training:
+  questions_per_state_group: 3
+  prompt_template: task_specific
+  max_prompt_tokens: 512
+
+benchmark:
+  run_name: tensor_qwen_serialized_vs_dense_inference
+  output_root: /root/autodl-tmp/wyx/tensor_llm_outputs/runs
+  dense_checkpoint: /root/autodl-tmp/wyx/tensor_llm_outputs/runs/20260728_185717_tensor_qwen_dense_cross_attention_8h_3gpu/cross_attention_best.pt
+  methods: [serialized, dense]
+  split: test
+  batch_size: 4
+  max_records: null
+
+  # End-to-end evaluation always covers the selected split. Model-only timing
+  # prebuilds this fixed prefix per method, warms kernels, then repeats it.
+  model_only: true
+  timing_records: 256
+  timing_repetitions: 3
+  warmup_batches: 3
+  # Both methods read the same latent files. Warm the shared OS page cache
+  # immediately before each timed pass so method order does not decide disk-cache luck.
+  prewarm_input_files: true
+
+  matrix_significant_digits: 6
+  matrix_cache_size: 2048
+  serialized_max_prompt_tokens: 8192
+  dense_max_prompt_tokens: 512
+  save_predictions: true
+
+  # QA records from one state are correlated, so uncertainty resamples states
+  # rather than pretending all five task records are independent.
+  bootstrap_samples: 2000
+  bootstrap_seed: 20260729
+
+  # Optional monetary estimate. Leave null unless the actual per-GPU-hour
+  # rental price is known; compute, latency, memory and GPU-hours are always saved.
+  gpu_hour_price: null
+  price_currency: CNY
+
+runtime:
+  seed: 42
+  shuffle_seed: 42
+  device: auto
+  distributed_timeout_seconds: 7200
+  serialize_llm_loading: true
+  low_cpu_mem_usage: true
+  min_host_memory_available_gib: 16
+  console_progress: true

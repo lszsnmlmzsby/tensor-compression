@@ -79,8 +79,8 @@
     <text x="102" y="124" text-anchor="middle" class="stage-badge-text">Stage 1</text>
     <text x="170" y="126" class="panel-title">Field-text alignment</text>
     <use href="#heatmap" x="55" y="250"/><text x="105" y="375" text-anchor="middle" class="box-title">Field X</text>
-    <path d="M155 300 H190" class="connector"/><circle cx="190" cy="300" r="4" fill="#33424f"/>
-    <path d="M190 300 V210 H198" class="arrow"/><path d="M190 300 V437 H198" class="arrow"/>
+    <path d="M155 300 H175" class="connector"/><circle cx="175" cy="300" r="4" fill="#33424f"/>
+    <path d="M175 300 V210 H198" class="arrow"/><path d="M175 300 V437 H198" class="arrow"/>
 
     <text x="320" y="162" text-anchor="middle" class="lane">Field branch (student)</text>
     <rect x="210" y="178" width="220" height="64" rx="6" class="trainable"/>
@@ -120,12 +120,12 @@
 
     <g id="field-hidden" transform="translate(1122,188)"><path d="M0 0 H-7 V44 H0" class="bracket-field"/><rect x="5" y="7" width="11" height="30" rx="2" fill="#add6c6" stroke="#3f7c65"/><rect x="19" y="7" width="11" height="30" rx="2" fill="#7fbea5" stroke="#3f7c65"/><text x="35" y="27" text-anchor="middle" class="tiny">&#8943;</text><rect x="40" y="7" width="11" height="30" rx="2" fill="#6aa98f" stroke="#3f7c65"/><rect x="54" y="7" width="11" height="30" rx="2" fill="#4d8d73" stroke="#3f7c65"/><path d="M70 0 H77 V44 H70" class="bracket-field"/></g>
     <path d="M1182 225 V264" class="arrow"/><text x="1182" y="283" text-anchor="middle" font-size="18" font-weight="700" font-style="italic">h<tspan baseline-shift="super" font-size="11">f</tspan></text>
-    <path d="M1204 277 H1308" class="arrow-violet"/>
+    <path d="M1204 277 H1238" class="arrow-violet"/>
 
     <g id="text-hidden" transform="translate(1122,415)"><path d="M0 0 H-7 V44 H0" class="bracket-text"/><rect x="5" y="7" width="11" height="30" rx="2" fill="#f6dfa0" stroke="#9b7930"/><rect x="19" y="7" width="11" height="30" rx="2" fill="#d6b75f" stroke="#9b7930"/><text x="35" y="27" text-anchor="middle" class="tiny">&#8943;</text><rect x="40" y="7" width="11" height="30" rx="2" fill="#bd9840" stroke="#9b7930"/><rect x="54" y="7" width="11" height="30" rx="2" fill="#9b7930" stroke="#9b7930"/><path d="M70 0 H77 V44 H70" class="bracket-text"/></g>
     <path d="M1182 422 V384" class="arrow"/><text x="1182" y="377" text-anchor="middle" font-size="18" font-weight="700" font-style="italic">h<tspan baseline-shift="super" font-size="11">t</tspan></text>
-    <path d="M1204 371 H1308" class="arrow-violet"/>
-    <g id="stage1-alignment-matrix" transform="translate(1320,209)">
+    <path d="M1204 371 H1238" class="arrow-violet"/>
+    <g id="stage1-alignment-matrix" transform="translate(1250,209)">
       <rect x="0" y="0" width="220" height="230" rx="7" class="loss-only"/>
       <text x="110" y="28" text-anchor="middle" font-size="16" font-weight="700">Contrastive alignment</text>
       <g transform="translate(37,47)">
