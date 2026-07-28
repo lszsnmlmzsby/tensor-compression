@@ -1,0 +1,117 @@
+# Independent ~8 hour A800x4 experiment for dense tensor-memory cross-attention.
+# This file is not consumed by the existing Stage-2 trainer and does not alter
+# any existing adapter/checkpoint.  All batch, budget, layer, and data-size
+# parameters remain configurable here or through the new script's CLI.
+
+storage:
+  hf_home: /data/wyx/hf_cache
+  output_root: /data/wyx/tensor_llm_outputs/runs
+
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: /data/wyx/tensor_llm_assets/models/Qwen2.5-14B-Instruct
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  # Required: non-reentrant checkpointing keeps the sidecar gradient path while
+  # bounding activation memory through the frozen 14B decoder.
+  gradient_checkpointing: true
+
+data:
+  qa_dir: /data/wyx/tensor_llm_assets/tensor_patch_qa_16_spatial256_14b_stage2b_matched_v1
+  latent_dir: /data/wyx/tensor_llm_assets/tensor_patch_latents_16_spatial256_14b_v3_direct
+  alignment_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260722_160923_tensor_patch_text_alignment_qwen25_14b_spatial256_stage2_final/alignment_best.pt
+  train_split: train
+  val_split: val
+  test_split: test
+  # Full, sample-disjoint dataset; the wall-clock guard stops cleanly if the
+  # new fusion path takes longer than its one-epoch budget.
+  max_train_records: null
+  max_val_records: null
+  max_test_records: null
+  record_subset_mode: hash_state
+  require_disjoint_splits: true
+  prefer_record_latent_ref: false
+  latent_cache_size: 8192
+  num_workers: 2
+
+memory:
+  # Reuse only the verified 256-cell spatial representation.  The new script
+  # reads its pre-output 512-d states; it does not load the old local reader.
+  init_checkpoint: /data/wyx/tensor_llm_outputs/runs/20260725_014234_tensor_patch_qa_direct_spatial_adapter_4gpu/adapter_best.pt
+  freeze_spatial_backbone: true
+  # Shared for every cell/task.  The first basis coordinate is exact FP32 z;
+  # the Fourier coordinates improve continuous-number discrimination.
+  value_fourier_bands: 4
+  value_hidden_dim: 128
+
+cross_attention:
+  # Positive one-based Qwen block indices.  No task or query arity changes this list.
+  layers_1based: [8, 20, 32]
+  bridge_dim: 512
+  heads: 8
+  dropout: 0.0
+  # Exact zero starts from frozen Qwen.  Output projection is deliberately not
+  # zero-initialized, so step one opens the gates and later steps train attention.
+  gate_init: 0.0
+
+training:
+  run_name: tensor_qwen_dense_cross_attention_8h_autodl
+  output_root: /data/wyx/tensor_llm_outputs/runs
+  # Permit at most two passes (~23,954 updates).  The wall-clock guard normally
+  # stops during the second pass, so a faster-than-expected implementation does
+  # not finish hours before the available budget is used.
+  epochs: 2
+  max_updates: 0
+  # Per-rank microbatch.  Current matched data has atomic groups of three, so
+  # valid values are 3, 6, 9, ...; this is a config/CLI parameter, not code.
+  batch_size: 3
+  gradient_accumulation_steps: 1
+  questions_per_state_group: 3
+  lr: 5.0e-5
+  # A scalar gate starts at zero and therefore receives the only bridge gradient
+  # on the first step; the larger LR skips projection warmup and opens it quickly.
+  gate_lr: 5.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.2
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  choice_ce_weight: 1.0
+  full_answer_ce_weight: 0.02
+  matched_group_weight: 0.1
+  matched_group_margin: 0.5
+  # This reconstructs z only from the query-independent per-cell value branch;
+  # it does not require Qwen hidden states to reconstruct the tensor.
+  value_reconstruction_weight: 0.01
+  prompt_template: task_specific
+  max_prompt_tokens: 512
+  max_target_tokens: 8
+  append_eos: true
+  log_interval: 20
+
+evaluation:
+  batch_size: 4
+  # Fixed validation subset screens five candidates.  Only its best candidate
+  # receives complete val/test evaluation under all causal baselines.
+  screening_records: 2000
+  screening_fractions: [0.125, 0.25, 0.50, 0.75, 1.0]
+  selection_metric: macro_accuracy
+  final_modes: [correct, no_tensor, zero_tensor, shuffled]
+  evaluate_test: true
+
+runtime:
+  seed: 42
+  shuffle_seed: 42
+  device: auto
+  distributed_timeout_seconds: 7200
+  serialize_llm_loading: true
+  low_cpu_mem_usage: true
+  min_host_memory_available_gib: 16
+  # Budget includes model loading, audits, screening, and final evaluation.
+  # Training stops at an optimizer boundary once only the reserve remains.
+  max_wall_clock_hours: 8.0
+  final_eval_reserve_minutes: 50
+  # Atomically overwrite one fully resumable checkpoint about every 40 minutes.
+  save_every_updates: 1000
+  resume: null
+  console_progress: true

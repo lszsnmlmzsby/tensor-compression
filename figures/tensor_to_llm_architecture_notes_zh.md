@@ -1,216 +1,139 @@
-# Tensor-to-LLM 模型结构图说明与修改指南
+# Field-to-LLM 架构图中文说明
 
-![模型结构图](tensor_to_llm_architecture.svg)
+本文方法把二维单变量数值场转换为可直接输入语言模型的连续 embedding，并通过两个训练阶段建立数值场、空间位置和自然语言问题之间的联系。图中应区分训练阶段与推理路径，也应区分全局 field tokens 和问题相关的局部 evidence tokens。
 
-## 图的核心信息
+## 1. 通用场表示
 
-这张图表达的是当前正式的两阶段结构，而不是早期的 Q-Former、hybrid residual adapter 或 question-conditioned cross-attention 版本：
-
-1. Stage 1 将一个不降采样、保留空间位置的 tensor 表示，对齐到冻结 Qwen 的浅层自然语言表示。
-2. Stage 2 复用该表示，把 256 个连续 tensor embedding 直接放到自然语言问题之前，由冻结 Qwen 自己完成 tensor 与问题的交互。
-3. QA 路径中没有 decoder、whitening、额外 projection head、坐标解析器或任务专用数值 head。
-
-图中英文标题可译为“空间定位的 Tensor-to-LLM 接口”。其中 `spatial token` 是直接送入 `inputs_embeds` 的连续向量，不是 tokenizer 产生的正整数 token ID。
-
-## Stage 1：表示对齐
-
-### 1. 输入与归一化
-
-对单字段的 `16 x 16` patch `X` 做逐 patch z-score：
+输入为规则网格上的数值场
 
 ```text
-z = (X - mu) / sigma
+X in R^(m x n).
 ```
 
-Student 与 teacher 看到的是同一组归一化数值。Stage 1 的数值文本不含字段名、sample/time 元数据或任务标签，避免模型通过无关文本识别样本。
-
-### 2. Value-preserving encoder
-
-编码器不做空间下采样：
+Value-preserving encoder 不做空间下采样。每个位置保留原始标量通路，并附加局部卷积特征：
 
 ```text
-E_phi: R^(1 x 16 x 16) -> R^(8 x 16 x 16)
+z_(r,c) = [X_(r,c); local_features_(r,c)] in R^d_E.
 ```
 
-- latent channel 0 精确保留归一化输入 `z`；
-- channel 1--7 学习局部特征；
-- 输入 cell `(r,c)` 与 latent 位置 `(r,c)` 保持直接对应；
-- reconstruction 仅作为 Stage 1 训练正则，decoder 不进入 Stage 2 或推理路径。
-
-当前配置下 encoder 会在 AE warmup 后继续以较小学习率参与 alignment；因此图中 Stage 1 encoder 标为 trainable。Stage 2 则冻结并缓存其 latent。
-
-### 3. Spatial adapter
-
-将 `Z` 按 row-major 顺序展平成 256 个 8 维 cell feature。对第 `i` 个位置：
+Spatial adapter 在每个位置加入二维行列位置编码，通过空间 Transformer 交换全局信息，并保留位置对应的局部残差。其输出为
 
 ```text
-u_i = Linear_content(Z_i) + PE_2D(r_i, c_i)
-C   = Transformer_2layers(u_1, ..., u_256)
-p_i = 0.05 * tanh(Linear_out(LN(C_i + Linear_residual(Z_i))))
+P(X) = [p_1, ..., p_(mn)] in R^(mn x d_L).
 ```
 
-其中二维 sinusoidal position encoding 和 per-cell residual 的 scale 都是固定的 `1.0`，不能被训练关闭。最终得到：
+一个 grid cell 对应一个输出槽位，但不意味着该 token 只包含一个标量。空间 Transformer 使每个 token 可以包含全场上下文，局部残差则保留该位置的直接数值通路。
+
+## 2. Stage 1：Field--text alignment
+
+Stage 1 使用同一个数值场构造两条路径：
 
 ```text
-P = [p_1, ..., p_256] in R^(256 x d_LLM)
+Field path: [P(X); shared probe]
+Text path:  [Embed(Serialize(X)); shared probe]
 ```
 
-“一个 cell 对应一个 token”指的是 token 槽位和位置身份保持一一对应，并不表示 self-attention 后 `p_i` 只包含一个标量。经过 spatial attention 后，每个 `p_i` 都带有全局上下文；per-cell residual 则保留该位置的直接数值通路。
-
-### 4. Student/teacher 对齐位置
-
-两条路径使用完全相同的短 probe `q`：
+两条路径使用同一个简短 probe，且 probe 后不附加答案。它们经过共享且冻结的 Qwen，在同一语义位置，即最后一个 probe token，读取第 ell 个 Transformer block 的 hidden state：
 
 ```text
-Student: [p_1, ..., p_256, q]
-Teacher: [Tokenize(serialize(z)), q]
+h_i^f = Readout_ell([P(X_i); probe])
+h_i^t = Readout_ell([Embed(Serialize(X_i)); probe]).
 ```
 
-二者经过共享且冻结的 Qwen，并读取第 `\ell` 个 Transformer block 后最后一个 probe token 的 hidden state。设 `a_f`、`a_t` 分别是两条序列中最后一个 probe token 的位置，则：
+训练使用双向对比目标，使配对的 field/text 表示相互接近，并区分 batch 内的有效负样本。固定 whitening 仅用于改善 Stage 1 损失的数值条件和检索诊断；相同的固定变换应用于两条路径，它不是可学习的双分支 projection，也不会进入 Stage 2 或推理路径。Stage 1 同时在原生 LLM hidden space 中施加约束，避免只在辅助空间中获得较好的检索结果。
+
+正式 Stage 1 不依赖 AE decoder。Encoder 中的原始数值通路由结构直接保证，卷积特征和 spatial adapter 由 alignment objective 联合训练。
+
+## 3. Stage 2：自然语言条件下的数值场推理
+
+Stage 1 的 field tokens 本身与问题无关。Stage 2 先进行一次 direct QA warm start，使同一套 grid-aligned interface 产生可供问答使用的全局表示：
 
 ```text
-h_i^f = Qwen_1:ell([P_i, q])[a_f]
-h_i^t = Qwen_1:ell([Tokenize(serialize(X_i)), q])[a_t]
+G(X) = [g_1, ..., g_(mn)].
 ```
 
-这里对齐的是“语义角色相同的最后一个 probe token”，不是两条不同长度序列中数值相同的绝对 index。probe 后不附加答案，也没有答案词表、LM-head CE 或 teacher-logit distillation。
+随后冻结生成 G(X) 的 global branch，并训练一个 question-conditioned local evidence reader。Local reader 不替换 G(X)，而是在其前面增加少量与问题相关的 evidence tokens。
 
-### 5. Stage 1 objective
+### 3.1 问题表示
 
-Teacher hidden 拟合出的固定 whitening `W` 只用于 Stage 1 objective 和 retrieval 诊断。按当前配置，损失可概括为：
+自然语言问题先单独经过冻结 Qwen。当前实现使用第 2 层和第 6 层的 token-level hidden states，经可训练投影和加权融合得到问题上下文：
 
 ```text
-L_stage1 = 1.00 * L_InfoNCE^W
-         + 0.25 * L_centered-InfoNCE^W
-         + 0.50 * L_centered-InfoNCE^native
-         + 0.50 * L_branch-mean
-         + 1.00 * L_reconstruction
+T(q) = sum_l softmax(zeta)_l A_l(Q_l(q)).
 ```
 
-双向 InfoNCE 内部的 i2t/t2i 权重为 `0.6/0.4`。`W` 不修改 soft token，不保存在 Stage 2 输入路径中；向 Stage 2 转移的是 encoder 与 native spatial adapter。
+两个 learned role queries 通过 cross-attention 读取 T(q)，分别得到 role states。Role 是通用的证据槽位，不是任务标签：点值问题通常启用一个 role，两点或两区域比较可启用两个 role，全局极值定位可以关闭局部 role。
 
-## Stage 2：自然语言 grounding
+### 3.2 二维路由和局部证据
 
-### 1. 直接 prefix
-
-Stage 2 复用 Stage 1 的 encoder 和 spatial adapter：
-
-- encoder 冻结，训练数据的 `Z` 可缓存；
-- spatial adapter 从 Stage 1 checkpoint 初始化，全部约 `8.94M` 参数以小学习率更新；
-- Qwen2.5-14B 的参数全部冻结。
-
-实际 LLM 输入顺序为：
+每个 role state 分别产生 row query 和 column query。所有行和列具有由固定轴位置编码及可训练残差构造的 row/column keys。行列相似度相加后在整个网格上 softmax：
 
 ```text
-inputs_embeds = [p_1, ..., p_256, Embed(natural-language question + options)]
+omega_(j,r,c) = softmax_(r,c)(row_score_(j,r) + col_score_(j,c))
+v_j = sum_(r,c) omega_(j,r,c) g_(r,c).
 ```
 
-自然语言问题不会先进入 spatial adapter。adapter 只看 `Z`；tensor token 与问题 token 的第一次交互发生在 Qwen 的 causal self-attention 中。对于需要恢复原始量纲的任务，`mu` 和 `sigma` 作为普通自然语言内容出现在问题中，而不是通过结构化数值接口注入。
+v_j 经过一个小型 residual bottleneck 得到 refined evidence。Learned gate 决定该 role 是否有效；无效 role 不仅被置零，也会从 LLM attention mask 中移除。
 
-### 2. 回答与训练目标
+### 3.3 最终 LLM 输入
 
-正式选择题路径读取 A/B/C/D 的 restricted logits。当前训练目标为：
+最终回答阶段的 embedding 顺序为
 
 ```text
-L_stage2 = 1.00 * L_choice-CE
-         + 0.05 * L_LM-CE
-         + 0.10 * max(0, margin + NLL_correct - NLL_no-latent)
+[local evidence tokens; global field tokens; question embeddings].
 ```
 
-`margin=0.1`。no-latent ranking 用同长度的零信息 prefix 作为负例；不把随机或 shuffled tensor 当作监督负例，因为错误 tensor 也可能恰好对应同一正确答案。
+其中：
 
-### 3. Grounding audit（当前图中省略）
+- local evidence tokens 随自然语言问题改变；
+- global field tokens 保留完整场信息和每个 cell 的槽位；
+- question embeddings 是普通 tokenizer 和 LLM embedding 的输出。
 
-Grounding audit 不是额外训练模块，而是验证模型是否真的使用 tensor 的评估；为保持主图简洁，当前图中不再显示该流程：
+完整冻结 Qwen 在这条拼接序列上预测答案。Whitening、AE decoder、训练目标和监督坐标都不进入推理输入。
 
-- `correct`：正确 tensor；
-- `shuffled`：来自其他样本的 tensor；
-- `zero_latent`：把 encoder latent 置零后仍经过 adapter；
-- `no_latent`：直接用零信息 soft prefix。
+## 4. Stage 2 训练目标
 
-## 参数状态
+Stage 2 使用以下六类监督：
 
-| 模块 | Stage 1 | Stage 2 |
-|---|---|---|
-| z-score | 固定操作 | 固定操作 |
-| Value-preserving encoder | trainable | frozen / cached |
-| AE decoder | reconstruction-only | 不存在 |
-| Spatial adapter | trainable | trainable, Stage-1 init |
-| 2D position encoding | fixed buffer, scale=1 | fixed buffer, scale=1 |
-| Per-cell residual scale | fixed buffer, scale=1 | fixed buffer, scale=1 |
-| Qwen | frozen，执行至第 `\ell` 层 | frozen，执行完整模型 |
-| Whitening `W` | fixed, loss-only | 不存在 |
-
-## SVG 修改入口
-
-源文件是 `figures/tensor_to_llm_architecture.svg`，画布为 `1800 x 1210`。SVG 顶部 `<style>` 中可统一修改字体、颜色、边框和箭头。
-
-主要 CSS class：
-
-- `.trainable`：橙红色，训练参数；
-- `.frozen`：灰蓝色，冻结模块；
-- `.tensor`：绿色，tensor/continuous embedding；
-- `.textual`：黄色，自然语言 token；
-- `.loss-only`：紫色虚线，仅训练 objective 使用。
-
-主要 SVG group ID：
-
-为避免 Stage 1 过度拥挤，当前图面把显式 `Normalize` 节点和 reconstruction 分支省略了；这只是绘图层面的简化，不改变上文所述的训练实现与损失定义。
-
-| ID | 内容 |
-|---|---|
-| `header`, `legend` | 标题与图例 |
-| `stage1` | Stage 1 总面板 |
-| `stage1-input-grid`, `input-split-stage1` | 共享输入 `X` 与上下分支 |
-| `value-preserving-encoder` | 不降采样 encoder |
-| `stage1-latent-grid` | `8 x 16 x 16` latent 输出 |
-| `spatial-adapter-stage1` | 精简后的 256-token spatial adapter |
-| `student-input-sequence` | Student 的 256 spatial tokens、拼接符号与 Probe |
-| `qwen-tokenizer-stage1` | 冻结 Qwen tokenizer |
-| `teacher-input-sequence`, `teacher-branch` | Teacher 的 numeric text tokens、拼接符号与 Probe |
-| `shared-shallow-qwen`, `student-shallow-qwen`, `teacher-shallow-qwen` | 上下对齐的共享冻结 Qwen 第 `\ell` 层 readout |
-| `student-hidden-vector`, `teacher-hidden-vector` | Qwen 输出向量示意 |
-| `stage1-alignment-loss`, `contrastive-matrix` | 带 `F_i`/`T_i` 配对序列和对角正样本的 contrastive alignment 矩阵 |
-| `stage2` | Stage 2 总面板 |
-| `stage2-input-sequence` | 256 spatial embeddings 与 question embeddings 的直接拼接 |
-| `stage2-question-tokenization` | 自然语言问题经过 Qwen tokenizer 和冻结 token embedding 后形成 question embeddings |
-| `full-frozen-qwen` | 完整冻结 Qwen |
-| `natural-language-question` | 自然语言问题 |
-| `answer-output` | 模型回答 |
-| `stage2-loss` | 仅用于训练损失计算的 QA objective，本身没有可训练参数 |
-
-可直接用 Inkscape、Illustrator 或 Figma 导入 SVG。修改时应保留三条关键视觉关系：
-
-1. 256 个 spatial token 与 text token 是同一条 `inputs_embeds` 序列；
-2. Stage 2 的 question 绕过 adapter，只在 Qwen 内与 tensor 交互；
-3. whitening 和 reconstruction 都没有进入 Stage 2 推理路径。
-
-不要在图中加入当前正式实现不存在的 Q-Former、question cross-attention、decoder QA 路径、坐标 parser 或任务专用 numerical head。
-
-## 推荐英文 caption
-
-> **Overview of the spatially grounded tensor-to-LLM interface.** In Stage 1, a value-preserving encoder retains the normalized value at every grid location, and a spatial adapter maps the resulting 16 x 16 latent map to 256 continuous LLM tokens with fixed 2D positional encoding. The tensor prefix and a serialized-value teacher are aligned at the same probe position in a shared frozen shallow Qwen backbone; teacher-fitted whitening is used only by the alignment objective. In Stage 2, the native spatial adapter is initialized from Stage 1 and fine-tuned while the encoder and Qwen2.5-14B remain frozen. The 256 tensor embeddings are placed directly before a natural-language question, so tensor-question interaction occurs only through the LLM's causal self-attention.
-
-## LaTeX 插图模板
-
-建议作为 AAAI 双栏通栏图使用：
-
-```latex
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=\textwidth]{figures/tensor_to_llm_architecture.pdf}
-  \caption{Overview of the spatially grounded tensor-to-LLM interface. In Stage 1, a value-preserving spatial representation is aligned with serialized numerical text in a frozen shallow LLM. In Stage 2, the resulting 256 tensor embeddings directly prefix the natural-language question and interact with text only inside the frozen LLM.}
-  \label{fig:architecture}
-\end{figure*}
+```text
+L_stage2 = lambda_choice L_choice
+         + lambda_LM     L_LM
+         + lambda_route  L_route
+         + lambda_gate   L_gate
+         + lambda_group  L_group
+         + lambda_swap   L_swap.
 ```
 
-用 Inkscape 导出论文 PDF 和高分辨率 PNG：
+- `L_choice`：在合法答案集合上的 restricted-choice cross entropy；
+- `L_LM`：答案 token 与 EOS 的低权重 token-level NLL；
+- `L_route`：路由分布在目标 cell 或目标区域上的 cross entropy；
+- `L_gate`：每个 role 是否应启用的 binary cross entropy；
+- `L_group`：同一 field 上不同坐标问题的 matched-group margin loss；
+- `L_swap`：交换两个问题的 local evidence 后，要求正确答案 NLL 变差。
 
-```bash
-inkscape figures/tensor_to_llm_architecture.svg \
-  --export-filename=figures/tensor_to_llm_architecture.pdf
+坐标和任务元数据只用于构造 routing/gate 监督，不作为模型输入。Swap 只交换 local evidence 及其 gate mask，保留 owner question 和原 field 的 global tokens。
 
-inkscape figures/tensor_to_llm_architecture.svg \
-  --export-width=3600 \
-  --export-filename=figures/tensor_to_llm_architecture_2x.png
-```
+## 5. 训练日程和参数状态
+
+| 模块 | Stage 1 | Stage 2 local-reader training | Inference |
+|---|---|---|---|
+| Value-preserving encoder | trainable | frozen/cached | fixed |
+| Spatial/global interface | trainable | direct QA warm start 后冻结 | fixed |
+| Qwen | frozen | frozen | frozen |
+| Question layer projections | absent | trainable | fixed |
+| Role cross-attention | absent | trainable | fixed |
+| Row/column router | absent | trainable | fixed |
+| Evidence bottleneck and gates | absent | trainable | fixed |
+| Whitening | loss/diagnostic only | absent | absent |
+| AE decoder | absent | absent | absent |
+
+正式训练顺序为：global interface 先进行 direct QA warm start；随后冻结 global branch，先训练 routing 与 gate，再联合训练答案和局部证据目标；最终进行一次较小规模的 continuation。低学习率完整数据续训没有通过预先规定的验证准入，因此最终 checkpoint 保留其 parent 参数。
+
+## 6. 架构图应表达的关键关系
+
+1. Stage 1 的 field/text 两条路径使用同一个 shared probe，并在相同 probe 位置读取 hidden state。
+2. 图中使用 `m`、`n`、`d_E` 和 `mn` 等符号，具体网格大小与 token 数放在实验设置中。
+3. Stage 2 中自然语言问题同时产生 question hidden states 和普通 question embeddings。
+4. Local reader 同时读取问题上下文与冻结的 global field tokens，并产生少量 local evidence tokens。
+5. 最终顺序明确画成 `[local; global; question]`，而不是只画 field tokens 与问题文本的直接拼接。
+6. 推理图中不出现 whitening、decoder、routing target、监督坐标或训练 loss。

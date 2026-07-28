@@ -1,376 +1,219 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1210" viewBox="0 0 1800 1210" role="img" aria-labelledby="figure-title figure-desc">
-  <title id="figure-title">Spatially grounded tensor-to-LLM interface</title>
-  <desc id="figure-desc">A two-stage architecture. In Stage 1, shared input X branches to a value-preserving encoder and a frozen Qwen tokenizer; the paired outputs are read after probes at frozen Qwen layer ell and aligned with a field-text contrastive matrix. Stage 2 tokenizes and embeds a natural-language question, then places its text embeddings directly after the same 256 spatial tokens in a frozen Qwen model.</desc>
-
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1700" viewBox="0 0 1600 1700" role="img" aria-labelledby="figure-title figure-desc">
+  <title id="figure-title">Spatially structured field-to-LLM interface</title>
+  <desc id="figure-desc">Stage 1 aligns grid-preserving field tokens with serialized numerical text at one shared probe. Stage 2 freezes the global field interface and trains a question-conditioned evidence reader. Inference concatenates local evidence, global field tokens, and question embeddings before a frozen language model.</desc>
   <defs>
-    <marker id="arrow-dark" markerWidth="11" markerHeight="11" refX="10" refY="5.5" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0,0 L11,5.5 L0,11 Z" fill="#33424f"/>
-    </marker>
-    <marker id="arrow-teal" markerWidth="11" markerHeight="11" refX="10" refY="5.5" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0,0 L11,5.5 L0,11 Z" fill="#28745f"/>
-    </marker>
-    <marker id="arrow-violet" markerWidth="11" markerHeight="11" refX="10" refY="5.5" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0,0 L11,5.5 L0,11 Z" fill="#76528b"/>
-    </marker>
+    <marker id="arrow-dark" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 Z" fill="#33424f"/></marker>
+    <marker id="arrow-violet" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L10,5 L0,10 Z" fill="#76528b"/></marker>
+    <linearGradient id="field-base" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#315f86"/><stop offset="0.34" stop-color="#5d9fa4"/>
+      <stop offset="0.62" stop-color="#d8cf74"/><stop offset="1" stop-color="#c95443"/>
+    </linearGradient>
+    <radialGradient id="field-hotspot" cx="72%" cy="30%" r="55%">
+      <stop offset="0" stop-color="#db5d44" stop-opacity="0.98"/><stop offset="0.38" stop-color="#e7a15e" stop-opacity="0.82"/>
+      <stop offset="0.75" stop-color="#efd681" stop-opacity="0.18"/><stop offset="1" stop-color="#efd681" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="field-coolspot" cx="20%" cy="80%" r="48%">
+      <stop offset="0" stop-color="#2c668e" stop-opacity="0.92"/><stop offset="0.58" stop-color="#4f8fa5" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#4f8fa5" stop-opacity="0"/>
+    </radialGradient>
     <style>
       text { font-family: Arial, Helvetica, sans-serif; fill: #1f2a33; letter-spacing: 0; }
-      .title { font-size: 36px; font-weight: 700; }
-      .panel-title { font-size: 28px; font-weight: 700; }
-      .lane { font-size: 21px; font-weight: 700; fill: #33424f; }
-      .box-title { font-size: 22px; font-weight: 700; }
-      .box-text { font-size: 19px; fill: #35434e; }
-      .small { font-size: 17px; fill: #50606c; }
-      .tiny { font-size: 15px; fill: #50606c; }
-      .mono { font-family: Consolas, "Courier New", monospace; }
+      .title { font-size: 34px; font-weight: 700; } .panel-title { font-size: 25px; font-weight: 700; }
+      .stage-badge { fill: #173b5e; stroke: #0f2b45; stroke-width: 1.5; }
+      .stage-badge-text { font-size: 18px; font-weight: 700; fill: #ffffff; }
+      .lane { font-size: 18px; font-weight: 700; fill: #40515d; } .box-title { font-size: 18px; font-weight: 700; }
+      .box-text { font-size: 15px; fill: #43535f; } .small { font-size: 14px; fill: #50606c; } .tiny { font-size: 12px; fill: #50606c; }
       .panel { fill: #f8fafb; stroke: #c8d2d9; stroke-width: 2; }
-      .trainable { fill: #fbe5de; stroke: #bd543e; stroke-width: 2.5; }
-      .frozen { fill: #e9eef2; stroke: #526879; stroke-width: 2.5; }
-      .tensor { fill: #dff0e8; stroke: #3f7c65; stroke-width: 2.5; }
-      .textual { fill: #fff2c9; stroke: #9b7930; stroke-width: 2.5; }
-      .loss-only { fill: #f0e8f4; stroke: #76528b; stroke-width: 2.5; stroke-dasharray: 8 6; }
-      .neutral { fill: #ffffff; stroke: #81909b; stroke-width: 2; }
-      .arrow { fill: none; stroke: #33424f; stroke-width: 2.8; marker-end: url(#arrow-dark); }
-      .arrow-teal { fill: none; stroke: #28745f; stroke-width: 3; marker-end: url(#arrow-teal); }
-      .arrow-violet { fill: none; stroke: #76528b; stroke-width: 2.8; stroke-dasharray: 8 6; marker-end: url(#arrow-violet); }
-      .connector { fill: none; stroke: #7b8994; stroke-width: 2; }
-      .dashed { stroke-dasharray: 7 6; }
-      .vector-bracket { fill: none; stroke: #3f7c65; stroke-width: 2.5; stroke-linecap: square; }
-      .vector-bracket-teacher { fill: none; stroke: #9b7930; stroke-width: 2.5; stroke-linecap: square; }
-      .matrix-bg { fill: #f4eef7; stroke: #76528b; stroke-width: 1.5; }
-      .matrix-grid { stroke: #d6c6df; stroke-width: 1; }
-      .matrix-diag { fill: #83c5a7; stroke: #3f7c65; stroke-width: 1; }
+      .trainable { fill: #fbe5de; stroke: #bd543e; stroke-width: 2.4; }
+      .frozen { fill: #e9eef2; stroke: #526879; stroke-width: 2.4; }
+      .field-token { fill: #dff0e8; stroke: #3f7c65; stroke-width: 2.2; }
+      .text-token { fill: #fff2c9; stroke: #9b7930; stroke-width: 2.2; }
+      .loss-only { fill: #f0e8f4; stroke: #76528b; stroke-width: 2.3; stroke-dasharray: 8 6; }
+      .neutral { fill: #ffffff; stroke: #81909b; stroke-width: 2.1; }
+      .arrow { fill: none; stroke: #33424f; stroke-width: 2.5; marker-end: url(#arrow-dark); }
+      .arrow-violet { fill: none; stroke: #76528b; stroke-width: 2.5; stroke-dasharray: 7 6; marker-end: url(#arrow-violet); }
+      .connector { fill: none; stroke: #60717d; stroke-width: 2.2; }
+      .bracket-field { fill: none; stroke: #3f7c65; stroke-width: 2.3; } .bracket-text { fill: none; stroke: #9b7930; stroke-width: 2.3; }
     </style>
+    <g id="heatmap">
+      <rect x="0" y="0" width="100" height="100" rx="6" class="neutral"/>
+      <rect x="7" y="7" width="86" height="86" rx="3" fill="url(#field-base)"/>
+      <rect x="7" y="7" width="86" height="86" rx="3" fill="url(#field-hotspot)"/>
+      <rect x="7" y="7" width="86" height="86" rx="3" fill="url(#field-coolspot)"/>
+      <g fill="none" stroke="#ffffff" stroke-width="1.2" opacity="0.58">
+        <path d="M14 77 C27 61, 40 65, 51 50 S73 24, 90 27"/>
+        <path d="M12 88 C27 73, 44 76, 58 57 S78 36, 92 38"/>
+        <path d="M19 46 C31 36, 43 38, 53 27 S72 14, 85 17"/>
+      </g>
+    </g>
+    <g id="latent-map">
+      <rect x="0" y="0" width="58" height="58" rx="6" class="field-token"/>
+      <g fill="#4d8d73">
+        <circle cx="10" cy="10" r="3"/><circle cx="22" cy="10" r="3"/><circle cx="34" cy="10" r="3"/><circle cx="46" cy="10" r="3"/>
+        <circle cx="10" cy="22" r="3"/><circle cx="22" cy="22" r="3"/><circle cx="34" cy="22" r="3"/><circle cx="46" cy="22" r="3"/>
+        <circle cx="10" cy="34" r="3"/><circle cx="22" cy="34" r="3"/><circle cx="34" cy="34" r="3"/><circle cx="46" cy="34" r="3"/>
+        <circle cx="10" cy="46" r="3"/><circle cx="22" cy="46" r="3"/><circle cx="34" cy="46" r="3"/><circle cx="46" cy="46" r="3"/>
+      </g>
+    </g>
+    <g id="concat-node">
+      <circle cx="16" cy="16" r="15" fill="#ffffff" stroke="#33424f" stroke-width="2.2"/>
+      <path d="M9 16 H23 M16 9 V23" fill="none" stroke="#33424f" stroke-width="2.4" stroke-linecap="round"/>
+    </g>
   </defs>
-
-  <rect x="0" y="0" width="1800" height="1080" fill="#ffffff"/>
-
+  <rect x="0" y="0" width="1600" height="1700" fill="#ffffff"/>
   <g id="header">
-    <text x="48" y="47" class="title">Spatially Grounded Tensor-to-LLM Interface</text>
-
-    <g id="legend" transform="translate(1025,24)">
-      <rect x="0" y="0" width="28" height="22" rx="4" class="trainable"/>
-      <text x="38" y="18" class="small">trainable</text>
-      <rect x="145" y="0" width="28" height="22" rx="4" class="frozen"/>
-      <text x="183" y="18" class="small">frozen</text>
-      <rect x="286" y="0" width="28" height="22" rx="4" class="loss-only"/>
-      <text x="324" y="18" class="small">training-loss only</text>
-      <rect x="0" y="34" width="28" height="18" rx="3" class="tensor"/>
-      <text x="38" y="49" class="small">tensor embedding</text>
-      <rect x="205" y="34" width="28" height="18" rx="3" class="textual"/>
-      <text x="243" y="49" class="small">text embedding</text>
+    <text x="45" y="47" class="title">Spatially Structured Field-to-LLM Interface</text>
+    <g id="legend" transform="translate(820,20)">
+      <rect x="0" y="0" width="27" height="21" rx="4" class="trainable"/><text x="36" y="17" class="small">trainable</text>
+      <rect x="115" y="0" width="27" height="21" rx="4" class="frozen"/><text x="151" y="17" class="small">frozen</text>
+      <rect x="220" y="0" width="27" height="21" rx="4" class="field-token"/><text x="256" y="17" class="small">field embedding</text>
+      <rect x="385" y="0" width="27" height="21" rx="4" class="text-token"/><text x="421" y="17" class="small">text embedding</text>
+      <rect x="555" y="0" width="27" height="21" rx="4" class="loss-only"/><text x="591" y="17" class="small">training loss</text>
     </g>
   </g>
 
   <g id="stage1">
-    <rect x="40" y="105" width="1720" height="545" rx="8" class="panel"/>
-    <circle cx="70" cy="137" r="18" fill="#33424f"/>
-    <text x="64" y="145" font-size="23" font-weight="700" fill="#ffffff">1</text>
-    <text x="100" y="146" class="panel-title">Representation alignment</text>
+    <rect x="40" y="82" width="1520" height="465" rx="8" class="panel"/>
+    <rect x="52" y="99" width="100" height="36" rx="18" class="stage-badge"/>
+    <text x="102" y="124" text-anchor="middle" class="stage-badge-text">Stage 1</text>
+    <text x="170" y="126" class="panel-title">Field-text alignment</text>
+    <use href="#heatmap" x="65" y="250"/><text x="115" y="375" text-anchor="middle" class="box-title">Field X</text>
+    <path d="M165 300 H190" class="connector"/><circle cx="190" cy="300" r="4" fill="#33424f"/>
+    <path d="M190 300 V210 H198" class="arrow"/><path d="M190 300 V437 H198" class="arrow"/>
 
-    <text x="268" y="171" class="lane">Tensor branch (student)</text>
-    <text x="268" y="381" class="lane">Text branch (teacher)</text>
+    <text x="320" y="162" text-anchor="middle" class="lane">Field branch (student)</text>
+    <rect x="210" y="178" width="220" height="64" rx="6" class="trainable"/>
+    <text x="320" y="216" text-anchor="middle" class="box-title">Value-preserving encoder</text>
+    <path d="M320 242 V259" class="arrow"/>
+    <use href="#latent-map" x="291" y="271"/>
+    <text x="320" y="350" text-anchor="middle" class="small">Z &#8712; &#8477;<tspan baseline-shift="super" font-size="10">m&#215;n&#215;d<tspan baseline-shift="sub" font-size="8">E</tspan></tspan></text>
+    <path d="M349 300 H470 V210 H498" class="arrow"/>
 
-    <g id="stage1-input-grid" transform="translate(60,270)">
-      <rect x="0" y="0" width="112" height="112" rx="6" class="neutral"/>
-      <g stroke="#ffffff" stroke-width="2">
-        <rect x="8" y="8" width="23" height="23" fill="#477f9d"/>
-        <rect x="32" y="8" width="23" height="23" fill="#6fa5ad"/>
-        <rect x="56" y="8" width="23" height="23" fill="#d9cf79"/>
-        <rect x="80" y="8" width="23" height="23" fill="#d56b52"/>
-        <rect x="8" y="32" width="23" height="23" fill="#3d718f"/>
-        <rect x="32" y="32" width="23" height="23" fill="#86b9aa"/>
-        <rect x="56" y="32" width="23" height="23" fill="#ebd88b"/>
-        <rect x="80" y="32" width="23" height="23" fill="#c85745"/>
-        <rect x="8" y="56" width="23" height="23" fill="#618ca4"/>
-        <rect x="32" y="56" width="23" height="23" fill="#74a995"/>
-        <rect x="56" y="56" width="23" height="23" fill="#efc86f"/>
-        <rect x="80" y="56" width="23" height="23" fill="#e28b5f"/>
-        <rect x="8" y="80" width="23" height="23" fill="#355f80"/>
-        <rect x="32" y="80" width="23" height="23" fill="#5d988d"/>
-        <rect x="56" y="80" width="23" height="23" fill="#d8b65b"/>
-        <rect x="80" y="80" width="23" height="23" fill="#bb493e"/>
+    <rect x="510" y="178" width="280" height="64" rx="6" class="trainable"/>
+    <text x="650" y="203" text-anchor="middle" class="box-title">Spatial adapter</text><text x="650" y="228" text-anchor="middle" class="box-text">2D position + spatial context</text>
+    <path d="M650 242 V271" class="arrow"/>
+    <g id="field-token-row"><g fill="#b9decf" stroke="#3f7c65" stroke-width="1.5">
+      <rect x="602" y="283" width="11" height="34" rx="2"/><rect x="616" y="283" width="11" height="34" rx="2"/><rect x="630" y="283" width="11" height="34" rx="2"/>
+      <rect x="659" y="283" width="11" height="34" rx="2"/><rect x="673" y="283" width="11" height="34" rx="2"/><rect x="687" y="283" width="11" height="34" rx="2"/>
+    </g><text x="650" y="305" text-anchor="middle" class="tiny">&#8943;</text><text x="650" y="350" text-anchor="middle" class="small" font-weight="700">mn field tokens</text></g>
+    <path d="M699 300 H812" class="arrow"/>
+    <use href="#concat-node" x="814" y="284"/>
+
+    <text x="320" y="390" text-anchor="middle" class="lane">Text branch (teacher)</text>
+    <rect x="210" y="405" width="220" height="64" rx="6" class="frozen"/>
+    <text x="320" y="443" text-anchor="middle" class="box-title">Qwen tokenizer</text>
+    <path d="M430 437 H498" class="arrow"/>
+    <rect x="510" y="407" width="280" height="60" rx="6" class="text-token"/>
+    <text x="650" y="444" text-anchor="middle" class="box-title">Numeric text tokens</text>
+    <path d="M790 437 H812" class="arrow"/>
+    <use href="#concat-node" x="814" y="421"/>
+
+    <g id="shared-probe">
+      <rect x="778" y="338" width="104" height="62" rx="6" class="text-token"/><text x="830" y="376" text-anchor="middle" class="box-title">Probe</text>
+      <path d="M830 338 V318" class="arrow"/><path d="M830 400 V419" class="arrow"/>
+    </g>
+    <path d="M830 284 V210 H858" class="arrow"/><path d="M846 437 H858" class="arrow"/>
+    <rect x="870" y="178" width="215" height="64" rx="6" class="frozen"/><text x="977" y="216" text-anchor="middle" class="box-title">Frozen Qwen (layer &#8467;)</text>
+    <rect x="870" y="405" width="215" height="64" rx="6" class="frozen"/><text x="977" y="443" text-anchor="middle" class="box-title">Frozen Qwen (layer &#8467;)</text>
+    <path d="M1085 210 H1103" class="arrow"/><path d="M1085 437 H1103" class="arrow"/>
+
+    <g id="field-hidden" transform="translate(1122,188)"><path d="M0 0 H-7 V44 H0" class="bracket-field"/><rect x="5" y="7" width="11" height="30" rx="2" fill="#add6c6" stroke="#3f7c65"/><rect x="19" y="7" width="11" height="30" rx="2" fill="#7fbea5" stroke="#3f7c65"/><text x="35" y="27" text-anchor="middle" class="tiny">&#8943;</text><rect x="40" y="7" width="11" height="30" rx="2" fill="#6aa98f" stroke="#3f7c65"/><rect x="54" y="7" width="11" height="30" rx="2" fill="#4d8d73" stroke="#3f7c65"/><path d="M70 0 H77 V15 M77 29 V44 H70" class="bracket-field"/><path d="M65 22 H84" class="arrow"/><text x="96" y="29" font-size="18" font-weight="700" font-style="italic">h<tspan baseline-shift="super" font-size="11">f</tspan></text></g>
+    <g id="text-hidden" transform="translate(1122,415)"><path d="M0 0 H-7 V44 H0" class="bracket-text"/><rect x="5" y="7" width="11" height="30" rx="2" fill="#f6dfa0" stroke="#9b7930"/><rect x="19" y="7" width="11" height="30" rx="2" fill="#d6b75f" stroke="#9b7930"/><text x="35" y="27" text-anchor="middle" class="tiny">&#8943;</text><rect x="40" y="7" width="11" height="30" rx="2" fill="#bd9840" stroke="#9b7930"/><rect x="54" y="7" width="11" height="30" rx="2" fill="#9b7930" stroke="#9b7930"/><path d="M70 0 H77 V15 M77 29 V44 H70" class="bracket-text"/><path d="M65 22 H84" class="arrow"/><text x="96" y="29" font-size="18" font-weight="700" font-style="italic">h<tspan baseline-shift="super" font-size="11">t</tspan></text></g>
+    <path d="M1242 210 H1272 V260 H1308" class="arrow-violet"/><path d="M1242 437 H1272 V388 H1308" class="arrow-violet"/>
+    <g id="stage1-alignment-matrix" transform="translate(1320,209)">
+      <rect x="0" y="0" width="220" height="230" rx="7" class="loss-only"/>
+      <text x="110" y="28" text-anchor="middle" font-size="16" font-weight="700">Contrastive alignment</text>
+      <g transform="translate(37,47)">
+        <rect x="34" y="0" width="28" height="28" rx="3" fill="#bdd9e7" stroke="#477f9d"/><rect x="62" y="0" width="28" height="28" rx="3" fill="#f2c4b1" stroke="#bd543e"/><rect x="90" y="0" width="28" height="28" rx="3" fill="#e3e8eb" stroke="#708390"/><rect x="118" y="0" width="28" height="28" rx="3" fill="#ddcee5" stroke="#76528b"/>
+        <text x="48" y="19" text-anchor="middle" font-size="11" font-weight="700">T<tspan baseline-shift="sub" font-size="8">1</tspan></text><text x="76" y="19" text-anchor="middle" font-size="11" font-weight="700">T<tspan baseline-shift="sub" font-size="8">2</tspan></text><text x="104" y="19" text-anchor="middle" font-size="11" font-weight="700">&#8943;</text><text x="132" y="19" text-anchor="middle" font-size="11" font-weight="700">T<tspan baseline-shift="sub" font-size="8">n</tspan></text>
+        <rect x="0" y="34" width="28" height="28" rx="3" fill="#477f9d" stroke="#315f78"/><rect x="0" y="62" width="28" height="28" rx="3" fill="#bd543e" stroke="#8e3f2f"/><rect x="0" y="90" width="28" height="28" rx="3" fill="#708390" stroke="#526879"/><rect x="0" y="118" width="28" height="28" rx="3" fill="#76528b" stroke="#583d68"/>
+        <text x="14" y="53" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="8">1</tspan></text><text x="14" y="81" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="8">2</tspan></text><text x="14" y="109" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">&#8943;</text><text x="14" y="137" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="8">n</tspan></text>
+        <rect x="34" y="34" width="112" height="112" fill="#f4eef7" stroke="#76528b"/>
+        <rect x="34" y="34" width="28" height="28" fill="#79abc4"/><rect x="62" y="62" width="28" height="28" fill="#d98967"/><rect x="90" y="90" width="28" height="28" fill="#aab4bb"/><rect x="118" y="118" width="28" height="28" fill="#aa87ba"/>
+        <g class="matrix-grid"><line x1="62" y1="34" x2="62" y2="146"/><line x1="90" y1="34" x2="90" y2="146"/><line x1="118" y1="34" x2="118" y2="146"/><line x1="34" y1="62" x2="146" y2="62"/><line x1="34" y1="90" x2="146" y2="90"/><line x1="34" y1="118" x2="146" y2="118"/></g>
       </g>
-      <text x="56" y="139" text-anchor="middle" class="box-title">Input X</text>
-    </g>
-
-    <g id="input-split-stage1">
-      <path d="M172 326 H218" class="connector"/>
-      <circle cx="218" cy="326" r="4" fill="#33424f"/>
-      <path d="M218 326 V215 H268" class="arrow"/>
-      <path d="M218 326 V425 H268" class="arrow"/>
-    </g>
-
-    <g id="value-preserving-encoder">
-      <rect x="280" y="180" width="220" height="70" rx="6" class="trainable"/>
-      <text x="390" y="207" text-anchor="middle" class="box-title">Value-preserving</text>
-      <text x="390" y="235" text-anchor="middle" class="box-title">encoder E<tspan baseline-shift="sub" font-size="14">&#966;</tspan></text>
-    </g>
-
-    <path d="M390 252 V273" class="arrow"/>
-
-    <g id="stage1-latent-grid">
-      <rect x="366" y="286" width="48" height="48" rx="6" class="tensor"/>
-      <g fill="#4d8d73" opacity="0.92">
-        <circle cx="374" cy="294" r="3"/><circle cx="384" cy="294" r="3"/><circle cx="394" cy="294" r="3"/><circle cx="404" cy="294" r="3"/>
-        <circle cx="374" cy="304" r="3"/><circle cx="384" cy="304" r="3"/><circle cx="394" cy="304" r="3"/><circle cx="404" cy="304" r="3"/>
-        <circle cx="374" cy="314" r="3"/><circle cx="384" cy="314" r="3"/><circle cx="394" cy="314" r="3"/><circle cx="404" cy="314" r="3"/>
-        <circle cx="374" cy="324" r="3"/><circle cx="384" cy="324" r="3"/><circle cx="394" cy="324" r="3"/><circle cx="404" cy="324" r="3"/>
-      </g>
-      <text x="390" y="360" text-anchor="middle" class="small" font-weight="700">Z: 8 &#215; 16 &#215; 16</text>
-    </g>
-
-    <path d="M416 310 H535 V215 H578" class="arrow"/>
-
-    <g id="spatial-adapter-stage1">
-      <rect x="590" y="180" width="320" height="70" rx="6" class="trainable"/>
-      <text x="750" y="207" text-anchor="middle" class="box-title">Spatial adapter A<tspan baseline-shift="sub" font-size="14">&#952;</tspan></text>
-      <text x="750" y="235" text-anchor="middle" class="small">fixed 2D PE &#183; 2&#215; self-attention &#183; residual</text>
-    </g>
-
-    <path d="M750 252 V279" class="arrow"/>
-
-    <g id="student-input-sequence">
-      <g fill="#b9decf" stroke="#3f7c65" stroke-width="1.5">
-        <rect x="704" y="292" width="10" height="30" rx="2"/>
-        <rect x="718" y="292" width="10" height="30" rx="2"/>
-        <rect x="732" y="292" width="10" height="30" rx="2"/>
-        <rect x="774" y="292" width="10" height="30" rx="2"/>
-        <rect x="788" y="292" width="10" height="30" rx="2"/>
-      </g>
-      <text x="760" y="314" text-anchor="middle" class="tiny">...</text>
-      <text x="750" y="354" text-anchor="middle" font-size="18" font-weight="700">256 spatial tokens</text>
-      <text x="890" y="342" text-anchor="middle" font-size="32" font-weight="700">+</text>
-      <rect x="910" y="290" width="96" height="74" rx="6" class="textual"/>
-      <text x="958" y="334" text-anchor="middle" class="box-title">Probe</text>
-    </g>
-
-    <path d="M1006 327 H1022 V215 H1038" class="arrow"/>
-
-    <g id="teacher-branch">
-      <g id="qwen-tokenizer-stage1">
-        <rect x="280" y="390" width="220" height="70" rx="6" class="frozen"/>
-        <text x="390" y="417" text-anchor="middle" class="box-title">Frozen Qwen</text>
-        <text x="390" y="445" text-anchor="middle" class="box-title">tokenizer</text>
-      </g>
-
-      <path d="M390 462 V537 H628" class="arrow"/>
-
-      <g id="teacher-input-sequence">
-        <rect x="640" y="500" width="230" height="74" rx="6" class="textual"/>
-        <text x="755" y="544" text-anchor="middle" class="box-title">numeric text tokens</text>
-        <text x="890" y="552" text-anchor="middle" font-size="32" font-weight="700">+</text>
-        <rect x="910" y="500" width="96" height="74" rx="6" class="textual"/>
-        <text x="958" y="544" text-anchor="middle" class="box-title">Probe</text>
-      </g>
-
-      <path d="M1006 537 H1022 V425 H1038" class="arrow"/>
-    </g>
-
-    <g id="shared-shallow-qwen">
-      <g id="student-shallow-qwen">
-        <rect x="1050" y="180" width="270" height="70" rx="7" class="frozen"/>
-        <text x="1185" y="221" text-anchor="middle" font-size="20" font-weight="700">Frozen Qwen (layer &#8467;)</text>
-        <path d="M1185 252 V287" class="arrow"/>
-        <g id="student-hidden-vector">
-          <path d="M1142 300 H1135 V352 H1142" class="vector-bracket"/>
-          <path d="M1202 300 H1209 V352 H1202" class="vector-bracket"/>
-          <rect x="1147" y="310" width="12" height="34" rx="2" fill="#add6c6" stroke="#3f7c65"/>
-          <rect x="1163" y="310" width="12" height="34" rx="2" fill="#7fbea5" stroke="#3f7c65"/>
-          <text x="1183" y="332" text-anchor="middle" class="tiny">...</text>
-          <rect x="1193" y="310" width="12" height="34" rx="2" fill="#4d8d73" stroke="#3f7c65"/>
-          <text x="1240" y="333" text-anchor="middle" font-size="20" font-weight="700" font-style="italic">h<tspan baseline-shift="sub" font-size="12">i</tspan><tspan baseline-shift="super" font-size="12">f</tspan></text>
-        </g>
-      </g>
-
-      <g id="teacher-shallow-qwen">
-        <rect x="1050" y="390" width="270" height="70" rx="7" class="frozen"/>
-        <text x="1185" y="431" text-anchor="middle" font-size="20" font-weight="700">Frozen Qwen (layer &#8467;)</text>
-        <path d="M1185 462 V497" class="arrow"/>
-        <g id="teacher-hidden-vector">
-          <path d="M1142 510 H1135 V562 H1142" class="vector-bracket-teacher"/>
-          <path d="M1202 510 H1209 V562 H1202" class="vector-bracket-teacher"/>
-          <rect x="1147" y="520" width="12" height="34" rx="2" fill="#f6dfa0" stroke="#9b7930"/>
-          <rect x="1163" y="520" width="12" height="34" rx="2" fill="#d6b75f" stroke="#9b7930"/>
-          <text x="1183" y="542" text-anchor="middle" class="tiny">...</text>
-          <rect x="1193" y="520" width="12" height="34" rx="2" fill="#9b7930" stroke="#9b7930"/>
-          <text x="1240" y="543" text-anchor="middle" font-size="20" font-weight="700" font-style="italic">h<tspan baseline-shift="sub" font-size="12">i</tspan><tspan baseline-shift="super" font-size="12">t</tspan></text>
-        </g>
-      </g>
-    </g>
-
-    <g id="stage1-alignment-loss">
-      <path d="M1270 327 H1470" class="arrow-violet"/>
-      <path d="M1270 537 H1470" class="arrow-violet"/>
-      <rect x="1480" y="275" width="260" height="300" rx="7" class="loss-only"/>
-      <text x="1610" y="304" text-anchor="middle" font-size="20" font-weight="700">Contrastive</text>
-      <text x="1610" y="330" text-anchor="middle" font-size="20" font-weight="700">alignment</text>
-      <g id="contrastive-matrix">
-        <g id="text-pair-labels">
-          <rect x="1570" y="350" width="28" height="28" rx="3" fill="#bdd9e7" stroke="#477f9d"/>
-          <rect x="1598" y="350" width="28" height="28" rx="3" fill="#f2c4b1" stroke="#bd543e"/>
-          <rect x="1626" y="350" width="28" height="28" rx="3" fill="#e3e8eb" stroke="#708390"/>
-          <rect x="1654" y="350" width="28" height="28" rx="3" fill="#ddcee5" stroke="#76528b"/>
-          <text x="1584" y="369" text-anchor="middle" font-size="13" font-weight="700">T<tspan baseline-shift="sub" font-size="9">1</tspan></text>
-          <text x="1612" y="369" text-anchor="middle" font-size="13" font-weight="700">T<tspan baseline-shift="sub" font-size="9">2</tspan></text>
-          <text x="1640" y="369" text-anchor="middle" font-size="13" font-weight="700">...</text>
-          <text x="1668" y="369" text-anchor="middle" font-size="13" font-weight="700">T<tspan baseline-shift="sub" font-size="9">n</tspan></text>
-        </g>
-
-        <g id="field-pair-labels">
-          <rect x="1536" y="386" width="28" height="28" rx="3" fill="#477f9d" stroke="#315f78"/>
-          <rect x="1536" y="414" width="28" height="28" rx="3" fill="#bd543e" stroke="#8e3f2f"/>
-          <rect x="1536" y="442" width="28" height="28" rx="3" fill="#708390" stroke="#526879"/>
-          <rect x="1536" y="470" width="28" height="28" rx="3" fill="#76528b" stroke="#583d68"/>
-          <text x="1550" y="405" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="9">1</tspan></text>
-          <text x="1550" y="433" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="9">2</tspan></text>
-          <text x="1550" y="461" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">...</text>
-          <text x="1550" y="489" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">F<tspan baseline-shift="sub" font-size="9">n</tspan></text>
-        </g>
-
-        <rect x="1570" y="386" width="112" height="112" rx="2" class="matrix-bg"/>
-        <g id="matched-pair-diagonal">
-          <rect x="1570" y="386" width="28" height="28" fill="#79abc4" stroke="#477f9d"/>
-          <rect x="1598" y="414" width="28" height="28" fill="#d98967" stroke="#bd543e"/>
-          <rect x="1626" y="442" width="28" height="28" fill="#aab4bb" stroke="#708390"/>
-          <rect x="1654" y="470" width="28" height="28" fill="#aa87ba" stroke="#76528b"/>
-        </g>
-        <g class="matrix-grid">
-          <line x1="1598" y1="386" x2="1598" y2="498"/>
-          <line x1="1626" y1="386" x2="1626" y2="498"/>
-          <line x1="1654" y1="386" x2="1654" y2="498"/>
-          <line x1="1570" y1="414" x2="1682" y2="414"/>
-          <line x1="1570" y1="442" x2="1682" y2="442"/>
-          <line x1="1570" y1="470" x2="1682" y2="470"/>
-        </g>
-      </g>
-    </g>
-
-  </g>
-
-  <g id="stage2" transform="translate(0,130)">
-    <rect x="40" y="600" width="1720" height="420" rx="8" class="panel"/>
-    <circle cx="70" cy="632" r="18" fill="#33424f"/>
-    <text x="64" y="640" font-size="23" font-weight="700" fill="#ffffff">2</text>
-    <text x="100" y="641" class="panel-title">Natural-language grounding</text>
-
-    <g id="stage2-input-grid" transform="translate(60,664)">
-      <rect x="0" y="0" width="112" height="112" rx="6" class="neutral"/>
-      <g stroke="#ffffff" stroke-width="2">
-        <rect x="8" y="8" width="23" height="23" fill="#477f9d"/>
-        <rect x="32" y="8" width="23" height="23" fill="#6fa5ad"/>
-        <rect x="56" y="8" width="23" height="23" fill="#d9cf79"/>
-        <rect x="80" y="8" width="23" height="23" fill="#d56b52"/>
-        <rect x="8" y="32" width="23" height="23" fill="#3d718f"/>
-        <rect x="32" y="32" width="23" height="23" fill="#86b9aa"/>
-        <rect x="56" y="32" width="23" height="23" fill="#ebd88b"/>
-        <rect x="80" y="32" width="23" height="23" fill="#c85745"/>
-        <rect x="8" y="56" width="23" height="23" fill="#618ca4"/>
-        <rect x="32" y="56" width="23" height="23" fill="#74a995"/>
-        <rect x="56" y="56" width="23" height="23" fill="#efc86f"/>
-        <rect x="80" y="56" width="23" height="23" fill="#e28b5f"/>
-        <rect x="8" y="80" width="23" height="23" fill="#355f80"/>
-        <rect x="32" y="80" width="23" height="23" fill="#5d988d"/>
-        <rect x="56" y="80" width="23" height="23" fill="#d8b65b"/>
-        <rect x="80" y="80" width="23" height="23" fill="#bb493e"/>
-      </g>
-      <text x="56" y="139" text-anchor="middle" class="box-title">Input X</text>
-    </g>
-
-    <path d="M172 720 H228" class="arrow"/>
-
-    <g id="stage2-encoder">
-      <rect x="240" y="685" width="220" height="70" rx="6" class="frozen"/>
-      <text x="350" y="712" text-anchor="middle" class="box-title">Value-preserving</text>
-      <text x="350" y="740" text-anchor="middle" class="box-title">encoder E<tspan baseline-shift="sub" font-size="14">&#966;</tspan></text>
-    </g>
-
-    <path d="M350 757 V783" class="arrow"/>
-
-    <g id="stage2-latent-grid">
-      <rect x="326" y="790" width="48" height="48" rx="6" class="tensor"/>
-      <g fill="#4d8d73" opacity="0.92">
-        <circle cx="334" cy="798" r="3"/><circle cx="344" cy="798" r="3"/><circle cx="354" cy="798" r="3"/><circle cx="364" cy="798" r="3"/>
-        <circle cx="334" cy="808" r="3"/><circle cx="344" cy="808" r="3"/><circle cx="354" cy="808" r="3"/><circle cx="364" cy="808" r="3"/>
-        <circle cx="334" cy="818" r="3"/><circle cx="344" cy="818" r="3"/><circle cx="354" cy="818" r="3"/><circle cx="364" cy="818" r="3"/>
-        <circle cx="334" cy="828" r="3"/><circle cx="344" cy="828" r="3"/><circle cx="354" cy="828" r="3"/><circle cx="364" cy="828" r="3"/>
-      </g>
-      <text x="350" y="864" text-anchor="middle" class="small" font-weight="700">Z: 8 &#215; 16 &#215; 16</text>
-    </g>
-
-    <path d="M376 814 H520 V720 H558" class="arrow"/>
-
-    <g id="spatial-adapter-stage2">
-      <rect x="570" y="685" width="320" height="70" rx="6" class="trainable"/>
-      <text x="730" y="712" text-anchor="middle" class="box-title">Spatial adapter A<tspan baseline-shift="sub" font-size="14">&#952;</tspan></text>
-      <text x="730" y="740" text-anchor="middle" class="small">fixed 2D PE &#183; 2&#215; self-attention &#183; residual</text>
-    </g>
-
-    <path d="M730 757 V797" class="arrow"/>
-
-    <g id="stage2-input-sequence">
-      <g fill="#b9decf" stroke="#3f7c65" stroke-width="1.5">
-        <rect x="684" y="810" width="10" height="30" rx="2"/>
-        <rect x="698" y="810" width="10" height="30" rx="2"/>
-        <rect x="712" y="810" width="10" height="30" rx="2"/>
-        <rect x="754" y="810" width="10" height="30" rx="2"/>
-        <rect x="768" y="810" width="10" height="30" rx="2"/>
-      </g>
-      <text x="740" y="832" text-anchor="middle" class="tiny">...</text>
-      <text x="730" y="870" text-anchor="middle" font-size="18" font-weight="700">256 spatial tokens</text>
-      <text x="874" y="840" text-anchor="middle" font-size="32" font-weight="700">+</text>
-
-      <g id="stage2-question-tokenization">
-        <g id="natural-language-question">
-          <rect x="900" y="645" width="230" height="55" rx="6" class="textual"/>
-          <text x="1015" y="668" text-anchor="middle" font-size="18" font-weight="700">Natural-language</text>
-          <text x="1015" y="691" text-anchor="middle" font-size="19" font-weight="700">question</text>
-        </g>
-
-        <path d="M1015 702 V718" class="arrow"/>
-
-        <g id="stage2-qwen-tokenizer-embedding">
-          <rect x="900" y="730" width="230" height="55" rx="6" class="frozen"/>
-          <text x="1015" y="752" text-anchor="middle" font-size="18" font-weight="700">Qwen tokenizer</text>
-          <text x="1015" y="776" text-anchor="middle" font-size="17" font-weight="700">+ frozen token embedding</text>
-        </g>
-
-        <path d="M1015 787 V798" class="arrow"/>
-
-        <g id="stage2-question-embeddings">
-          <g fill="#f6dfa0" stroke="#9b7930" stroke-width="1.5">
-            <rect x="969" y="810" width="10" height="30" rx="2"/>
-            <rect x="983" y="810" width="10" height="30" rx="2"/>
-            <rect x="997" y="810" width="10" height="30" rx="2"/>
-            <rect x="1039" y="810" width="10" height="30" rx="2"/>
-            <rect x="1053" y="810" width="10" height="30" rx="2"/>
-          </g>
-          <text x="1025" y="832" text-anchor="middle" class="tiny">...</text>
-          <text x="1016" y="870" text-anchor="middle" font-size="18" font-weight="700">question embeddings</text>
-        </g>
-      </g>
-    </g>
-
-    <path d="M1065 825 H1185 V720 H1208" class="arrow"/>
-
-    <g id="full-frozen-qwen">
-      <rect x="1220" y="685" width="250" height="70" rx="7" class="frozen"/>
-      <text x="1345" y="728" text-anchor="middle" class="box-title">Frozen Qwen</text>
-    </g>
-
-    <path d="M1472 720 H1518" class="arrow"/>
-
-    <g id="answer-output">
-      <rect x="1530" y="690" width="180" height="60" rx="6" class="neutral"/>
-      <text x="1620" y="728" text-anchor="middle" class="box-title">Answer</text>
-    </g>
-
-    <g id="stage2-loss">
-      <path d="M1620 752 V870" class="arrow-violet"/>
-      <rect x="1510" y="883" width="210" height="64" rx="6" class="loss-only"/>
-      <text x="1615" y="922" text-anchor="middle" class="box-title">QA objective</text>
     </g>
   </g>
 
-  <text x="900" y="1184" text-anchor="middle" class="small">Spatial identity is preserved by constant token count and row-major indexing; attention contextualizes each token without pooling it away.</text>
+  <g id="stage2">
+    <rect x="40" y="572" width="1520" height="535" rx="8" class="panel"/>
+    <rect x="52" y="589" width="100" height="36" rx="18" class="stage-badge"/>
+    <text x="102" y="614" text-anchor="middle" class="stage-badge-text">Stage 2</text>
+    <text x="170" y="616" class="panel-title">Question-conditioned field reasoning</text>
+
+    <use href="#heatmap" x="65" y="648"/><text x="115" y="773" text-anchor="middle" class="box-title">Field X</text>
+    <path d="M165 698 H208" class="arrow"/>
+    <rect x="220" y="667" width="180" height="62" rx="6" class="frozen"/><text x="310" y="692" text-anchor="middle" class="box-title">Frozen encoder</text><text x="310" y="716" text-anchor="middle" class="box-text">grid preserving</text>
+    <path d="M310 729 V740" class="arrow"/>
+    <g id="stage2-latent"><use href="#latent-map" x="281" y="752"/><text x="310" y="830" text-anchor="middle" class="small">Z &#8712; &#8477;<tspan baseline-shift="super" font-size="10">m&#215;n&#215;d<tspan baseline-shift="sub" font-size="8">E</tspan></tspan></text></g>
+    <path d="M359 781 H435 V698 H458" class="arrow"/>
+    <rect x="470" y="667" width="220" height="62" rx="6" class="frozen"/><text x="580" y="692" text-anchor="middle" class="box-title">Frozen global interface</text><text x="580" y="716" text-anchor="middle" class="box-text">Stage-1 initialization</text>
+    <path d="M580 729 V752" class="arrow"/>
+    <g id="global-token-row"><g fill="#b9decf" stroke="#3f7c65" stroke-width="1.5"><rect x="532" y="764" width="11" height="34" rx="2"/><rect x="546" y="764" width="11" height="34" rx="2"/><rect x="560" y="764" width="11" height="34" rx="2"/><rect x="589" y="764" width="11" height="34" rx="2"/><rect x="603" y="764" width="11" height="34" rx="2"/><rect x="617" y="764" width="11" height="34" rx="2"/></g><text x="580" y="786" text-anchor="middle" class="tiny">&#8943;</text><text x="580" y="830" text-anchor="middle" class="small" font-weight="700">global tokens G(X)</text></g>
+
+    <rect x="65" y="918" width="180" height="58" rx="6" class="neutral"/><text x="155" y="943" text-anchor="middle" class="box-title">Natural-language</text><text x="155" y="965" text-anchor="middle" class="box-title">question q</text>
+    <path d="M245 947 H270" class="connector"/><circle cx="270" cy="947" r="4" fill="#33424f"/>
+    <path d="M270 947 V886 H288" class="arrow"/>
+    <rect x="300" y="855" width="220" height="62" rx="6" class="frozen"/><text x="410" y="893" text-anchor="middle" class="box-title">Frozen Qwen blocks</text>
+    <path d="M410 917 V926" class="arrow"/>
+    <g id="question-state-row"><g fill="#f6dfa0" stroke="#9b7930" stroke-width="1.5"><rect x="359" y="930" width="11" height="28" rx="2"/><rect x="373" y="930" width="11" height="28" rx="2"/><rect x="387" y="930" width="11" height="28" rx="2"/><rect x="422" y="930" width="11" height="28" rx="2"/><rect x="436" y="930" width="11" height="28" rx="2"/><rect x="450" y="930" width="11" height="28" rx="2"/></g><text x="410" y="949" text-anchor="middle" class="tiny">&#8943;</text><text x="410" y="978" text-anchor="middle" class="small" font-weight="700">question token states T(q)</text></g>
+
+    <rect x="650" y="855" width="220" height="78" rx="6" class="trainable"/><text x="760" y="882" text-anchor="middle" class="box-title">Evidence reader</text><text x="760" y="905" text-anchor="middle" class="box-text">role attention + 2D routing</text><text x="760" y="925" text-anchor="middle" class="box-text">residual + gate</text>
+    <path d="M629 781 H760 V843" class="arrow"/><path d="M461 944 H625 V894 H638" class="arrow"/>
+    <path d="M760 933 V943" class="arrow"/>
+    <g id="local-token-row"><rect x="739" y="945" width="18" height="34" rx="3" class="field-token"/><rect x="763" y="945" width="18" height="34" rx="3" class="field-token"/><text x="760" y="1000" text-anchor="middle" class="small" font-weight="700">local evidence</text></g>
+
+    <path d="M270 947 V1017 H288" class="arrow"/>
+    <rect x="300" y="989" width="220" height="56" rx="6" class="frozen"/><text x="410" y="1023" text-anchor="middle" class="box-title">Tokenizer + embedding</text>
+    <path d="M410 1045 V1049" class="arrow"/>
+    <g id="question-token-row"><g fill="#f6dfa0" stroke="#9b7930" stroke-width="1.5"><rect x="359" y="1057" width="11" height="24" rx="2"/><rect x="373" y="1057" width="11" height="24" rx="2"/><rect x="387" y="1057" width="11" height="24" rx="2"/><rect x="422" y="1057" width="11" height="24" rx="2"/><rect x="436" y="1057" width="11" height="24" rx="2"/><rect x="450" y="1057" width="11" height="24" rx="2"/></g><text x="410" y="1074" text-anchor="middle" class="tiny">&#8943;</text><text x="410" y="1097" text-anchor="middle" class="small" font-weight="700">question embeddings e(q)</text></g>
+
+    <path d="M629 781 H1000 V944" class="arrow"/><path d="M781 962 H982" class="arrow"/><path d="M461 1069 H1000 V980" class="arrow"/>
+    <use href="#concat-node" x="984" y="946"/>
+    <path d="M1016 962 H1028" class="arrow"/>
+    <rect x="1040" y="927" width="230" height="70" rx="7" class="frozen"/><text x="1155" y="969" text-anchor="middle" class="box-title">Frozen Qwen</text>
+    <path d="M1270 962 H1308" class="arrow"/><rect x="1320" y="932" width="205" height="60" rx="6" class="neutral"/><text x="1422" y="969" text-anchor="middle" class="box-title">Answer</text>
+    <path d="M1422 992 V1015" class="arrow-violet"/><rect x="1320" y="1027" width="205" height="48" rx="6" class="loss-only"/><text x="1422" y="1057" text-anchor="middle" class="box-title">QA + routing losses</text>
+  </g>
+
+  <g id="inference">
+    <rect x="40" y="1132" width="1520" height="535" rx="8" class="panel"/>
+    <rect x="52" y="1149" width="118" height="36" rx="18" class="stage-badge"/>
+    <text x="111" y="1174" text-anchor="middle" class="stage-badge-text">Inference</text>
+    <text x="188" y="1176" class="panel-title">Question-conditioned field reasoning</text>
+
+    <use href="#heatmap" x="65" y="1208"/><text x="115" y="1333" text-anchor="middle" class="box-title">Field X</text>
+    <path d="M165 1258 H208" class="arrow"/>
+    <rect x="220" y="1227" width="180" height="62" rx="6" class="frozen"/><text x="310" y="1252" text-anchor="middle" class="box-title">Frozen encoder</text><text x="310" y="1276" text-anchor="middle" class="box-text">grid preserving</text>
+    <path d="M310 1289 V1300" class="arrow"/>
+    <g id="inference-latent"><use href="#latent-map" x="281" y="1312"/><text x="310" y="1390" text-anchor="middle" class="small">Z &#8712; &#8477;<tspan baseline-shift="super" font-size="10">m&#215;n&#215;d<tspan baseline-shift="sub" font-size="8">E</tspan></tspan></text></g>
+    <path d="M359 1341 H435 V1258 H458" class="arrow"/>
+    <rect x="470" y="1227" width="220" height="62" rx="6" class="frozen"/><text x="580" y="1252" text-anchor="middle" class="box-title">Frozen global interface</text><text x="580" y="1276" text-anchor="middle" class="box-text">Stage-1 initialization</text>
+    <path d="M580 1289 V1312" class="arrow"/>
+    <g id="inference-global-token-row"><g fill="#b9decf" stroke="#3f7c65" stroke-width="1.5"><rect x="532" y="1324" width="11" height="34" rx="2"/><rect x="546" y="1324" width="11" height="34" rx="2"/><rect x="560" y="1324" width="11" height="34" rx="2"/><rect x="589" y="1324" width="11" height="34" rx="2"/><rect x="603" y="1324" width="11" height="34" rx="2"/><rect x="617" y="1324" width="11" height="34" rx="2"/></g><text x="580" y="1346" text-anchor="middle" class="tiny">&#8943;</text><text x="580" y="1390" text-anchor="middle" class="small" font-weight="700">global tokens G(X)</text></g>
+
+    <rect x="65" y="1478" width="180" height="58" rx="6" class="neutral"/><text x="155" y="1503" text-anchor="middle" class="box-title">Natural-language</text><text x="155" y="1525" text-anchor="middle" class="box-title">question q</text>
+    <path d="M245 1507 H270" class="connector"/><circle cx="270" cy="1507" r="4" fill="#33424f"/>
+    <path d="M270 1507 V1446 H288" class="arrow"/>
+    <rect x="300" y="1415" width="220" height="62" rx="6" class="frozen"/><text x="410" y="1453" text-anchor="middle" class="box-title">Frozen Qwen blocks</text>
+    <path d="M410 1477 V1486" class="arrow"/>
+    <g id="inference-question-state-row"><g fill="#f6dfa0" stroke="#9b7930" stroke-width="1.5"><rect x="359" y="1490" width="11" height="28" rx="2"/><rect x="373" y="1490" width="11" height="28" rx="2"/><rect x="387" y="1490" width="11" height="28" rx="2"/><rect x="422" y="1490" width="11" height="28" rx="2"/><rect x="436" y="1490" width="11" height="28" rx="2"/><rect x="450" y="1490" width="11" height="28" rx="2"/></g><text x="410" y="1509" text-anchor="middle" class="tiny">&#8943;</text><text x="410" y="1538" text-anchor="middle" class="small" font-weight="700">question token states T(q)</text></g>
+
+    <rect x="650" y="1415" width="220" height="78" rx="6" class="frozen"/><text x="760" y="1442" text-anchor="middle" class="box-title">Frozen evidence reader</text><text x="760" y="1465" text-anchor="middle" class="box-text">role attention + 2D routing</text><text x="760" y="1485" text-anchor="middle" class="box-text">residual + gate</text>
+    <path d="M629 1341 H760 V1403" class="arrow"/><path d="M461 1504 H625 V1454 H638" class="arrow"/>
+    <path d="M760 1493 V1503" class="arrow"/>
+    <g id="inference-local-token-row"><rect x="739" y="1505" width="18" height="34" rx="3" class="field-token"/><rect x="763" y="1505" width="18" height="34" rx="3" class="field-token"/><text x="760" y="1560" text-anchor="middle" class="small" font-weight="700">local evidence</text></g>
+
+    <path d="M270 1507 V1577 H288" class="arrow"/>
+    <rect x="300" y="1549" width="220" height="56" rx="6" class="frozen"/><text x="410" y="1583" text-anchor="middle" class="box-title">Tokenizer + embedding</text>
+    <path d="M410 1605 V1609" class="arrow"/>
+    <g id="inference-question-token-row"><g fill="#f6dfa0" stroke="#9b7930" stroke-width="1.5"><rect x="359" y="1617" width="11" height="24" rx="2"/><rect x="373" y="1617" width="11" height="24" rx="2"/><rect x="387" y="1617" width="11" height="24" rx="2"/><rect x="422" y="1617" width="11" height="24" rx="2"/><rect x="436" y="1617" width="11" height="24" rx="2"/><rect x="450" y="1617" width="11" height="24" rx="2"/></g><text x="410" y="1634" text-anchor="middle" class="tiny">&#8943;</text><text x="410" y="1657" text-anchor="middle" class="small" font-weight="700">question embeddings e(q)</text></g>
+
+    <path d="M629 1341 H1000 V1504" class="arrow"/><path d="M781 1522 H982" class="arrow"/><path d="M461 1629 H1000 V1540" class="arrow"/>
+    <use href="#concat-node" x="984" y="1506"/>
+    <path d="M1016 1522 H1028" class="arrow"/>
+    <rect x="1040" y="1487" width="230" height="70" rx="7" class="frozen"/><text x="1155" y="1529" text-anchor="middle" class="box-title">Frozen Qwen</text>
+    <path d="M1270 1522 H1308" class="arrow"/><rect x="1320" y="1492" width="205" height="60" rx="6" class="neutral"/><text x="1422" y="1529" text-anchor="middle" class="box-title">Answer</text>
+  </g>
 </svg>
