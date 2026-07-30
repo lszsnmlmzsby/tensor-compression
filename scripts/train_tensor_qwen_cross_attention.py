@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-"""Train a dense tensor-memory cross-attention sidecar for a frozen Qwen model.
+"""Train the full-grid field cross-attention interface for a frozen LLM.
 
-This is intentionally independent of ``train_tensor_llm_adapter.py``'s Stage-2
-model/loss/checkpoint path.  It reuses only stable data, distributed, tokenizer,
-and frozen-LLM utilities.  The model never consumes parsed coordinates,
+This uses the Direct-QA initializer plus shared data, distributed, tokenizer,
+and frozen-LLM utilities. The model never consumes parsed coordinates,
 ``query_spec``, task IDs, or a task-to-slot-count mapping.
 """
 
@@ -118,7 +117,7 @@ def _csv_strings(value: Any) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train full-grid tensor-memory cross-attention inside a frozen Qwen decoder."
+        description="Train full-grid field-memory cross-attention inside a frozen LLM decoder."
     )
     parser.add_argument("--config", required=True, type=str)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -151,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
     args.hf_home = _path_value(_config_value(config, ["storage.hf_home"]))
     args.qa_dir = _path_value(
-        _config_value(config, ["data.qa_dir", "patch_qa.stage2b_qa_dir"])
+        _config_value(config, ["data.qa_dir", "patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"])
     )
     args.latent_dir = _path_value(
         _config_value(config, ["data.latent_dir", "patch_qa.latent_dir"])
@@ -702,7 +701,7 @@ def load_metadata_and_contract(args: argparse.Namespace) -> tuple[dict[str, Any]
         raise ValueError("Natural-language coordinates must use the one-based prompt contract.")
     stage2b = metadata.get("stage2b")
     if not isinstance(stage2b, Mapping):
-        raise ValueError("The configured QA directory is not a matched Stage-2B dataset.")
+        raise ValueError("The configured QA directory is not a matched-QA dataset.")
     group_size = int(stage2b.get("batch_group_size", 0))
     if group_size <= 0 or group_size != int(args.questions_per_state_group):
         raise ValueError(

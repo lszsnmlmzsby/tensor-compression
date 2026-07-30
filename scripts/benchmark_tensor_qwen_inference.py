@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-"""Benchmark frozen Qwen tensor-text input against dense tensor cross-attention.
+"""Benchmark serialized-field input against the cross-attention interface.
 
-The two methods share one frozen Qwen replica, one QA record order, one
+The two methods share one frozen LLM replica, one QA record order, one
 candidate-restricted next-token scorer, and one exact distributed shard.  The
 script reports both end-to-end evaluation cost and warmed model-only cost.
 """
@@ -197,7 +197,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args.hf_home = _path_value(cli.hf_home or _config_value(config, ["storage.hf_home"]))
     args.qa_dir = _path_value(
-        cli.qa_dir or _config_value(config, ["data.qa_dir", "patch_qa.stage2b_qa_dir"])
+        cli.qa_dir
+        or _config_value(
+            config, ["data.qa_dir", "patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"]
+        )
     )
     args.latent_dir = _path_value(
         cli.latent_dir or _config_value(config, ["data.latent_dir", "patch_qa.latent_dir"])

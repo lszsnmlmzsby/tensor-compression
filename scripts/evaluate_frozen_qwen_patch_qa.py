@@ -59,6 +59,7 @@ except ImportError as exc:  # pragma: no cover - dependency error on the executi
     ) from exc
 
 
+# Historical result identifiers are retained for checkpoint compatibility.
 BASELINE_NAME = "frozen_qwen_serialized_tensor"
 RESULT_FORMAT = "frozen_qwen_serialized_tensor_patch_qa_baseline_v2"
 PRESERVED_Z_CHANNEL = 0
@@ -226,7 +227,7 @@ def parse_splits(raw: str) -> list[str]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a completely frozen Qwen on Stage-2B patch QA with the full 16x16 "
+            "Evaluate a completely frozen Qwen on matched patch QA with the full 16x16 "
             "standardized tensor matrix serialized as text. No tensor adapter or adapter "
             "checkpoint is constructed or loaded."
         )
@@ -279,7 +280,7 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         )
 
     path_defaults = {
-        "qa_dir": first_nested(config, ["patch_qa.stage2b_qa_dir"]),
+        "qa_dir": first_nested(config, ["patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"]),
         "latent_dir": first_nested(config, ["patch_qa.latent_dir"]),
         "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
         "hf_home": first_nested(config, ["storage.hf_home"]),
@@ -565,7 +566,7 @@ def audit_qa_metadata(
     root = Path(qa_dir)
     build_marker = root / PATCH_QA_BUILD_MARKER
     if build_marker.exists():
-        raise RuntimeError(f"Stage-2B QA is marked as incomplete or active: {build_marker}")
+        raise RuntimeError(f"Matched QA is marked as incomplete or active: {build_marker}")
     metadata_path = root / "metadata.json"
     if not metadata_path.exists():
         if require_formal_contract:
@@ -605,7 +606,7 @@ def audit_qa_metadata(
             if observed[key] != value
         }
         if mismatches:
-            raise ValueError(f"Formal Stage-2B QA metadata contract mismatch: {mismatches}")
+            raise ValueError(f"Formal matched-QA metadata contract mismatch: {mismatches}")
 
     declared_hashes = metadata.get("output_split_sha256", {})
     if not isinstance(declared_hashes, Mapping):
@@ -1909,7 +1910,7 @@ def runtime_contract() -> dict[str, Any]:
         "prompt_record_fields": ["task_type", "query", "question", "choices"],
         "prompt_tensor_source": "validated latent_map[0], serialized with no answer-dependent transform",
         "task_prompt_contract": (
-            "shared Stage-2B task prompt with input-representation wording changed before "
+            "shared matched-QA prompt with input-representation wording changed before "
             "the Query boundary; query, choices, and output contract remain unchanged"
         ),
         "answer_in_model_prompt_or_forward_inputs": False,

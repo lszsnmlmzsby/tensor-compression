@@ -1,2 +1,1 @@
-"""Reserved namespace for downstream and LLM-integrated tasks."""
-
+"""Field QA prompts, contracts, and I/O helpers."""

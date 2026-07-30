@@ -1,0 +1,177 @@
+# Paper configuration for Stage 1 and the two QA-data build steps.
+# Required environment variables:
+#   FIELD_TO_LLM_ROOT
+#   PDEBENCH_HDF5
+#   FIELD_TO_LLM_ALIGNMENT_CHECKPOINT (after Stage 1 finishes)
+
+storage:
+  hf_home: ${FIELD_TO_LLM_ROOT}/hf_cache
+  output_root: ${FIELD_TO_LLM_ROOT}/runs
+
+runtime:
+  seed: 42
+  device: auto
+
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: null
+  torch_dtype: bfloat16
+  trust_remote_code: false
+
+patch_qa:
+  seed: 42
+  alignment_checkpoint: ${FIELD_TO_LLM_ALIGNMENT_CHECKPOINT}
+  hdf5_path: ${PDEBENCH_HDF5}
+  qa_dir: ${FIELD_TO_LLM_ROOT}/data/patch_qa
+  matched_qa_dir: ${FIELD_TO_LLM_ROOT}/data/matched_patch_qa
+  latent_dir: ${FIELD_TO_LLM_ROOT}/data/patch_latents
+  fields: [density, pressure, Vx, Vy]
+  allow_unseen_alignment_fields: false
+  patch_size: 16
+  train_patches: 16384
+  val_patches: 1024
+  test_patches: 1024
+  train_question_variants: 3
+  val_question_variants: 2
+  test_question_variants: 1
+  sample_indices: all
+  time_indices: all
+  split_mode: sample
+  tasks:
+    - normalized_point_value
+    - raw_point_value_with_stats
+    - point_compare
+    - region_mean_compare
+    - extreme_quadrant
+  region_size: 4
+  numeric_choice_spacing: 0.5
+  matched_numeric_min_gap: 0.5
+  matched_region_min_gap: 0.2
+  decimal_places: 6
+  batch_size: 256
+  device: auto
+  storage_dtype: float16
+  include_oracle: false
+  overwrite: false
+  matched_overwrite: false
+
+patch_alignment:
+  run_name: field_to_llm_stage1_alignment
+  output_root: ${FIELD_TO_LLM_ROOT}/runs
+  hdf5_path: ${PDEBENCH_HDF5}
+  fields: [Vx, Vy, density, pressure]
+  field_sampling_mode: single
+  patch_size: 16
+  train_records: 3500000
+  val_records: 8192
+  test_records: 8192
+  sample_indices: all
+  time_indices: all
+  split_mode: sample
+  split_train_ratio: 0.8
+  split_val_ratio: 0.1
+  split_test_ratio: 0.1
+  unique_records: true
+  ensure_disjoint_records: true
+  seed: 42
+  device: auto
+  batch_size: 64
+  eval_batch_size: 64
+  epochs: 2
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  num_workers: 4
+  distributed_timeout_seconds: 1800
+  llm_gradient_checkpointing: true
+
+  encoder_source: patch_ae_config
+  train_patch_ae: true
+  freeze_patch_ae_after_pretrain: false
+  alignment_patch_ae_lr_scale: 0.1
+  patch_ae_pretrain_epochs: 2
+  patch_ae_pretrain_batch_size: 256
+  resize_patch_to_compressor_input: false
+  patch_encoder:
+    normalization:
+      mode: zscore
+      scope: channel
+      stats_path: null
+      clip_min: null
+      clip_max: null
+    model:
+      name: conv_token_autoencoder_2d
+      input_size: [16, 16]
+      base_channels: 32
+      channel_multipliers: []
+      num_res_blocks: 1
+      latent_dim: 8
+      latent_grid: [16, 16]
+      preserve_input_channels: true
+      dropout: 0.0
+      norm: group
+      activation: gelu
+      output_activation: identity
+
+  adapter_type: spatial_transformer
+  adapter_dim: 512
+  query_tokens: 256
+  adapter_layers: 2
+  adapter_heads: 8
+  projection_dim: null
+  alignment_transform:
+    mode: whitening
+    whitening:
+      records: 2048
+      dim: 512
+      shrinkage: 0.01
+      epsilon: 1.0e-5
+      max_condition_number: 1000.0
+  alignment_projection:
+    dim: 512
+    hidden_dim: 1024
+    layers: 1
+    dropout: 0.0
+    shared: false
+  dropout: 0.0
+  soft_prompt_scale: 0.05
+  temperature: 0.07
+  contrastive_loss_weight: 1.0
+  contrastive_direction_weights:
+    i2t: 0.6
+    t2i: 0.4
+  centered_contrastive_loss_weight: 0.25
+  native_centered_contrastive_loss_weight: 0.5
+  mean_alignment_loss_weight: 0.5
+  reconstruction_loss_weight: 1.0
+
+  teacher_text_source: normalized
+  alignment_text_layout: values_shared_suffix
+  alignment_anchor_mode: probe
+  representation_suffix: "\nRepresentation:"
+  probe_families: [point_value]
+  probe_region_size: 4
+  evaluation_probe_count: 8
+  teacher_probe_warn_below_correlation: 0.1
+  teacher_probe_diagnostic_records: 128
+  max_shared_suffix_tokens: 32
+  fail_on_text_anchor_missing: true
+  fail_on_text_max_length_hit: true
+  global_retrieval_eval: true
+  global_retrieval_max_records: 8192
+  global_retrieval_chunk_size: 1024
+  text_prompt_template: compact
+  text_decimal_places: 2
+  max_text_tokens: 3072
+  text_preflight_records: 32
+  teacher_layer: 2
+  auxiliary_teacher_layers: []
+  auxiliary_teacher_layer_weights: []
+  log_interval: 20
+
+wandb:
+  enabled: false
+  project: field-to-llm
+  group: stage1
+  mode: offline
+  log_model: false

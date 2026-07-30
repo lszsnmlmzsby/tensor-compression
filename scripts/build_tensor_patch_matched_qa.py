@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Build strict Stage-2B matched QA records from immutable patch latents."""
+"""Build strict matched QA records from immutable field-patch latents."""
 
 import argparse
 import copy
@@ -82,9 +82,9 @@ RAW_STATS_RE = re.compile(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build QA-only matched-coordinate Stage-2B assets without writing latent files."
+        description="Build matched-coordinate QA assets without rewriting field latents."
     )
-    parser.add_argument("--config", type=str, default="configs/tensor_llm_adapter_pipeline.yaml")
+    parser.add_argument("--config", type=str, default="configs/field_to_llm_stage1.yaml")
     parser.add_argument("--source-qa-dir", type=str, default=None)
     parser.add_argument("--output-qa-dir", type=str, default=None)
     parser.add_argument("--latent-dir", type=str, default=None)
@@ -100,7 +100,9 @@ def parse_args() -> argparse.Namespace:
 
     path_defaults = {
         "source_qa_dir": first_nested(config, ["patch_qa.qa_dir"]),
-        "output_qa_dir": first_nested(config, ["patch_qa.stage2b_qa_dir"]),
+        "output_qa_dir": first_nested(
+            config, ["patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"]
+        ),
         "latent_dir": first_nested(config, ["patch_qa.latent_dir"]),
         "alignment_checkpoint": first_nested(config, ["patch_qa.alignment_checkpoint"]),
     }
@@ -111,23 +113,31 @@ def parse_args() -> argparse.Namespace:
     set_default(
         args,
         "numeric_min_gap",
-        first_nested(config, ["patch_qa.stage2b_numeric_min_gap", "patch_qa.numeric_choice_spacing"]),
+        first_nested(
+            config,
+            ["patch_qa.matched_numeric_min_gap", "patch_qa.stage2b_numeric_min_gap", "patch_qa.numeric_choice_spacing"],
+        ),
         0.5,
     )
     set_default(
         args,
         "region_min_gap",
-        first_nested(config, ["patch_qa.stage2b_region_min_gap"]),
+        first_nested(config, ["patch_qa.matched_region_min_gap", "patch_qa.stage2b_region_min_gap"]),
         0.2,
     )
     set_default(args, "region_size", first_nested(config, ["patch_qa.region_size"]), 4)
     set_default(args, "decimal_places", first_nested(config, ["patch_qa.decimal_places"]), 6)
-    set_default(args, "overwrite", first_nested(config, ["patch_qa.stage2b_overwrite"]), False)
+    set_default(
+        args,
+        "overwrite",
+        first_nested(config, ["patch_qa.matched_overwrite", "patch_qa.stage2b_overwrite"]),
+        False,
+    )
     require_args(args, ["source_qa_dir", "output_qa_dir", "latent_dir", "alignment_checkpoint"])
     if float(args.numeric_min_gap) <= 0.0 or float(args.region_min_gap) <= 0.0:
-        raise ValueError("Stage-2B numeric and region gaps must be positive.")
+        raise ValueError("Matched-QA numeric and region gaps must be positive.")
     if int(args.region_size) <= 0 or int(args.decimal_places) <= 0:
-        raise ValueError("Stage-2B region size and decimal places must be positive.")
+        raise ValueError("Matched-QA region size and decimal places must be positive.")
     return args
 
 
@@ -215,18 +225,18 @@ def source_split_index(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str,
 
 def validate_source_metadata(metadata: Mapping[str, Any], alignment_path: Path) -> dict[str, Any]:
     if str(metadata.get("format", "")) != PATCH_QA_FORMAT:
-        raise ValueError("Stage-2B source QA must be the immutable tensor_patch_qa_v3 asset.")
+        raise ValueError("Matched-QA source must be the immutable tensor_patch_qa_v3 asset.")
     if str(metadata.get("prompt_contract", "")) != PATCH_QA_PROMPT_CONTRACT:
-        raise ValueError("Stage-2B source QA has an incompatible prompt contract.")
+        raise ValueError("Matched-QA source has an incompatible prompt contract.")
     if int(metadata.get("natural_language_coordinate_origin", -1)) != 1:
-        raise ValueError("Stage-2B source QA must use one-based natural-language coordinates.")
+        raise ValueError("Matched-QA source must use one-based natural-language coordinates.")
     if str(metadata.get("latent_format", "")) != PATCH_LATENT_FORMAT:
-        raise ValueError("Stage-2B source QA has an incompatible latent format.")
+        raise ValueError("Matched-QA source has an incompatible latent format.")
     if str(metadata.get("latent_audit_format", "")) != PATCH_LATENT_AUDIT_FORMAT:
-        raise ValueError("Stage-2B source QA has an incompatible latent-audit format.")
+        raise ValueError("Matched-QA source has an incompatible latent-audit format.")
     if str(metadata.get("storage_dtype", "")) != "float16":
         raise ValueError(
-            "Stage-2B matched targets are defined from the stored FP16 channel; "
+            "Matched-QA targets are defined from the stored FP16 channel; "
             f"source metadata reports storage_dtype={metadata.get('storage_dtype')!r}."
         )
     expected_sha = str(metadata.get("alignment_checkpoint_sha256", "")).lower()
@@ -258,11 +268,11 @@ def validate_preserved_channel_checkpoint(
     if not isinstance(model, Mapping):
         raise ValueError("Alignment compressor_config is missing model settings.")
     if str(model.get("name", "")) != "conv_token_autoencoder_2d":
-        raise ValueError("Stage-2B requires conv_token_autoencoder_2d preserved-input latents.")
+        raise ValueError("Matched QA requires conv_token_autoencoder_2d preserved-input latents.")
     if not bool(model.get("preserve_input_channels", False)):
-        raise ValueError("Stage-2B requires compressor.model.preserve_input_channels=true.")
+        raise ValueError("Matched QA requires model.preserve_input_channels=true.")
     if int(model.get("in_channels", 1)) != 1:
-        raise ValueError("Stage-2B currently requires a single preserved input channel.")
+        raise ValueError("Matched QA currently requires a single preserved input channel.")
     input_size = tuple(int(value) for value in model.get("input_size", ()))
     latent_grid = tuple(int(value) for value in model.get("latent_grid", input_size))
     expected_grid = tuple(int(value) for value in latent_shape[-2:])
@@ -425,9 +435,9 @@ def assign_spatial_families(
     for state_ref, record in representatives.items():
         capability = capabilities.get(state_ref)
         if not isinstance(capability, Mapping) or not bool(capability.get("eligible", False)):
-            raise ValueError(f"Cannot assign an ineligible Stage-2B train state: {state_ref}.")
+            raise ValueError(f"Cannot assign an ineligible matched-QA train state: {state_ref}.")
         if not bool(capability.get("point_pair_supported", False)):
-            raise ValueError(f"Eligible Stage-2B state lacks point-pair support: {state_ref}.")
+            raise ValueError(f"Eligible matched-QA state lacks point-pair support: {state_ref}.")
         by_field[str(record["field"])].append(state_ref)
 
     result: dict[str, str] = {}
@@ -471,9 +481,9 @@ def state_selection_summary(
         excluded_by_reason[reason] += 1
         excluded_by_field_and_reason[field][reason] += 1
     if set(representatives) != included_states | set(exclusion_reasons):
-        raise RuntimeError("Stage-2B state-selection audit does not cover every source state exactly once.")
+        raise RuntimeError("Matched-QA selection audit does not cover every source state exactly once.")
     if included_states & set(exclusion_reasons):
-        raise RuntimeError("Stage-2B state-selection audit marks states as both included and excluded.")
+        raise RuntimeError("Matched-QA selection audit marks states as both included and excluded.")
     return {
         "source_states": len(representatives),
         "included_states": len(included_states),
@@ -909,7 +919,7 @@ def grounding_target_from_source(record: Mapping[str, Any]) -> dict[str, Any]:
     height, width = int(grid[0]), int(grid[1])
     origin = int(metadata.get("coordinate_origin", -1))
     if origin != 1:
-        raise ValueError("Stage-2B evaluation grounding expects one-based source questions.")
+        raise ValueError("Matched-QA evaluation expects one-based source questions.")
 
     def point(row: str, col: str) -> list[int]:
         result = [int(row) - origin, int(col) - origin]
@@ -1332,7 +1342,7 @@ def build_state_records(
     )
     records.append(extreme)
     if len(records) != 9:
-        raise RuntimeError(f"Stage-2B state {state_ref} generated {len(records)} records instead of 9.")
+        raise RuntimeError(f"Matched-QA state {state_ref} generated {len(records)} records instead of 9.")
     return records
 
 
@@ -1344,7 +1354,7 @@ def main() -> None:
     alignment_path = Path(args.alignment_checkpoint).expanduser().resolve()
     if paths_overlap(output_root, source_root) or paths_overlap(output_root, latent_root):
         raise ValueError(
-            "Stage-2B output QA directory must be disjoint from source QA and latent directories."
+            "Matched-QA output must be disjoint from source QA and latent directories."
         )
     source_marker = source_root / PATCH_QA_BUILD_MARKER
     if source_marker.exists():
@@ -1417,7 +1427,7 @@ def main() -> None:
     if output_root.exists() and not bool(args.overwrite):
         existing = [output_root / name for name in ("train.jsonl", "val.jsonl", "test.jsonl", "metadata.json")]
         if any(path.exists() for path in existing):
-            raise FileExistsError(f"Stage-2B output already exists under {output_root}; pass --overwrite.")
+            raise FileExistsError(f"Matched-QA output already exists under {output_root}; pass --overwrite.")
     output_root.mkdir(parents=True, exist_ok=True)
     marker = output_root / PATCH_QA_BUILD_MARKER
     atomic_dump(
@@ -1433,7 +1443,7 @@ def main() -> None:
         # Validate every train latent first, then separate data integrity from
         # task feasibility.  Constant/low-variation states are valid cache
         # entries but cannot honestly supply the three distinct numeric answers
-        # required by the matched Stage-2B objective.
+        # required by the matched-question objective.
         train_values: dict[str, torch.Tensor] = {}
         train_capabilities: dict[str, dict[str, Any]] = {}
         train_exclusion_reasons: dict[str, str] = {}
@@ -1462,7 +1472,7 @@ def main() -> None:
                 )
         if not included_train_states:
             raise ValueError(
-                "No train state can supply the configured Stage-2B numeric gaps; "
+                "No train state can supply the configured matched-QA numeric gaps; "
                 "rebuild source QA with variance-aware patch sampling or lower the gaps explicitly."
             )
         source_train_fields = {
@@ -1474,7 +1484,7 @@ def main() -> None:
         }
         if included_train_fields != source_train_fields:
             raise ValueError(
-                "Stage-2B feasibility filtering removed every train state for one or more fields: "
+                "Matched-QA feasibility filtering removed every train state for one or more fields: "
                 f"source_fields={sorted(source_train_fields)}, "
                 f"included_fields={sorted(included_train_fields)}. Rebuild the source QA with "
                 "variance-aware sampling instead of silently dropping a field."
@@ -1491,7 +1501,7 @@ def main() -> None:
         family_counts = Counter(family_by_state.values())
         if not family_counts["point"] or not family_counts["region"]:
             raise ValueError(
-                "Stage-2B feasibility filtering left no support for one spatial family: "
+                "Matched-QA feasibility filtering left no support for one spatial family: "
                 f"family_counts={dict(family_counts)}. Rebuild source QA with more varied patches."
             )
         train_selection = state_selection_summary(
@@ -1568,7 +1578,7 @@ def main() -> None:
             }
             if missing_train_answer_labels:
                 raise ValueError(
-                    "Stage-2B train filtering removed required answer-label coverage: "
+                    "Matched-QA train filtering removed required answer-label coverage: "
                     f"{missing_train_answer_labels}."
                 )
         train_values.clear()
@@ -1623,7 +1633,7 @@ def main() -> None:
                 candidate_values.pop(state_ref, None)
             included_states = set(candidate_values)
             if not included_states:
-                raise ValueError(f"Stage-2B filtering removed the entire {split} split.")
+                raise ValueError(f"Matched-QA filtering removed the entire {split} split.")
             source_fields = {
                 str(record["field"])
                 for record in split_representatives[split].values()
@@ -1634,7 +1644,7 @@ def main() -> None:
             }
             if included_fields != source_fields:
                 raise ValueError(
-                    f"Stage-2B evaluation replay filtering removed every {split} state for one or "
+                    f"Matched-QA replay filtering removed every {split} state for one or "
                     f"more fields: source_fields={sorted(source_fields)}, "
                     f"included_fields={sorted(included_fields)}."
                 )
@@ -1675,7 +1685,7 @@ def main() -> None:
                 }
                 if missing_answer_labels:
                     raise ValueError(
-                        f"Stage-2B {split} filtering removed required answer-label coverage: "
+                        f"Matched-QA {split} filtering removed required answer-label coverage: "
                         f"{missing_answer_labels}."
                     )
             evaluation_output_counts[split] = split_counts
@@ -1684,13 +1694,13 @@ def main() -> None:
 
         after_digest, after_inventory = latent_inventory(latent_paths)
         if before_digest != after_digest or before_inventory != after_inventory:
-            raise RuntimeError("Latent inventory changed while Stage-2B QA was being generated.")
+            raise RuntimeError("Latent inventory changed while matched QA was being generated.")
         source_hashes_after = {
             "metadata": sha256_file(metadata_path),
             **{split: sha256_file(path) for split, path in split_paths.items()},
         }
         if source_hashes_before != source_hashes_after:
-            raise RuntimeError("Source QA metadata or JSONL changed during Stage-2B generation.")
+            raise RuntimeError("Source QA metadata or JSONL changed during matched-QA generation.")
         output_split_hashes = {
             split: sha256_file(output_root / f"{split}.jsonl")
             for split in ("train", "val", "test")
@@ -1829,7 +1839,7 @@ def main() -> None:
         raise
 
     print(
-        f"stage2b_qa_dir={output_root} source_train_states={len(train_representatives)} "
+        f"matched_qa_dir={output_root} source_train_states={len(train_representatives)} "
         f"train_states={len(included_train_states)} "
         f"excluded_train_states={len(train_representatives) - len(included_train_states)} "
         f"train_records={sum(output_counts.values())} "

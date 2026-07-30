@@ -1,288 +1,89 @@
 from __future__ import annotations
 
-import tempfile
-import unittest
 from pathlib import Path
 import sys
 
 import torch
 import yaml
 
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from tensor_compression.config import load_config
-from tensor_compression.data.datasets.tensor_folder_2d import TensorFolder2DDataset
+from tensor_compression.data.normalization import denormalize_tensor, normalize_tensor
 
 
-def _write_config(path: Path, payload: dict) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
+def load_release_config(name: str) -> dict:
+    path = PROJECT_ROOT / "configs" / name
+    with path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    assert isinstance(payload, dict)
+    return payload
 
 
-class TestConfigSynchronization(unittest.TestCase):
-    def test_scales_latent_dim_with_channel_count_when_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "hdf5_dataset_keys": ["density", "pressure", "Vx", "Vy"],
-                            "normalization": {"mode": "zscore", "scope": "channel"},
-                        }
-                    },
-                    "model": {
-                        "name": "conv_token_autoencoder_2d",
-                        "input_size": [32, 32],
-                        "latent_grid": [2, 2],
-                        "channel_multipliers": [1, 2, 4, 8],
-                        "base_channels": 8,
-                        "num_res_blocks": 1,
-                        "latent_dim": 128,
-                        "latent_dim_base": 128,
-                        "latent_dim_scale_with_channels": True,
-                        "latent_dim_reference_channels": 1,
-                        "latent_dim_round_to": 32,
-                        "dropout": 0.0,
-                        "norm": "group",
-                        "activation": "gelu",
-                        "output_activation": "identity",
-                    },
-                },
-            )
+def test_stage1_release_recipe_keeps_encoder_trainable() -> None:
+    config = load_release_config("field_to_llm_stage1.yaml")
+    alignment = config["patch_alignment"]
 
-            config = load_config(config_path, base_root=PROJECT_ROOT)
-
-        self.assertEqual(config["model"]["in_channels"], 4)
-        self.assertEqual(config["model"]["latent_dim_base"], 128)
-        self.assertEqual(config["model"]["latent_dim"], 512)
-
-    def test_keeps_base_latent_dim_for_single_channel_when_scaling_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "hdf5_dataset_key": "Vx",
-                            "normalization": {"mode": "zscore", "scope": "channel"},
-                        }
-                    },
-                    "model": {
-                        "name": "conv_token_autoencoder_2d",
-                        "input_size": [32, 32],
-                        "latent_grid": [2, 2],
-                        "channel_multipliers": [1, 2, 4, 8],
-                        "base_channels": 8,
-                        "num_res_blocks": 1,
-                        "latent_dim": 128,
-                        "latent_dim_scale_with_channels": True,
-                        "latent_dim_reference_channels": 1,
-                        "latent_dim_round_to": 32,
-                        "dropout": 0.0,
-                        "norm": "group",
-                        "activation": "gelu",
-                        "output_activation": "identity",
-                    },
-                },
-            )
-
-            config = load_config(config_path, base_root=PROJECT_ROOT)
-
-        self.assertEqual(config["model"]["in_channels"], 1)
-        self.assertEqual(config["model"]["latent_dim"], 128)
-
-    def test_inferrs_channels_when_explicit_values_are_omitted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "hdf5_dataset_keys": ["density", "pressure", "Vx", "Vy", "Vz"],
-                            "normalization": {"mode": "zscore", "scope": "channel"},
-                        }
-                    },
-                    "model": {
-                        "name": "conv_token_autoencoder_2d",
-                        "input_size": [32, 32],
-                        "latent_grid": [2, 2],
-                        "channel_multipliers": [1, 2, 4, 8],
-                        "base_channels": 8,
-                        "num_res_blocks": 1,
-                        "latent_dim": 16,
-                        "dropout": 0.0,
-                        "norm": "group",
-                        "activation": "gelu",
-                        "output_activation": "identity",
-                    },
-                },
-            )
-
-            config = load_config(config_path, base_root=PROJECT_ROOT)
-
-        self.assertEqual(config["data"]["dataset"]["channels"], 5)
-        self.assertEqual(config["model"]["in_channels"], 5)
-        self.assertEqual(config["model"]["out_channels"], 5)
-
-    def test_syncs_model_channels_from_hdf5_dataset_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "channels": 4,
-                            "hdf5_dataset_keys": ["density", "pressure", "Vx", "Vy"],
-                            "normalization": {"mode": "none"},
-                        }
-                    },
-                    "model": {
-                        "name": "conv_token_autoencoder_2d",
-                        "input_size": [32, 32],
-                        "latent_grid": [2, 2],
-                        "channel_multipliers": [1, 2, 4, 8],
-                        "base_channels": 8,
-                        "num_res_blocks": 1,
-                        "latent_dim": 16,
-                        "dropout": 0.0,
-                        "norm": "group",
-                        "activation": "gelu",
-                        "output_activation": "identity",
-                    },
-                },
-            )
-
-            config = load_config(config_path, base_root=PROJECT_ROOT)
-
-        self.assertEqual(config["data"]["dataset"]["channels"], 4)
-        self.assertEqual(config["model"]["in_channels"], 4)
-        self.assertEqual(config["model"]["out_channels"], 4)
-
-    def test_rejects_channel_count_mismatch_against_hdf5_dataset_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "channels": 3,
-                            "hdf5_dataset_keys": ["density", "pressure", "Vx", "Vy"],
-                        }
-                    },
-                    "model": {},
-                },
-            )
-
-            with self.assertRaisesRegex(ValueError, "does not match the number of hdf5_dataset_keys"):
-                load_config(config_path, base_root=PROJECT_ROOT)
-
-    def test_rejects_single_field_config_with_non_unit_channels(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.yaml"
-            _write_config(
-                config_path,
-                {
-                    "data": {
-                        "dataset": {
-                            "channels": 2,
-                            "hdf5_dataset_key": "Vx",
-                        }
-                    },
-                    "model": {},
-                },
-            )
-
-            with self.assertRaisesRegex(ValueError, "must be 1 when using a single hdf5_dataset_key"):
-                load_config(config_path, base_root=PROJECT_ROOT)
+    assert alignment["fields"] == ["Vx", "Vy", "density", "pressure"]
+    assert alignment["train_records"] == 3_500_000
+    assert alignment["batch_size"] == 64
+    assert alignment["eval_batch_size"] == 64
+    assert alignment["encoder_source"] == "patch_ae_config"
+    assert alignment["train_patch_ae"] is True
+    assert alignment["freeze_patch_ae_after_pretrain"] is False
+    assert alignment["patch_ae_pretrain_epochs"] == 2
+    assert alignment["text_decimal_places"] == 2
+    assert alignment["query_tokens"] == 256
 
 
-class TestChannelWiseNormalization(unittest.TestCase):
-    def _dataset(self, normalization: dict) -> TensorFolder2DDataset:
-        config = {
-            "data": {
-                "dataset_name": "tensor_folder_2d",
-                "source_roots": {
-                    "all_primary": str(PROJECT_ROOT / "data" / "raw" / "all"),
-                    "all_extra": [],
-                    "train_primary": "",
-                    "train_extra": [],
-                    "val_primary": "",
-                    "val_extra": [],
-                    "test_primary": "",
-                    "test_extra": [],
-                },
-                "split": {
-                    "mode": "auto",
-                    "train_ratio": 1.0,
-                    "val_ratio": 0.0,
-                    "test_ratio": 0.0,
-                    "shuffle": False,
-                    "seed": 42,
-                },
-                "dataset": {
-                    "recursive": True,
-                    "allow_empty": True,
-                    "extensions": [".npy"],
-                    "npz_key": None,
-                    "hdf5_dataset_key": None,
-                    "hdf5_key_candidates": [],
-                    "detect_hdf5_by_signature": True,
-                    "hdf5_index_mode": "auto",
-                    "hdf5_sample_axes": None,
-                    "hdf5_sample_axis": 0,
-                    "allow_images": False,
-                    "channels": 2,
-                    "input_size": [2, 2],
-                    "strict_size": True,
-                    "resize_mode": "bilinear",
-                    "normalization": normalization,
-                },
-            }
-        }
-        return TensorFolder2DDataset(config=config, split="train")
+def test_release_configs_expose_only_the_paper_interfaces() -> None:
+    direct = load_release_config("field_to_llm_direct_qa.yaml")
+    cross = load_release_config("field_to_llm_cross_attention.yaml")
+    benchmark = load_release_config("field_to_llm_benchmark.yaml")
 
-    def test_channelwise_minmax_normalizes_each_channel_independently(self) -> None:
-        dataset = self._dataset({"mode": "minmax", "scope": "channel", "clip_min": None, "clip_max": None})
-        tensor = torch.tensor(
-            [
-                [[0.0, 2.0], [4.0, 6.0]],
-                [[10.0, 14.0], [18.0, 22.0]],
-            ]
-        )
-
-        normalized, _ = dataset.normalize_tensor(tensor)
-
-        expected = torch.tensor(
-            [
-                [[0.0, 1.0 / 3.0], [2.0 / 3.0, 1.0]],
-                [[0.0, 1.0 / 3.0], [2.0 / 3.0, 1.0]],
-            ]
-        )
-        self.assertTrue(torch.allclose(normalized, expected, atol=1.0e-6))
-
-    def test_channelwise_zscore_roundtrips_with_denormalize(self) -> None:
-        dataset = self._dataset({"mode": "zscore", "scope": "channel", "clip_min": None, "clip_max": None})
-        tensor = torch.tensor(
-            [
-                [[1.0, 3.0], [5.0, 7.0]],
-                [[100.0, 120.0], [140.0, 160.0]],
-            ]
-        )
-
-        normalized, state = dataset.normalize_tensor(tensor)
-        restored = dataset.denormalize_tensor(normalized, state)
-
-        self.assertTrue(torch.allclose(restored, tensor, atol=1.0e-5))
+    assert direct["adapter"]["architecture"] == "alignment_adapter"
+    assert direct["adapter"]["question_conditioning"] is False
+    assert direct["adapter"]["structured_query_conditioning"] is False
+    assert cross["memory"]["freeze_spatial_backbone"] is True
+    assert cross["cross_attention"]["layers_1based"] == [8, 20, 32]
+    assert cross["runtime"]["final_eval_reserve_minutes"] == 70
+    assert benchmark["benchmark"]["methods"] == ["serialized", "dense"]
+    assert benchmark["benchmark"]["max_records"] is None
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+def test_channelwise_minmax_normalizes_each_channel_independently() -> None:
+    config = {"mode": "minmax", "scope": "channel", "clip_min": None, "clip_max": None}
+    tensor = torch.tensor(
+        [
+            [[0.0, 2.0], [4.0, 6.0]],
+            [[10.0, 14.0], [18.0, 22.0]],
+        ]
+    )
+
+    normalized, _ = normalize_tensor(tensor, config)
+
+    expected = torch.tensor(
+        [
+            [[0.0, 1.0 / 3.0], [2.0 / 3.0, 1.0]],
+            [[0.0, 1.0 / 3.0], [2.0 / 3.0, 1.0]],
+        ]
+    )
+    assert torch.allclose(normalized, expected, atol=1.0e-6)
+
+
+def test_channelwise_zscore_roundtrips_with_denormalize() -> None:
+    config = {"mode": "zscore", "scope": "channel", "clip_min": None, "clip_max": None}
+    tensor = torch.tensor(
+        [
+            [[1.0, 3.0], [5.0, 7.0]],
+            [[100.0, 120.0], [140.0, 160.0]],
+        ]
+    )
+
+    normalized, state = normalize_tensor(tensor, config)
+    restored = denormalize_tensor(normalized, state)
+
+    assert torch.allclose(restored, tensor, atol=1.0e-5)

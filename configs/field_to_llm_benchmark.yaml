@@ -1,0 +1,63 @@
+# Paired paper benchmark: serialized field versus the final cross-attention
+# interface on the same records, order, frozen LLM, and three A800 GPUs.
+# Required: FIELD_TO_LLM_ROOT, FIELD_TO_LLM_ALIGNMENT_CHECKPOINT,
+# FIELD_TO_LLM_DIRECT_CHECKPOINT, and FIELD_TO_LLM_CROSS_CHECKPOINT.
+
+storage:
+  hf_home: ${FIELD_TO_LLM_ROOT}/hf_cache
+  output_root: ${FIELD_TO_LLM_ROOT}/runs
+
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: null
+  torch_dtype: bfloat16
+  trust_remote_code: false
+
+data:
+  qa_dir: ${FIELD_TO_LLM_ROOT}/data/matched_patch_qa
+  latent_dir: ${FIELD_TO_LLM_ROOT}/data/patch_latents
+  alignment_checkpoint: ${FIELD_TO_LLM_ALIGNMENT_CHECKPOINT}
+  prefer_record_latent_ref: false
+  latent_cache_size: 8192
+  num_workers: 2
+
+memory:
+  init_checkpoint: ${FIELD_TO_LLM_DIRECT_CHECKPOINT}
+
+training:
+  questions_per_state_group: 3
+  prompt_template: task_specific
+  max_prompt_tokens: 512
+
+benchmark:
+  run_name: field_to_llm_inference_benchmark
+  output_root: ${FIELD_TO_LLM_ROOT}/runs
+  dense_checkpoint: ${FIELD_TO_LLM_CROSS_CHECKPOINT}
+  methods: [serialized, dense]
+  split: test
+  batch_size: 4
+  max_records: null
+  model_only: true
+  timing_records: 256
+  timing_repetitions: 3
+  warmup_batches: 3
+  prewarm_input_files: true
+  matrix_significant_digits: 6
+  matrix_cache_size: 2048
+  serialized_max_prompt_tokens: 8192
+  dense_max_prompt_tokens: 512
+  save_predictions: true
+  bootstrap_samples: 2000
+  bootstrap_seed: 20260729
+  gpu_hour_price: null
+  price_currency: CNY
+
+runtime:
+  seed: 42
+  shuffle_seed: 42
+  device: auto
+  distributed_timeout_seconds: 7200
+  serialize_llm_loading: true
+  low_cpu_mem_usage: true
+  min_host_memory_available_gib: 16
+  console_progress: true

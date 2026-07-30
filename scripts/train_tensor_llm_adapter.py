@@ -61,7 +61,7 @@ from tensor_compression.downstream.patch_qa_prompt import (  # noqa: E402
     task_specific_instruction,
     valid_choice_instruction,
 )
-from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
+from tensor_compression.downstream.field_io import resolve_device  # noqa: E402
 from tensor_compression.integrations import WandbLogger  # noqa: E402
 from tensor_compression.utils import dump_json  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
@@ -3552,9 +3552,22 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
             config, ["llm_training.matched_group_loss_margin"]
         ),
     }
+    reported_loss_fields = set(configured_loss_fields)
+    if configured_architecture in DIRECT_ALIGNMENT_ARCHITECTURES:
+        reported_loss_fields = {
+            "ce_loss_weight",
+            "choice_ce_loss_weight",
+            "ranking_loss_weight",
+            "ranking_loss_margin",
+            "swapped_question_loss_weight",
+            "swapped_question_loss_margin",
+            "matched_group_loss_weight",
+            "matched_group_loss_margin",
+        }
     defaulted_loss_fields = [
         field
         for field, configured_value in configured_loss_fields.items()
+        if field in reported_loss_fields
         if args.config and getattr(args, field, None) is None and configured_value is None
     ]
 

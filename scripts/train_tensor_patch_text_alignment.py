@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from tensor_compression.config import load_config  # noqa: E402
-from tensor_compression.downstream.pdebench import (  # noqa: E402
+from tensor_compression.downstream.field_io import (  # noqa: E402
     resolve_checkpoint_field_keys,
     resolve_device,
     resize_chw_batch,

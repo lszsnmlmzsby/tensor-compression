@@ -49,7 +49,7 @@ from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     validate_stage1_alignment_checkpoint_payload,
     validate_patch_latent_payload,
 )
-from tensor_compression.downstream.pdebench import resolve_device  # noqa: E402
+from tensor_compression.downstream.field_io import resolve_device  # noqa: E402
 from tensor_compression.models import build_model  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
     first_nested,

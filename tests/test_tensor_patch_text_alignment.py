@@ -11,7 +11,6 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from scripts.scan_tensor_teacher_layers import probe_target_and_control_perturbations, resolve_scan_args
 from scripts.train_tensor_patch_text_alignment import (
     AlignmentAnchor,
     AlignmentProjectionPair,
@@ -290,7 +289,7 @@ def test_teacher_text_serializes_raw_values_at_configured_precision() -> None:
 
     texts = build_teacher_texts_for_batch({"patch": patches}, patches, args)
 
-    assert texts == ["[[[1.0000, 1.0000]; [0.0000, 0.0000]]]"
+    assert texts == ["[[[1.0000, 1.0000]; [0.0000, 0.0000]]]"]
 
 
 def test_teacher_text_uses_normalized_patch_when_configured() -> None:
@@ -1093,39 +1092,6 @@ def test_point_value_evaluation_cycles_all_eight_short_stems() -> None:
     assert len({anchor.token_ids for anchor in anchors}) == 8
 
 
-@pytest.mark.parametrize("configured", ["point_value", ["point_value"], "point_value,point_mean"])
-def test_layer_scan_parses_probe_family_scalars_and_lists(configured) -> None:
-    cli = SimpleNamespace(
-        anchor_mode=None,
-        split=None,
-        records=None,
-        batch_size=None,
-        layers=None,
-        probe_count=None,
-        perturbation_scale=None,
-        device=None,
-        output=None,
-    )
-    config = {
-        "model": {"name_or_path": "unused-test-model"},
-        "patch_alignment": {
-            "hdf5_path": "unused-test-data.h5",
-            "fields": ["Vx"],
-            "probe_families": configured,
-            "teacher_text_source": "raw",
-            "patch_encoder": {"normalization": {"mode": "none"}},
-        },
-    }
-
-    resolved = resolve_scan_args(cli, config)
-
-    assert resolved.probe_families == (
-        ["point_value", "point_mean"]
-        if configured == "point_value,point_mean"
-        else ["point_value"]
-    )
-
-
 def test_probe_channel_text_matches_parameter_channel() -> None:
     tokenizer = CharacterTokenizer()
     anchor = build_numeric_probe_anchor(
@@ -1359,30 +1325,3 @@ def test_contrastive_direction_weights_reject_non_finite_values(invalid: float) 
             i2t_weight=invalid,
             t2i_weight=1.0,
         )
-
-
-def test_layer_scan_control_changes_equal_number_of_off_target_values() -> None:
-    patch = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
-    anchor = AlignmentAnchor(
-        name="difference",
-        mode="probe",
-        token_ids=(1,),
-        text="\nThe difference is",
-        probe_family="point_difference",
-        probe_template_index=0,
-        probe_parameters=(0, 1, 1, 2, 2),
-    )
-
-    target_perturbed, control_perturbed = probe_target_and_control_perturbations(
-        patch,
-        anchor,
-        scale=0.1,
-    )
-    original_target, _ = probe_targets_from_patches(anchor, patch, decimal_places=4)
-    changed_target, _ = probe_targets_from_patches(anchor, target_perturbed, decimal_places=4)
-    control_target, _ = probe_targets_from_patches(anchor, control_perturbed, decimal_places=4)
-
-    assert int(target_perturbed.ne(patch).sum().item()) == 2
-    assert int(control_perturbed.ne(patch).sum().item()) == 2
-    assert not torch.equal(changed_target, original_target)
-    assert torch.equal(control_target, original_target)

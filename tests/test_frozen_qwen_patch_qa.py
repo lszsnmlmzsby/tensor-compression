@@ -332,7 +332,7 @@ class FrozenQwenPatchQATests(unittest.TestCase):
         self.assertEqual(second_oracles, 2)
         self.assertTrue(all("oracle" not in item for item in first))
 
-    def test_config_prefers_stage2b_qa_and_batch_is_cli_tunable(self) -> None:
+    def test_config_prefers_matched_qa_and_batch_is_cli_tunable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = root / "pipeline.yaml"
@@ -340,7 +340,7 @@ class FrozenQwenPatchQATests(unittest.TestCase):
                 "\n".join(
                     [
                         "patch_qa:",
-                        f"  stage2b_qa_dir: {root / 'stage2b'}",
+                        f"  matched_qa_dir: {root / 'matched'}",
                         f"  latent_dir: {root / 'latents'}",
                         "  qa_dir: /wrong/legacy/path",
                         "model:",
@@ -356,7 +356,7 @@ class FrozenQwenPatchQATests(unittest.TestCase):
                 encoding="utf-8",
             )
             args = baseline.parse_args(["--config", str(config), "--batch-size", "5"])
-        self.assertEqual(args.qa_dir, str(root / "stage2b"))
+        self.assertEqual(args.qa_dir, str(root / "matched"))
         self.assertEqual(args.latent_dir, str(root / "latents"))
         self.assertEqual(args.batch_size, 5)
         self.assertEqual(args.max_prompt_tokens, 8192)

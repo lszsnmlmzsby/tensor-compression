@@ -5,11 +5,16 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Virtual environments
+# Virtual environments and local tooling
 .venv/
 venv/
 env/
+.codex/
+.agents/
 
 # IDE and OS
 .idea/
@@ -19,55 +24,76 @@ env/
 .DS_Store
 Thumbs.db
 
-# Training outputs
-outputs/*
-!outputs/.gitkeep
-wandb/
+# Paper release configuration allowlist
+/configs/*
+!/configs/field_to_llm_stage1.yaml
+!/configs/field_to_llm_direct_qa.yaml
+!/configs/field_to_llm_cross_attention.yaml
+!/configs/field_to_llm_benchmark.yaml
+
+# Paper release entry-point allowlist
+/scripts/*
+!/scripts/train_tensor_patch_text_alignment.py
+!/scripts/build_tensor_patch_qa.py
+!/scripts/build_tensor_patch_matched_qa.py
+!/scripts/train_tensor_llm_adapter.py
+!/scripts/train_tensor_qwen_cross_attention.py
+!/scripts/evaluate_frozen_qwen_patch_qa.py
+!/scripts/benchmark_tensor_qwen_inference.py
+
+# Paper release test allowlist
+/tests/*
+!/tests/test_config_and_normalization.py
+!/tests/test_patch_qa_contract.py
+!/tests/test_tensor_patch_text_alignment.py
+!/tests/test_tensor_patch_matched_qa.py
+!/tests/test_direct_qa_warm_start.py
+!/tests/test_frozen_qwen_patch_qa.py
+!/tests/test_tensor_qwen_cross_attention.py
+!/tests/test_tensor_qwen_inference_benchmark.py
+
+# Historical compression, editor, and downstream-evaluation implementation
+/src/tensor_compression/adapters/
+/src/tensor_compression/data/builders.py
+/src/tensor_compression/data/datasets/
+/src/tensor_compression/downstream/pdebench.py
+/src/tensor_compression/downstream/tensor_edit_dataset.py
+/src/tensor_compression/engine/
+/src/tensor_compression/losses/
+/src/tensor_compression/metrics/
+/src/tensor_compression/models/compressors/conv_token_autoencoder_3d.py
+/src/tensor_compression/models/compressors/factorized_autoencoder_4d.py
+/src/tensor_compression/models/editors/
+/src/tensor_compression/utils/checkpoint.py
+/src/tensor_compression/utils/seed.py
+/src/tensor_compression/utils/visualization.py
+
+# Local research history and paper-authoring artifacts
+/training_workflow.md
+/docs/
+/figures/
+
+# Data, checkpoints, model weights, and generated outputs
+/data/
+/outputs/
+/runs/
+/wandb/
+/PDEBench_code/
+/models/
+/hf_cache/
+/tensor_llm_assets/
 *.pt
 *.pth
 *.ckpt
 *.onnx
+*.safetensors
+*.h5
+*.hdf5
 
 # Runtime artifacts
 *.log
 *.tmp
 *.temp
-
-# Local writing drafts
-docs/
-
-# Generated paper figures and rendering artifacts
-figures/
-
-# Local data
-PDEBench_code/
-
-data/raw/*
-!data/raw/.gitkeep
-!data/raw/all/
-!data/raw/train/
-!data/raw/val/
-!data/raw/test/
-data/raw/all/*
-data/raw/train/*
-data/raw/val/*
-data/raw/test/*
-!data/raw/all/.gitkeep
-!data/raw/train/.gitkeep
-!data/raw/val/.gitkeep
-!data/raw/test/.gitkeep
-
-data/interim/*
-!data/interim/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
-data/external/*
-!data/external/.gitkeep
-
-# Local model/cache directories
-models/
-hf_cache/
-tensor_llm_assets/
 
 # Sensitive local overrides
 .env
