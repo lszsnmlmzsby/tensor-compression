@@ -32,6 +32,7 @@ data:
 memory:
   init_checkpoint: ${FIELD_TO_LLM_DIRECT_CHECKPOINT}
   freeze_spatial_backbone: true
+  latent_channel_policy: all
   value_fourier_bands: 4
   value_hidden_dim: 128
 

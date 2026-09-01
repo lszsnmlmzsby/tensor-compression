@@ -10,6 +10,7 @@ and frozen-LLM utilities. The model never consumes parsed coordinates,
 import argparse
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import signal
@@ -135,6 +136,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--latent-channel-policy",
+        choices=("all", "value_only"),
+        default=None,
+        help="Preserve all cached channels or expose only the exact value channel for ablation.",
+    )
     parser.add_argument("--evaluate-test", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--console-progress", action=argparse.BooleanOptionalAction, default=None)
     cli = parser.parse_args()
@@ -198,6 +205,10 @@ def parse_args() -> argparse.Namespace:
     )
     args.latent_cache_size = int(_config_value(config, ["data.latent_cache_size"], 8192))
     args.num_workers = int(_config_value(config, ["data.num_workers"], 2))
+    args.latent_channel_policy = str(
+        cli.latent_channel_policy
+        or _config_value(config, ["memory.latent_channel_policy"], "all")
+    )
 
     args.device = str(_config_value(config, ["runtime.device"], "auto"))
     args.seed = int(_config_value(config, ["runtime.seed"], 42))
@@ -371,6 +382,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("cross-attention dropout must be in [0,1).")
     if args.batch_size <= 0 or args.gradient_accumulation_steps <= 0:
         raise ValueError("batch sizes and accumulation steps must be positive.")
+    if args.latent_channel_policy not in {"all", "value_only"}:
+        raise ValueError("memory.latent_channel_policy must be 'all' or 'value_only'.")
     validate_atomic_group_batch_size(
         args.batch_size,
         args.questions_per_state_group,
@@ -728,6 +741,7 @@ def audit_general_qa_datasets(
     state_sets: dict[str, set[str]] = {}
     all_qa_ids: dict[str, str] = {}
     for split, dataset in datasets.items():
+        record_contract_digest = hashlib.sha256()
         task_counts: dict[str, int] = defaultdict(int)
         field_counts: dict[str, int] = defaultdict(int)
         batch_groups: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
@@ -737,6 +751,19 @@ def audit_general_qa_datasets(
             qa_id = str(record.get("qa_id", ""))
             if not qa_id:
                 raise ValueError(f"{split} contains a record without qa_id.")
+            # Records originate in JSONL, so hashing the complete canonical
+            # object binds question text, ordered choices, label, sample/state,
+            # matched-group metadata, and every other effective input field.
+            record_contract_digest.update(
+                json.dumps(
+                    record,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
             previous_split = all_qa_ids.setdefault(qa_id, split)
             if previous_split != split:
                 raise ValueError(f"qa_id {qa_id!r} appears in both {previous_split} and {split}.")
@@ -781,6 +808,7 @@ def audit_general_qa_datasets(
             "batch_groups": len(batch_groups),
             "task_counts": dict(sorted(task_counts.items())),
             "field_counts": dict(sorted(field_counts.items())),
+            "record_contract_sha256": record_contract_digest.hexdigest(),
         }
     overlaps: dict[str, Any] = {}
     split_names = list(datasets)
@@ -825,6 +853,7 @@ def build_datasets(
         "shuffle_seed": int(args.shuffle_seed),
         "latent_cache_size": int(args.latent_cache_size),
         "latent_contract": latent_contract,
+        "latent_channel_policy": str(args.latent_channel_policy),
     }
     train_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.train_split),
@@ -1099,6 +1128,7 @@ def load_spatial_initializer(
     llm_hidden_size: int,
     latent_contract: Mapping[str, Any],
     expected_model_name: str,
+    expected_latent_channel_policy: str,
 ) -> tuple[TensorPatchAlignmentAdapter, dict[str, Any]]:
     path = Path(checkpoint_path).expanduser()
     if not path.exists():
@@ -1112,6 +1142,7 @@ def load_spatial_initializer(
         expected_llm_hidden_size=int(llm_hidden_size),
         expected_architecture="alignment_adapter",
         expected_latent_contract=latent_contract,
+        expected_latent_channel_policy=str(expected_latent_channel_policy),
     )
     checkpoint_args = checkpoint.get("args")
     if not isinstance(checkpoint_args, Mapping):
@@ -1122,6 +1153,12 @@ def load_spatial_initializer(
         raise ValueError(
             "Dense-memory initializer and current frozen Qwen identities differ: "
             f"initializer={checkpoint_model!r}, current={current_model!r}."
+        )
+    source_latent_channel_policy = str(checkpoint_args.get("latent_channel_policy", "all"))
+    if source_latent_channel_policy != str(expected_latent_channel_policy):
+        raise ValueError(
+            "Dense-memory initializer and cross-attention run use different latent channel policies: "
+            f"initializer={source_latent_channel_policy!r}, current={expected_latent_channel_policy!r}."
         )
     adapter = adapter_from_checkpoint(
         checkpoint,
@@ -1142,6 +1179,7 @@ def load_spatial_initializer(
             checkpoint_args.get("global_adapter_type", checkpoint_args.get("adapter_type", ""))
         ),
         "source_model": checkpoint_model,
+        "latent_channel_policy": source_latent_channel_policy,
     }
     return adapter, provenance
 
@@ -1214,6 +1252,7 @@ def build_sidecar(
         "gate_init": float(args.gate_init),
         "value_fourier_bands": int(args.value_fourier_bands),
         "freeze_spatial_backbone": bool(args.freeze_spatial_backbone),
+        "latent_channel_policy": str(args.latent_channel_policy),
     }
 
 
@@ -1382,6 +1421,7 @@ def architecture_contract(
         "value_fourier_bands": int(args.value_fourier_bands),
         "value_hidden_dim": int(args.value_hidden_dim),
         "freeze_spatial_backbone": bool(args.freeze_spatial_backbone),
+        "latent_channel_policy": str(args.latent_channel_policy),
         "initializer": dict(initializer),
         "latent_contract": copy.deepcopy(dict(latent_contract)),
         "forbidden_model_inputs": [
@@ -1423,6 +1463,13 @@ def validate_checkpoint_contract(
         for key in stable_keys
         if observed.get(key) != expected_contract.get(key)
     }
+    observed_latent_channel_policy = str(observed.get("latent_channel_policy", "all"))
+    expected_latent_channel_policy = str(expected_contract.get("latent_channel_policy", "all"))
+    if observed_latent_channel_policy != expected_latent_channel_policy:
+        differences["latent_channel_policy"] = {
+            "expected": expected_latent_channel_policy,
+            "observed": observed_latent_channel_policy,
+        }
     expected_init = expected_contract.get("initializer", {})
     observed_init = observed.get("initializer", {})
     if not isinstance(expected_init, Mapping) or not isinstance(observed_init, Mapping) or (
@@ -2097,6 +2144,7 @@ def main() -> None:
             llm_hidden_size,
             latent_contract,
             args.model_name_or_path,
+            args.latent_channel_policy,
         )
         sidecar, install_report = build_sidecar(
             llm,

@@ -1,0 +1,54 @@
+# Screening ablation: remove only the learned Stage-1 spatial-adapter
+# initialization. Cached latent channels and their encoder lineage are kept.
+#
+# Required environment variables are the same as the release configs:
+#   FIELD_TO_LLM_ROOT
+#   FIELD_TO_LLM_ALIGNMENT_CHECKPOINT
+#
+# The wrapper inherits every scientific training setting from the release
+# Direct-QA and cross-attention configs. Only run identity, test access, and
+# later-stage resume modes are overridden here.
+
+ablation:
+  condition: adapter_only
+  seed: 42
+  source_stage1_checkpoint: ${FIELD_TO_LLM_ALIGNMENT_CHECKPOINT}
+
+traceability:
+  require_git: true
+  require_clean_tracked_tree: true
+
+direct:
+  base_config: configs/field_to_llm_direct_qa.yaml
+  arg_overrides:
+    run_name: field_to_llm_stage1_adapter_ablation_direct
+    stage2_warm_start_checkpoint: null
+    stage2b_resume_checkpoint: null
+    joint_ab_training: false
+    point_reader_training: false
+    full_local_reader_training: false
+    evaluate_test: false
+
+dense:
+  base_config: configs/field_to_llm_cross_attention.yaml
+  arg_overrides:
+    run_name: field_to_llm_stage1_adapter_ablation_cross_attention
+    max_updates: 3000
+    evaluate_test: false
+
+evaluation_contract:
+  experiment_id: stage1_necessity_matched_v1
+  role: matched_three_condition_comparison
+  conditions: [full_stage1_reference, adapter_only, no_learned_stage1]
+  reference_condition: full_stage1_reference
+  primary_metric: validation_macro_accuracy
+  final_metric_after_protocol_lock: test_macro_accuracy
+  noninferiority_margin_percentage_points: 1.5
+  maximum_per_task_drop_percentage_points: 3.0
+  dense_screening_max_updates: 3000
+  screening_fractions: [0.125, 0.25, 0.50, 0.75, 1.0]
+  test_access: disabled_by_default
+  interpretation_guard: >-
+    Adapter-only does not remove learned encoder channels. No-learned-Stage1
+    retains per-patch normalization and downstream compute. Validation results
+    select the conclusion; the test split remains sealed until protocol lock.

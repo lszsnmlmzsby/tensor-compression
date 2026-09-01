@@ -211,6 +211,91 @@ python -m torch.distributed.run --standalone --nproc_per_node=3 \
   --splits test
 ```
 
+## Stage 1 Necessity Ablations
+
+One matched reference and two isolated ablations reuse the release Direct-QA
+recipe and a common 3,000-update cross-attention screening budget without
+changing the cached files:
+
+- `full_stage1_reference` preserves the learned Stage-1 spatial adapter and all
+  latent channels under the same current commit, seed, and downstream budgets.
+- `adapter_only` replaces the learned Stage-1 spatial adapter with
+  a deterministic random adapter of identical architecture while retaining all
+  latent channels.
+- `no_learned_stage1` applies the same adapter reset and exposes only latent
+  channel 0, the explicitly preserved standardized scalar. Learned channels
+  1 through N are zeroed at load time.
+
+Run the Direct and dense phases with the same condition config. Start with the
+matched reference shown here, then repeat with each ablation config:
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/train_tensor_qwen_stage1_ablation.py direct \
+  --config configs/field_to_llm_stage1_reference.yaml
+
+python -m torch.distributed.run --standalone --nproc_per_node=3 \
+  scripts/train_tensor_qwen_stage1_ablation.py dense \
+  --config configs/field_to_llm_stage1_reference.yaml \
+  --spatial-init-checkpoint "$FIELD_TO_LLM_ROOT/runs/<reference-direct-run>/adapter_best.pt"
+```
+
+The two ablation configs are
+`configs/field_to_llm_stage1_adapter_ablation.yaml` and
+`configs/field_to_llm_no_learned_stage1_ablation.yaml`. Test evaluation is
+forbidden in the Direct phase and disabled by default in the dense phase; pass
+`--resume <same-run>/cross_attention_last.pt --evaluate-test --protocol-lock
+<filled-lock.json>` to the same completed dense run only after the validation
+comparison is complete and the protocol is locked. The launcher verifies the
+locked validation run summary, data audit, best/last dense checkpoints, Direct
+checkpoint, and Direct companion audits before evaluating test metrics; a lock
+cannot authorize fresh training. Both trainers still construct all declared
+split records and perform integrity audits at startup, so “sealed” here means
+that test predictions and metrics are not computed before the lock, not that
+test JSONL bytes are never read.
+Use `configs/stage1_test_protocol_lock.example.json` as the lock template and
+copy the filled lock outside the Git worktree (for example under
+`$FIELD_TO_LLM_ROOT/runs/`), recording the validation comparison file's
+SHA-256. An interrupted validation phase can be continued with
+`--resume <run>/cross_attention_last.pt` while retaining the same lineage and
+world/effective-batch contract. Elapsed wall-clock time is cumulative across
+resume, so resume recovers an interruption but does not extend the configured
+wall-clock budget.
+
+The wrapper records the source checkpoint, source and effective initial adapter
+state digests, condition, config hashes, source commit, tracked-diff hash, and
+Direct checkpoint SHA. It refuses formal execution from a dirty tracked tree
+or while any experiment script/config is absent from the current commit.
+The adapter-only condition does **not** establish that the whole Stage 1 is
+unnecessary because its learned encoder channels remain active. A negative
+result from either screening condition also requires a clean shared-initializer
+fork to separate representation benefit from extra pretraining compute.
+
+After all three dense validation runs complete, audit invariants and apply the
+pre-registered non-inferiority guards:
+
+```bash
+python scripts/compare_tensor_qwen_stage1_ablation.py \
+  --reference "$FIELD_TO_LLM_ROOT/runs/<reference-dense-run>" \
+  --adapter-only "$FIELD_TO_LLM_ROOT/runs/<adapter-only-dense-run>" \
+  --no-learned-stage1 "$FIELD_TO_LLM_ROOT/runs/<no-learned-dense-run>" \
+  --split validation \
+  --output "$FIELD_TO_LLM_ROOT/runs/stage1_validation_comparison.json"
+```
+
+The comparison is rejected before scoring if the source Stage-1 SHA, tracked
+commit, QA-record fingerprints, model contract, trainable parameter count,
+record counts, or optimizer-update budget differ across conditions.
+Passing this screen is a reason to run a longer fixed-update confirmation, not
+by itself a final claim that every possible Stage 1 is unnecessary.
+
+The released Stage-1 artifact binds its embedded encoder state by SHA-256, but
+its older upstream compressor checkpoint path has no recorded checkpoint SHA
+(`source_encoder_lineage_complete=false`). This limits complete historical
+reconstruction of that ancestor; it does not weaken the three-condition
+comparison because every condition consumes the same byte-identical embedded
+encoder state.
+
 ## Paper Checkpoint Provenance
 
 The paper artifacts are identified by SHA-256 rather than machine-specific

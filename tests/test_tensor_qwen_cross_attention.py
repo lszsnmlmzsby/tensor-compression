@@ -13,6 +13,9 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(path))
 
 from scripts.train_tensor_qwen_cross_attention import (
+    CHECKPOINT_TYPE,
+    CHECKPOINT_VERSION,
+    validate_checkpoint_contract,
     validate_relocated_qa_latent_contract,
 )
 from tensor_compression.downstream.patch_qa_contract import (
@@ -42,6 +45,27 @@ def formal_metadata(declared_checkpoint: Path, checkpoint_sha256: str) -> dict[s
         "alignment_checkpoint": str(declared_checkpoint),
         "alignment_checkpoint_sha256": checkpoint_sha256,
     }
+
+
+def dense_architecture(*, latent_channel_policy: str | None) -> dict[str, object]:
+    architecture: dict[str, object] = {
+        "format": "dense_tensor_memory_cross_attention_v1",
+        "llm_hidden_size": 16,
+        "latent_shape": [8, 16, 16],
+        "layers_1based": [8, 20, 32],
+        "bridge_dim": 8,
+        "heads": 2,
+        "dropout": 0.0,
+        "gate_init": 0.0,
+        "value_fourier_bands": 4,
+        "value_hidden_dim": 8,
+        "freeze_spatial_backbone": True,
+        "initializer": {"sha256": "1" * 64},
+        "latent_contract": {"alignment_checkpoint_sha256": "2" * 64},
+    }
+    if latent_channel_policy is not None:
+        architecture["latent_channel_policy"] = latent_channel_policy
+    return architecture
 
 
 class TestRelocatedLatentContract(unittest.TestCase):
@@ -122,6 +146,33 @@ class TestRelocatedLatentContract(unittest.TestCase):
                 "changed after patch latents were generated",
             ):
                 validate_relocated_qa_latent_contract(metadata, configured)
+
+
+class TestLatentChannelPolicyContract(unittest.TestCase):
+    def test_legacy_dense_checkpoint_defaults_to_all_channels(self) -> None:
+        checkpoint = {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "architecture": dense_architecture(latent_channel_policy=None),
+        }
+
+        validate_checkpoint_contract(
+            checkpoint,
+            dense_architecture(latent_channel_policy="all"),
+        )
+
+    def test_dense_resume_rejects_latent_channel_policy_change(self) -> None:
+        checkpoint = {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "architecture": dense_architecture(latent_channel_policy=None),
+        }
+
+        with self.assertRaisesRegex(ValueError, "latent_channel_policy"):
+            validate_checkpoint_contract(
+                checkpoint,
+                dense_architecture(latent_channel_policy="value_only"),
+            )
 
 
 if __name__ == "__main__":

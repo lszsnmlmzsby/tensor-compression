@@ -30,6 +30,10 @@ Thumbs.db
 !/configs/field_to_llm_direct_qa.yaml
 !/configs/field_to_llm_cross_attention.yaml
 !/configs/field_to_llm_benchmark.yaml
+!/configs/field_to_llm_stage1_adapter_ablation.yaml
+!/configs/field_to_llm_no_learned_stage1_ablation.yaml
+!/configs/field_to_llm_stage1_reference.yaml
+!/configs/stage1_test_protocol_lock.example.json
 
 # Paper release entry-point allowlist
 /scripts/*
@@ -40,6 +44,8 @@ Thumbs.db
 !/scripts/train_tensor_qwen_cross_attention.py
 !/scripts/evaluate_frozen_qwen_patch_qa.py
 !/scripts/benchmark_tensor_qwen_inference.py
+!/scripts/train_tensor_qwen_stage1_ablation.py
+!/scripts/compare_tensor_qwen_stage1_ablation.py
 
 # Paper release test allowlist
 /tests/*
@@ -51,6 +57,8 @@ Thumbs.db
 !/tests/test_frozen_qwen_patch_qa.py
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_tensor_qwen_inference_benchmark.py
+!/tests/test_tensor_qwen_stage1_ablation.py
+!/tests/test_compare_tensor_qwen_stage1_ablation.py
 
 # Historical compression, editor, and downstream-evaluation implementation
 /src/tensor_compression/adapters/

@@ -1,0 +1,12 @@
+{
+  "experiment_id": "stage1_necessity_matched_v1",
+  "status": "locked",
+  "conditions": [
+    "full_stage1_reference",
+    "adapter_only",
+    "no_learned_stage1"
+  ],
+  "validation_comparison": "/absolute/path/to/stage1_validation_comparison.json",
+  "validation_comparison_sha256": "REPLACE_WITH_64_HEX_SHA256",
+  "decision_note": "REPLACE_WITH_THE_DECISION_MADE_BEFORE_OPENING_TEST"
+}

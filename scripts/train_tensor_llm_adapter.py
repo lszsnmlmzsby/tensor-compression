@@ -99,6 +99,7 @@ SUPPORTED_BASELINE_MODES = {
     "random",
     "shuffled_stats",
 }
+LATENT_CHANNEL_POLICIES = frozenset({"all", "value_only"})
 DIRECT_ALIGNMENT_ARCHITECTURES = frozenset({"alignment_qformer", "alignment_adapter"})
 CONTEXTUAL_LOCAL_ARCHITECTURES = frozenset(
     {
@@ -112,6 +113,31 @@ CONTEXTUAL_LOCAL_ARCHITECTURES = frozenset(
 
 def is_direct_alignment_architecture(value: str) -> bool:
     return str(value) in DIRECT_ALIGNMENT_ARCHITECTURES
+
+
+def apply_latent_channel_policy(
+    latent: torch.Tensor,
+    policy: str,
+    *,
+    source: str | Path | None = None,
+) -> torch.Tensor:
+    normalized = str(policy)
+    if normalized not in LATENT_CHANNEL_POLICIES:
+        raise ValueError(
+            f"Unsupported latent channel policy {policy!r}; expected one of "
+            f"{sorted(LATENT_CHANNEL_POLICIES)}."
+        )
+    if normalized == "all":
+        return latent
+    if latent.ndim != 3 or int(latent.shape[0]) < 1:
+        suffix = f" from {source}" if source is not None else ""
+        raise ValueError(
+            "value_only latent policy requires [C,H,W] with at least one channel; "
+            f"got {tuple(latent.shape)}{suffix}."
+        )
+    value_only = torch.zeros_like(latent)
+    value_only[0].copy_(latent[0])
+    return value_only
 
 
 def uses_contextual_local_prompt(args: argparse.Namespace) -> bool:
@@ -2201,6 +2227,7 @@ class TensorReadoutQADataset(Dataset):
         shuffle_seed: int = 42,
         latent_cache_size: int = 0,
         latent_contract: Mapping[str, Any] | None = None,
+        latent_channel_policy: str = "all",
     ) -> None:
         self.jsonl_path = Path(jsonl_path)
         self.latent_dir = Path(latent_dir)
@@ -2217,6 +2244,12 @@ class TensorReadoutQADataset(Dataset):
             raise RuntimeError(f"No QA records found in {self.jsonl_path}.")
         self.latent_cache_size = max(0, int(latent_cache_size))
         self.latent_contract = dict(latent_contract) if isinstance(latent_contract, Mapping) else None
+        self.latent_channel_policy = str(latent_channel_policy)
+        if self.latent_channel_policy not in LATENT_CHANNEL_POLICIES:
+            raise ValueError(
+                "Unsupported latent channel policy: "
+                f"{self.latent_channel_policy!r}; expected one of {sorted(LATENT_CHANNEL_POLICIES)}."
+            )
         self._latent_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._latent_path_cache: dict[str, Path] = {}
         self._latent_identity_cache: dict[str, dict[str, Any]] = {}
@@ -2444,6 +2477,11 @@ class TensorReadoutQADataset(Dataset):
         latent = self._latent_from_payload(payload, path=path, record=record)
         payload = None
         latent = latent.to(dtype=torch.float32)
+        latent = apply_latent_channel_policy(
+            latent,
+            self.latent_channel_policy,
+            source=path,
+        )
         cache_capacity = self.effective_latent_cache_size()
         if cache_capacity > 0:
             self._latent_cache[cache_key] = latent
@@ -2890,6 +2928,7 @@ def audit_qa_datasets(
     globally_seen_latent_paths: set[str] = set()
     latent_audit_started = time.monotonic()
     for split, dataset in datasets.items():
+        record_contract_digest = hashlib.sha256()
         qa_ids: set[str] = set()
         states: set[str] = set()
         samples: set[int] = set()
@@ -2901,6 +2940,16 @@ def audit_qa_datasets(
         numeric_option_records = 0
         ascending_numeric_option_records = 0
         for record in dataset.records:
+            record_contract_digest.update(
+                json.dumps(
+                    record,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
             qa_id = str(record.get("qa_id", ""))
             if not qa_id or qa_id in qa_ids:
                 raise ValueError(f"QA audit found a missing or duplicate qa_id in {split}: {qa_id!r}")
@@ -3001,6 +3050,7 @@ def audit_qa_datasets(
             "ascending_numeric_option_fraction": ascending_fraction,
             "matched_groups": audit_matched_groups(dataset.records),
             "complete_coverage_checked": bool(require_complete_split_coverage),
+            "record_contract_sha256": record_contract_digest.hexdigest(),
         }
     reference_split = "train" if "train" in split_tasks else next(iter(split_tasks))
     if require_complete_split_coverage:
@@ -3137,6 +3187,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-untruncated-prompts", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--prefer-record-latent-ref", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--latent-cache-size", type=int, default=None)
+    parser.add_argument(
+        "--latent-channel-policy",
+        choices=tuple(sorted(LATENT_CHANNEL_POLICIES)),
+        default=None,
+        help=(
+            "Runtime view of cached latent channels. 'value_only' preserves channel 0 and zeros "
+            "all learned channels without modifying cache files; intended for controlled ablations."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument(
         "--distributed-timeout-seconds",
@@ -3626,6 +3685,12 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         False,
     )
     set_default(args, "latent_cache_size", first_nested(config, ["llm_training.latent_cache_size"]), 32768)
+    set_default(
+        args,
+        "latent_channel_policy",
+        first_nested(config, ["llm_training.latent_channel_policy"]),
+        "all",
+    )
     set_default(args, "num_workers", first_nested(config, ["llm_training.num_workers"]), 0)
     set_default(
         args,
@@ -4591,6 +4656,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("llm_training.record_subset_mode must be 'prefix' or 'hash_state'.")
     if int(args.latent_cache_size) < 0 or int(args.num_workers) < 0:
         raise ValueError("llm_training.latent_cache_size and num_workers must be non-negative.")
+    if str(args.latent_channel_policy) not in LATENT_CHANNEL_POLICIES:
+        raise ValueError(
+            "llm_training.latent_channel_policy must be one of "
+            f"{sorted(LATENT_CHANNEL_POLICIES)}."
+        )
     if (
         not math.isfinite(float(args.distributed_timeout_seconds))
         or float(args.distributed_timeout_seconds) <= 0.0
@@ -10249,6 +10319,7 @@ def validate_latent_contract_compatibility(
 def audit_stage2_warm_start_checkpoint(
     path: str | Path,
     expected_latent_contract: Mapping[str, Any],
+    expected_latent_channel_policy: str = "all",
 ) -> dict[str, Any]:
     """Validate the warm-start envelope before loading the frozen LLM replicas."""
     checkpoint_path = Path(path).expanduser().resolve()
@@ -10270,6 +10341,7 @@ def audit_stage2_warm_start_checkpoint(
         expected_llm_hidden_size=llm_hidden_size,
         expected_architecture="alignment_adapter",
         expected_latent_contract=expected_latent_contract,
+        expected_latent_channel_policy=expected_latent_channel_policy,
     )
     return {
         "validated_before_llm_load": True,
@@ -10296,6 +10368,7 @@ def validate_adapter_checkpoint_payload(
     expected_llm_hidden_size: int,
     expected_architecture: str,
     expected_latent_contract: Mapping[str, Any],
+    expected_latent_channel_policy: str = "all",
 ) -> Mapping[str, torch.Tensor]:
     """Validate that a saved Stage-2 checkpoint is standalone and belongs to this run."""
     if not isinstance(checkpoint, Mapping):
@@ -10351,6 +10424,13 @@ def validate_adapter_checkpoint_payload(
         raise ValueError(
             "Stage-2 adapter checkpoint architecture mismatch: "
             f"observed={observed_architecture!r}, expected={str(expected_architecture)!r}."
+        )
+    observed_latent_channel_policy = str(checkpoint_args.get("latent_channel_policy", "all"))
+    if observed_latent_channel_policy != str(expected_latent_channel_policy):
+        raise ValueError(
+            "Stage-2 adapter checkpoint latent channel policy mismatch: "
+            f"observed={observed_latent_channel_policy!r}, "
+            f"expected={str(expected_latent_channel_policy)!r}."
         )
     observed_contract = checkpoint.get("latent_contract")
     if not isinstance(observed_contract, Mapping):
@@ -10810,6 +10890,7 @@ def save_validate_and_rebuild_adapter_checkpoint(
             expected_llm_hidden_size=int(llm_hidden_size),
             expected_architecture=str(args.adapter_architecture),
             expected_latent_contract=latent_contract,
+            expected_latent_channel_policy=str(args.latent_channel_policy),
         )
         rebuilt = adapter_from_checkpoint(
             checkpoint,
@@ -11656,6 +11737,7 @@ def main() -> None:
             lambda: audit_stage2_warm_start_checkpoint(
                 args.stage2_warm_start_checkpoint,
                 latent_contract,
+                str(args.latent_channel_policy),
             ),
             "Stage-2 warm-start checkpoint audit",
         )
@@ -11685,6 +11767,7 @@ def main() -> None:
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
         latent_contract=latent_contract,
+        latent_channel_policy=str(args.latent_channel_policy),
     )
     if bool(args.task_balanced_answer_loss):
         args.task_loss_weights = inverse_frequency_task_weights(
@@ -11703,6 +11786,7 @@ def main() -> None:
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
         latent_contract=latent_contract,
+        latent_channel_policy=str(args.latent_channel_policy),
     )
     test_dataset = TensorReadoutQADataset(
         qa_path(args.qa_dir, args.test_split),
@@ -11714,6 +11798,7 @@ def main() -> None:
         shuffle_seed=int(args.shuffle_seed),
         latent_cache_size=int(args.latent_cache_size),
         latent_contract=latent_contract,
+        latent_channel_policy=str(args.latent_channel_policy),
     )
     first_latent = train_dataset[0]["latent_map"]
     latent_shape = tuple(int(dim) for dim in first_latent.shape)
@@ -12084,6 +12169,7 @@ def main() -> None:
                 expected_llm_hidden_size=llm_hidden_size,
                 expected_architecture="alignment_adapter",
                 expected_latent_contract=latent_contract or {},
+                expected_latent_channel_policy=str(args.latent_channel_policy),
             )
             warm_args = warm_checkpoint.get("args")
             if not isinstance(warm_args, Mapping):
@@ -12217,6 +12303,7 @@ def main() -> None:
                     expected_llm_hidden_size=llm_hidden_size,
                     expected_architecture="grounded_evidence_adapter",
                     expected_latent_contract=latent_contract or {},
+                    expected_latent_channel_policy=str(args.latent_channel_policy),
                 )
                 resume_args = resume_checkpoint.get("args")
                 if not isinstance(resume_args, Mapping):
@@ -12648,6 +12735,7 @@ def main() -> None:
         "val_records": len(val_dataset),
         "test_records": len(test_dataset),
         "latent_cache_size": int(args.latent_cache_size),
+        "latent_channel_policy": str(args.latent_channel_policy),
         "num_workers": int(args.num_workers),
         "train_update_metrics": {
             "enabled": bool(args.save_step_metrics),
@@ -12888,6 +12976,7 @@ def main() -> None:
                 shuffle_seed=int(args.shuffle_seed),
                 latent_cache_size=int(args.latent_cache_size),
                 latent_contract=latent_contract,
+                latent_channel_policy=str(args.latent_channel_policy),
             )
             if uses_screened_stage2b_training(args):
                 screening_dataset = initial_dataset
@@ -14565,6 +14654,7 @@ def main() -> None:
                     expected_llm_hidden_size=llm_hidden_size,
                     expected_architecture=str(args.adapter_architecture),
                     expected_latent_contract=latent_contract or {},
+                    expected_latent_channel_policy=str(args.latent_channel_policy),
                 )
                 adapter.load_state_dict(candidate_state, strict=True)
                 del candidate_state, candidate_checkpoint
@@ -14620,6 +14710,7 @@ def main() -> None:
                 expected_llm_hidden_size=llm_hidden_size,
                 expected_architecture=str(args.adapter_architecture),
                 expected_latent_contract=latent_contract or {},
+                expected_latent_channel_policy=str(args.latent_channel_policy),
             )
             adapter.load_state_dict(selected_state, strict=True)
             del selected_state, selected_checkpoint
@@ -14722,6 +14813,7 @@ def main() -> None:
             expected_llm_hidden_size=llm_hidden_size,
             expected_architecture=str(args.adapter_architecture),
             expected_latent_contract=latent_contract or {},
+            expected_latent_channel_policy=str(args.latent_channel_policy),
         )
         # Reconstruct from metadata instead of loading back into the existing
         # object. This proves adapter_best.pt is independently usable by later

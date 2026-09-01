@@ -50,6 +50,7 @@ llm_training:
   require_untruncated_prompts: true
   prefer_record_latent_ref: false
   latent_cache_size: 8192
+  latent_channel_policy: all
   num_workers: 0
   distributed_timeout_seconds: 7200
   serialize_llm_loading: true

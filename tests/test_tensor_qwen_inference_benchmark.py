@@ -15,6 +15,7 @@ for search_path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from scripts.benchmark_tensor_qwen_inference import (  # noqa: E402
     aggregate_cost_reports,
     apply_checkpoint_architecture,
+    apply_checkpoint_dataset_policy,
     attention_score_proxy,
     distribution_summary,
     paired_contingency,
@@ -182,7 +183,34 @@ class TestTensorQwenInferenceBenchmark(unittest.TestCase):
         self.assertEqual(args.bridge_heads, 8)
         self.assertEqual(args.value_fourier_bands, 4)
         self.assertTrue(args.freeze_spatial_backbone)
+        self.assertEqual(args.latent_channel_policy, "all")
+        self.assertEqual(observed["latent_channel_policy"], "all")
         self.assertEqual(observed["value_hidden_dim"], 128)
+
+        value_only_checkpoint = {
+            **checkpoint,
+            "architecture": {
+                **checkpoint["architecture"],
+                "latent_channel_policy": "value_only",
+            },
+        }
+        value_only_args = argparse.Namespace()
+        observed_value_only = apply_checkpoint_architecture(
+            value_only_args, value_only_checkpoint
+        )
+        self.assertEqual(value_only_args.latent_channel_policy, "value_only")
+        self.assertEqual(observed_value_only["latent_channel_policy"], "value_only")
+
+    def test_dense_dataset_policy_is_applied_before_first_latent_access(self) -> None:
+        dataset = argparse.Namespace(_latent_cache={}, latent_channel_policy="all")
+        apply_checkpoint_dataset_policy(dataset, "value_only")
+        self.assertEqual(dataset.latent_channel_policy, "value_only")
+
+        accessed_dataset = argparse.Namespace(
+            _latent_cache={"state": object()}, latent_channel_policy="all"
+        )
+        with self.assertRaisesRegex(RuntimeError, "accessed before"):
+            apply_checkpoint_dataset_policy(accessed_dataset, "value_only")
 
     def test_paired_contingency_and_cluster_bootstrap(self) -> None:
         serialized = [

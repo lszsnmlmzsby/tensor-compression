@@ -47,7 +47,9 @@ def test_release_configs_expose_only_the_paper_interfaces() -> None:
     assert direct["adapter"]["architecture"] == "alignment_adapter"
     assert direct["adapter"]["question_conditioning"] is False
     assert direct["adapter"]["structured_query_conditioning"] is False
+    assert direct["llm_training"]["latent_channel_policy"] == "all"
     assert cross["memory"]["freeze_spatial_backbone"] is True
+    assert cross["memory"]["latent_channel_policy"] == "all"
     assert cross["cross_attention"]["layers_1based"] == [8, 20, 32]
     assert cross["runtime"]["final_eval_reserve_minutes"] == 70
     assert benchmark["benchmark"]["methods"] == ["serialized", "dense"]
