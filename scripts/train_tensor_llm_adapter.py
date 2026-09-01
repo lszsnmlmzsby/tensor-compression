@@ -65,6 +65,7 @@ from tensor_compression.downstream.field_io import resolve_device  # noqa: E402
 from tensor_compression.integrations import WandbLogger  # noqa: E402
 from tensor_compression.utils import dump_json  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
+    environment_override,
     first_nested,
     load_yaml_mapping,
     require_args,
@@ -3630,7 +3631,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         if args.config and getattr(args, field, None) is None and configured_value is None
     ]
 
-    model_local_dir = first_nested(config, ["model.local_dir"])
+    model_local_dir = environment_override(
+        "FIELD_TO_LLM_MODEL_DIR",
+        first_nested(config, ["model.local_dir"]),
+    )
     model_name = first_nested(config, ["model.name_or_path", "model.model_name_or_path"])
     if args.model_name_or_path is None:
         args.model_name_or_path = (
@@ -3645,8 +3649,14 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         else None
     ) or first_nested(config, ["patch_qa.qa_dir", "data.qa_dir"])
     path_defaults = {
-        "qa_dir": configured_qa_dir,
-        "latent_dir": first_nested(config, ["patch_qa.latent_dir", "data.latent_dir", "latent_export.output_dir"]),
+        "qa_dir": environment_override("FIELD_TO_LLM_DIRECT_QA_DIR", configured_qa_dir),
+        "latent_dir": environment_override(
+            "FIELD_TO_LLM_LATENT_DIR",
+            first_nested(
+                config,
+                ["patch_qa.latent_dir", "data.latent_dir", "latent_export.output_dir"],
+            ),
+        ),
         "qa_alignment_checkpoint": first_nested(config, ["patch_qa.alignment_checkpoint"]),
         "adapter_init_checkpoint": first_nested(config, ["adapter.init_checkpoint", "patch_qa.alignment_checkpoint"]),
         "stage2_warm_start_checkpoint": first_nested(
@@ -3655,9 +3665,18 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "stage2b_resume_checkpoint": first_nested(
             config, ["adapter.stage2b_resume_checkpoint"]
         ),
-        "output_root": first_nested(config, ["llm_training.output_root", "storage.output_root"]),
-        "cache_dir": first_nested(config, ["model.cache_dir", "storage.hf_home"]),
-        "hf_home": first_nested(config, ["storage.hf_home"]),
+        "output_root": environment_override(
+            "FIELD_TO_LLM_RUNS_DIR",
+            first_nested(config, ["llm_training.output_root", "storage.output_root"]),
+        ),
+        "cache_dir": environment_override(
+            "FIELD_TO_LLM_HF_HOME",
+            first_nested(config, ["model.cache_dir", "storage.hf_home"]),
+        ),
+        "hf_home": environment_override(
+            "FIELD_TO_LLM_HF_HOME",
+            first_nested(config, ["storage.hf_home"]),
+        ),
     }
     for attr, value in path_defaults.items():
         if getattr(args, attr, None) is None and value is not None:

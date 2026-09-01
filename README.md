@@ -101,7 +101,9 @@ python -m pip install -r requirements.txt
 
 Weights can be downloaded by Transformers from
 `Qwen/Qwen2.5-14B-Instruct`. For an offline model copy, set `model.local_dir` in
-the four release configurations to its absolute path.
+the release configurations to its absolute path. The Direct-QA and
+cross-attention entry points also accept `FIELD_TO_LLM_MODEL_DIR`, which takes
+precedence without requiring a tracked configuration edit.
 
 ## Data And Paths
 
@@ -118,6 +120,19 @@ Set a writable experiment root and the source HDF5 path:
 export FIELD_TO_LLM_ROOT=/absolute/path/to/field_to_llm_assets
 export PDEBENCH_HDF5=/absolute/path/to/2D_CFD_Turb_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
 mkdir -p "$FIELD_TO_LLM_ROOT"/{data,hf_cache,runs}
+```
+
+For machines whose existing assets do not share that directory layout, the
+Direct-QA and cross-attention entry points accept the following optional path
+overrides while retaining `FIELD_TO_LLM_ROOT` as the fallback:
+
+```bash
+export FIELD_TO_LLM_HF_HOME=/absolute/path/to/hf_cache
+export FIELD_TO_LLM_RUNS_DIR=/absolute/path/to/runs
+export FIELD_TO_LLM_MODEL_DIR=/absolute/path/to/Qwen2.5-14B-Instruct
+export FIELD_TO_LLM_DIRECT_QA_DIR=/absolute/path/to/direct_qa
+export FIELD_TO_LLM_MATCHED_QA_DIR=/absolute/path/to/matched_qa
+export FIELD_TO_LLM_LATENT_DIR=/absolute/path/to/patch_latents
 ```
 
 Verify the source data before training:

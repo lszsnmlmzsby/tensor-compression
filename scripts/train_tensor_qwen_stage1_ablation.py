@@ -180,6 +180,20 @@ def _validate_condition_match(configured: Any, contract: Mapping[str, Any]) -> s
     return configured_condition
 
 
+def _validate_exact_model_identity(direct_model: Any, dense_model: Any) -> None:
+    def normalized(value: Any) -> str:
+        return str(value or "").strip().replace("\\", "/").rstrip("/")
+
+    direct_identity = normalized(direct_model)
+    dense_identity = normalized(dense_model)
+    if not direct_identity or direct_identity != dense_identity:
+        raise ValueError(
+            "Dense Stage-1 comparison must use the exact frozen-LLM identifier recorded "
+            "by its Direct initializer. "
+            f"direct={direct_identity!r}, dense={dense_identity!r}."
+        )
+
+
 def _mapping_for_digest(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Missing or invalid {label} mapping.")
@@ -1097,6 +1111,36 @@ def _ablation_contract_identity(contract: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _dense_training_recipe(
+    args: argparse.Namespace,
+    *,
+    launch_world_size: int,
+) -> dict[str, Any]:
+    """Record the matched Dense recipe while preserving full-dataset limits."""
+
+    def optional_int(value: Any) -> int | None:
+        return None if value is None else int(value)
+
+    return {
+        "world_size": int(launch_world_size),
+        "per_rank_batch_size": int(args.batch_size),
+        "eval_batch_size": int(args.eval_batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "effective_batch_size": int(args.batch_size)
+        * int(args.gradient_accumulation_steps)
+        * int(launch_world_size),
+        "epochs": int(args.epochs),
+        "max_updates": int(args.max_updates),
+        "seed": int(args.seed),
+        "shuffle_seed": int(args.shuffle_seed),
+        "record_subset_mode": str(args.record_subset_mode),
+        "model_name_or_path": str(args.model_name_or_path),
+        "max_train_records": optional_int(args.max_train_records),
+        "max_val_records": optional_int(args.max_val_records),
+        "max_test_records": optional_int(args.max_test_records),
+    }
+
+
 def _run_direct(
     config: Mapping[str, Any],
     orchestration_config: Path,
@@ -1463,6 +1507,10 @@ def _run_dense(
     def parse_args() -> argparse.Namespace:
         args = original_parse()
         args.memory_init_checkpoint = str(init_path)
+        _validate_exact_model_identity(
+            direct_args.get("model_name_or_path"),
+            args.model_name_or_path,
+        )
         if str(args.latent_channel_policy) != "all":
             raise ValueError(
                 "The production dense base config must use latent_channel_policy='all'; "
@@ -1475,23 +1523,10 @@ def _run_dense(
             raise ValueError("WORLD_SIZE must be a positive integer for matched training.") from error
         if launch_world_size <= 0:
             raise ValueError("WORLD_SIZE must be a positive integer for matched training.")
-        dense_training_recipe = {
-            "world_size": launch_world_size,
-            "per_rank_batch_size": int(args.batch_size),
-            "eval_batch_size": int(args.eval_batch_size),
-            "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
-            "effective_batch_size": int(args.batch_size)
-            * int(args.gradient_accumulation_steps)
-            * launch_world_size,
-            "epochs": int(args.epochs),
-            "max_updates": int(args.max_updates),
-            "seed": int(args.seed),
-            "shuffle_seed": int(args.shuffle_seed),
-            "record_subset_mode": str(args.record_subset_mode),
-            "max_train_records": int(args.max_train_records),
-            "max_val_records": int(args.max_val_records),
-            "max_test_records": int(args.max_test_records),
-        }
+        dense_training_recipe = _dense_training_recipe(
+            args,
+            launch_world_size=launch_world_size,
+        )
         dense_contract["dense_training_recipe"] = dense_training_recipe
         expected_dense_identity = _ablation_contract_identity(dense_contract)
         for checkpoint_label, observed_identity in locked_dense_identities:

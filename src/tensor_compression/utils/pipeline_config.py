@@ -38,6 +38,15 @@ def first_nested(config: Mapping[str, Any], dotted_paths: Sequence[str], default
     return default
 
 
+def environment_override(name: str, configured_value: Any) -> Any:
+    """Use a non-empty machine-local environment value before a portable config value."""
+
+    override = os.environ.get(name)
+    if override is None or not override.strip():
+        return configured_value
+    return override
+
+
 def resolve_path_string(value: Any, project_root: str | Path) -> str | None:
     if value is None:
         return None

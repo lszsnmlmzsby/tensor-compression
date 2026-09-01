@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
@@ -21,6 +22,7 @@ from scripts.train_tensor_qwen_stage1_ablation import (
     LOCKED_VALIDATION_ARTIFACT_FIELDS,
     _ablation_contract_identity,
     _build_ablation_contract,
+    _dense_training_recipe,
     _direct_run_audit,
     _enforce_traceability,
     _json_digest,
@@ -32,6 +34,7 @@ from scripts.train_tensor_qwen_stage1_ablation import (
     _validate_ablation_contract,
     _validate_condition_match,
     _validate_dense_lineage,
+    _validate_exact_model_identity,
     _validated_dense_checkpoint_payload,
     _validate_forwarded_flags,
     _validate_override_keys,
@@ -165,6 +168,18 @@ def test_dense_phase_rejects_cross_condition_direct_checkpoint(
         _validate_condition_match(configured, {"condition": checkpoint})
 
 
+def test_dense_phase_requires_exact_direct_model_identifier() -> None:
+    _validate_exact_model_identity(
+        "/models/Qwen2.5-14B-Instruct/",
+        "/models/Qwen2.5-14B-Instruct",
+    )
+    with pytest.raises(ValueError, match="exact frozen-LLM identifier"):
+        _validate_exact_model_identity(
+            "/models/first/Qwen2.5-14B-Instruct",
+            "/models/second/Qwen2.5-14B-Instruct",
+        )
+
+
 def test_test_access_requires_lock_and_exact_resume() -> None:
     with pytest.raises(ValueError, match="cannot authorize a fresh"):
         _validate_test_access_request(
@@ -194,6 +209,32 @@ def test_dense_recipe_is_part_of_resume_identity() -> None:
     changed["dense_training_recipe"]["world_size"] = 1
 
     assert _ablation_contract_identity(first) != _ablation_contract_identity(changed)
+
+
+def test_dense_recipe_preserves_full_dataset_limits() -> None:
+    args = argparse.Namespace(
+        batch_size=3,
+        eval_batch_size=4,
+        gradient_accumulation_steps=1,
+        epochs=2,
+        max_updates=3000,
+        seed=42,
+        shuffle_seed=42,
+        record_subset_mode="hash_state",
+        model_name_or_path="/models/Qwen2.5-14B-Instruct",
+        max_train_records=None,
+        max_val_records=None,
+        max_test_records=None,
+    )
+
+    recipe = _dense_training_recipe(args, launch_world_size=3)
+
+    assert recipe["world_size"] == 3
+    assert recipe["effective_batch_size"] == 9
+    assert recipe["model_name_or_path"] == "/models/Qwen2.5-14B-Instruct"
+    assert recipe["max_train_records"] is None
+    assert recipe["max_val_records"] is None
+    assert recipe["max_test_records"] is None
 
 
 def test_formal_traceability_rejects_untracked_experiment_file() -> None:

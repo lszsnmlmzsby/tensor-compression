@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -15,6 +17,7 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from scripts.train_tensor_qwen_cross_attention import (
     CHECKPOINT_TYPE,
     CHECKPOINT_VERSION,
+    parse_args,
     validate_checkpoint_contract,
     validate_relocated_qa_latent_contract,
 )
@@ -173,6 +176,42 @@ class TestLatentChannelPolicyContract(unittest.TestCase):
                 checkpoint,
                 dense_architecture(latent_channel_policy="value_only"),
             )
+
+
+class TestMachinePathOverrides(unittest.TestCase):
+    def test_cross_attention_machine_paths_override_portable_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "FIELD_TO_LLM_ROOT": str(root / "portable-root"),
+                "FIELD_TO_LLM_ALIGNMENT_CHECKPOINT": str(root / "alignment_best.pt"),
+                "FIELD_TO_LLM_DIRECT_CHECKPOINT": str(root / "adapter_best.pt"),
+                "FIELD_TO_LLM_HF_HOME": str(root / "hf"),
+                "FIELD_TO_LLM_RUNS_DIR": str(root / "runs"),
+                "FIELD_TO_LLM_MODEL_DIR": str(root / "Qwen2.5-14B-Instruct"),
+                "FIELD_TO_LLM_MATCHED_QA_DIR": str(root / "matched-qa"),
+                "FIELD_TO_LLM_LATENT_DIR": str(root / "latents"),
+            }
+            argv = [
+                "train_tensor_qwen_cross_attention.py",
+                "--config",
+                str(PROJECT_ROOT / "configs" / "field_to_llm_cross_attention.yaml"),
+            ]
+
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                sys, "argv", argv
+            ):
+                args = parse_args()
+
+            self.assertEqual(
+                args.model_name_or_path,
+                environment["FIELD_TO_LLM_MODEL_DIR"],
+            )
+            self.assertEqual(args.qa_dir, environment["FIELD_TO_LLM_MATCHED_QA_DIR"])
+            self.assertEqual(args.latent_dir, environment["FIELD_TO_LLM_LATENT_DIR"])
+            self.assertEqual(args.cache_dir, environment["FIELD_TO_LLM_HF_HOME"])
+            self.assertEqual(args.hf_home, environment["FIELD_TO_LLM_HF_HOME"])
+            self.assertEqual(args.output_root, environment["FIELD_TO_LLM_RUNS_DIR"])
 
 
 if __name__ == "__main__":

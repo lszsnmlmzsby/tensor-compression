@@ -26,7 +26,7 @@ def test_paper_direct_qa_config_resolves_to_prefix_warm_start(tmp_path: Path) ->
         str(PROJECT_ROOT / "configs" / "field_to_llm_direct_qa.yaml"),
     ]
 
-    with patch.dict(os.environ, environment, clear=False), patch.object(sys, "argv", argv):
+    with patch.dict(os.environ, environment, clear=True), patch.object(sys, "argv", argv):
         args = parse_args()
 
     assert args.adapter_architecture == "alignment_adapter"
@@ -45,6 +45,33 @@ def test_paper_direct_qa_config_resolves_to_prefix_warm_start(tmp_path: Path) ->
     assert args.ranking_loss_negative == "no_latent"
     assert args.matched_group_loss_weight == 0.0
     assert args.full_local_reader_training is False
+
+
+def test_direct_qa_machine_paths_override_portable_root(tmp_path: Path) -> None:
+    paths = {
+        "FIELD_TO_LLM_ROOT": str(tmp_path / "portable-root"),
+        "FIELD_TO_LLM_ALIGNMENT_CHECKPOINT": str(tmp_path / "alignment_best.pt"),
+        "FIELD_TO_LLM_HF_HOME": str(tmp_path / "hf"),
+        "FIELD_TO_LLM_RUNS_DIR": str(tmp_path / "runs"),
+        "FIELD_TO_LLM_MODEL_DIR": str(tmp_path / "Qwen2.5-14B-Instruct"),
+        "FIELD_TO_LLM_DIRECT_QA_DIR": str(tmp_path / "direct-qa"),
+        "FIELD_TO_LLM_LATENT_DIR": str(tmp_path / "latents"),
+    }
+    argv = [
+        "train_tensor_llm_adapter.py",
+        "--config",
+        str(PROJECT_ROOT / "configs" / "field_to_llm_direct_qa.yaml"),
+    ]
+
+    with patch.dict(os.environ, paths, clear=True), patch.object(sys, "argv", argv):
+        args = parse_args()
+
+    assert args.model_name_or_path == paths["FIELD_TO_LLM_MODEL_DIR"]
+    assert args.qa_dir == paths["FIELD_TO_LLM_DIRECT_QA_DIR"]
+    assert args.latent_dir == paths["FIELD_TO_LLM_LATENT_DIR"]
+    assert args.cache_dir == paths["FIELD_TO_LLM_HF_HOME"]
+    assert args.hf_home == paths["FIELD_TO_LLM_HF_HOME"]
+    assert args.output_root == paths["FIELD_TO_LLM_RUNS_DIR"]
 
 
 def test_direct_qa_checkpoint_strictly_rebuilds_the_spatial_adapter() -> None:

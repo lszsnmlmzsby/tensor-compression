@@ -75,6 +75,7 @@ from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapte
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
 from tensor_compression.downstream.patch_qa_contract import canonical_path, sha256_file  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
+    environment_override,
     first_nested,
     load_yaml_mapping,
     resolve_path_string,
@@ -147,20 +148,40 @@ def parse_args() -> argparse.Namespace:
     cli = parser.parse_args()
     config = load_yaml_mapping(cli.config)
 
-    model_local = _config_value(config, ["model.local_dir"])
+    model_local = environment_override(
+        "FIELD_TO_LLM_MODEL_DIR",
+        _config_value(config, ["model.local_dir"]),
+    )
     model_name = _config_value(config, ["model.name_or_path", "model.model_name_or_path"])
     args = argparse.Namespace()
     args.config = str(cli.config)
     args.model_name_or_path = _path_value(model_local) if model_local else str(model_name or "")
     args.cache_dir = _path_value(
-        _config_value(config, ["model.cache_dir", "storage.hf_home"])
+        environment_override(
+            "FIELD_TO_LLM_HF_HOME",
+            _config_value(config, ["model.cache_dir", "storage.hf_home"]),
+        )
     )
-    args.hf_home = _path_value(_config_value(config, ["storage.hf_home"]))
+    args.hf_home = _path_value(
+        environment_override(
+            "FIELD_TO_LLM_HF_HOME",
+            _config_value(config, ["storage.hf_home"]),
+        )
+    )
     args.qa_dir = _path_value(
-        _config_value(config, ["data.qa_dir", "patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"])
+        environment_override(
+            "FIELD_TO_LLM_MATCHED_QA_DIR",
+            _config_value(
+                config,
+                ["data.qa_dir", "patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"],
+            ),
+        )
     )
     args.latent_dir = _path_value(
-        _config_value(config, ["data.latent_dir", "patch_qa.latent_dir"])
+        environment_override(
+            "FIELD_TO_LLM_LATENT_DIR",
+            _config_value(config, ["data.latent_dir", "patch_qa.latent_dir"]),
+        )
     )
     args.qa_alignment_checkpoint = _path_value(
         _config_value(config, ["data.alignment_checkpoint", "patch_qa.alignment_checkpoint"])
@@ -170,7 +191,10 @@ def parse_args() -> argparse.Namespace:
     )
     args.output_root = _path_value(
         cli.output_root
-        or _config_value(config, ["training.output_root", "storage.output_root"])
+        or environment_override(
+            "FIELD_TO_LLM_RUNS_DIR",
+            _config_value(config, ["training.output_root", "storage.output_root"]),
+        )
     )
     args.run_name = str(
         cli.run_name
