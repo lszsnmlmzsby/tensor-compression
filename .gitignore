@@ -108,3 +108,6 @@ Thumbs.db
 .env
 .env.*
 configs/local_*.yaml
+
+/tmp_svg_render/
+/submission_code/
