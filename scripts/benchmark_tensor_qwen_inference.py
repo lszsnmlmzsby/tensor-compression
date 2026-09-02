@@ -364,6 +364,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.value_fourier_bands = 0
     args.value_hidden_dim = 0
     args.freeze_spatial_backbone = True
+    args.input_source = "precomputed_latent"
+    args.memory_init_mode = "direct_qa_checkpoint"
+    args.field_encoder_trainable = False
     # The dense checkpoint is the source of truth.  Legacy checkpoints did not
     # record this field and are defined to mean the historical ``all`` policy.
     args.latent_channel_policy = None
@@ -569,6 +572,13 @@ def apply_checkpoint_architecture(
     args.value_fourier_bands = int(architecture["value_fourier_bands"])
     args.value_hidden_dim = int(architecture["value_hidden_dim"])
     args.freeze_spatial_backbone = bool(architecture["freeze_spatial_backbone"])
+    args.input_source = str(architecture.get("input_source", "precomputed_latent"))
+    args.memory_init_mode = str(
+        architecture.get("memory_init_mode", "direct_qa_checkpoint")
+    )
+    args.field_encoder_trainable = bool(
+        architecture.get("field_encoder_trainable", False)
+    )
     args.latent_channel_policy = str(architecture.get("latent_channel_policy", "all"))
     if args.latent_channel_policy not in {"all", "value_only"}:
         raise ValueError(
@@ -1677,6 +1687,15 @@ def load_dense_interface(
     if not isinstance(checkpoint, Mapping):
         raise ValueError("Dense checkpoint payload must be a mapping.")
     observed_architecture = apply_checkpoint_architecture(args, checkpoint)
+    if (
+        str(args.input_source) != "precomputed_latent"
+        or str(args.memory_init_mode) != "direct_qa_checkpoint"
+    ):
+        raise ValueError(
+            "The paired paper benchmark currently supports only precomputed-latent "
+            "checkpoints initialized by Direct-QA. Evaluate a Direct-Cross scratch run "
+            "with the trainer's built-in validation modes."
+        )
     apply_checkpoint_dataset_policy(dense_dataset, args.latent_channel_policy)
     first_latent = dense_dataset[0]["latent_map"]
     latent_shape = tuple(int(value) for value in first_latent.shape)
@@ -1692,6 +1711,7 @@ def load_dense_interface(
     sidecar, install_report = build_sidecar(llm, spatial_initializer, args, device)
     expected_architecture = architecture_contract(
         args,
+        latent_shape,
         latent_shape,
         hidden_size,
         latent_contract,

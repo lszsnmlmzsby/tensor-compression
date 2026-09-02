@@ -1,6 +1,6 @@
-# Final paper model: full-grid cross-attention into a frozen 14B LLM.
-# Required: FIELD_TO_LLM_ROOT, FIELD_TO_LLM_ALIGNMENT_CHECKPOINT,
-# and FIELD_TO_LLM_DIRECT_CHECKPOINT.
+# Primary Direct-Cross ablation: train the final full-grid cross-attention path
+# from raw fields without Stage-1 or Direct-QA model initialization.
+# Required: FIELD_TO_LLM_ROOT and PDEBENCH_HDF5.
 
 storage:
   hf_home: ${FIELD_TO_LLM_ROOT}/hf_cache
@@ -14,10 +14,13 @@ model:
   gradient_checkpointing: true
 
 data:
-  input_source: precomputed_latent
+  input_source: raw_hdf5
+  hdf5_path: ${PDEBENCH_HDF5}
+  patch_size: 16
+  # Matched-QA targets were constructed from the preserved FP16 value channel.
+  # Round the runtime-normalized raw patch identically without opening that cache.
+  raw_normalized_dtype: float16
   qa_dir: ${FIELD_TO_LLM_ROOT}/data/matched_patch_qa
-  latent_dir: ${FIELD_TO_LLM_ROOT}/data/patch_latents
-  alignment_checkpoint: ${FIELD_TO_LLM_ALIGNMENT_CHECKPOINT}
   train_split: train
   val_split: val
   test_split: test
@@ -26,14 +29,42 @@ data:
   max_test_records: null
   record_subset_mode: hash_state
   require_disjoint_splits: true
-  prefer_record_latent_ref: false
-  latent_cache_size: 8192
+  input_cache_size: 8192
   num_workers: 2
 
+field_encoder:
+  trainable: true
+  normalization:
+    mode: zscore
+    scope: channel
+    stats_path: null
+    clip_min: null
+    clip_max: null
+  model:
+    name: conv_token_autoencoder_2d
+    input_size: [16, 16]
+    base_channels: 32
+    channel_multipliers: []
+    num_res_blocks: 1
+    latent_dim: 8
+    latent_grid: [16, 16]
+    preserve_input_channels: true
+    dropout: 0.0
+    norm: group
+    activation: gelu
+    output_activation: identity
+
+spatial_adapter:
+  type: full_grid_transformer
+  adapter_dim: 512
+  adapter_layers: 2
+  adapter_heads: 8
+  dropout: 0.0
+
 memory:
-  init_mode: direct_qa_checkpoint
-  init_checkpoint: ${FIELD_TO_LLM_DIRECT_CHECKPOINT}
-  freeze_spatial_backbone: true
+  init_mode: scratch
+  init_checkpoint: null
+  freeze_spatial_backbone: false
   latent_channel_policy: all
   value_fourier_bands: 4
   value_hidden_dim: 128
@@ -46,10 +77,10 @@ cross_attention:
   gate_init: 0.0
 
 training:
-  run_name: field_to_llm_cross_attention
+  run_name: direct_cross_from_scratch
   output_root: ${FIELD_TO_LLM_ROOT}/runs
   epochs: 2
-  max_updates: 0
+  max_updates: 3000
   batch_size: 3
   gradient_accumulation_steps: 1
   questions_per_state_group: 3
@@ -77,7 +108,7 @@ evaluation:
   screening_fractions: [0.125, 0.25, 0.50, 0.75, 1.0]
   selection_metric: macro_accuracy
   final_modes: [correct, no_tensor, zero_tensor, shuffled]
-  evaluate_test: true
+  evaluate_test: false
 
 runtime:
   seed: 42

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 """Train the full-grid field cross-attention interface for a frozen LLM.
 
-This uses the Direct-QA initializer plus shared data, distributed, tokenizer,
-and frozen-LLM utilities. The model never consumes parsed coordinates,
-``query_spec``, task IDs, or a task-to-slot-count mapping.
+The paper mode uses a Direct-QA initializer and cached field latents. The
+Direct-Cross mode instead replays raw HDF5 patches and trains a field encoder
+and prefix-free spatial memory from scratch. Both modes keep the LLM frozen and
+never consume parsed coordinates, ``query_spec``, task IDs, or a
+task-to-slot-count mapping.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -71,9 +74,25 @@ from scripts.train_tensor_llm_adapter import (  # noqa: E402
     validate_atomic_group_batch_size,
     validate_qa_latent_contract,
 )
-from scripts.train_tensor_patch_text_alignment import TensorPatchAlignmentAdapter  # noqa: E402
+from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
+    SpatialTransformerBlock,
+    TensorPatchAlignmentAdapter,
+    build_patch_encoder_config,
+    require_h5py,
+    sinusoidal_2d_position_encoding,
+)
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
-from tensor_compression.downstream.patch_qa_contract import canonical_path, sha256_file  # noqa: E402
+from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
+    PATCH_LATENT_AUDIT_FORMAT,
+    PATCH_MATCHED_QA_FORMAT,
+    PATCH_QA_PROMPT_CONTRACT,
+    canonical_normalization,
+    canonical_path,
+    latent_identity_from_record,
+    latent_qa_stats_from_record,
+    sha256_file,
+)
+from tensor_compression.models.builders import build_model  # noqa: E402
 from tensor_compression.utils.pipeline_config import (  # noqa: E402
     environment_override,
     first_nested,
@@ -138,6 +157,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument(
+        "--input-source",
+        choices=("precomputed_latent", "raw_hdf5"),
+        default=None,
+        help="Read the paper latent cache or replay normalized field patches directly from PDEBench HDF5.",
+    )
+    parser.add_argument("--hdf5-path", type=str, default=None)
+    parser.add_argument(
+        "--memory-init-mode",
+        choices=("direct_qa_checkpoint", "scratch"),
+        default=None,
+    )
+    parser.add_argument(
         "--latent-channel-policy",
         choices=("all", "value_only"),
         default=None,
@@ -177,6 +208,21 @@ def parse_args() -> argparse.Namespace:
             ),
         )
     )
+    args.input_source = str(
+        cli.input_source
+        or _config_value(config, ["data.input_source"], "precomputed_latent")
+    ).strip().lower()
+    args.hdf5_path = _path_value(
+        cli.hdf5_path
+        or environment_override(
+            "PDEBENCH_HDF5",
+            _config_value(config, ["data.hdf5_path", "patch_qa.hdf5_path"]),
+        )
+    )
+    args.patch_size = int(_config_value(config, ["data.patch_size"], 16))
+    args.raw_normalized_dtype = str(
+        _config_value(config, ["data.raw_normalized_dtype"], "float16")
+    ).strip().lower()
     args.latent_dir = _path_value(
         environment_override(
             "FIELD_TO_LLM_LATENT_DIR",
@@ -227,7 +273,9 @@ def parse_args() -> argparse.Namespace:
     args.prefer_record_latent_ref = bool(
         _config_value(config, ["data.prefer_record_latent_ref"], False)
     )
-    args.latent_cache_size = int(_config_value(config, ["data.latent_cache_size"], 8192))
+    args.latent_cache_size = int(
+        _config_value(config, ["data.input_cache_size", "data.latent_cache_size"], 8192)
+    )
     args.num_workers = int(_config_value(config, ["data.num_workers"], 2))
     args.latent_channel_policy = str(
         cli.latent_channel_policy
@@ -287,8 +335,23 @@ def parse_args() -> argparse.Namespace:
         _config_value(config, ["memory.value_fourier_bands"], 4)
     )
     args.value_hidden_dim = int(_config_value(config, ["memory.value_hidden_dim"], 128))
+    args.memory_init_mode = str(
+        cli.memory_init_mode
+        or _config_value(config, ["memory.init_mode"], "direct_qa_checkpoint")
+    ).strip().lower()
     args.freeze_spatial_backbone = bool(
         _config_value(config, ["memory.freeze_spatial_backbone"], True)
+    )
+    field_encoder_config = _config_value(config, ["field_encoder"], {})
+    spatial_adapter_config = _config_value(config, ["spatial_adapter"], {})
+    if not isinstance(field_encoder_config, Mapping):
+        raise ValueError("field_encoder must be a YAML mapping.")
+    if not isinstance(spatial_adapter_config, Mapping):
+        raise ValueError("spatial_adapter must be a YAML mapping.")
+    args.field_encoder_config = copy.deepcopy(dict(field_encoder_config))
+    args.spatial_adapter_config = copy.deepcopy(dict(spatial_adapter_config))
+    args.field_encoder_trainable = bool(
+        args.field_encoder_config.get("trainable", args.input_source == "raw_hdf5")
     )
 
     args.epochs = int(
@@ -386,14 +449,78 @@ def validate_args(args: argparse.Namespace) -> None:
     required_paths = {
         "model_name_or_path": args.model_name_or_path,
         "qa_dir": args.qa_dir,
-        "latent_dir": args.latent_dir,
-        "qa_alignment_checkpoint": args.qa_alignment_checkpoint,
-        "memory_init_checkpoint": args.memory_init_checkpoint,
         "output_root": args.output_root,
     }
+    if args.input_source == "precomputed_latent":
+        required_paths.update(
+            {
+                "latent_dir": args.latent_dir,
+                "qa_alignment_checkpoint": args.qa_alignment_checkpoint,
+            }
+        )
+    elif args.input_source == "raw_hdf5":
+        required_paths["hdf5_path"] = args.hdf5_path
+    else:
+        raise ValueError(
+            "data.input_source must be 'precomputed_latent' or 'raw_hdf5'."
+        )
+    if args.memory_init_mode == "direct_qa_checkpoint":
+        required_paths["memory_init_checkpoint"] = args.memory_init_checkpoint
+    elif args.memory_init_mode != "scratch":
+        raise ValueError(
+            "memory.init_mode must be 'direct_qa_checkpoint' or 'scratch'."
+        )
     missing = [name for name, value in required_paths.items() if not value]
     if missing:
         raise ValueError(f"Missing required cross-attention configuration paths: {missing}.")
+    if args.input_source == "raw_hdf5":
+        if args.memory_init_mode != "scratch":
+            raise ValueError(
+                "raw_hdf5 Direct-Cross requires memory.init_mode=scratch so no Direct-QA "
+                "initializer enters the model path."
+            )
+        if bool(args.freeze_spatial_backbone):
+            raise ValueError(
+                "raw_hdf5 Direct-Cross requires memory.freeze_spatial_backbone=false."
+            )
+        if not bool(args.field_encoder_trainable):
+            raise ValueError("raw_hdf5 Direct-Cross requires field_encoder.trainable=true.")
+        if args.patch_size <= 0:
+            raise ValueError("data.patch_size must be positive.")
+        if args.raw_normalized_dtype not in {"float32", "float16"}:
+            raise ValueError("data.raw_normalized_dtype must be float32 or float16.")
+        if not args.field_encoder_config or not args.spatial_adapter_config:
+            raise ValueError(
+                "raw_hdf5 Direct-Cross requires explicit field_encoder and spatial_adapter mappings."
+            )
+        field_model = args.field_encoder_config.get("model")
+        if not isinstance(field_model, Mapping):
+            raise ValueError("raw_hdf5 Direct-Cross requires field_encoder.model settings.")
+        field_norm = str(field_model.get("norm", "group")).strip().lower()
+        if field_norm not in {"group", "identity"}:
+            raise ValueError(
+                "Direct-Cross supports only stateless group/identity normalization; "
+                "BatchNorm running buffers are not part of the manual DDP checkpoint contract."
+            )
+        configured_dropouts = {
+            "field_encoder.model.dropout": float(field_model.get("dropout", 0.0)),
+            "spatial_adapter.dropout": float(
+                args.spatial_adapter_config.get("dropout", 0.0)
+            ),
+            "cross_attention.dropout": float(args.bridge_dropout),
+        }
+        nonzero_dropouts = {
+            name: value for name, value in configured_dropouts.items() if value != 0.0
+        }
+        if nonzero_dropouts:
+            raise ValueError(
+                "Direct-Cross scratch currently requires dropout=0 for exact multi-rank "
+                f"resume reproducibility; observed={nonzero_dropouts}."
+            )
+    elif args.memory_init_mode == "scratch":
+        raise ValueError(
+            "memory.init_mode=scratch is currently reserved for raw_hdf5 Direct-Cross."
+        )
     if not args.cross_attention_layers:
         raise ValueError("cross_attention.layers_1based must contain at least one layer.")
     if len(set(args.cross_attention_layers)) != len(args.cross_attention_layers):
@@ -411,7 +538,7 @@ def validate_args(args: argparse.Namespace) -> None:
     validate_atomic_group_batch_size(
         args.batch_size,
         args.questions_per_state_group,
-        context="Dense cross-attention matched-QA training",
+        context="Full-grid cross-attention matched-QA training",
     )
     if args.epochs <= 0 or args.eval_batch_size <= 0:
         raise ValueError("epochs and evaluation batch size must be positive.")
@@ -437,6 +564,111 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Every screening fraction must lie in (0,1].")
 
 
+class DirectFieldEncoder(nn.Module):
+    """Only the encoder path used by Direct-Cross; no autoencoder decoder exists here."""
+
+    def __init__(self, compressor: nn.Module) -> None:
+        super().__init__()
+        required = ("encoder", "to_latent", "input_size", "latent_grid", "in_channels", "latent_dim")
+        missing = [name for name in required if not hasattr(compressor, name)]
+        if missing:
+            raise TypeError(f"Configured field encoder is missing attributes: {missing}.")
+        if not bool(getattr(compressor, "preserve_input_channels", False)):
+            raise ValueError(
+                "Direct-Cross field encoder must preserve its exact normalized input channel."
+            )
+        self.encoder = compressor.encoder
+        self.to_latent = compressor.to_latent
+        self.input_size = tuple(int(value) for value in compressor.input_size)
+        self.latent_grid = tuple(int(value) for value in compressor.latent_grid)
+        self.in_channels = int(compressor.in_channels)
+        self.latent_dim = int(compressor.latent_dim)
+
+    def forward(self, normalized_field: torch.Tensor) -> torch.Tensor:
+        if normalized_field.ndim != 4:
+            raise ValueError(
+                f"Direct-Cross field input must be [B,C,H,W], got {tuple(normalized_field.shape)}."
+            )
+        if int(normalized_field.shape[1]) != self.in_channels or tuple(
+            int(value) for value in normalized_field.shape[-2:]
+        ) != self.input_size:
+            raise ValueError(
+                "Direct-Cross field input differs from the encoder contract: "
+                f"observed={tuple(normalized_field.shape[1:])}, "
+                f"expected={(self.in_channels, *self.input_size)}."
+            )
+        learned = self.to_latent(self.encoder(normalized_field))
+        if tuple(int(value) for value in learned.shape[-2:]) != self.latent_grid:
+            raise RuntimeError(
+                f"Field encoder produced grid {tuple(learned.shape[-2:])}, expected {self.latent_grid}."
+            )
+        return torch.cat([normalized_field.to(dtype=learned.dtype), learned], dim=1)
+
+
+class FullGridSpatialBackbone(nn.Module):
+    """Cross-attention memory backbone with no prefix projection or soft-prompt head."""
+
+    adapter_type = "spatial_transformer"
+
+    def __init__(
+        self,
+        *,
+        latent_channels: int,
+        latent_grid: Sequence[int],
+        adapter_dim: int,
+        adapter_layers: int,
+        adapter_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.latent_grid = tuple(int(value) for value in latent_grid)
+        if len(self.latent_grid) != 2 or any(value <= 0 for value in self.latent_grid):
+            raise ValueError(f"Invalid full-grid spatial shape: {self.latent_grid}.")
+        self.latent_token_count = int(self.latent_grid[0] * self.latent_grid[1])
+        self.adapter_dim = int(adapter_dim)
+        if self.adapter_dim <= 0 or int(adapter_layers) <= 0 or int(adapter_heads) <= 0:
+            raise ValueError("Spatial adapter dimension, layers, and heads must be positive.")
+        if self.adapter_dim % int(adapter_heads):
+            raise ValueError("Spatial adapter dimension must be divisible by its head count.")
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError("Spatial adapter dropout must be in [0,1).")
+        self.latent_projection = nn.Linear(int(latent_channels), self.adapter_dim)
+        self.local_residual_projection = nn.Linear(int(latent_channels), self.adapter_dim)
+        self.register_buffer(
+            "spatial_pos_encoding",
+            sinusoidal_2d_position_encoding(*self.latent_grid, self.adapter_dim),
+            persistent=True,
+        )
+        self.register_buffer("spatial_pos_scale", torch.tensor(1.0), persistent=True)
+        self.register_buffer("local_residual_scale", torch.tensor(1.0), persistent=True)
+        self.blocks = nn.ModuleList(
+            [
+                SpatialTransformerBlock(
+                    self.adapter_dim,
+                    int(adapter_heads),
+                    float(dropout),
+                )
+                for _ in range(int(adapter_layers))
+            ]
+        )
+
+    def spatial_input_states(self, latent_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if latent_map.ndim != 4 or tuple(int(value) for value in latent_map.shape[-2:]) != self.latent_grid:
+            raise ValueError(
+                f"Expected encoded field [B,C,{self.latent_grid[0]},{self.latent_grid[1]}], "
+                f"got {tuple(latent_map.shape)}."
+            )
+        latent_tokens = latent_map.flatten(2).transpose(1, 2).contiguous()
+        latent_tokens = latent_tokens.to(dtype=self.latent_projection.weight.dtype)
+        local_residual = self.local_residual_projection(latent_tokens)
+        content = self.latent_projection(latent_tokens)
+        position = self.spatial_pos_scale.to(dtype=content.dtype) * self.spatial_pos_encoding.to(
+            device=content.device,
+            dtype=content.dtype,
+        )
+        return content + position, local_residual
+
+
 @dataclass
 class DenseMemoryState:
     content: torch.Tensor
@@ -445,26 +677,31 @@ class DenseMemoryState:
 
 
 class DenseTensorMemory(nn.Module):
-    """Frozen spatial cell states plus a shared, query-independent exact-z path."""
+    """Full-grid spatial states plus a shared, query-independent exact-z path."""
 
     def __init__(
         self,
-        spatial_backbone: TensorPatchAlignmentAdapter,
+        spatial_backbone: nn.Module,
         fourier_bands: int,
         value_hidden_dim: int,
         freeze_spatial_backbone: bool,
+        field_encoder: DirectFieldEncoder | None = None,
     ) -> None:
         super().__init__()
         if spatial_backbone.adapter_type != "spatial_transformer":
             raise ValueError("Dense memory requires a one-token-per-cell spatial_transformer initializer.")
         self.spatial_backbone = spatial_backbone
+        self.field_encoder = field_encoder
         self.memory_dim = int(spatial_backbone.adapter_dim)
         self.fourier_bands = int(fourier_bands)
         self.freeze_spatial_backbone = bool(freeze_spatial_backbone)
         if self.fourier_bands < 0:
             raise ValueError("value_fourier_bands must be non-negative.")
-        for parameter in self.spatial_backbone.parameters():
-            parameter.requires_grad_(not self.freeze_spatial_backbone)
+        for name, parameter in self.spatial_backbone.named_parameters():
+            # A legacy Direct-QA initializer still contains the prefix-only output
+            # head. It is deliberately absent from the final memory path.
+            prefix_only = str(name).startswith("output.")
+            parameter.requires_grad_(not self.freeze_spatial_backbone and not prefix_only)
         if self.freeze_spatial_backbone:
             self.spatial_backbone.eval()
         basis_dim = 4 + 2 * self.fourier_bands
@@ -511,11 +748,20 @@ class DenseTensorMemory(nn.Module):
             expanded.append(feature.unsqueeze(-1) if feature.ndim == z.ndim else feature)
         return torch.cat(expanded, dim=-1)
 
-    def forward(self, latent_map: torch.Tensor) -> DenseMemoryState:
-        if latent_map.ndim != 4 or int(latent_map.shape[1]) < 1:
-            raise ValueError(f"Expected latent_map [B,C,H,W], got {tuple(latent_map.shape)}.")
+    def forward(self, field_input: torch.Tensor) -> DenseMemoryState:
+        if field_input.ndim != 4 or int(field_input.shape[1]) < 1:
+            raise ValueError(f"Expected field input [B,C,H,W], got {tuple(field_input.shape)}.")
+        # The scalar path reads the exact standardized input, independently of
+        # learned encoder channel ordering. For the paper cache this is channel 0;
+        # for Direct-Cross it is the raw normalized single-channel grid.
+        z_values = field_input[:, 0].flatten(1)
+        latent_map = self.field_encoder(field_input) if self.field_encoder is not None else field_input
         content = self.content_norm(self._spatial_states(latent_map))
-        z_values = latent_map[:, 0].flatten(1)
+        if int(z_values.shape[1]) != int(content.shape[1]):
+            raise ValueError(
+                "Exact scalar grid and spatial memory must have one-to-one cells: "
+                f"values={z_values.shape[1]}, memory={content.shape[1]}."
+            )
         value = self.value_encoder(self._value_basis(z_values))
         reconstructed = self.value_reconstruction(value).squeeze(-1).float()
         reconstruction_loss = F.smooth_l1_loss(reconstructed, z_values.float())
@@ -724,6 +970,131 @@ def validate_relocated_qa_latent_contract(
     return contract, resolution
 
 
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_raw_hdf5_qa_contract(
+    metadata: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind Direct-Cross to raw patches and the QA value-space, not Stage-1 latents."""
+
+    hdf5_path = Path(str(args.hdf5_path)).expanduser()
+    if not hdf5_path.is_file():
+        raise FileNotFoundError(f"Direct-Cross PDEBench HDF5 file is missing: {hdf5_path}.")
+    if str(metadata.get("format", "")) != PATCH_MATCHED_QA_FORMAT:
+        raise ValueError("Direct-Cross requires the formal matched-QA dataset format.")
+    if str(metadata.get("prompt_contract", "")) != PATCH_QA_PROMPT_CONTRACT:
+        raise ValueError("Direct-Cross matched-QA prompt contract is missing or stale.")
+    if str(metadata.get("latent_audit_format", "")) != PATCH_LATENT_AUDIT_FORMAT:
+        raise ValueError("Direct-Cross requires per-record raw-value normalization audits.")
+    metadata_patch_size = int(metadata.get("patch_size", 0))
+    if metadata_patch_size != int(args.patch_size):
+        raise ValueError(
+            "Direct-Cross patch size differs from the fixed matched-QA records: "
+            f"configured={args.patch_size}, metadata={metadata_patch_size}."
+        )
+    observed_normalization = metadata.get("encoder_input_normalization")
+    configured_normalization = args.field_encoder_config.get("normalization")
+    if not isinstance(observed_normalization, Mapping) or not isinstance(
+        configured_normalization, Mapping
+    ):
+        raise ValueError(
+            "Direct-Cross requires explicit QA and field-encoder normalization mappings."
+        )
+    observed_normalization = canonical_normalization(observed_normalization)
+    configured_normalization = canonical_normalization(configured_normalization)
+    required_normalization = canonical_normalization(
+        {
+            "mode": "zscore",
+            "scope": "channel",
+            "stats_path": None,
+            "clip_min": None,
+            "clip_max": None,
+        }
+    )
+    if observed_normalization != configured_normalization:
+        raise ValueError(
+            "Direct-Cross field-encoder normalization differs from the matched-QA value space: "
+            f"configured={configured_normalization}, metadata={observed_normalization}."
+        )
+    if configured_normalization != required_normalization:
+        raise ValueError(
+            "Direct-Cross currently requires unclipped per-patch channel z-score normalization."
+        )
+    if str(metadata.get("qa_value_space", "")) != "per_patch_zscore_from_raw_patch":
+        raise ValueError("Matched-QA metadata does not describe raw-patch z-score targets.")
+    storage_dtype = str(metadata.get("storage_dtype", "")).strip().lower()
+    if storage_dtype not in {"float16", "float32"}:
+        raise ValueError(
+            "Matched-QA metadata has an unsupported preserved-value storage dtype: "
+            f"{storage_dtype!r}."
+        )
+    if str(args.raw_normalized_dtype) != storage_dtype:
+        raise ValueError(
+            "Direct-Cross runtime quantization must match the preserved value channel used "
+            "to construct the matched-QA targets: "
+            f"configured={args.raw_normalized_dtype!r}, metadata={storage_dtype!r}."
+        )
+    fields = metadata.get("fields")
+    if not isinstance(fields, Sequence) or isinstance(fields, (str, bytes)) or not fields:
+        raise ValueError("Matched-QA metadata does not declare its PDEBench fields.")
+    declared_split_sha256 = metadata.get("output_split_sha256")
+    if not isinstance(declared_split_sha256, Mapping):
+        raise ValueError("Matched-QA metadata does not bind its output JSONL files.")
+    actual_split_sha256: dict[str, str] = {}
+    for split in dict.fromkeys((args.train_split, args.val_split, args.test_split)):
+        split_path = qa_path(args.qa_dir, str(split))
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Matched-QA split is missing: {split_path}.")
+        actual_digest = sha256_file(split_path)
+        declared_digest = str(declared_split_sha256.get(str(split), "")).lower()
+        if not declared_digest or actual_digest != declared_digest:
+            raise ValueError(
+                "Matched-QA JSONL differs from its immutable metadata digest: "
+                f"split={split!r}, declared={declared_digest!r}, actual={actual_digest!r}."
+            )
+        actual_split_sha256[str(split)] = actual_digest
+    identity = {
+        "format": "raw_hdf5_normalized_patch_v1",
+        "patch_size": int(args.patch_size),
+        "input_shape": [1, int(args.patch_size), int(args.patch_size)],
+        "normalization": configured_normalization,
+        "raw_normalized_dtype": str(args.raw_normalized_dtype),
+        "fields": [str(value) for value in fields],
+        "qa_output_split_sha256": actual_split_sha256,
+        "qa_source_split_sha256": copy.deepcopy(metadata.get("source_split_sha256", {})),
+    }
+    contract = {
+        **identity,
+        "identity_sha256": _json_sha256(identity),
+        "hdf5_path": canonical_path(hdf5_path),
+        "hdf5_bytes": int(hdf5_path.stat().st_size),
+        # This is transparent QA-generation lineage only. The Stage-1 file is
+        # never opened and no learned Stage-1 tensor enters Direct-Cross.
+        "qa_generation_alignment_sha256": str(
+            metadata.get("alignment_checkpoint_sha256", "")
+        ),
+    }
+    resolution = {
+        "input_source": "raw_hdf5",
+        "configured_path": canonical_path(hdf5_path),
+        "stage1_checkpoint_opened": False,
+        "learned_latent_cache_opened": False,
+        "identity_sha256": contract["identity_sha256"],
+    }
+    return contract, resolution
+
+
 def load_metadata_and_contract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata_path = Path(args.qa_dir) / "metadata.json"
     if not metadata_path.exists():
@@ -745,13 +1116,290 @@ def load_metadata_and_contract(args: argparse.Namespace) -> tuple[dict[str, Any]
             "training.questions_per_state_group must match metadata.stage2b.batch_group_size: "
             f"configured={args.questions_per_state_group}, metadata={group_size}."
         )
+    resolved_metadata = dict(metadata)
+    if args.input_source == "raw_hdf5":
+        input_contract, input_resolution = validate_raw_hdf5_qa_contract(metadata, args)
+        resolved_metadata["runtime_input_resolution"] = input_resolution
+        return resolved_metadata, input_contract
     latent_contract, checkpoint_resolution = validate_relocated_qa_latent_contract(
         metadata,
         args.qa_alignment_checkpoint,
     )
-    resolved_metadata = dict(metadata)
     resolved_metadata["runtime_alignment_checkpoint_resolution"] = checkpoint_resolution
+    resolved_metadata["runtime_input_resolution"] = {
+        "input_source": "precomputed_latent",
+        "stage1_checkpoint_opened": True,
+        "learned_latent_cache_opened": True,
+    }
     return resolved_metadata, latent_contract
+
+
+def normalize_raw_patch_for_qa(
+    raw_patch: torch.Tensor,
+    record: Mapping[str, Any],
+    normalization: Mapping[str, Any],
+    *,
+    normalized_dtype: str = "float32",
+) -> torch.Tensor:
+    """Reproduce the QA builder's float32 per-patch z-score and audit it."""
+
+    if raw_patch.ndim != 3 or int(raw_patch.shape[0]) != 1:
+        raise ValueError(
+            f"Direct-Cross expects one raw field channel [1,H,W], got {tuple(raw_patch.shape)}."
+        )
+    required = canonical_normalization(
+        {
+            "mode": "zscore",
+            "scope": "channel",
+            "stats_path": None,
+            "clip_min": None,
+            "clip_max": None,
+        }
+    )
+    if canonical_normalization(normalization) != required:
+        raise ValueError("Direct-Cross raw patch normalization must be unclipped channel z-score.")
+    patch = raw_patch.float()
+    if not bool(torch.isfinite(patch).all()):
+        raise FloatingPointError("Direct-Cross raw HDF5 patch contains NaN or infinity.")
+    mean = patch.mean()
+    std = patch.std(unbiased=False)
+    scale = std + 1.0e-6
+    observed_stats = {
+        "mean": float(mean.item()),
+        "std": float(std.item()),
+        "scale": float(scale.item()),
+    }
+    expected_stats = latent_qa_stats_from_record(record)
+    for name, observed in observed_stats.items():
+        expected = float(expected_stats[name])
+        tolerance = max(1.0e-8, 1.0e-6 * max(1.0, abs(expected)))
+        if abs(observed - expected) > tolerance:
+            raise ValueError(
+                "Direct-Cross raw HDF5 patch does not match matched-QA provenance: "
+                f"state={record.get('state_ref')!r}, {name} observed={observed}, expected={expected}."
+            )
+    normalized = (patch - mean) / scale
+    if str(normalized_dtype) == "float16":
+        normalized = normalized.to(dtype=torch.float16).float()
+    elif str(normalized_dtype) != "float32":
+        raise ValueError(f"Unsupported normalized raw dtype: {normalized_dtype!r}.")
+    return normalized.contiguous()
+
+
+class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
+    """Matched QA whose model input is replayed from raw PDEBench, never a Stage-1 cache."""
+
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        *,
+        hdf5_path: str | Path,
+        patch_size: int,
+        normalization: Mapping[str, Any],
+        normalized_dtype: str,
+        max_records: int | None,
+        subset_mode: str,
+        subset_seed: int,
+        shuffle_seed: int,
+        input_cache_size: int,
+    ) -> None:
+        super().__init__(
+            jsonl_path=jsonl_path,
+            latent_dir=Path(hdf5_path).expanduser().parent,
+            max_records=max_records,
+            subset_mode=subset_mode,
+            subset_seed=subset_seed,
+            prefer_record_latent_ref=False,
+            shuffle_seed=shuffle_seed,
+            latent_cache_size=input_cache_size,
+            latent_contract=None,
+            latent_channel_policy="all",
+        )
+        self.hdf5_path = Path(hdf5_path).expanduser()
+        self.patch_size = int(patch_size)
+        self.normalization = canonical_normalization(normalization)
+        self.normalized_dtype = str(normalized_dtype)
+        self._hdf5_handle: Any | None = None
+        self._hdf5_pid: int | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_hdf5_handle"] = None
+        state["_hdf5_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        handle = getattr(self, "_hdf5_handle", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+        self._hdf5_handle = None
+        self._hdf5_pid = None
+
+    def _open_hdf5(self) -> Any:
+        process_id = os.getpid()
+        handle = self._hdf5_handle
+        if handle is not None and self._hdf5_pid == process_id and bool(handle.id.valid):
+            return handle
+        self.close()
+        h5py_module = require_h5py()
+        self._hdf5_handle = h5py_module.File(self.hdf5_path, "r")
+        self._hdf5_pid = process_id
+        return self._hdf5_handle
+
+    def _read_raw_patch(self, record: Mapping[str, Any]) -> torch.Tensor:
+        identity = latent_identity_from_record(record)
+        row, col = (int(value) for value in identity["top_left"])
+        sample_index = int(identity["sample_index"])
+        time_index = int(identity["time_index"])
+        field = str(identity["field"])
+        metadata = record.get("metadata")
+        grid_shape = metadata.get("grid_shape") if isinstance(metadata, Mapping) else None
+        if (
+            not isinstance(grid_shape, Sequence)
+            or isinstance(grid_shape, (str, bytes))
+            or [int(value) for value in grid_shape] != [self.patch_size, self.patch_size]
+        ):
+            raise ValueError(
+                f"Matched-QA state {identity['patch_id']!r} has an invalid grid_shape."
+            )
+        handle = self._open_hdf5()
+        if field not in handle:
+            raise KeyError(f"PDEBench HDF5 field {field!r} is missing from {self.hdf5_path}.")
+        dataset = handle[field]
+        if len(dataset.shape) != 4:
+            raise ValueError(f"Expected PDEBench field [sample,time,height,width], got {dataset.shape}.")
+        if not 0 <= sample_index < int(dataset.shape[0]) or not 0 <= time_index < int(
+            dataset.shape[1]
+        ):
+            raise IndexError(
+                f"Matched-QA state {identity['patch_id']!r} is outside the PDEBench sample/time axes."
+            )
+        if (
+            row < 0
+            or col < 0
+            or row + self.patch_size > int(dataset.shape[2])
+            or col + self.patch_size > int(dataset.shape[3])
+        ):
+            raise IndexError(
+                f"Matched-QA state {identity['patch_id']!r} is outside the PDEBench spatial axes."
+            )
+        array = dataset[
+            sample_index,
+            time_index,
+            row : row + self.patch_size,
+            col : col + self.patch_size,
+        ]
+        return torch.as_tensor(array, dtype=torch.float32).clone().unsqueeze(0)
+
+    def load_latent_for_record(self, record: Mapping[str, Any]) -> torch.Tensor:
+        state_ref = str(record.get("state_ref") or record.get("patch_id") or "")
+        if not state_ref:
+            raise ValueError("Direct-Cross record has no state_ref/patch_id.")
+        identity = latent_identity_from_record(record)
+        previous_identity = self._latent_identity_cache.get(state_ref)
+        if previous_identity is not None and previous_identity != identity:
+            raise ValueError(
+                f"Direct-Cross records reuse state_ref={state_ref!r} for different raw patches."
+            )
+        self._latent_identity_cache[state_ref] = identity
+        qa_stats = latent_qa_stats_from_record(record)
+        previous_stats = self._latent_qa_stats_cache.get(state_ref)
+        if previous_stats is not None and previous_stats != qa_stats:
+            raise ValueError(
+                f"Direct-Cross records reuse state_ref={state_ref!r} with different QA statistics."
+            )
+        self._latent_qa_stats_cache[state_ref] = qa_stats
+        cached = self._latent_cache.get(state_ref)
+        if cached is not None:
+            self._latent_cache.move_to_end(state_ref)
+            return cached
+        normalized = normalize_raw_patch_for_qa(
+            self._read_raw_patch(record),
+            record,
+            self.normalization,
+            normalized_dtype=self.normalized_dtype,
+        )
+        cache_capacity = self.effective_latent_cache_size()
+        if cache_capacity > 0:
+            self._latent_cache[state_ref] = normalized
+            self._latent_cache.move_to_end(state_ref)
+            while len(self._latent_cache) > cache_capacity:
+                self._latent_cache.popitem(last=False)
+        return normalized
+
+    def validate_latent_file_for_record(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        value = self.load_latent_for_record(record)
+        return {
+            "path": canonical_path(self.hdf5_path),
+            "shape": [int(item) for item in value.shape],
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "input_source": "raw_hdf5",
+        }
+
+
+def audit_raw_hdf5_input_content(
+    datasets: Mapping[str, TensorReadoutQADataset],
+) -> dict[str, Any]:
+    """Hash every distinct normalized QA patch that can enter this run."""
+
+    split_audits: dict[str, Any] = {}
+    for split, generic_dataset in datasets.items():
+        if not isinstance(generic_dataset, RawHDF5TensorReadoutQADataset):
+            raise TypeError("Raw input content audit received a latent-cache dataset.")
+        digest = hashlib.sha256()
+        seen_states: dict[str, dict[str, Any]] = {}
+        for record in generic_dataset.records:
+            state_ref = str(record.get("state_ref") or record.get("patch_id") or "")
+            identity = latent_identity_from_record(record)
+            # Invoke the dataset contract for every QA row so repeated states
+            # must also agree on their recorded normalization statistics.
+            normalized = (
+                generic_dataset.load_latent_for_record(record)
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+            previous = seen_states.get(state_ref)
+            if previous is not None:
+                if previous != identity:
+                    raise ValueError(
+                        f"Raw input audit found conflicting identities for state {state_ref!r}."
+                    )
+                continue
+            seen_states[state_ref] = identity
+            digest.update(
+                json.dumps(
+                    identity,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            digest.update(
+                f"\0{normalized.dtype}\0{tuple(normalized.shape)}\0".encode("utf-8")
+            )
+            digest.update(normalized.view(torch.uint8).numpy().tobytes())
+        split_audits[str(split)] = {
+            "states": len(seen_states),
+            "normalized_patch_sha256": digest.hexdigest(),
+        }
+        generic_dataset._latent_cache.clear()
+        generic_dataset.close()
+    content_identity = {
+        split: dict(values) for split, values in sorted(split_audits.items())
+    }
+    return {
+        "format": "normalized_qa_patch_content_v1",
+        "splits": split_audits,
+        "sha256": _json_sha256(content_identity),
+    }
 
 
 def audit_general_qa_datasets(
@@ -864,48 +1512,73 @@ def audit_general_qa_datasets(
 
 def build_datasets(
     args: argparse.Namespace,
-    latent_contract: Mapping[str, Any],
+    input_contract: Mapping[str, Any],
 ) -> tuple[
     TensorReadoutQADataset,
     TensorReadoutQADataset,
     TensorReadoutQADataset,
     TensorReadoutQADataset,
 ]:
-    common = {
-        "latent_dir": args.latent_dir,
-        "prefer_record_latent_ref": bool(args.prefer_record_latent_ref),
-        "shuffle_seed": int(args.shuffle_seed),
-        "latent_cache_size": int(args.latent_cache_size),
-        "latent_contract": latent_contract,
-        "latent_channel_policy": str(args.latent_channel_policy),
-    }
-    train_dataset = TensorReadoutQADataset(
-        qa_path(args.qa_dir, args.train_split),
+    def make_dataset(
+        split: str,
+        *,
+        max_records: int | None,
+        subset_mode: str,
+        subset_seed: int,
+    ) -> TensorReadoutQADataset:
+        path = qa_path(args.qa_dir, split)
+        if args.input_source == "raw_hdf5":
+            normalization = input_contract.get("normalization")
+            if not isinstance(normalization, Mapping):
+                raise ValueError("Raw HDF5 input contract has no normalization mapping.")
+            return RawHDF5TensorReadoutQADataset(
+                path,
+                hdf5_path=args.hdf5_path,
+                patch_size=int(args.patch_size),
+                normalization=normalization,
+                normalized_dtype=str(args.raw_normalized_dtype),
+                max_records=max_records,
+                subset_mode=subset_mode,
+                subset_seed=subset_seed,
+                shuffle_seed=int(args.shuffle_seed),
+                input_cache_size=int(args.latent_cache_size),
+            )
+        return TensorReadoutQADataset(
+            path,
+            latent_dir=args.latent_dir,
+            max_records=max_records,
+            subset_mode=subset_mode,
+            subset_seed=subset_seed,
+            prefer_record_latent_ref=bool(args.prefer_record_latent_ref),
+            shuffle_seed=int(args.shuffle_seed),
+            latent_cache_size=int(args.latent_cache_size),
+            latent_contract=input_contract,
+            latent_channel_policy=str(args.latent_channel_policy),
+        )
+
+    train_dataset = make_dataset(
+        args.train_split,
         max_records=args.max_train_records,
         subset_mode=str(args.record_subset_mode),
         subset_seed=int(args.shuffle_seed),
-        **common,
     )
-    val_dataset = TensorReadoutQADataset(
-        qa_path(args.qa_dir, args.val_split),
+    val_dataset = make_dataset(
+        args.val_split,
         max_records=args.max_val_records,
         subset_mode=str(args.record_subset_mode),
         subset_seed=int(args.shuffle_seed) + 1,
-        **common,
     )
-    test_dataset = TensorReadoutQADataset(
-        qa_path(args.qa_dir, args.test_split),
+    test_dataset = make_dataset(
+        args.test_split,
         max_records=args.max_test_records,
         subset_mode=str(args.record_subset_mode),
         subset_seed=int(args.shuffle_seed) + 2,
-        **common,
     )
-    screening_dataset = TensorReadoutQADataset(
-        qa_path(args.qa_dir, args.val_split),
+    screening_dataset = make_dataset(
+        args.val_split,
         max_records=min(int(args.screening_records), len(val_dataset.records)),
         subset_mode="hash_state",
         subset_seed=int(args.shuffle_seed) + 10_001,
-        **common,
     )
     return train_dataset, val_dataset, test_dataset, screening_dataset
 
@@ -1208,11 +1881,92 @@ def load_spatial_initializer(
     return adapter, provenance
 
 
+def _module_state_sha256(modules: Mapping[str, nn.Module]) -> str:
+    digest = hashlib.sha256()
+    for module_name, module in sorted(modules.items()):
+        for tensor_name, tensor in sorted(module.state_dict().items()):
+            value = tensor.detach().cpu().contiguous()
+            digest.update(f"{module_name}.{tensor_name}\0{value.dtype}\0{tuple(value.shape)}\0".encode("utf-8"))
+            digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def build_scratch_memory_components(
+    args: argparse.Namespace,
+    input_shape: Sequence[int],
+) -> tuple[DirectFieldEncoder, FullGridSpatialBackbone, tuple[int, int, int], dict[str, Any]]:
+    """Construct every field-side component without opening an upstream checkpoint."""
+
+    normalized_input_shape = tuple(int(value) for value in input_shape)
+    expected_input_shape = (1, int(args.patch_size), int(args.patch_size))
+    if normalized_input_shape != expected_input_shape:
+        raise ValueError(
+            f"Direct-Cross raw input shape is {normalized_input_shape}, expected {expected_input_shape}."
+        )
+    encoder_config = build_patch_encoder_config(
+        patch_encoder_cfg=args.field_encoder_config,
+        field_keys=["__single_field__"],
+        patch_size=int(args.patch_size),
+    )
+    model_config = encoder_config.get("model")
+    if not isinstance(model_config, Mapping):
+        raise ValueError("Direct-Cross field encoder did not resolve a model mapping.")
+    if str(model_config.get("name", "")) != "conv_token_autoencoder_2d":
+        raise ValueError("Direct-Cross currently supports conv_token_autoencoder_2d only.")
+    if not bool(model_config.get("preserve_input_channels", False)):
+        raise ValueError("Direct-Cross field encoder requires preserve_input_channels=true.")
+    compressor = build_model(copy.deepcopy(encoder_config))
+    field_encoder = DirectFieldEncoder(compressor)
+    if field_encoder.input_size != expected_input_shape[1:]:
+        raise ValueError(
+            "Direct-Cross field_encoder.model.input_size must match data.patch_size: "
+            f"encoder={field_encoder.input_size}, data={expected_input_shape[1:]}."
+        )
+    memory_shape = (
+        int(field_encoder.latent_dim),
+        int(field_encoder.latent_grid[0]),
+        int(field_encoder.latent_grid[1]),
+    )
+    spatial = args.spatial_adapter_config
+    spatial_type = str(spatial.get("type", "full_grid_transformer"))
+    if spatial_type != "full_grid_transformer":
+        raise ValueError("Direct-Cross spatial_adapter.type must be full_grid_transformer.")
+    spatial_backbone = FullGridSpatialBackbone(
+        latent_channels=memory_shape[0],
+        latent_grid=memory_shape[1:],
+        adapter_dim=int(spatial.get("adapter_dim", 512)),
+        adapter_layers=int(spatial.get("adapter_layers", 2)),
+        adapter_heads=int(spatial.get("adapter_heads", 8)),
+        dropout=float(spatial.get("dropout", 0.0)),
+    )
+    state_sha256 = _module_state_sha256(
+        {"field_encoder": field_encoder, "spatial_backbone": spatial_backbone}
+    )
+    provenance = {
+        "kind": "scratch",
+        "sha256": state_sha256,
+        "seed": int(args.seed),
+        "stage1_checkpoint_opened": False,
+        "direct_qa_checkpoint_opened": False,
+        "prefix_output_head": "absent",
+        "field_encoder_config": copy.deepcopy(encoder_config),
+        "spatial_adapter_config": {
+            "type": spatial_type,
+            "adapter_dim": int(spatial_backbone.adapter_dim),
+            "adapter_layers": len(spatial_backbone.blocks),
+            "adapter_heads": int(spatial.get("adapter_heads", 8)),
+            "dropout": float(spatial.get("dropout", 0.0)),
+        },
+    }
+    return field_encoder, spatial_backbone, memory_shape, provenance
+
+
 def build_sidecar(
     llm: nn.Module,
-    spatial_initializer: TensorPatchAlignmentAdapter,
+    spatial_initializer: nn.Module,
     args: argparse.Namespace,
     device: torch.device,
+    field_encoder: DirectFieldEncoder | None = None,
 ) -> tuple[DenseCrossAttentionSidecar, dict[str, Any]]:
     llm_hidden_size = int(llm.get_input_embeddings().embedding_dim)
     memory = DenseTensorMemory(
@@ -1220,6 +1974,7 @@ def build_sidecar(
         fourier_bands=int(args.value_fourier_bands),
         value_hidden_dim=int(args.value_hidden_dim),
         freeze_spatial_backbone=bool(args.freeze_spatial_backbone),
+        field_encoder=field_encoder,
     )
     bridges = [
         GatedTensorCrossAttention(
@@ -1276,6 +2031,7 @@ def build_sidecar(
         "gate_init": float(args.gate_init),
         "value_fourier_bands": int(args.value_fourier_bands),
         "freeze_spatial_backbone": bool(args.freeze_spatial_backbone),
+        "field_encoder_trainable": bool(field_encoder is not None),
         "latent_channel_policy": str(args.latent_channel_policy),
     }
 
@@ -1347,6 +2103,25 @@ def build_optimizer(
     return optimizer, {
         "trainable_parameters": sum(parameter.numel() for _name, parameter in named),
         "trainable_tensors": len(named),
+        "trainable_field_encoder_parameters": sum(
+            parameter.numel()
+            for name, parameter in named
+            if name.startswith("memory.field_encoder.")
+        ),
+        "trainable_spatial_parameters": sum(
+            parameter.numel()
+            for name, parameter in named
+            if name.startswith("memory.spatial_backbone.")
+        ),
+        "trainable_value_parameters": sum(
+            parameter.numel()
+            for name, parameter in named
+            if name.startswith("memory.value_encoder.")
+            or name.startswith("memory.value_reconstruction.")
+        ),
+        "trainable_cross_attention_parameters": sum(
+            parameter.numel() for name, parameter in named if name.startswith("bridges.")
+        ),
         "gate_parameters": sum(parameter.numel() for parameter in gates),
         "gate_tensors": len(gates),
         "frozen_spatial_parameters": sum(
@@ -1427,16 +2202,22 @@ def load_trainable_state_dict(
 
 def architecture_contract(
     args: argparse.Namespace,
-    latent_shape: Sequence[int],
+    input_shape: Sequence[int],
+    memory_shape: Sequence[int],
     llm_hidden_size: int,
-    latent_contract: Mapping[str, Any],
+    input_contract: Mapping[str, Any],
     initializer: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "format": "dense_tensor_memory_cross_attention_v1",
         "qwen_model": str(args.model_name_or_path),
         "llm_hidden_size": int(llm_hidden_size),
-        "latent_shape": [int(value) for value in latent_shape],
+        "input_source": str(args.input_source),
+        "memory_init_mode": str(args.memory_init_mode),
+        "input_shape": [int(value) for value in input_shape],
+        # Retain the historical key for paper-checkpoint compatibility. In
+        # Direct-Cross it describes the online field-encoder output.
+        "latent_shape": [int(value) for value in memory_shape],
         "layers_1based": [int(value) for value in args.cross_attention_layers],
         "bridge_dim": int(args.bridge_dim),
         "heads": int(args.bridge_heads),
@@ -1445,9 +2226,15 @@ def architecture_contract(
         "value_fourier_bands": int(args.value_fourier_bands),
         "value_hidden_dim": int(args.value_hidden_dim),
         "freeze_spatial_backbone": bool(args.freeze_spatial_backbone),
+        "field_encoder_trainable": bool(args.field_encoder_trainable),
         "latent_channel_policy": str(args.latent_channel_policy),
         "initializer": dict(initializer),
-        "latent_contract": copy.deepcopy(dict(latent_contract)),
+        "input_contract": copy.deepcopy(dict(input_contract)),
+        "latent_contract": (
+            copy.deepcopy(dict(input_contract))
+            if args.input_source == "precomputed_latent"
+            else {}
+        ),
         "forbidden_model_inputs": [
             "query_spec",
             "grounding_target",
@@ -1487,6 +2274,45 @@ def validate_checkpoint_contract(
         for key in stable_keys
         if observed.get(key) != expected_contract.get(key)
     }
+    observed_model = str(observed.get("qwen_model", "")).replace("\\", "/").rstrip("/")
+    expected_model = str(expected_contract.get("qwen_model", "")).replace("\\", "/").rstrip("/")
+    observed_model_identity = observed_model.rsplit("/", 1)[-1].casefold()
+    expected_model_identity = expected_model.rsplit("/", 1)[-1].casefold()
+    if (
+        not observed_model_identity
+        or observed_model_identity != expected_model_identity
+    ):
+        differences["qwen_model_identity"] = {
+            "expected": expected_model,
+            "observed": observed_model,
+        }
+    observed_input_source = str(observed.get("input_source", "precomputed_latent"))
+    expected_input_source = str(
+        expected_contract.get("input_source", "precomputed_latent")
+    )
+    if observed_input_source != expected_input_source:
+        differences["input_source"] = {
+            "expected": expected_input_source,
+            "observed": observed_input_source,
+        }
+    observed_init_mode = str(
+        observed.get("memory_init_mode", "direct_qa_checkpoint")
+    )
+    expected_init_mode = str(
+        expected_contract.get("memory_init_mode", "direct_qa_checkpoint")
+    )
+    if observed_init_mode != expected_init_mode:
+        differences["memory_init_mode"] = {
+            "expected": expected_init_mode,
+            "observed": observed_init_mode,
+        }
+    if expected_input_source == "raw_hdf5":
+        for key in ("input_shape", "field_encoder_trainable"):
+            if observed.get(key) != expected_contract.get(key):
+                differences[key] = {
+                    "expected": expected_contract.get(key),
+                    "observed": observed.get(key),
+                }
     observed_latent_channel_policy = str(observed.get("latent_channel_policy", "all"))
     expected_latent_channel_policy = str(expected_contract.get("latent_channel_policy", "all"))
     if observed_latent_channel_policy != expected_latent_channel_policy:
@@ -1503,24 +2329,43 @@ def validate_checkpoint_contract(
             "expected": expected_init.get("sha256") if isinstance(expected_init, Mapping) else None,
             "observed": observed_init.get("sha256") if isinstance(observed_init, Mapping) else None,
         }
-    expected_latent = expected_contract.get("latent_contract", {})
-    observed_latent = observed.get("latent_contract", {})
-    if not isinstance(expected_latent, Mapping) or not isinstance(observed_latent, Mapping) or (
-        expected_latent.get("alignment_checkpoint_sha256")
-        != observed_latent.get("alignment_checkpoint_sha256")
-    ):
-        differences["latent_contract.alignment_checkpoint_sha256"] = {
-            "expected": (
-                expected_latent.get("alignment_checkpoint_sha256")
-                if isinstance(expected_latent, Mapping)
-                else None
-            ),
-            "observed": (
-                observed_latent.get("alignment_checkpoint_sha256")
-                if isinstance(observed_latent, Mapping)
-                else None
-            ),
-        }
+    if expected_input_source == "raw_hdf5":
+        expected_input = expected_contract.get("input_contract", {})
+        observed_input = observed.get("input_contract", {})
+        if not isinstance(expected_input, Mapping) or not isinstance(observed_input, Mapping) or (
+            expected_input.get("identity_sha256") != observed_input.get("identity_sha256")
+        ):
+            differences["input_contract.identity_sha256"] = {
+                "expected": (
+                    expected_input.get("identity_sha256")
+                    if isinstance(expected_input, Mapping)
+                    else None
+                ),
+                "observed": (
+                    observed_input.get("identity_sha256")
+                    if isinstance(observed_input, Mapping)
+                    else None
+                ),
+            }
+    else:
+        expected_latent = expected_contract.get("latent_contract", {})
+        observed_latent = observed.get("latent_contract", {})
+        if not isinstance(expected_latent, Mapping) or not isinstance(observed_latent, Mapping) or (
+            expected_latent.get("alignment_checkpoint_sha256")
+            != observed_latent.get("alignment_checkpoint_sha256")
+        ):
+            differences["latent_contract.alignment_checkpoint_sha256"] = {
+                "expected": (
+                    expected_latent.get("alignment_checkpoint_sha256")
+                    if isinstance(expected_latent, Mapping)
+                    else None
+                ),
+                "observed": (
+                    observed_latent.get("alignment_checkpoint_sha256")
+                    if isinstance(observed_latent, Mapping)
+                    else None
+                ),
+            }
     if differences:
         raise ValueError(f"Checkpoint architecture does not match this run: {differences}.")
 
@@ -2094,13 +2939,13 @@ def main() -> None:
         )
 
     try:
-        metadata, latent_contract = run_on_rank_zero_and_broadcast(
+        metadata, input_contract = run_on_rank_zero_and_broadcast(
             lambda: load_metadata_and_contract(args),
             "matched QA metadata validation",
         )
         train_dataset, val_dataset, test_dataset, screening_dataset = build_datasets(
             args,
-            latent_contract,
+            input_contract,
         )
         datasets = {
             "train": train_dataset,
@@ -2114,6 +2959,41 @@ def main() -> None:
             ),
             "general QA audit",
         )
+        if args.input_source == "raw_hdf5":
+            raw_content_audit = run_on_rank_zero_and_broadcast(
+                lambda: audit_raw_hdf5_input_content(datasets),
+                "raw HDF5 input content audit",
+            )
+            input_contract = copy.deepcopy(dict(input_contract))
+            input_contract["selected_patch_content"] = copy.deepcopy(
+                dict(raw_content_audit)
+            )
+            input_contract["identity_sha256"] = _json_sha256(
+                {
+                    key: value
+                    for key, value in input_contract.items()
+                    if key
+                    not in {
+                        "identity_sha256",
+                        "hdf5_path",
+                        "hdf5_bytes",
+                        "qa_generation_alignment_sha256",
+                    }
+                }
+            )
+            metadata = copy.deepcopy(dict(metadata))
+            input_resolution = copy.deepcopy(
+                dict(metadata.get("runtime_input_resolution", {}))
+            )
+            input_resolution["identity_sha256"] = input_contract[
+                "identity_sha256"
+            ]
+            input_resolution["selected_patch_content_sha256"] = raw_content_audit[
+                "sha256"
+            ]
+            metadata["runtime_input_resolution"] = input_resolution
+            data_audit = copy.deepcopy(dict(data_audit))
+            data_audit["raw_input_content"] = copy.deepcopy(dict(raw_content_audit))
         tokenizer = load_tokenizer(args)
         prompt_audit = run_on_rank_zero_and_broadcast(
             lambda: audit_prompt_tokenization(
@@ -2160,22 +3040,43 @@ def main() -> None:
 
         llm, model_dtype = load_llm_with_bounded_host_memory(args, device)
         llm_hidden_size = int(llm.get_input_embeddings().embedding_dim)
-        first_latent = train_dataset[0]["latent_map"]
-        latent_shape = tuple(int(value) for value in first_latent.shape)
-        spatial_initializer, initializer_provenance = load_spatial_initializer(
-            args.memory_init_checkpoint,
-            latent_shape,
-            llm_hidden_size,
-            latent_contract,
-            args.model_name_or_path,
-            args.latent_channel_policy,
-        )
+        first_field_input = train_dataset[0]["latent_map"]
+        input_shape = tuple(int(value) for value in first_field_input.shape)
+        field_encoder: DirectFieldEncoder | None = None
+        if args.memory_init_mode == "scratch":
+            # Decouple the ablation initializer from any RNG consumed while the
+            # frozen Transformers checkpoint is being materialized.
+            seed_everything(int(args.seed))
+            (
+                field_encoder,
+                spatial_initializer,
+                memory_shape,
+                initializer_provenance,
+            ) = build_scratch_memory_components(args, input_shape)
+        else:
+            memory_shape = input_shape
+            spatial_initializer, initializer_provenance = load_spatial_initializer(
+                args.memory_init_checkpoint,
+                memory_shape,
+                llm_hidden_size,
+                input_contract,
+                args.model_name_or_path,
+                args.latent_channel_policy,
+            )
         sidecar, install_report = build_sidecar(
             llm,
             spatial_initializer,
             args,
             device,
+            field_encoder=field_encoder,
         )
+        if args.memory_init_mode == "scratch":
+            initializer_provenance["field_spatial_sha256"] = initializer_provenance[
+                "sha256"
+            ]
+            initializer_provenance["sha256"] = _module_state_sha256(
+                {"full_sidecar": sidecar}
+            )
         synchronize_trainable_sidecar(sidecar)
         # Any configured stochastic sidecar operation receives a deterministic,
         # rank-specific stream after the common initialization is synchronized.
@@ -2209,6 +3110,22 @@ def main() -> None:
         if int(args.max_updates) > 0:
             planned_updates = min(planned_updates, int(args.max_updates))
         optimizer, parameter_report = build_optimizer(sidecar, args)
+        if args.input_source == "raw_hdf5":
+            required_trainable_groups = (
+                "trainable_field_encoder_parameters",
+                "trainable_spatial_parameters",
+                "trainable_value_parameters",
+                "trainable_cross_attention_parameters",
+            )
+            missing_groups = [
+                name
+                for name in required_trainable_groups
+                if int(parameter_report.get(name, 0)) <= 0
+            ]
+            if missing_groups:
+                raise RuntimeError(
+                    f"Direct-Cross is missing trainable final-path parameter groups: {missing_groups}."
+                )
         sidecar_parameter_ids = {id(value) for value in sidecar.parameters()}
         parameter_report["frozen_llm_parameters"] = sum(
             parameter.numel()
@@ -2224,9 +3141,10 @@ def main() -> None:
         )
         architecture = architecture_contract(
             args,
-            latent_shape,
+            input_shape,
+            memory_shape,
             llm_hidden_size,
-            latent_contract,
+            input_contract,
             initializer_provenance,
         )
         run_contract = {
@@ -2238,6 +3156,9 @@ def main() -> None:
                 "stage2b": copy.deepcopy(dict(metadata.get("stage2b", {}))),
                 "alignment_checkpoint_resolution": copy.deepcopy(
                     dict(metadata.get("runtime_alignment_checkpoint_resolution", {}))
+                ),
+                "input_resolution": copy.deepcopy(
+                    dict(metadata.get("runtime_input_resolution", {}))
                 ),
             },
             "install": install_report,
@@ -2269,6 +3190,7 @@ def main() -> None:
         if is_main_process():
             print(
                 "startup=model "
+                f"input={args.input_source} init={args.memory_init_mode} "
                 f"layers={args.cross_attention_layers} trainable={parameter_report['trainable_parameters']:,} "
                 f"frozen_llm={parameter_report['frozen_llm_parameters']:,} "
                 f"updates={planned_updates} warmup={warmup_updates}"
@@ -2379,7 +3301,7 @@ def main() -> None:
         progress = tqdm(
             total=planned_updates,
             initial=min(global_step, planned_updates),
-            desc="Dense cross-attention",
+            desc="Full-grid cross-attention",
             disable=not bool(args.console_progress) or not is_main_process(),
         )
 

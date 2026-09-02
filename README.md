@@ -67,6 +67,7 @@ configs/
   field_to_llm_stage1.yaml          # Stage 1 and QA-data construction
   field_to_llm_direct_qa.yaml       # Direct-QA memory initialization
   field_to_llm_cross_attention.yaml # Final paper model
+  field_to_llm_cross_attention_scratch.yaml # Direct-Cross scratch ablation
   field_to_llm_benchmark.yaml       # Paired accuracy and cost benchmark
 scripts/
   train_tensor_patch_text_alignment.py
@@ -226,7 +227,50 @@ python -m torch.distributed.run --standalone --nproc_per_node=3 \
   --splits test
 ```
 
-## Stage 1 Necessity Ablations
+## Direct-Cross Scratch Ablation
+
+The primary Stage 1 / QA-warm-start ablation trains the final full-grid field
+memory path directly, using
+`configs/field_to_llm_cross_attention_scratch.yaml`. Its defining settings are
+`data.input_source=raw_hdf5` and `memory.init_mode=scratch`.
+
+This run reuses the existing matched-QA JSONL questions, answers, and
+sample-disjoint splits so that its supervision is directly comparable with the
+paper run. For every QA state, however, the model input is reread from the
+PDEBench HDF5 file and normalized at runtime. The trainer does not open a Stage
+1 checkpoint, a Direct-QA checkpoint, or a learned latent-cache file. The field
+encoder, full-grid spatial backbone, pointwise scalar-value encoder, and
+cross-attention bridges are initialized from scratch and trained together;
+Qwen remains frozen. The scratch spatial backbone contains no prefix/soft-prompt
+output head. Runtime values are rounded to the same FP16 value space used when
+the matched-QA targets were built, and every selected normalized patch is
+content-hashed so resuming cannot silently switch HDF5 contents.
+
+The released scratch configuration is a 3,000-update validation screen and
+keeps test evaluation disabled. On physical GPUs 4, 5, and 6, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6 \
+python -m torch.distributed.run --standalone --nproc_per_node=3 \
+  scripts/train_tensor_qwen_cross_attention.py \
+  --config configs/field_to_llm_cross_attention_scratch.yaml
+```
+
+Only `FIELD_TO_LLM_ROOT` and `PDEBENCH_HDF5` are required by this configuration
+(plus an optional machine-local model path such as `FIELD_TO_LLM_MODEL_DIR`).
+The existing matched-QA directory is still required under
+`$FIELD_TO_LLM_ROOT/data/matched_patch_qa`. Consequently, this experiment
+removes Stage 1 and Direct-QA from the model-training path while holding the QA
+dataset fixed; it does not claim that the current matched-QA data-generation
+utilities are themselves Stage-1-free.
+
+## Earlier Stage 1 Initialization Diagnostics
+
+The following three-condition experiment predates the Direct-Cross scratch
+design. It remains useful for diagnosing which learned Stage 1 components
+survive initialization changes, but it still runs a Direct-QA prefix warm start
+and therefore is not the primary test of whether both upstream phases can be
+removed.
 
 One matched reference and two isolated ablations reuse the release Direct-QA
 recipe and a common 3,000-update cross-attention screening budget without

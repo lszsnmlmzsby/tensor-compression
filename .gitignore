@@ -29,6 +29,7 @@ Thumbs.db
 !/configs/field_to_llm_stage1.yaml
 !/configs/field_to_llm_direct_qa.yaml
 !/configs/field_to_llm_cross_attention.yaml
+!/configs/field_to_llm_cross_attention_scratch.yaml
 !/configs/field_to_llm_benchmark.yaml
 !/configs/field_to_llm_stage1_adapter_ablation.yaml
 !/configs/field_to_llm_no_learned_stage1_ablation.yaml
