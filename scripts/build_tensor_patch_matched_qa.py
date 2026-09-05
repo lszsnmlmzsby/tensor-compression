@@ -884,7 +884,12 @@ def verify_extreme_replay(
     find_max = match.group(1).lower() == "maximum"
     extreme_value = float(values.max() if find_max else values.min())
     positions = torch.nonzero(values == extreme_value, as_tuple=False).tolist()
-    quadrants = {quadrant(int(row), int(col), int(values.shape[0])) for row, col in positions}
+    from tensor_compression.downstream.variable_shape import rectangular_quadrant
+
+    quadrants = {
+        rectangular_quadrant(int(row), int(col), int(values.shape[0]), int(values.shape[1]))
+        for row, col in positions
+    }
     source_answer = str(record.get("answer", ""))
     if source_answer not in quadrants:
         raise ValueError(

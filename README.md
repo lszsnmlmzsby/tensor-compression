@@ -10,6 +10,13 @@ cross-attention. The LLM receives only the natural-language QA prompt; parsed
 coordinates, structured task IDs, oracle values, and task-specific readout
 heads are not model inputs.
 
+The variable-shape extension supports a single model over rectangular `H x W`
+fields, with `--profile pilot` and `--profile full` selecting independent data
+and training budgets. See [the experiment runbook](VARIABLE_SHAPE_RUNBOOK.md)
+for the protocol and complete local Git / remote-server commands. This path
+builds QA from raw HDF5 and trains from scratch; its default evaluation uses
+only the normal field input.
+
 ## Method
 
 The paper pipeline has two training stages:

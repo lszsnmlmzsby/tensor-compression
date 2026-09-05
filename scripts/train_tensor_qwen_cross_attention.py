@@ -82,6 +82,11 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     sinusoidal_2d_position_encoding,
 )
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
+from tensor_compression.downstream.variable_shape import (  # noqa: E402
+    VARIABLE_QA_FORMAT, VARIABLE_PROMPT_CONTRACT, ShapeBatchSampler,
+    experiment_config, parse_shapes, record_shape, shape_name,
+    balanced_screen_records, shape_matched_shuffle_indices,
+)
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     PATCH_LATENT_AUDIT_FORMAT,
     PATCH_MATCHED_QA_FORMAT,
@@ -141,6 +146,9 @@ def parse_args() -> argparse.Namespace:
         description="Train full-grid field-memory cross-attention inside a frozen LLM decoder."
     )
     parser.add_argument("--config", required=True, type=str)
+    parser.add_argument("--profile", choices=("pilot", "full"))
+    parser.add_argument("--qa-dir", type=str)
+    parser.add_argument("--evaluate-only", action="store_true", help="Evaluate the best checkpoint in --resume's run, without training.")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
@@ -177,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluate-test", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--console-progress", action=argparse.BooleanOptionalAction, default=None)
     cli = parser.parse_args()
-    config = load_yaml_mapping(cli.config)
+    config = experiment_config(load_yaml_mapping(cli.config), cli.profile)
 
     model_local = environment_override(
         "FIELD_TO_LLM_MODEL_DIR",
@@ -186,6 +194,10 @@ def parse_args() -> argparse.Namespace:
     model_name = _config_value(config, ["model.name_or_path", "model.model_name_or_path"])
     args = argparse.Namespace()
     args.config = str(cli.config)
+    args.experiment_profile = cli.profile
+    args.shape_mode = str(_config_value(config, ["data.shape_mode"], "fixed"))
+    args.train_shapes = parse_shapes(config["data"]["train_shapes"]) if args.shape_mode == "variable" else []
+    args.evaluate_only = bool(cli.evaluate_only)
     args.model_name_or_path = _path_value(model_local) if model_local else str(model_name or "")
     args.cache_dir = _path_value(
         environment_override(
@@ -200,8 +212,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     args.qa_dir = _path_value(
-        environment_override(
-            "FIELD_TO_LLM_MATCHED_QA_DIR",
+        cli.qa_dir or environment_override(
+            "FIELD_TO_LLM_VARIABLE_QA_DIR" if args.shape_mode == "variable" else "FIELD_TO_LLM_MATCHED_QA_DIR",
             _config_value(
                 config,
                 ["data.qa_dir", "patch_qa.matched_qa_dir", "patch_qa.stage2b_qa_dir"],
@@ -446,6 +458,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if getattr(args, "evaluate_only", False) and not args.resume:
+        raise ValueError("--evaluate-only requires --resume pointing to this run's last.pt.")
+    if getattr(args, "shape_mode", "fixed") not in {"fixed", "variable"}:
+        raise ValueError("data.shape_mode must be fixed or variable.")
+    if getattr(args, "shape_mode", "fixed") == "variable":
+        if args.input_source != "raw_hdf5" or args.memory_init_mode != "scratch":
+            raise ValueError("Variable shapes require raw_hdf5 and scratch initialization.")
+        if any(value is not None for value in (args.max_train_records, args.max_val_records, args.max_test_records)):
+            raise ValueError("Variable-shape runs use complete profile datasets; select --profile pilot for a small experiment.")
+        if args.questions_per_state_group != 3:
+            raise ValueError("Variable-shape QA uses atomic groups of three.")
     required_paths = {
         "model_name_or_path": args.model_name_or_path,
         "qa_dir": args.qa_dir,
@@ -553,7 +576,9 @@ def validate_args(args: argparse.Namespace) -> None:
     unsupported = sorted(set(args.eval_modes) - set(SUPPORTED_EVAL_MODES))
     if unsupported:
         raise ValueError(f"Unsupported final evaluation modes: {unsupported}.")
-    if "correct" not in args.eval_modes or "no_tensor" not in args.eval_modes:
+    if "correct" not in args.eval_modes or (
+        getattr(args, "shape_mode", "fixed") != "variable" and "no_tensor" not in args.eval_modes
+    ):
         raise ValueError("Final evaluation must include correct and no_tensor modes.")
     if args.selection_metric not in {"accuracy", "macro_accuracy", "normalized_accuracy"}:
         raise ValueError(
@@ -567,8 +592,9 @@ def validate_args(args: argparse.Namespace) -> None:
 class DirectFieldEncoder(nn.Module):
     """Only the encoder path used by Direct-Cross; no autoencoder decoder exists here."""
 
-    def __init__(self, compressor: nn.Module) -> None:
+    def __init__(self, compressor: nn.Module, dynamic_grid: bool = False) -> None:
         super().__init__()
+        self.dynamic_grid = bool(dynamic_grid)
         required = ("encoder", "to_latent", "input_size", "latent_grid", "in_channels", "latent_dim")
         missing = [name for name in required if not hasattr(compressor, name)]
         if missing:
@@ -589,18 +615,20 @@ class DirectFieldEncoder(nn.Module):
             raise ValueError(
                 f"Direct-Cross field input must be [B,C,H,W], got {tuple(normalized_field.shape)}."
             )
-        if int(normalized_field.shape[1]) != self.in_channels or tuple(
-            int(value) for value in normalized_field.shape[-2:]
-        ) != self.input_size:
+        spatial_shape = tuple(int(value) for value in normalized_field.shape[-2:])
+        if int(normalized_field.shape[1]) != self.in_channels or (
+            not self.dynamic_grid and spatial_shape != self.input_size
+        ):
             raise ValueError(
                 "Direct-Cross field input differs from the encoder contract: "
                 f"observed={tuple(normalized_field.shape[1:])}, "
                 f"expected={(self.in_channels, *self.input_size)}."
             )
         learned = self.to_latent(self.encoder(normalized_field))
-        if tuple(int(value) for value in learned.shape[-2:]) != self.latent_grid:
+        expected_grid = tuple(normalized_field.shape[-2:]) if self.dynamic_grid else self.latent_grid
+        if tuple(int(value) for value in learned.shape[-2:]) != expected_grid:
             raise RuntimeError(
-                f"Field encoder produced grid {tuple(learned.shape[-2:])}, expected {self.latent_grid}."
+                f"Field encoder produced grid {tuple(learned.shape[-2:])}, expected {expected_grid}."
             )
         return torch.cat([normalized_field.to(dtype=learned.dtype), learned], dim=1)
 
@@ -619,8 +647,10 @@ class FullGridSpatialBackbone(nn.Module):
         adapter_layers: int,
         adapter_heads: int,
         dropout: float,
+        dynamic_grid: bool = False,
     ) -> None:
         super().__init__()
+        self.dynamic_grid = bool(dynamic_grid)
         self.latent_grid = tuple(int(value) for value in latent_grid)
         if len(self.latent_grid) != 2 or any(value <= 0 for value in self.latent_grid):
             raise ValueError(f"Invalid full-grid spatial shape: {self.latent_grid}.")
@@ -653,7 +683,7 @@ class FullGridSpatialBackbone(nn.Module):
         )
 
     def spatial_input_states(self, latent_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if latent_map.ndim != 4 or tuple(int(value) for value in latent_map.shape[-2:]) != self.latent_grid:
+        if latent_map.ndim != 4 or (not self.dynamic_grid and tuple(int(value) for value in latent_map.shape[-2:]) != self.latent_grid):
             raise ValueError(
                 f"Expected encoded field [B,C,{self.latent_grid[0]},{self.latent_grid[1]}], "
                 f"got {tuple(latent_map.shape)}."
@@ -662,7 +692,9 @@ class FullGridSpatialBackbone(nn.Module):
         latent_tokens = latent_tokens.to(dtype=self.latent_projection.weight.dtype)
         local_residual = self.local_residual_projection(latent_tokens)
         content = self.latent_projection(latent_tokens)
-        position = self.spatial_pos_scale.to(dtype=content.dtype) * self.spatial_pos_encoding.to(
+        grid = tuple(int(value) for value in latent_map.shape[-2:])
+        position_table = self.spatial_pos_encoding if grid == self.latent_grid else sinusoidal_2d_position_encoding(*grid, self.adapter_dim)
+        position = self.spatial_pos_scale.to(dtype=content.dtype) * position_table.to(
             device=content.device,
             dtype=content.dtype,
         )
@@ -991,14 +1023,17 @@ def validate_raw_hdf5_qa_contract(
     hdf5_path = Path(str(args.hdf5_path)).expanduser()
     if not hdf5_path.is_file():
         raise FileNotFoundError(f"Direct-Cross PDEBench HDF5 file is missing: {hdf5_path}.")
-    if str(metadata.get("format", "")) != PATCH_MATCHED_QA_FORMAT:
+    dynamic = getattr(args, "shape_mode", "fixed") == "variable"
+    if (Path(args.qa_dir) / ".build_in_progress.json").exists():
+        raise ValueError("QA generation is incomplete; select a completed dataset directory.")
+    if str(metadata.get("format", "")) != (VARIABLE_QA_FORMAT if dynamic else PATCH_MATCHED_QA_FORMAT):
         raise ValueError("Direct-Cross requires the formal matched-QA dataset format.")
-    if str(metadata.get("prompt_contract", "")) != PATCH_QA_PROMPT_CONTRACT:
+    if str(metadata.get("prompt_contract", "")) != (VARIABLE_PROMPT_CONTRACT if dynamic else PATCH_QA_PROMPT_CONTRACT):
         raise ValueError("Direct-Cross matched-QA prompt contract is missing or stale.")
     if str(metadata.get("latent_audit_format", "")) != PATCH_LATENT_AUDIT_FORMAT:
         raise ValueError("Direct-Cross requires per-record raw-value normalization audits.")
     metadata_patch_size = int(metadata.get("patch_size", 0))
-    if metadata_patch_size != int(args.patch_size):
+    if not dynamic and metadata_patch_size != int(args.patch_size):
         raise ValueError(
             "Direct-Cross patch size differs from the fixed matched-QA records: "
             f"configured={args.patch_size}, metadata={metadata_patch_size}."
@@ -1074,6 +1109,22 @@ def validate_raw_hdf5_qa_contract(
         "qa_output_split_sha256": actual_split_sha256,
         "qa_source_split_sha256": copy.deepcopy(metadata.get("source_split_sha256", {})),
     }
+    if dynamic:
+        if metadata.get("profile") != args.experiment_profile:
+            raise ValueError("QA profile differs from --profile; pilot and full datasets are separate.")
+        if list(fields) != list(args.raw_config["data"]["fields"]):
+            raise ValueError("QA fields differ from the selected configuration; rebuild the dataset.")
+        if metadata.get("generation") != args.raw_config.get("generation"):
+            raise ValueError("QA generation settings differ from the selected configuration; rebuild the dataset.")
+        shape_sets = {}
+        for key in ("train_shapes", "heldout_shapes", "extrapolation_shapes"):
+            shapes = parse_shapes(metadata[key])
+            if shapes != parse_shapes(args.raw_config["data"][key]):
+                raise ValueError(f"QA/config shape mismatch: {key}.")
+            shape_sets[key] = [list(shape) for shape in shapes]
+        identity.update(format="raw_hdf5_variable_grid_v1", input_shape=[1, -1, -1],
+                        shape_mode="variable", profile=args.experiment_profile, **shape_sets)
+        identity.pop("patch_size")
     contract = {
         **identity,
         "identity_sha256": _json_sha256(identity),
@@ -1202,7 +1253,11 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         subset_seed: int,
         shuffle_seed: int,
         input_cache_size: int,
+        dynamic_grid: bool = False,
+        allowed_shapes: Sequence | None = None,
     ) -> None:
+        self.dynamic_grid = bool(dynamic_grid)
+        self.allowed_shapes = set(tuple(shape) for shape in (allowed_shapes or []))
         super().__init__(
             jsonl_path=jsonl_path,
             latent_dir=Path(hdf5_path).expanduser().parent,
@@ -1221,6 +1276,11 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         self.normalized_dtype = str(normalized_dtype)
         self._hdf5_handle: Any | None = None
         self._hdf5_pid: int | None = None
+
+    def _build_random_different_indices(self, seed: int) -> list[int]:
+        if self.dynamic_grid:
+            return shape_matched_shuffle_indices(self.records, seed)
+        return super()._build_random_different_indices(seed)
 
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
@@ -1258,12 +1318,9 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         sample_index = int(identity["sample_index"])
         time_index = int(identity["time_index"])
         field = str(identity["field"])
-        metadata = record.get("metadata")
-        grid_shape = metadata.get("grid_shape") if isinstance(metadata, Mapping) else None
-        if (
-            not isinstance(grid_shape, Sequence)
-            or isinstance(grid_shape, (str, bytes))
-            or [int(value) for value in grid_shape] != [self.patch_size, self.patch_size]
+        height, width = record_shape(record)
+        if (self.dynamic_grid and self.allowed_shapes and (height, width) not in self.allowed_shapes) or (
+            not self.dynamic_grid and (height, width) != (self.patch_size, self.patch_size)
         ):
             raise ValueError(
                 f"Matched-QA state {identity['patch_id']!r} has an invalid grid_shape."
@@ -1283,8 +1340,8 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         if (
             row < 0
             or col < 0
-            or row + self.patch_size > int(dataset.shape[2])
-            or col + self.patch_size > int(dataset.shape[3])
+            or row + height > int(dataset.shape[2])
+            or col + width > int(dataset.shape[3])
         ):
             raise IndexError(
                 f"Matched-QA state {identity['patch_id']!r} is outside the PDEBench spatial axes."
@@ -1292,8 +1349,8 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         array = dataset[
             sample_index,
             time_index,
-            row : row + self.patch_size,
-            col : col + self.patch_size,
+            row : row + height,
+            col : col + width,
         ]
         return torch.as_tensor(array, dtype=torch.float32).clone().unsqueeze(0)
 
@@ -1302,6 +1359,9 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         if not state_ref:
             raise ValueError("Direct-Cross record has no state_ref/patch_id.")
         identity = latent_identity_from_record(record)
+        if self.dynamic_grid:
+            identity = {**identity, "grid_shape": list(record_shape(record)),
+                        "normalized_sha256": record["metadata"].get("normalized_sha256")}
         previous_identity = self._latent_identity_cache.get(state_ref)
         if previous_identity is not None and previous_identity != identity:
             raise ValueError(
@@ -1325,6 +1385,10 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
             self.normalization,
             normalized_dtype=self.normalized_dtype,
         )
+        if self.dynamic_grid:
+            digest = hashlib.sha256(normalized.numpy().tobytes()).hexdigest()
+            if digest != record["metadata"].get("normalized_sha256"):
+                raise ValueError(f"Raw field values differ from QA hash for {state_ref}.")
         cache_capacity = self.effective_latent_cache_size()
         if cache_capacity > 0:
             self._latent_cache[state_ref] = normalized
@@ -1542,6 +1606,8 @@ def build_datasets(
                 subset_seed=subset_seed,
                 shuffle_seed=int(args.shuffle_seed),
                 input_cache_size=int(args.latent_cache_size),
+                dynamic_grid=getattr(args, "shape_mode", "fixed") == "variable",
+                allowed_shapes=(input_contract.get("train_shapes", []) + input_contract.get("heldout_shapes", []) + input_contract.get("extrapolation_shapes", [])),
             )
         return TensorReadoutQADataset(
             path,
@@ -1576,10 +1642,29 @@ def build_datasets(
     )
     screening_dataset = make_dataset(
         args.val_split,
-        max_records=min(int(args.screening_records), len(val_dataset.records)),
+        max_records=None if getattr(args, "shape_mode", "fixed") == "variable" else min(int(args.screening_records), len(val_dataset.records)),
         subset_mode="hash_state",
         subset_seed=int(args.shuffle_seed) + 10_001,
     )
+    if getattr(args, "shape_mode", "fixed") == "variable":
+        metadata = json.loads((Path(args.qa_dir) / "metadata.json").read_text(encoding="utf-8"))
+        shape_partitions = {tuple(shape): partition for key, partition in (
+            ("train_shapes", "seen"), ("heldout_shapes", "heldout"), ("extrapolation_shapes", "extrapolation")
+        ) for shape in metadata[key]}
+        for split, dataset in ((args.train_split, train_dataset), (args.val_split, val_dataset), (args.test_split, test_dataset)):
+            allowed_samples = set(metadata["trajectory_splits"][split])
+            expected_shapes = set(args.train_shapes) if split == args.train_split else set(shape_partitions)
+            if {record_shape(record) for record in dataset.records} != expected_shapes:
+                raise ValueError(f"Missing or unexpected shapes in {split}.")
+            for record in dataset.records:
+                if int(record["sample_index"]) not in allowed_samples:
+                    raise ValueError(f"Record lies outside the declared {split} trajectory partition.")
+                if record["metadata"].get("shape_partition") != shape_partitions[record_shape(record)]:
+                    raise ValueError("Record shape_partition differs from metadata.")
+        screening_dataset.records = balanced_screen_records(
+            val_dataset.records, args.train_shapes, int(args.screening_records), int(args.shuffle_seed) + 10_001
+        )
+        screening_dataset._random_different_indices = shape_matched_shuffle_indices(screening_dataset.records, int(args.shuffle_seed))
     return train_dataset, val_dataset, test_dataset, screening_dataset
 
 
@@ -1899,7 +1984,8 @@ def build_scratch_memory_components(
 
     normalized_input_shape = tuple(int(value) for value in input_shape)
     expected_input_shape = (1, int(args.patch_size), int(args.patch_size))
-    if normalized_input_shape != expected_input_shape:
+    dynamic = getattr(args, "shape_mode", "fixed") == "variable"
+    if (not dynamic and normalized_input_shape != expected_input_shape) or (dynamic and (len(normalized_input_shape) != 3 or normalized_input_shape[0] != 1)):
         raise ValueError(
             f"Direct-Cross raw input shape is {normalized_input_shape}, expected {expected_input_shape}."
         )
@@ -1916,7 +2002,9 @@ def build_scratch_memory_components(
     if not bool(model_config.get("preserve_input_channels", False)):
         raise ValueError("Direct-Cross field encoder requires preserve_input_channels=true.")
     compressor = build_model(copy.deepcopy(encoder_config))
-    field_encoder = DirectFieldEncoder(compressor)
+    field_encoder = DirectFieldEncoder(compressor, dynamic_grid=dynamic)
+    if dynamic and (model_config.get("channel_multipliers") or field_encoder.latent_grid != field_encoder.input_size):
+        raise ValueError("Variable field encoder must preserve H,W without downsampling or pooling.")
     if field_encoder.input_size != expected_input_shape[1:]:
         raise ValueError(
             "Direct-Cross field_encoder.model.input_size must match data.patch_size: "
@@ -1938,6 +2026,7 @@ def build_scratch_memory_components(
         adapter_layers=int(spatial.get("adapter_layers", 2)),
         adapter_heads=int(spatial.get("adapter_heads", 8)),
         dropout=float(spatial.get("dropout", 0.0)),
+        dynamic_grid=dynamic,
     )
     state_sha256 = _module_state_sha256(
         {"field_encoder": field_encoder, "spatial_backbone": spatial_backbone}
@@ -2214,10 +2303,12 @@ def architecture_contract(
         "llm_hidden_size": int(llm_hidden_size),
         "input_source": str(args.input_source),
         "memory_init_mode": str(args.memory_init_mode),
-        "input_shape": [int(value) for value in input_shape],
+        "input_shape": [1, -1, -1] if getattr(args, "shape_mode", "fixed") == "variable" else [int(value) for value in input_shape],
+        "shape_mode": getattr(args, "shape_mode", "fixed"),
         # Retain the historical key for paper-checkpoint compatibility. In
         # Direct-Cross it describes the online field-encoder output.
-        "latent_shape": [int(value) for value in memory_shape],
+        "latent_shape": ([int(memory_shape[0]), -1, -1] if getattr(args, "shape_mode", "fixed") == "variable"
+                         else [int(value) for value in memory_shape]),
         "layers_1based": [int(value) for value in args.cross_attention_layers],
         "bridge_dim": int(args.bridge_dim),
         "heads": int(args.bridge_heads),
@@ -2274,6 +2365,9 @@ def validate_checkpoint_contract(
         for key in stable_keys
         if observed.get(key) != expected_contract.get(key)
     }
+    for key, default in (("shape_mode", "fixed"), ("training_recipe", None)):
+        if observed.get(key, default) != expected_contract.get(key, default):
+            differences[key] = {"expected": expected_contract.get(key, default), "observed": observed.get(key, default)}
     observed_model = str(observed.get("qwen_model", "")).replace("\\", "/").rstrip("/")
     expected_model = str(expected_contract.get("qwen_model", "")).replace("\\", "/").rstrip("/")
     observed_model_identity = observed_model.rsplit("/", 1)[-1].casefold()
@@ -2550,11 +2644,13 @@ def evaluate(
         if distributed_is_initialized()
         else None
     )
+    dynamic = getattr(args, "shape_mode", "fixed") == "variable"
+    batching = {"batch_sampler": ShapeBatchSampler(dataset, int(args.eval_batch_size), rank=distributed_rank(), num_replicas=distributed_world_size())} if dynamic else {
+        "batch_size": max(1, int(args.eval_batch_size)), "shuffle": False, "sampler": sampler,
+    }
     loader = DataLoader(
         dataset,
-        batch_size=max(1, int(args.eval_batch_size)),
-        shuffle=False,
-        sampler=sampler,
+        **batching,
         num_workers=int(args.num_workers),
         persistent_workers=False,
         prefetch_factor=1 if int(args.num_workers) > 0 else None,
@@ -2579,6 +2675,7 @@ def evaluate(
         field_correct: dict[str, int] = defaultdict(int)
         task_field_total: dict[str, int] = defaultdict(int)
         task_field_correct: dict[str, int] = defaultdict(int)
+        shape_counts: dict[str, list[int]] = {}
         progress = tqdm(
             loader,
             desc=f"Eval [{mode}]",
@@ -2627,6 +2724,13 @@ def evaluate(
                 field_correct[field] += is_correct
                 task_field_total[task_field] += 1
                 task_field_correct[task_field] += is_correct
+                if dynamic:
+                    for key in (f"shape:{shape_name(record_shape(record))}",
+                                f"shape_task:{shape_name(record_shape(record))}|{task}",
+                                f"partition:{record['metadata']['shape_partition']}"):
+                        counts = shape_counts.setdefault(key, [0, 0])
+                        counts[0] += is_correct
+                        counts[1] += 1
         (
             total,
             correct,
@@ -2668,6 +2772,24 @@ def evaluate(
             "by_field": accuracy_map(field_total, field_correct),
             "by_task_field": accuracy_map(task_field_total, task_field_correct),
         }
+        if dynamic:
+            gathered = [shape_counts]
+            if distributed_is_initialized():
+                gathered = [None] * distributed_world_size()
+                dist.all_gather_object(gathered, shape_counts)
+            combined: dict[str, list[int]] = {}
+            for rank_counts in gathered:
+                for key, counts in rank_counts.items():
+                    target = combined.setdefault(key, [0, 0])
+                    target[0] += counts[0]
+                    target[1] += counts[1]
+            for prefix, name in (("shape:", "by_shape"), ("shape_task:", "by_shape_task"), ("partition:", "by_shape_partition")):
+                result["modes"][mode][name] = {
+                    key[len(prefix):]: {"correct": counts[0], "total": counts[1], "accuracy": counts[0] / counts[1]}
+                    for key, counts in sorted(combined.items()) if key.startswith(prefix)
+                }
+            if total != len(dataset):
+                raise RuntimeError(f"Variable evaluation lost or duplicated records: {total} != {len(dataset)}.")
     add_evaluation_deltas(result)
     set_frozen_llm_execution_mode(llm, checkpoint_training=previous_checkpoint_mode)
     sidecar.train()
@@ -2705,6 +2827,12 @@ def print_eval_summary(label: str, metrics: Mapping[str, Any]) -> None:
             f"{label} mode={mode} accuracy={float(values.get('accuracy', 0.0)):.4f} "
             f"macro={float(values.get('macro_accuracy', 0.0)):.4f} {task_text}"
         )
+        for partition, counts in values.get("by_shape_partition", {}).items():
+            print(f"{label} mode={mode} shape_partition={partition} accuracy={counts['accuracy']:.4f} n={counts['total']}")
+        for shape, counts in values.get("by_shape", {}).items():
+            tasks_for_shape = " ".join(f"{key.split('|', 1)[1]}={item['accuracy']:.4f}"
+                                       for key, item in values.get("by_shape_task", {}).items() if key.startswith(shape + "|"))
+            print(f"{label} mode={mode} shape={shape} accuracy={counts['accuracy']:.4f} n={counts['total']} {tasks_for_shape}")
 
 
 def save_checkpoint_on_rank_zero(
@@ -3030,7 +3158,8 @@ def main() -> None:
                 },
             )
 
-        run_on_rank_zero_and_broadcast(write_startup_audits, "startup audit writes")
+        if not args.resume:
+            run_on_rank_zero_and_broadcast(write_startup_audits, "startup audit writes")
         if is_main_process():
             print(
                 "startup=data "
@@ -3087,10 +3216,12 @@ def main() -> None:
         )
         sidecar.train()
 
-        train_sampler = StateTaskGroupedBatchSampler(
+        sampler_class = ShapeBatchSampler if args.shape_mode == "variable" else StateTaskGroupedBatchSampler
+        sampler_options = {"training": True} if args.shape_mode == "variable" else {"questions_per_group": int(args.questions_per_state_group)}
+        train_sampler = sampler_class(
             dataset=train_dataset,
             batch_size=int(args.batch_size),
-            questions_per_group=int(args.questions_per_state_group),
+            **sampler_options,
             seed=int(args.shuffle_seed),
             rank=distributed_rank(),
             num_replicas=distributed_world_size(),
@@ -3107,6 +3238,8 @@ def main() -> None:
         accumulation_steps = int(args.gradient_accumulation_steps)
         updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
         planned_updates = updates_per_epoch * int(args.epochs)
+        if args.shape_mode == "variable" and int(args.max_updates) > planned_updates:
+            raise ValueError(f"Epoch budget allows {planned_updates} updates, less than max_updates={args.max_updates}; increase --epochs or lower --max-updates.")
         if int(args.max_updates) > 0:
             planned_updates = min(planned_updates, int(args.max_updates))
         optimizer, parameter_report = build_optimizer(sidecar, args)
@@ -3147,6 +3280,19 @@ def main() -> None:
             input_contract,
             initializer_provenance,
         )
+        if args.shape_mode == "variable":
+            recipe_keys = ("experiment_profile", "seed", "shuffle_seed", "epochs", "batch_size",
+                           "gradient_accumulation_steps", "lr", "gate_lr", "lr_scheduler", "warmup_ratio",
+                           "min_lr_ratio", "weight_decay", "grad_clip_norm", "choice_ce_weight",
+                           "full_answer_ce_weight", "matched_group_weight", "matched_group_margin",
+                           "value_reconstruction_weight", "prompt_template", "max_prompt_tokens",
+                           "max_target_tokens", "append_eos", "screening_records", "screening_fractions", "selection_metric")
+            architecture["training_recipe"] = {key: getattr(args, key) for key in recipe_keys}
+            architecture["training_recipe"].update(planned_updates=planned_updates, world_size=distributed_world_size())
+            parameter_report["shape_padding_records_per_epoch"] = train_sampler.padding_records_per_epoch
+            if is_main_process():
+                print(f"startup=variable_shapes profile={args.experiment_profile} train_shapes={args.train_shapes} "
+                      f"padding_records_per_epoch={train_sampler.padding_records_per_epoch} planned_updates={planned_updates}")
         run_contract = {
             "architecture": architecture,
             "qa_metadata": {
@@ -3183,10 +3329,11 @@ def main() -> None:
                 "warmup_updates": warmup_updates,
             },
         }
-        run_on_rank_zero_and_broadcast(
-            lambda: atomic_dump_json(run_dir / "run_contract.json", run_contract),
-            "run contract write",
-        )
+        if not args.resume:
+            run_on_rank_zero_and_broadcast(
+                lambda: atomic_dump_json(run_dir / "run_contract.json", run_contract),
+                "run contract write",
+            )
         if is_main_process():
             print(
                 "startup=model "
@@ -3221,6 +3368,23 @@ def main() -> None:
             if isinstance(checkpoint_metrics, Mapping):
                 best_score = float(checkpoint_metrics.get("best_score", -math.inf))
                 best_step = int(checkpoint_metrics.get("best_step", global_step))
+                best_screen_metrics = dict(checkpoint_metrics.get("best_screen_metrics", {}))
+            if best_path.exists():
+                saved_best = torch.load(best_path, map_location="cpu", weights_only=True)
+                validate_checkpoint_contract(saved_best, architecture)
+                saved_metrics = saved_best.get("metrics", {})
+                best_score = float(saved_metrics.get("score", saved_metrics.get("best_score", best_score)))
+                best_step = int(saved_best["progress"]["global_step"])
+                best_screen_metrics = dict(saved_metrics.get("metrics", best_screen_metrics))
+                del saved_best
+            elif args.evaluate_only:
+                raise FileNotFoundError(f"--evaluate-only requires {best_path}.")
+            # Validate first: a rejected resume must not overwrite the original run's evidence.
+            run_on_rank_zero_and_broadcast(write_startup_audits, "validated resume audit writes")
+            run_on_rank_zero_and_broadcast(
+                lambda: atomic_dump_json(run_dir / "run_contract.json", run_contract),
+                "validated resume contract write",
+            )
             run_on_rank_zero_and_broadcast(
                 lambda: atomic_dump_json(run_dir / "resume_report.json", resume_report),
                 "resume report write",
@@ -3256,7 +3420,7 @@ def main() -> None:
                 device,
                 model_dtype,
                 args,
-                modes=["correct", "no_tensor"],
+                modes=["correct"] if args.shape_mode == "variable" else ["correct", "no_tensor"],
             )
             best_score = selection_score(initial_metrics, args.selection_metric)
             best_step = global_step
@@ -3305,7 +3469,7 @@ def main() -> None:
             disable=not bool(args.console_progress) or not is_main_process(),
         )
 
-        for epoch_index in range(start_epoch, int(args.epochs)):
+        for epoch_index in range(start_epoch, start_epoch if args.evaluate_only else int(args.epochs)):
             train_sampler.set_epoch(epoch_index)
             epoch_skip = resume_batch_index if epoch_index == start_epoch else 0
             next_epoch_for_resume = epoch_index
@@ -3567,7 +3731,10 @@ def main() -> None:
 
         final_elapsed = elapsed_seconds(process_start, previous_elapsed)
         summary = {
-            "status": "complete",
+            "status": "complete" if global_step >= planned_updates else "training_incomplete",
+            "training_budget_completed": global_step >= planned_updates,
+            "evaluation_only": bool(args.evaluate_only),
+            "experiment_profile": args.experiment_profile,
             "stop_reason": stop_reason,
             "global_step": global_step,
             "planned_updates": planned_updates,

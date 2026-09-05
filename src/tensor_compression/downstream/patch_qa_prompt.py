@@ -117,6 +117,16 @@ def build_prompt(record: Mapping[str, Any], prompt_template: str) -> str:
     if not isinstance(choices, Sequence) or isinstance(choices, str):
         choices = []
     choice_text = ", ".join(str(choice) for choice in choices)
+    if prompt_template == "field_memory":
+        return (
+            "The supplied field memory represents the numerical grid, with one memory cell per grid cell.\n"
+            "Rows and columns in the query use one-based indices. Use the field values to answer.\n\n"
+            f"Query: {query}\n"
+            f"Choices: {choice_text}\n"
+            f"{choice_semantics(record)}\n"
+            f"{valid_choice_instruction(record)}\n"
+            "Answer:"
+        )
     if prompt_template == "generic":
         return (
             "Tensor-state soft tokens are prepended before this text.\n"

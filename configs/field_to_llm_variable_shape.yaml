@@ -1,0 +1,137 @@
+# One model, one token per cell, variable even HxW. Select --profile explicitly.
+storage:
+  hf_home: ${FIELD_TO_LLM_ROOT}/hf_cache
+  output_root: ${FIELD_TO_LLM_ROOT}/tensor_llm_outputs/runs
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  local_dir: null
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  gradient_checkpointing: true
+data:
+  shape_mode: variable
+  input_source: raw_hdf5
+  hdf5_path: ${PDEBENCH_HDF5}
+  patch_size: 16  # Initialization reference only; runtime H,W come from each record.
+  raw_normalized_dtype: float16
+  fields: [Vx, Vy, density, pressure]
+  train_shapes: [8x8, 8x16, 16x8, 16x16, 16x32, 32x16, 32x32]
+  heldout_shapes: [12x20, 20x12, 16x24, 24x16, 24x24, 8x32, 32x8]
+  extrapolation_shapes: [40x40, 48x48]
+  require_disjoint_splits: true
+  input_cache_size: 4096
+  num_workers: 2
+generation:
+  seed: 20260905
+  region_size: 4
+  numeric_min_gap: 0.5
+  region_min_gap: 0.2
+  decimal_places: 6
+  max_attempts_per_state: 100
+field_encoder:
+  trainable: true
+  normalization:
+    mode: zscore
+    scope: channel
+    stats_path: null
+    clip_min: null
+    clip_max: null
+  model:
+    name: conv_token_autoencoder_2d
+    input_size: [16, 16]
+    base_channels: 32
+    channel_multipliers: []
+    num_res_blocks: 1
+    latent_dim: 8
+    latent_grid: [16, 16]
+    preserve_input_channels: true
+    dropout: 0.0
+    norm: group
+    activation: gelu
+    output_activation: identity
+spatial_adapter:
+  type: full_grid_transformer
+  adapter_dim: 512
+  adapter_layers: 2
+  adapter_heads: 8
+  dropout: 0.0
+memory:
+  init_mode: scratch
+  freeze_spatial_backbone: false
+  latent_channel_policy: all
+  value_fourier_bands: 4
+  value_hidden_dim: 128
+cross_attention:
+  layers_1based: [8, 20, 32]
+  bridge_dim: 512
+  heads: 8
+  dropout: 0.0
+  gate_init: 0.0
+training:
+  batch_size: 3
+  gradient_accumulation_steps: 1
+  questions_per_state_group: 3
+  lr: 5.0e-5
+  gate_lr: 5.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.2
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  choice_ce_weight: 1.0
+  full_answer_ce_weight: 0.02
+  matched_group_weight: 0.1
+  matched_group_margin: 0.5
+  value_reconstruction_weight: 0.01
+  prompt_template: field_memory
+  max_prompt_tokens: 512
+  max_target_tokens: 8
+  append_eos: true
+  log_interval: 20
+evaluation:
+  batch_size: 3
+  screening_fractions: [0.125, 0.25, 0.5, 0.75, 1.0]
+  selection_metric: macro_accuracy
+  final_modes: [correct]
+  evaluate_test: false
+runtime:
+  seed: 42
+  shuffle_seed: 42
+  device: auto
+  distributed_timeout_seconds: 7200
+  serialize_llm_loading: true
+  low_cpu_mem_usage: true
+  min_host_memory_available_gib: 16
+  save_every_updates: 250
+  console_progress: true
+profiles:
+  pilot:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/variable_shape_qa/pilot
+    generation:
+      train_states: 1344
+      eval_states_per_shape: 32
+    training:
+      run_name: variable_shape_pilot
+      epochs: 3
+      max_updates: 1500
+    evaluation:
+      screening_records: 350
+    runtime:
+      max_wall_clock_hours: 6
+      final_eval_reserve_minutes: 45
+  full:
+    data:
+      qa_dir: ${FIELD_TO_LLM_ROOT}/data/variable_shape_qa/full
+    generation:
+      train_states: 15969
+      eval_states_per_shape: 500
+    training:
+      run_name: variable_shape_full
+      epochs: 2
+      max_updates: 31938
+    evaluation:
+      screening_records: 3500
+    runtime:
+      max_wall_clock_hours: 24
+      final_eval_reserve_minutes: 120
