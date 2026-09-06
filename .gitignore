@@ -31,6 +31,7 @@ Thumbs.db
 !/configs/field_to_llm_cross_attention.yaml
 !/configs/field_to_llm_cross_attention_scratch.yaml
 !/configs/field_to_llm_variable_shape.yaml
+!/configs/field_to_llm_variable_shape_mixed.yaml
 !/configs/field_to_llm_benchmark.yaml
 !/configs/field_to_llm_stage1_adapter_ablation.yaml
 !/configs/field_to_llm_no_learned_stage1_ablation.yaml
@@ -43,6 +44,9 @@ Thumbs.db
 !/scripts/build_tensor_patch_qa.py
 !/scripts/build_tensor_patch_matched_qa.py
 !/scripts/build_variable_shape_qa.py
+!/scripts/mixed_shape_qa.py
+!/scripts/analyze_field_predictions.py
+!/scripts/evaluate_variable_shape_checkpoint.py
 !/scripts/summarize_variable_shape_run.py
 !/scripts/train_tensor_llm_adapter.py
 !/scripts/train_tensor_qwen_cross_attention.py
@@ -61,6 +65,7 @@ Thumbs.db
 !/tests/test_frozen_qwen_patch_qa.py
 !/tests/test_tensor_qwen_cross_attention.py
 !/tests/test_variable_shape_fields.py
+!/tests/test_mixed_shape_fields.py
 !/tests/test_tensor_qwen_inference_benchmark.py
 !/tests/test_tensor_qwen_stage1_ablation.py
 !/tests/test_compare_tensor_qwen_stage1_ablation.py

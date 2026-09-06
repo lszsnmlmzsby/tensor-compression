@@ -82,10 +82,12 @@ from scripts.train_tensor_patch_text_alignment import (  # noqa: E402
     sinusoidal_2d_position_encoding,
 )
 from tensor_compression.downstream.patch_qa_prompt import build_prompt  # noqa: E402
+from tensor_compression.downstream.field_diagnostics import prediction_record, write_prediction_shard  # noqa: E402
 from tensor_compression.downstream.variable_shape import (  # noqa: E402
     VARIABLE_QA_FORMAT, VARIABLE_PROMPT_CONTRACT, ShapeBatchSampler,
     experiment_config, parse_shapes, record_shape, shape_name,
     balanced_screen_records, shape_matched_shuffle_indices,
+    MIXED_QA_FORMAT, MIXED_PROMPT_CONTRACT, mixed_protocol, mixed_screen_records,
 )
 from tensor_compression.downstream.patch_qa_contract import (  # noqa: E402
     PATCH_LATENT_AUDIT_FORMAT,
@@ -196,7 +198,8 @@ def parse_args() -> argparse.Namespace:
     args.config = str(cli.config)
     args.experiment_profile = cli.profile
     args.shape_mode = str(_config_value(config, ["data.shape_mode"], "fixed"))
-    args.train_shapes = parse_shapes(config["data"]["train_shapes"]) if args.shape_mode == "variable" else []
+    args.train_shapes = parse_shapes(config["data"]["train_shapes"], allow_odd=mixed_protocol(config)) if args.shape_mode == "variable" else []
+    args.export_predictions = bool(_config_value(config, ["evaluation.export_predictions"], False))
     args.evaluate_only = bool(cli.evaluate_only)
     args.model_name_or_path = _path_value(model_local) if model_local else str(model_name or "")
     args.cache_dir = _path_value(
@@ -1024,11 +1027,12 @@ def validate_raw_hdf5_qa_contract(
     if not hdf5_path.is_file():
         raise FileNotFoundError(f"Direct-Cross PDEBench HDF5 file is missing: {hdf5_path}.")
     dynamic = getattr(args, "shape_mode", "fixed") == "variable"
+    mixed = dynamic and mixed_protocol(args.raw_config)
     if (Path(args.qa_dir) / ".build_in_progress.json").exists():
         raise ValueError("QA generation is incomplete; select a completed dataset directory.")
-    if str(metadata.get("format", "")) != (VARIABLE_QA_FORMAT if dynamic else PATCH_MATCHED_QA_FORMAT):
+    if str(metadata.get("format", "")) != (MIXED_QA_FORMAT if mixed else VARIABLE_QA_FORMAT if dynamic else PATCH_MATCHED_QA_FORMAT):
         raise ValueError("Direct-Cross requires the formal matched-QA dataset format.")
-    if str(metadata.get("prompt_contract", "")) != (VARIABLE_PROMPT_CONTRACT if dynamic else PATCH_QA_PROMPT_CONTRACT):
+    if str(metadata.get("prompt_contract", "")) != (MIXED_PROMPT_CONTRACT if mixed else VARIABLE_PROMPT_CONTRACT if dynamic else PATCH_QA_PROMPT_CONTRACT):
         raise ValueError("Direct-Cross matched-QA prompt contract is missing or stale.")
     if str(metadata.get("latent_audit_format", "")) != PATCH_LATENT_AUDIT_FORMAT:
         raise ValueError("Direct-Cross requires per-record raw-value normalization audits.")
@@ -1118,13 +1122,22 @@ def validate_raw_hdf5_qa_contract(
             raise ValueError("QA generation settings differ from the selected configuration; rebuild the dataset.")
         shape_sets = {}
         for key in ("train_shapes", "heldout_shapes", "extrapolation_shapes"):
-            shapes = parse_shapes(metadata[key])
-            if shapes != parse_shapes(args.raw_config["data"][key]):
+            shapes = parse_shapes(metadata[key], allow_odd=mixed)
+            if shapes != parse_shapes(args.raw_config["data"][key], allow_odd=mixed):
                 raise ValueError(f"QA/config shape mismatch: {key}.")
             shape_sets[key] = [list(shape) for shape in shapes]
         identity.update(format="raw_hdf5_variable_grid_v1", input_shape=[1, -1, -1],
                         shape_mode="variable", profile=args.experiment_profile, **shape_sets)
         identity.pop("patch_size")
+        if mixed:
+            asset = metadata.get("synthetic_asset", {})
+            if asset.get("file") != "synthetic_fields.hdf5":
+                raise ValueError("Mixed QA requires its local synthetic_fields.hdf5 asset.")
+            actual = sha256_file(Path(args.qa_dir) / asset["file"])
+            if actual != asset.get("sha256"):
+                raise ValueError("Synthetic raw field asset differs from the immutable QA hash.")
+            identity.update(format="raw_mixed_variable_grid_v2", synthetic_asset_sha256=actual,
+                            qa_protocol=MIXED_QA_FORMAT)
     contract = {
         **identity,
         "identity_sha256": _json_sha256(identity),
@@ -1276,6 +1289,9 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         self.normalized_dtype = str(normalized_dtype)
         self._hdf5_handle: Any | None = None
         self._hdf5_pid: int | None = None
+        self._synthetic_handle: Any | None = None
+        self._synthetic_pid: int | None = None
+        self.synthetic_path = Path(jsonl_path).parent / "synthetic_fields.hdf5"
 
     def _build_random_different_indices(self, seed: int) -> list[int]:
         if self.dynamic_grid:
@@ -1286,6 +1302,8 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         state = dict(self.__dict__)
         state["_hdf5_handle"] = None
         state["_hdf5_pid"] = None
+        state["_synthetic_handle"] = None
+        state["_synthetic_pid"] = None
         return state
 
     def __del__(self) -> None:
@@ -1300,6 +1318,11 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
                 pass
         self._hdf5_handle = None
         self._hdf5_pid = None
+        synthetic = getattr(self, "_synthetic_handle", None)
+        if synthetic is not None:
+            synthetic.close()
+        self._synthetic_handle = None
+        self._synthetic_pid = None
 
     def _open_hdf5(self) -> Any:
         process_id = os.getpid()
@@ -1325,6 +1348,20 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
             raise ValueError(
                 f"Matched-QA state {identity['patch_id']!r} has an invalid grid_shape."
             )
+        kind = record.get("metadata", {}).get("source_kind", "real")
+        if kind not in {"real", "correlated", "iid"}:
+            raise ValueError(f"Unsupported raw source kind: {kind}.")
+        if kind != "real":
+            spec = record["metadata"]["synthetic"]
+            if self._synthetic_handle is None or self._synthetic_pid != os.getpid():
+                if self._synthetic_handle is not None:
+                    self._synthetic_handle.close()
+                self._synthetic_handle = require_h5py().File(self.synthetic_path, "r")
+                self._synthetic_pid = os.getpid()
+            array = self._synthetic_handle[spec["key"]][int(spec["index"])]
+            if tuple(array.shape) != (height, width):
+                raise ValueError("Synthetic stored shape differs from QA metadata.")
+            return torch.as_tensor(array, dtype=torch.float32).clone().unsqueeze(0)
         handle = self._open_hdf5()
         if field not in handle:
             raise KeyError(f"PDEBench HDF5 field {field!r} is missing from {self.hdf5_path}.")
@@ -1362,6 +1399,8 @@ class RawHDF5TensorReadoutQADataset(TensorReadoutQADataset):
         if self.dynamic_grid:
             identity = {**identity, "grid_shape": list(record_shape(record)),
                         "normalized_sha256": record["metadata"].get("normalized_sha256")}
+            if "source_kind" in record["metadata"]:
+                identity.update(source_kind=record["metadata"]["source_kind"], synthetic=record["metadata"].get("synthetic"))
         previous_identity = self._latent_identity_cache.get(state_ref)
         if previous_identity is not None and previous_identity != identity:
             raise ValueError(
@@ -1661,7 +1700,8 @@ def build_datasets(
                     raise ValueError(f"Record lies outside the declared {split} trajectory partition.")
                 if record["metadata"].get("shape_partition") != shape_partitions[record_shape(record)]:
                     raise ValueError("Record shape_partition differs from metadata.")
-        screening_dataset.records = balanced_screen_records(
+        screen_selector = mixed_screen_records if mixed_protocol(args.raw_config) else balanced_screen_records
+        screening_dataset.records = screen_selector(
             val_dataset.records, args.train_shapes, int(args.screening_records), int(args.shuffle_seed) + 10_001
         )
         screening_dataset._random_different_indices = shape_matched_shuffle_indices(screening_dataset.records, int(args.shuffle_seed))
@@ -2573,20 +2613,24 @@ def predictions_from_prompt_hidden(
     records: Sequence[Mapping[str, Any]],
     tokenizer,
     output_embeddings: nn.Module,
-) -> list[str]:
+    *, return_logits: bool = False,
+):
     specification = single_token_choice_ids(records, tokenizer)
     if specification is None:
         raise ValueError("Cross-attention evaluation requires unique single-token choices.")
     candidate_ids, _targets = specification
     row_logits = restricted_choice_logits(prompt_hidden, candidate_ids, output_embeddings)
     predictions: list[str] = []
+    scores = []
     for record, logits in zip(records, row_logits):
         choices = [str(value) for value in record.get("choices", [])]
         answer = str(record.get("answer", ""))
         if answer not in choices:
             choices = [answer] + choices
         predictions.append(choices[int(torch.argmax(logits).item())])
-    return predictions
+        if return_logits:
+            scores.append(dict(zip(choices, logits.detach().float().cpu().tolist())))
+    return (predictions, scores) if return_logits else predictions
 
 
 def add_evaluation_deltas(metrics: dict[str, Any]) -> None:
@@ -2628,6 +2672,7 @@ def evaluate(
     model_dtype: torch.dtype,
     args: argparse.Namespace,
     modes: Sequence[str],
+    *, prediction_prefix: Path | None = None,
 ) -> dict[str, Any]:
     previous_checkpoint_mode = bool(
         getattr(llm, "is_gradient_checkpointing", False)
@@ -2676,6 +2721,7 @@ def evaluate(
         task_field_total: dict[str, int] = defaultdict(int)
         task_field_correct: dict[str, int] = defaultdict(int)
         shape_counts: dict[str, list[int]] = {}
+        prediction_rows = []
         progress = tqdm(
             loader,
             desc=f"Eval [{mode}]",
@@ -2707,10 +2753,14 @@ def evaluate(
                         records,
                         tokenizer,
                         output_embeddings,
+                        return_logits=prediction_prefix is not None,
                     )
             finally:
                 sidecar.clear()
-            for record, prediction in zip(records, predictions):
+            scores = [None] * len(records)
+            if prediction_prefix is not None:
+                predictions, scores = predictions
+            for record, prediction, logits in zip(records, predictions, scores):
                 answer = str(record["answer"])
                 is_correct = int(prediction == answer)
                 task = str(record.get("task_type", "unknown"))
@@ -2724,10 +2774,21 @@ def evaluate(
                 field_correct[field] += is_correct
                 task_field_total[task_field] += 1
                 task_field_correct[task_field] += is_correct
+                if prediction_prefix is not None:
+                    if "diagnostic" not in record.get("metadata", {}):
+                        # Legacy QA can be diagnosed after prediction without changing model inputs.
+                        from scripts.mixed_shape_qa import add_numeric_diagnostics
+                        record = copy.deepcopy(record)
+                        add_numeric_diagnostics(record, dataset.load_latent_for_record(record)[0])
+                    prediction_rows.append(prediction_record(record, prediction, logits))
                 if dynamic:
+                    source = record["metadata"].get("source_kind", "real")
+                    axis = record["metadata"].get("extrapolation_axis") or record["metadata"]["shape_partition"]
                     for key in (f"shape:{shape_name(record_shape(record))}",
                                 f"shape_task:{shape_name(record_shape(record))}|{task}",
-                                f"partition:{record['metadata']['shape_partition']}"):
+                                f"partition:{record['metadata']['shape_partition']}",
+                                f"source:{source}", f"source_task:{source}|{task}",
+                                f"axis_task:{axis}|{task}"):
                         counts = shape_counts.setdefault(key, [0, 0])
                         counts[0] += is_correct
                         counts[1] += 1
@@ -2783,13 +2844,25 @@ def evaluate(
                     target = combined.setdefault(key, [0, 0])
                     target[0] += counts[0]
                     target[1] += counts[1]
-            for prefix, name in (("shape:", "by_shape"), ("shape_task:", "by_shape_task"), ("partition:", "by_shape_partition")):
+            for prefix, name in (("shape:", "by_shape"), ("shape_task:", "by_shape_task"), ("partition:", "by_shape_partition"),
+                                 ("source:", "by_source"), ("source_task:", "by_source_task"), ("axis_task:", "by_extrapolation_task")):
                 result["modes"][mode][name] = {
                     key[len(prefix):]: {"correct": counts[0], "total": counts[1], "accuracy": counts[0] / counts[1]}
                     for key, counts in sorted(combined.items()) if key.startswith(prefix)
                 }
             if total != len(dataset):
                 raise RuntimeError(f"Variable evaluation lost or duplicated records: {total} != {len(dataset)}.")
+        if prediction_prefix is not None:
+            shard = write_prediction_shard(prediction_prefix, mode, prediction_rows, distributed_rank())
+            shards = [shard]
+            if distributed_is_initialized():
+                shards = [None] * distributed_world_size()
+                dist.all_gather_object(shards, shard)
+            manifest_path = Path(f"{prediction_prefix}.{mode}.manifest.json")
+            run_on_rank_zero_and_broadcast(
+                lambda: atomic_dump_json(manifest_path, {"format": "field_predictions_v1", "mode": mode,
+                    "records": total, "shards": shards}), "prediction manifest write")
+            result["modes"][mode]["prediction_manifest"] = str(manifest_path)
     add_evaluation_deltas(result)
     set_frozen_llm_execution_mode(llm, checkpoint_training=previous_checkpoint_mode)
     sidecar.train()
@@ -3705,6 +3778,7 @@ def main() -> None:
             model_dtype,
             args,
             modes=args.eval_modes,
+            prediction_prefix=run_dir / "predictions" / "final_val" if getattr(args, "export_predictions", False) else None,
         )
         run_on_rank_zero_and_broadcast(
             lambda: atomic_dump_json(run_dir / "final_val_metrics.json", final_val),
@@ -3722,6 +3796,7 @@ def main() -> None:
                 model_dtype,
                 args,
                 modes=args.eval_modes,
+                prediction_prefix=run_dir / "predictions" / "final_test" if getattr(args, "export_predictions", False) else None,
             )
             run_on_rank_zero_and_broadcast(
                 lambda: atomic_dump_json(run_dir / "final_test_metrics.json", final_test),

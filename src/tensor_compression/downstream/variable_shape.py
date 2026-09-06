@@ -13,6 +13,12 @@ from torch.utils.data import Sampler
 
 VARIABLE_QA_FORMAT = "variable_shape_field_qa_v1"
 VARIABLE_PROMPT_CONTRACT = "raw_field_dynamic_grid_one_based_v1"
+MIXED_QA_FORMAT = "mixed_shape_field_qa_v2"
+MIXED_PROMPT_CONTRACT = "raw_field_dynamic_grid_explicit_quadrants_v2"
+
+
+def mixed_protocol(config: Mapping) -> bool:
+    return config.get("data", {}).get("qa_protocol") == MIXED_QA_FORMAT
 
 
 def experiment_config(config: Mapping, profile: str | None) -> dict:
@@ -37,14 +43,14 @@ def experiment_config(config: Mapping, profile: str | None) -> dict:
     return result
 
 
-def parse_shapes(values: Sequence) -> list[tuple[int, int]]:
+def parse_shapes(values: Sequence, *, allow_odd: bool = False) -> list[tuple[int, int]]:
     shapes = []
     for value in values:
         parts = value.lower().split("x") if isinstance(value, str) else value
         if len(parts) != 2:
             raise ValueError(f"Expected HxW, got {value!r}.")
         shape = tuple(int(part) for part in parts)
-        if any(size < 4 or size % 2 for size in shape):
+        if any(size < 4 or (size % 2 and not allow_odd) for size in shape):
             raise ValueError(f"First variable-grid protocol requires even H,W >= 4: {shape}.")
         if shape in shapes:
             raise ValueError(f"Duplicate shape: {shape}.")
@@ -104,6 +110,36 @@ def balanced_screen_records(records: Sequence[dict], shapes: Sequence, limit: in
     return result
 
 
+def mixed_screen_records(records: Sequence[dict], shapes: Sequence, limit: int, seed: int) -> list[dict]:
+    """Complete states; exactly 4 real : 2 correlated : 2 IID in every seen shape.
+
+    One packet covers all four real fields and two independent states per synthetic
+    family. The screen is fixed before training and excludes all held-out shapes.
+    """
+    allowed = set(map(tuple, shapes))
+    buckets = defaultdict(dict)
+    for record in records:
+        if record_shape(record) in allowed:
+            key = (record_shape(record), record["metadata"]["source_kind"], record["field"])
+            buckets[key].setdefault(record["state_ref"], []).append(record)
+    ordered = {key: sorted(states, key=lambda ref: hashlib.sha256(f"{seed}:{ref}".encode()).hexdigest())
+               for key, states in buckets.items()}
+    packets = limit // (len(allowed) * 8 * 5)
+    if packets < 1:
+        raise ValueError("Mixed screening needs at least eight complete states per training shape.")
+    selected = set()
+    for shape in sorted(allowed):
+        keys = [key for key in ordered if key[0] == shape]
+        for key in keys:
+            count = packets * (1 if key[1] == "real" else 2)
+            if len(ordered[key]) < count:
+                raise ValueError("Insufficient validation states for the balanced mixed screen.")
+            selected.update(ordered[key][:count])
+        if len(keys) != 6:
+            raise ValueError("Mixed screening requires four real fields and two synthetic families.")
+    return [record for record in records if record["state_ref"] in selected]
+
+
 def shape_matched_shuffle_indices(records: Sequence[Mapping], seed: int) -> list[int]:
     """Always match shape, prefer field; never substitute the same trajectory."""
     by_shape = defaultdict(lambda: defaultdict(list))
@@ -114,18 +150,23 @@ def shape_matched_shuffle_indices(records: Sequence[Mapping], seed: int) -> list
         by_shape[shape][sample].append(index)
         by_field[(shape, str(record["field"]))][sample].append(index)
     rng = random.Random(seed)
+    # O(N) setup and O(1) draws: rebuilding a list of thousands of synthetic
+    # state IDs for every QA row makes the larger experiment needlessly slow.
+    indexed = {id(bucket): (list(bucket), {key: index for index, key in enumerate(bucket)})
+               for bucket in list(by_shape.values()) + list(by_field.values())}
     result = []
     for record in records:
         shape = record_shape(record)
         sample = int(record["sample_index"])
         bucket = by_field[(shape, str(record["field"]))]
-        choices = [key for key in bucket if key != sample]
-        if not choices:
+        if len(bucket) < 2:
             bucket = by_shape[shape]
-            choices = [key for key in bucket if key != sample]
-        if not choices:
+        if len(bucket) < 2:
             raise ValueError(f"Shuffled control needs at least two trajectories for shape {shape}.")
-        result.append(rng.choice(bucket[rng.choice(choices)]))
+        keys, positions = indexed[id(bucket)]
+        draw = rng.randrange(len(keys) - 1)
+        draw += int(draw >= positions[sample])
+        result.append(rng.choice(bucket[keys[draw]]))
     return result
 
 

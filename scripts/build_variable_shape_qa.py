@@ -7,6 +7,7 @@ import json
 import random
 import sys
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 
 import h5py
@@ -24,6 +25,7 @@ from scripts.build_tensor_patch_matched_qa import (
 from tensor_compression.downstream.patch_qa_contract import PATCH_LATENT_AUDIT_FORMAT, sha256_file
 from tensor_compression.downstream.variable_shape import (
     VARIABLE_PROMPT_CONTRACT, VARIABLE_QA_FORMAT, experiment_config,
+    MIXED_QA_FORMAT, MIXED_PROMPT_CONTRACT, mixed_protocol,
     parse_shapes, rectangular_quadrant, shape_name,
 )
 from tensor_compression.utils.pipeline_config import environment_override, load_yaml_mapping, resolve_path_string
@@ -98,14 +100,25 @@ def evaluation_records(source, z, rng, *, numeric_gap, region_gap, region_size, 
 
 def build_dataset(config, output: Path, hdf5_path: Path):
     data, generation = config["data"], config["generation"]
-    train_shapes = parse_shapes(data["train_shapes"])
-    heldout = parse_shapes(data["heldout_shapes"])
-    extrapolation = parse_shapes(data["extrapolation_shapes"])
+    mixed = mixed_protocol(config)
+    train_shapes = parse_shapes(data["train_shapes"], allow_odd=mixed)
+    heldout = parse_shapes(data["heldout_shapes"], allow_odd=mixed)
+    extrapolation = parse_shapes(data["extrapolation_shapes"], allow_odd=mixed)
     all_shapes = train_shapes + heldout + extrapolation
     if len(set(all_shapes)) != len(all_shapes):
         raise ValueError("Train, held-out and extrapolation shape sets must be disjoint.")
     if int(generation["region_size"]) > min(min(shape) for shape in all_shapes):
         raise ValueError("A configured grid is smaller than the region size.")
+    if mixed:
+        from scripts.mixed_shape_qa import finish_mixed_records, synthetic_raw
+        if len(data["real_fields"]) != 4 or list(data["fields"]) != list(data["real_fields"]) + ["scalar"]:
+            raise ValueError("Mixed protocol requires four real fields followed by synthetic scalar.")
+        if int(generation["train_states"]) % (len(train_shapes) * 32) or int(generation["eval_states_per_shape"]) % 8:
+            raise ValueError("Use a multiple of 32 train states per shape and 8 evaluation states per shape.")
+        if float(generation["point_compare_min_gap"]) <= 0:
+            raise ValueError("Point comparison gap must be positive.")
+        if any(min(shape) < 8 or max(shape) > 96 or shape[0] * shape[1] > 2048 for shape in train_shapes):
+            raise ValueError("Mixed training shapes must satisfy axes 8..96 and area <= 2048.")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing to overwrite dataset {output}; use a new directory.")
     output.mkdir(parents=True, exist_ok=True)
@@ -120,29 +133,33 @@ def build_dataset(config, output: Path, hdf5_path: Path):
                   region_size=int(generation["region_size"]), digits=int(generation["decimal_places"]))
     if numeric_gap <= 0 or region_gap <= 0:
         raise ValueError("QA gaps must be positive.")
-    counts, excluded, manifests, shape_counts = {}, {}, {}, {}
-    with h5py.File(hdf5_path, "r") as handle:
-        if any(field not in handle for field in fields):
+    counts, excluded, manifests, shape_counts, source_counts = {}, {}, {}, {}, {}
+    real_fields = list(data["real_fields"]) if mixed else fields
+    with ExitStack() as stack:
+        handle = stack.enter_context(h5py.File(hdf5_path, "r"))
+        synthetic_handle = stack.enter_context(h5py.File(output / "synthetic_fields.hdf5", "w", track_order=True)) if mixed else None
+        if any(field not in handle for field in real_fields):
             raise ValueError("The HDF5 file is missing a configured field.")
-        dimensions = tuple(handle[fields[0]].shape)
-        if len(dimensions) != 4 or any(tuple(handle[field].shape) != dimensions for field in fields):
+        dimensions = tuple(handle[real_fields[0]].shape)
+        if len(dimensions) != 4 or any(tuple(handle[field].shape) != dimensions for field in real_fields):
             raise ValueError("Fields must share [sample,time,height,width] dimensions.")
         samples, times, source_h, source_w = dimensions
         if any(h > source_h or w > source_w for h, w in all_shapes):
             raise ValueError("A requested shape exceeds the source HDF5 grid.")
         shuffled = list(range(samples))
-        random.Random(seed).shuffle(shuffled)
+        random.Random(int(generation.get("split_seed", seed))).shuffle(shuffled)
         train_end, val_end = int(samples * 0.8), int(samples * 0.9)
         partitions = {"train": sorted(shuffled[:train_end]), "val": sorted(shuffled[train_end:val_end]),
                       "test": sorted(shuffled[val_end:])}
         if min(map(len, partitions.values())) < 2:
             raise ValueError("Each trajectory split needs at least two samples (normally >= 20 total).")
-        for split, sample_ids in partitions.items():
+        for split_index, (split, sample_ids) in enumerate(partitions.items()):
             shapes = train_shapes if split == "train" else all_shapes
             total_train = int(generation["train_states"])
             if total_train < len(train_shapes) * 8 or int(generation["eval_states_per_shape"]) < 8:
                 raise ValueError("Use at least eight states per shape for coverage/shuffled controls.")
             split_counter, rejects, state_refs, per_shape = Counter(), Counter(), set(), {}
+            split_sources, synthetic_ids = Counter(), set()
             destination = output / f"{split}.jsonl"
             with destination.open("w", encoding="utf-8", newline="\n") as writer:
                 for shape_index, (height, width) in enumerate(shapes):
@@ -154,15 +171,29 @@ def build_dataset(config, output: Path, hdf5_path: Path):
                         attempts += 1
                         if attempts > target_count * int(generation.get("max_attempts_per_state", 100)):
                             raise RuntimeError(f"Cannot fill {split} {height}x{width}: {dict(rejects)}.")
-                        field = fields[accepted % len(fields)]
+                        kind = ("real" if accepted % 8 < 4 else "correlated" if accepted % 8 < 6 else "iid") if mixed else "real"
+                        field = real_fields[accepted % len(real_fields)] if kind == "real" else "scalar"
                         sample = sample_ids[(accepted // len(fields) + shape_index * 17 + attempts - accepted - 1) % len(sample_ids)]
                         time_index = rng.randrange(times)
                         row, col = rng.randrange(source_h - height + 1), rng.randrange(source_w - width + 1)
                         ref = f"{field}_s{sample:06d}_t{time_index:04d}_r{row:04d}_c{col:04d}_h{height}_w{width}"
+                        synthetic_spec = None
+                        if kind != "real":
+                            sample = 10**9 + split_index * 10**12 + shape_index * 10**8 + accepted
+                            time_index, row, col = 0, 0, 0
+                            ref = f"{kind}_{split}_s{sample}_h{height}_w{width}"
+                            synthetic_seed = int.from_bytes(hashlib.sha256(f"{seed}:{ref}:{attempts}".encode()).digest()[:8], "big")
+                            key = f"{split}/{height}x{width}"
+                            if key not in synthetic_handle:
+                                synthetic_handle.create_dataset(key, shape=(0, height, width), maxshape=(None, height, width),
+                                                                chunks=(1, height, width), dtype="float32", compression="lzf", track_times=False)
+                            synthetic_spec = {"key": key, "index": int(synthetic_handle[key].shape[0]),
+                                              "seed": synthetic_seed, "generator": "pcg64_waves_blobs_iid_v1"}
                         if ref in state_refs:
                             rejects["duplicate_state"] += 1
                             continue
-                        raw = torch.as_tensor(handle[field][sample, time_index, row:row + height, col:col + width]).float()
+                        raw = (synthetic_raw((height, width), kind, synthetic_seed) if kind != "real" else
+                               torch.as_tensor(handle[field][sample, time_index, row:row + height, col:col + width]).float())
                         try:
                             z, stats = normalized_values(raw)
                             source = {"patch_id": ref, "state_ref": ref, "field": field,
@@ -171,40 +202,57 @@ def build_dataset(config, output: Path, hdf5_path: Path):
                                                    "shape_partition": "seen" if (height, width) in train_shapes else "heldout" if (height, width) in heldout else "extrapolation",
                                                    "normalized_sha256": hashlib.sha256(z.contiguous().numpy().tobytes()).hexdigest()},
                                       "latent_audit": stats}
+                            if mixed:
+                                source["metadata"].update(source_kind=kind, synthetic=synthetic_spec,
+                                    extrapolation_axis=("length" if height * width > 2048 else "coordinate")
+                                    if (height, width) in extrapolation else None)
                             if split == "train":
                                 extreme = extreme_record(source, z, rng)
                                 records = build_state_records(source, extreme, z, seed=seed,
                                     numeric_gap=numeric_gap, region_gap=region_gap,
                                     region_size=kwargs["region_size"], decimal_places=kwargs["digits"],
-                                    spatial_family="point" if (accepted // len(fields)) % 2 == 0 else "region")
+                                    spatial_family="point" if (accepted // (16 if mixed else len(fields))) % 2 == 0 else "region")
                             else:
                                 records = evaluation_records(source, z, rng, **kwargs)
+                            if mixed:
+                                records = finish_mixed_records(records, source, z, rng, training=split == "train",
+                                    uniform_numeric=(accepted // 8) % 2 == 1, gap=numeric_gap, digits=kwargs["digits"],
+                                    point_gap=float(generation["point_compare_min_gap"]))
                         except ValueError as error:
                             rejects[str(error).split("\n")[0][:180]] += 1
                             continue
                         # A malformed generated prompt is a programming error, not a resampling event.
                         replay_failures = [replay["reason"] for record in records
                                            if not (replay := evaluation_record_replay(
-                                               record, z, numeric_gap=numeric_gap, region_gap=region_gap))["eligible"]]
+                                               record, z, numeric_gap=float(generation["point_compare_min_gap"]) if mixed else numeric_gap,
+                                               region_gap=region_gap))["eligible"]]
                         if replay_failures:
                             rejects.update(replay_failures)
                             continue
+                        if synthetic_spec is not None:
+                            stored = synthetic_handle[synthetic_spec["key"]]
+                            stored.resize(stored.shape[0] + 1, axis=0)
+                            stored[-1] = raw.numpy()
+                            synthetic_ids.add(sample)
                         for record in records:
                             record.pop("prompt_data", None)
                             question = record["question"].replace("The tensor soft tokens encode", "The field memory contains")
                             record["question"] = record["query"] = question
-                            record["metadata"]["prompt_contract"] = VARIABLE_PROMPT_CONTRACT
+                            record["metadata"]["prompt_contract"] = MIXED_PROMPT_CONTRACT if mixed else VARIABLE_PROMPT_CONTRACT
                             writer.write(json.dumps(record, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n")
                             split_counter[record["task_type"]] += 1
                         state_refs.add(ref)
+                        split_sources[f"{height}x{width}|{kind}|{field}"] += 1
                         accepted += 1
                     per_shape[shape_name((height, width))] = accepted
                     print(f"build split={split} shape={height}x{width} states={accepted} attempts={attempts}", flush=True)
             counts[split] = dict(split_counter)
             excluded[split] = dict(rejects)
             shape_counts[split] = per_shape
-            manifests[split] = sample_ids
-    metadata = {"format": VARIABLE_QA_FORMAT, "prompt_contract": VARIABLE_PROMPT_CONTRACT,
+            manifests[split] = sorted(set(sample_ids) | synthetic_ids)
+            source_counts[split] = dict(split_sources)
+    metadata = {"format": MIXED_QA_FORMAT if mixed else VARIABLE_QA_FORMAT,
+                "prompt_contract": MIXED_PROMPT_CONTRACT if mixed else VARIABLE_PROMPT_CONTRACT,
                 "shape_mode": "variable", "profile": config["experiment_profile"], "split_mode": "sample",
                 "natural_language_coordinate_origin": 1, "latent_audit_format": PATCH_LATENT_AUDIT_FORMAT,
                 "qa_value_space": "per_patch_zscore_from_raw_patch", "storage_dtype": "float16",
@@ -215,6 +263,11 @@ def build_dataset(config, output: Path, hdf5_path: Path):
                 "generation": generation, "task_counts": counts, "states_by_shape": shape_counts,
                 "excluded_attempts": excluded, "stage1_checkpoint_required": False,
                 "output_split_sha256": {split: sha256_file(output / f"{split}.jsonl") for split in manifests}}
+    if mixed:
+        metadata.update(synthetic_asset={"file": "synthetic_fields.hdf5", "sha256": sha256_file(output / "synthetic_fields.hdf5")},
+                        source_states=source_counts, real_trajectory_splits=partitions,
+                        mixture={"real": 0.5, "correlated": 0.25, "iid": 0.25},
+                        numeric_training_recipes={"matched": 0.5, "uniform": 0.5})
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     marker.unlink()
     print(f"completed dataset={output} train_records={metadata['stage2b']['train_records']}", flush=True)

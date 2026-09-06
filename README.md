@@ -17,6 +17,12 @@ for the protocol and complete local Git / remote-server commands. This path
 builds QA from raw HDF5 and trains from scratch; its default evaluation uses
 only the normal field input.
 
+The [mixed-field v2 runbook](VARIABLE_SHAPE_MIXED_RUNBOOK.md) adds seeded
+correlated and IID synthetic fields, odd and elongated grids, a 65,536-state
+full training profile, per-question diagnostics, and independent checkpoint
+evaluation on a common QA set. The original variable-shape configuration
+remains the v1 baseline.
+
 ## Method
 
 The paper pipeline has two training stages:

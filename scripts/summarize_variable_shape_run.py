@@ -22,6 +22,8 @@ def summarize(run_dir: Path, split: str = "val", csv_path: Path | None = None):
     metrics = json.loads(path.read_text(encoding="utf-8"))["modes"]["correct"]
     for name, row in metrics["by_shape_partition"].items():
         print(f"{name}: {100 * row['accuracy']:.2f}% ({row['correct']}/{row['total']})")
+    for name, row in metrics.get("by_source_task", {}).items():
+        print(f"source_task={name}: {100 * row['accuracy']:.2f}% ({row['correct']}/{row['total']})")
     rows = []
     print("shape,n,accuracy," + ",".join(TASKS))
     for shape in sorted(metrics["by_shape"], key=lambda value: tuple(int(x) for x in value.split("x"))):
